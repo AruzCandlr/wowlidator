@@ -2,7 +2,7 @@
 
 Derived from the same code survey as `docs/sequence-testing-spec.md`. The request this answers: *given a database schema, test whether the database is called or modified as planned.* Those are two different questions with two different verdicts, and conflating them is how a tool ends up claiming things it never observed.
 
-> **Status: proposed.** Nothing in this document is implemented. There is no database driver anywhere in the dependency tree today (verified: `package.json` has 13 runtime deps, none DB-related; a repo-wide grep for `postgres|mysql|sqlite|prisma|knex|sequelize|typeorm` over `src/` returns zero hits).
+> **Status: implemented** (branch `backend-quest-for-the-grail`) — D1–D9 landed; D10 (OTel trace ingestion, the causal "called as planned" tier) is deferred and still open, as is the `db-seed` policy tier this spec already kept out of v1. There is still no database driver in the dependency tree: `pg` is a lazy optional import behind a local declaration file, exactly as specified. Two places the implementation sharpened the spec: at run time the schema is always live introspection through the client (a DDL/Prisma file feeds *planning and authoring* via the ingester; the runtime grounding gate never trusts a file over the database it is about to query), and an **injected** `DbClient` is not closed by the run — ownership follows the runner's own only-close-what-you-opened rule. Covered by `tests/db.test.ts` (stub tier always; real-Postgres tier gated on `WOWLIDATOR_DB_TESTS=1`) and `tests/schema-ingester.test.ts`.
 
 ## Verdict
 

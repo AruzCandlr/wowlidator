@@ -2,7 +2,7 @@
 
 Derived from a code survey of the observation plane (`src/api/network-observer.ts`, the marks machinery in `src/engine/runner.ts`) and the input pipeline (`src/catalog/extract.ts`, the claims gate, `src/context/`). Every capability claim below cites the line it stands on; every gap is disclosed rather than papered over.
 
-> **Status: proposed.** Nothing in this document is implemented. The verdict table is the summary; the rest is how.
+> **Status: implemented** (branch `backend-quest-for-the-grail`) — S1–S8 landed; S9 (the observed-window → Mermaid renderer) is deferred and still open. Three places the implementation landed sharper than first specified: the flat authored form refuses a prose line outright by requiring path-shaped templates (`"just words"` must not parse as a call); a *missed* presence claim over a truncated window is also blocked rather than failed, since the call may simply have been evicted — B1's rule turned out to cut both ways; and the participant table lives in the claims file and the CLI's `lane` lines, with wowUI rendering the claims list unchanged (the JSON is the gate — dedicated plane columns in the panel are still open). Covered by `tests/sequence.test.ts`, browser tier included.
 
 ## Verdict
 
