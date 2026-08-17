@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.wowlidator/
+*.tsbuildinfo
+
+# Healed-selector cache is environment-specific; commit it deliberately if you
+# want repairs shared across a team, otherwise leave it local.
+healed-selectors.json
+
+# Local provider keys — never commit these.
+.env

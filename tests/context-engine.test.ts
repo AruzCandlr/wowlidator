@@ -1,0 +1,430 @@
+/**
+ * Contract tests for the repository context engine.
+ *
+ * Entirely offline and filesystem-only — no model, no browser, no CDP. Every
+ * ingester is deterministic static analysis, so these fixtures are small,
+ * synthetic mini-projects written to a temp dir per suite.
+ */
+
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { after, before, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+
+import { ContextEngine, matchesRoutePattern, pathnameOf } from '../src/context/context-engine.js';
+import { DEFAULT_CONTEXT_MAX_NODES, findRouteForUrl, summarize, toPromptContext } from '../src/context/query.js';
+import { ManifestIngester } from '../src/context/ingesters/manifest-ingester.js';
+import { ComponentIngester } from '../src/context/ingesters/component-ingester.js';
+import { RouteIngester } from '../src/context/ingesters/route-ingester.js';
+import { TestIngester } from '../src/context/ingesters/test-ingester.js';
+import type { IngestContext, IngestResult, Ingester, ProjectGraph } from '../src/context/types.js';
+
+async function writeFixture(root: string, files: Record<string, string>): Promise<void> {
+  for (const [rel, content] of Object.entries(files)) {
+    const full = join(root, rel);
+    await mkdir(dirname(full), { recursive: true });
+    await writeFile(full, content, 'utf8');
+  }
+}
+
+/** Every non-ignored file, unsorted-input-safe, mirroring what `ContextEngine`'s own walk would hand an ingester. */
+async function ingestContextFor(root: string, files: string[]): Promise<IngestContext> {
+  return { rootDir: root, files: [...files].sort() };
+}
+
+const NEXT_APP_FIXTURE = {
+  'package.json': JSON.stringify({
+    name: 'fixture-app',
+    version: '1.0.0',
+    description: '',
+    dependencies: { react: '^18.0.0', next: '^14.0.0' },
+  }),
+  'README.md': '# Fixture App\n\nA small app for testing.\n',
+  'src/components/Button.tsx': `
+    import React from 'react';
+    export function Button({ children }: { children: React.ReactNode }) {
+      return <button>{children}</button>;
+    }
+  `,
+  'src/components/EmployeeCard.tsx': `
+    import { Button } from './Button';
+    export default function EmployeeCard() {
+      return (
+        <div>
+          <Button>View</Button>
+        </div>
+      );
+    }
+  `,
+  'app/employees/[id]/page.tsx': `
+    import EmployeeCard from '../../../src/components/EmployeeCard';
+    export default function EmployeePage() {
+      return <EmployeeCard />;
+    }
+  `,
+  'app/(marketing)/about/page.tsx': `
+    export default function About() {
+      return <div>About</div>;
+    }
+  `,
+  'app/api/employees/route.ts': `
+    export function GET() { return new Response('[]'); }
+  `,
+  'pages/blog/[slug].tsx': `
+    export default function BlogPost() {
+      return <article />;
+    }
+  `,
+  'pages/index.tsx': `
+    export default function Home() {
+      return <main />;
+    }
+  `,
+  'employee.flow.json': JSON.stringify({
+    name: 'employee page loads',
+    steps: [
+      { action: 'goto', url: '/employees/42' },
+      { action: 'expectVisible', selector: 'text=View' },
+    ],
+  }),
+  'tests/example.test.ts': `
+    import { describe, it } from 'node:test';
+    describe('employee page', () => {
+      it('renders the card', () => {});
+    });
+  `,
+};
+
+describe('context engine', () => {
+  let dir: string;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'wowlidator-context-'));
+    await writeFixture(dir, NEXT_APP_FIXTURE);
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  describe('ManifestIngester', () => {
+    it('reads package metadata, frameworks, and a README fallback description', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new ManifestIngester().ingest(ctx);
+
+      assert.equal(result.nodes.length, 1);
+      const [node] = result.nodes;
+      assert.equal(node?.kind, 'package');
+      assert.equal(node?.name, 'fixture-app');
+      assert.equal(node?.detail, 'Fixture App');
+      assert.equal(node?.meta?.frameworks, 'react,next.js');
+      assert.equal(result.warnings.length, 0);
+    });
+
+    it('warns rather than throwing when package.json is absent', async () => {
+      const ctx: IngestContext = { rootDir: dir, files: ['README.md'] };
+      const result = await new ManifestIngester().ingest(ctx);
+      assert.equal(result.nodes.length, 0);
+      assert.match(result.warnings[0] ?? '', /no package\.json/);
+    });
+  });
+
+  describe('ComponentIngester', () => {
+    it('parses exported components and links uses/renders through real imports', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new ComponentIngester().ingest(ctx);
+
+      const byName = new Map(result.nodes.map((node) => [node.name, node]));
+      assert.ok(byName.has('Button'));
+      assert.ok(byName.has('EmployeeCard'));
+      assert.ok(byName.has('EmployeePage'));
+      assert.equal(byName.get('EmployeeCard')?.meta?.default, 'true');
+      assert.equal(byName.get('Button')?.meta?.default, 'false');
+
+      const employeePage = byName.get('EmployeePage');
+      const employeeCard = byName.get('EmployeeCard');
+      const button = byName.get('Button');
+      assert.ok(
+        result.edges.some((e) => e.kind === 'uses' && e.from === employeePage?.id && e.to === employeeCard?.id),
+      );
+      assert.ok(result.edges.some((e) => e.kind === 'uses' && e.from === employeeCard?.id && e.to === button?.id));
+    });
+
+    it('does not fabricate edges for external or unresolved imports', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'wowlidator-context-ext-'));
+      try {
+        await writeFixture(root, {
+          'src/Widget.tsx': `
+            import { Card } from 'some-external-lib';
+            import { Helper } from '@/aliased/helper';
+            export function Widget() {
+              return <Card><Helper /></Card>;
+            }
+          `,
+        });
+        const ctx = await ingestContextFor(root, ['src/Widget.tsx']);
+        const result = await new ComponentIngester().ingest(ctx);
+        assert.equal(result.nodes.length, 1);
+        assert.equal(result.edges.length, 0);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('RouteIngester', () => {
+    it('converts App Router dynamic segments and drops route groups', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+      const byFile = new Map(result.nodes.map((node) => [node.file, node]));
+
+      assert.equal(byFile.get('app/employees/[id]/page.tsx')?.name, '/employees/:id');
+      assert.equal(byFile.get('app/(marketing)/about/page.tsx')?.name, '/about');
+      assert.equal(byFile.get('app/api/employees/route.ts')?.meta?.type, 'api');
+    });
+
+    it('handles Pages Router index and dynamic files', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+      const byFile = new Map(result.nodes.map((node) => [node.file, node]));
+
+      assert.equal(byFile.get('pages/index.tsx')?.name, '/');
+      assert.equal(byFile.get('pages/blog/[slug].tsx')?.name, '/blog/:slug');
+    });
+
+    it('guesses a renders edge toward the page component', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+      const employeeRoute = result.nodes.find((n) => n.file === 'app/employees/[id]/page.tsx');
+      assert.ok(
+        result.edges.some(
+          (e) => e.kind === 'renders' && e.from === employeeRoute?.id && e.to.endsWith('#EmployeePage'),
+        ),
+      );
+    });
+  });
+
+  describe('TestIngester', () => {
+    it('extracts describe/it titles from a generic test file', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new TestIngester().ingest(ctx);
+      const node = result.nodes.find((n) => n.file === 'tests/example.test.ts');
+      assert.ok(node);
+      assert.equal(node?.meta?.framework, 'node:test');
+      assert.match(node?.detail ?? '', /employee page/);
+      assert.match(node?.detail ?? '', /renders the card/);
+    });
+
+    it('reads urls and assertion status out of a wowlidator flow file', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new TestIngester().ingest(ctx);
+      const node = result.nodes.find((n) => n.file === 'employee.flow.json');
+      assert.equal(node?.meta?.hasAssertion, 'true');
+      assert.equal(node?.meta?.urls, '/employees/42');
+    });
+  });
+
+  describe('ContextEngine', () => {
+    it('builds a linked graph: route -> renders -> component -> uses -> component, test -> covers -> route', async () => {
+      const engine = new ContextEngine({ rootDir: dir, cacheFile: join(dir, '.wowlidator/context-graph.json') });
+      const graph = await engine.build({ force: true });
+
+      const route = graph.nodes.find((n) => n.name === '/employees/:id');
+      const page = graph.nodes.find((n) => n.name === 'EmployeePage');
+      const card = graph.nodes.find((n) => n.name === 'EmployeeCard');
+      const test = graph.nodes.find((n) => n.file === 'employee.flow.json');
+      assert.ok(route && page && card && test);
+
+      assert.ok(graph.edges.some((e) => e.kind === 'renders' && e.from === route?.id && e.to === page?.id));
+      assert.ok(graph.edges.some((e) => e.kind === 'uses' && e.from === page?.id && e.to === card?.id));
+      assert.ok(graph.edges.some((e) => e.kind === 'covers' && e.from === test?.id && e.to === route?.id));
+    });
+
+    it('reuses the cached graph when nothing has changed, and rebuilds when it has', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'wowlidator-context-cache-'));
+      try {
+        await writeFixture(root, { 'package.json': JSON.stringify({ name: 'a', version: '1.0.0' }) });
+        const cacheFile = join(root, '.wowlidator/context-graph.json');
+        const engine = new ContextEngine({ rootDir: root, cacheFile });
+
+        const first = await engine.build();
+        const second = await engine.build();
+        assert.equal(second.generatedAt, first.generatedAt); // cache hit: no rebuild happened
+        assert.equal(second.signature, first.signature);
+
+        // A different byte length, not just different bytes: the signature is size+mtime, not
+        // content, so a same-length edit landing in the same mtime tick as the original write
+        // would be indistinguishable from no edit at all — this keeps the assertion deterministic
+        // rather than racing the filesystem's mtime resolution.
+        await writeFixture(root, { 'package.json': JSON.stringify({ name: 'a', version: '2.0.0-longer' }) });
+        const third = await engine.build();
+        assert.notEqual(third.signature, first.signature);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('force rebuilds even when the signature is unchanged', async () => {
+      let calls = 0;
+      const counting: Ingester = {
+        id: 'counting',
+        async ingest(): Promise<IngestResult> {
+          calls += 1;
+          return { nodes: [], edges: [], warnings: [] };
+        },
+      };
+      const root = await mkdtemp(join(tmpdir(), 'wowlidator-context-force-'));
+      try {
+        await writeFixture(root, { 'package.json': JSON.stringify({ name: 'a', version: '1.0.0' }) });
+        const engine = new ContextEngine({
+          rootDir: root,
+          cacheFile: join(root, '.wowlidator/context-graph.json'),
+          ingesters: [counting],
+        });
+
+        await engine.build();
+        assert.equal(calls, 1);
+        await engine.build(); // unchanged signature -> served from cache, ingester not re-run
+        assert.equal(calls, 1);
+        await engine.build({ force: true });
+        assert.equal(calls, 2);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('drops edges whose endpoints were never indexed, and records why', async () => {
+      const danglingIngester: Ingester = {
+        id: 'dangling-test',
+        async ingest(): Promise<IngestResult> {
+          return {
+            nodes: [{ id: 'a', kind: 'component', name: 'A', file: 'a.tsx' }],
+            edges: [{ from: 'a', to: 'does-not-exist', kind: 'uses' }],
+            warnings: [],
+          };
+        },
+      };
+      const root = await mkdtemp(join(tmpdir(), 'wowlidator-context-dangling-'));
+      try {
+        const engine = new ContextEngine({
+          rootDir: root,
+          cacheFile: join(root, '.wowlidator/context-graph.json'),
+          ingesters: [danglingIngester],
+        });
+        const graph = await engine.build();
+        assert.equal(graph.edges.length, 0);
+        assert.ok(graph.sources.some((s) => s.warnings.some((w) => /dropped 1 edge/.test(w))));
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps the first node on a duplicate id and warns about the loser', async () => {
+      const makeIngester = (id: string, name: string): Ingester => ({
+        id,
+        async ingest(): Promise<IngestResult> {
+          return { nodes: [{ id: 'dup', kind: 'component', name, file: 'x.tsx' }], edges: [], warnings: [] };
+        },
+      });
+      const root = await mkdtemp(join(tmpdir(), 'wowlidator-context-dup-'));
+      try {
+        const engine = new ContextEngine({
+          rootDir: root,
+          cacheFile: join(root, '.wowlidator/context-graph.json'),
+          ingesters: [makeIngester('first', 'First'), makeIngester('second', 'Second')],
+        });
+        const graph = await engine.build();
+        assert.equal(graph.nodes.length, 1);
+        assert.equal(graph.nodes[0]?.name, 'First');
+        const secondSource = graph.sources.find((s) => s.id === 'second');
+        assert.ok(secondSource?.warnings.some((w) => /duplicate node id/.test(w)));
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('does not let one crashing ingester block the others', async () => {
+      const crashing: Ingester = {
+        id: 'crashes',
+        ingest(): Promise<IngestResult> {
+          throw new Error('boom');
+        },
+      };
+      const root = await mkdtemp(join(tmpdir(), 'wowlidator-context-crash-'));
+      try {
+        await writeFixture(root, { 'package.json': JSON.stringify({ name: 'a', version: '1.0.0' }) });
+        const engine = new ContextEngine({
+          rootDir: root,
+          cacheFile: join(root, '.wowlidator/context-graph.json'),
+          ingesters: [crashing, new ManifestIngester()],
+        });
+        const graph = await engine.build();
+        assert.ok(graph.nodes.some((n) => n.kind === 'package'));
+        assert.ok(graph.sources.find((s) => s.id === 'crashes')?.warnings.some((w) => /crashed/.test(w)));
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('query helpers', () => {
+    let graph: ProjectGraph;
+
+    before(async () => {
+      const engine = new ContextEngine({ rootDir: dir, cacheFile: join(dir, '.wowlidator/context-graph.json') });
+      graph = await engine.build({ force: true });
+    });
+
+    it('matches a dynamic route against a concrete URL', () => {
+      const route = findRouteForUrl(graph, 'http://localhost:3000/employees/42');
+      assert.equal(route?.name, '/employees/:id');
+    });
+
+    it('returns undefined when nothing matches', () => {
+      assert.equal(findRouteForUrl(graph, 'http://localhost:3000/nowhere'), undefined);
+    });
+
+    it('builds a route-centered prompt slice with the renders/uses/covers chain', () => {
+      const text = toPromptContext(graph, { url: 'http://localhost:3000/employees/42' });
+      assert.match(text, /Project context for \/employees\/:id/);
+      assert.match(text, /renders EmployeePage/);
+      assert.match(text, /EmployeePage uses EmployeeCard/);
+      assert.match(text, /covered by "employee page loads"/);
+    });
+
+    it('returns an empty string when no url is given', () => {
+      assert.equal(toPromptContext(graph), '');
+    });
+
+    it('truncates at the node budget and says so', () => {
+      const text = toPromptContext(graph, { url: 'http://localhost:3000/employees/42', maxNodes: 2 });
+      assert.match(text, /context truncated at 2 nodes/);
+    });
+
+    it('summarizes node counts and surfaces ingester warnings', () => {
+      const text = summarize(graph);
+      assert.match(text, /nodes\s+\d+ \(/);
+      assert.match(text, /edges\s+\d+/);
+    });
+  });
+
+  describe('route pattern matching', () => {
+    it('matches static, dynamic, and catch-all segments', () => {
+      assert.equal(matchesRoutePattern('/employees/42', '/employees/:id'), true);
+      assert.equal(matchesRoutePattern('/employees', '/employees/:id'), false);
+      assert.equal(matchesRoutePattern('/blog/a/b/c', '/blog/*slug'), true);
+      assert.equal(matchesRoutePattern('/blog', '/blog/*slug'), false);
+    });
+
+    it('extracts a pathname from an absolute url or passes through a bare path', () => {
+      assert.equal(pathnameOf('http://localhost:3000/foo?x=1'), '/foo');
+      assert.equal(pathnameOf('/bare/path'), '/bare/path');
+      assert.equal(pathnameOf('not a url'), undefined);
+    });
+  });
+
+  it('default max node budget stays in sync with the exported constant', () => {
+    assert.equal(DEFAULT_CONTEXT_MAX_NODES, 40);
+  });
+});

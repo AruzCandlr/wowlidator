@@ -1,0 +1,237 @@
+/**
+ * Where a run's artifacts land — flow files, machine reports, quarantine —
+ * and the browser-lifecycle glue every browser command shares. Split out of
+ * cli.ts verbatim.
+ */
+
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { ensureChrome, portOf, stopChrome, waitForApp } from '../browser/chrome.js';
+import type { ProofBundle } from '../engine/proof-bundle.js';
+import { DEFAULT_CDP_URL, type Flow, type FlowStep } from '../engine/runner.js';
+import { decideQuarantine } from '../history/quarantine.js';
+import { RunHistory, type HistoryEntry } from '../history/run-history.js';
+import { defaultReportFilename, reportGroupForUrl } from '../reporter/html-reporter.js';
+import { writeCtrfReport, writeJUnitReport } from '../reporter/machine-report.js';
+import { EXIT } from './exit.js';
+import type { CliOptions } from './options.js';
+import { lineLogger } from './runtime.js';
+
+/**
+ * The folder a page's artifacts share — its flow JSON and its report, together,
+ * so everything about testing one page is in one place instead of scattered
+ * between the project root and the reports directory.
+ *
+ * An explicit `--report` is not second-guessed: it decides where reports go,
+ * and the flow stays here with the rest of the page's output.
+ */
+export function pageDir(options: CliOptions, group: string): string {
+  return resolve(options.reportDir, group);
+}
+
+/**
+ * The report and the flow share a basename, so `03-edge-case-pagination.html`
+ * and `03-edge-case-pagination.flow.json` sit next to each other and it is
+ * obvious which produced which.
+ */
+export function flowFilename(context: Parameters<typeof defaultReportFilename>[0]): string {
+  return `${defaultReportFilename(context).replace(/\.html$/, '')}.flow.json`;
+}
+
+export async function writeFlowFile(path: string, flow: Flow): Promise<string> {
+  const target = resolve(path);
+  await mkdir(resolve(target, '..'), { recursive: true });
+  await writeFile(target, `${JSON.stringify(flow, null, 2)}\n`, 'utf8');
+  return target;
+}
+
+/**
+ * Which page is this flow about? Its first navigation is the honest answer —
+ * that is the page whose behaviour the assertions describe.
+ */
+export function groupForFlow(flow: Flow): string | undefined {
+  const steps = [...(flow.setup ?? []), ...flow.steps];
+  const firstGoto = steps.find((step): step is Extract<FlowStep, { action: 'goto' }> =>
+    step.action === 'goto',
+  );
+  if (firstGoto === undefined) {
+    return flow.baseUrl === undefined ? undefined : reportGroupForUrl(flow.baseUrl);
+  }
+  try {
+    return reportGroupForUrl(new URL(firstGoto.url, flow.baseUrl).toString());
+  } catch {
+    return reportGroupForUrl(firstGoto.url);
+  }
+}
+
+export function isFlow(value: unknown): value is Flow {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as Flow).name === 'string' &&
+    Array.isArray((value as Flow).steps)
+  );
+}
+
+/**
+ * Mark a run quarantined when the caller asked for it and history agrees.
+ *
+ * Mutates the bundle rather than returning a copy because everything
+ * downstream — the HTML report, JUnit, CTRF, the suite index — reads the same
+ * object, and a quarantine that only some of them knew about would be worse
+ * than none.
+ */
+export async function applyQuarantine(
+  bundle: ProofBundle,
+  options: CliOptions,
+): Promise<{ quarantined: boolean; reason: string }> {
+  // Read the same window `analyseTrend` used. `flaky` there means "two or more
+  // flips in the last twenty runs", which stays true long after a test settles
+  // down — so leaving quarantine needs its own evidence, and that evidence is
+  // the recent history, not the verdict.
+  let history: HistoryEntry[] = [];
+  if (options.quarantineFlaky && options.history) {
+    try {
+      history = await new RunHistory(options.historyPath).forFlow(bundle.name);
+    } catch {
+      // Diagnostic, like everything else history-backed: an unreadable log
+      // must not change a run's verdict.
+    }
+  }
+  const decision = decideQuarantine(bundle, history, {
+    enabled: options.quarantineFlaky,
+  });
+  if (decision.quarantined) {
+    (bundle as { quarantined?: boolean }).quarantined = true;
+    process.stdout.write(`  quarantine ${decision.reason}\n`);
+  } else if (options.quarantineFlaky && bundle.status === 'failed') {
+    process.stdout.write(`  quarantine not applied — ${decision.reason}\n`);
+  }
+  return decision;
+}
+
+/**
+ * Emit whatever machine-readable formats were asked for.
+ *
+ * Kept in one place so `run`, `generate` and `author` cannot drift in what
+ * they support — a CI job should not have to know which command produced the
+ * results it is reading.
+ */
+export async function writeMachineReports(
+  bundles: readonly ProofBundle[],
+  options: CliOptions,
+): Promise<void> {
+  if (bundles.length === 0) return;
+  if (options.junit) {
+    const path = await writeJUnitReport(bundles, options.junit);
+    process.stdout.write(`  junit      ${path}\n`);
+  }
+  if (options.ctrf) {
+    const path = await writeCtrfReport(bundles, options.ctrf);
+    process.stdout.write(`  ctrf       ${path}\n`);
+  }
+}
+
+/**
+ * Everything that has to be true before a browser command can run.
+ *
+ * This is the work `wowlidator.sh` used to do — find or fix a driveable Chrome,
+ * wait for the application — moved into the CLI so that one command is the
+ * whole story and the rules live next to the code that depends on them.
+ *
+ * Returns an exit code when it could not get there, or `null` to carry on.
+ */
+export async function prepare(options: CliOptions, appUrl?: string): Promise<number | null> {
+  const log = lineLogger(options);
+
+  if (options.waitFor) {
+    const ready = await waitForApp(options.waitFor, 90_000, log);
+    if (!ready) {
+      process.stderr.write(`wowlidator: ${options.waitFor} did not respond within 90s\n`);
+      return EXIT.environment;
+    }
+  }
+
+  if (!options.ensureChrome) return null;
+
+  const result = await ensureChrome({
+    cdpUrl: options.cdp ?? DEFAULT_CDP_URL,
+    profile: options.chromeProfile,
+    headless: options.headless,
+    onLog: log,
+  });
+  chromeStartedByUs = result.startedByUs;
+
+  if (result.status === 'blocked' || result.status === 'missing-chrome' || result.status === 'failed') {
+    // Environment, not usage: the invocation was right, the machine is not
+    // ready, and CI has to be able to tell those apart.
+    process.stderr.write(`wowlidator: ${result.message}\n`);
+    return EXIT.environment;
+  }
+  if (result.status !== 'ready') log?.(result.message);
+
+  // A reachability check on the page under test, when we know it. Failing here
+  // beats failing on step 1 with a selector error about a page that never
+  // loaded.
+  if (appUrl && !options.waitFor) {
+    try {
+      await fetch(appUrl, { signal: AbortSignal.timeout(5_000), redirect: 'follow' });
+    } catch {
+      process.stderr.write(
+        `wowlidator: cannot reach ${appUrl} — is the app running?\n` +
+          'Use --wait-for <url> to wait for it instead of failing.\n',
+      );
+      return EXIT.environment;
+    }
+  }
+
+  return null;
+}
+
+/** Set by `prepare`; only a browser this process started may be stopped. */
+let chromeStartedByUs = false;
+
+/** Stop the browser, if we started it and were asked to. */
+export async function cleanupChrome(options: CliOptions): Promise<void> {
+  if (!chromeStartedByUs || !options.stopChrome) return;
+  lineLogger(options)?.('stopping the Chrome this run started');
+  await stopChrome(portOf(options.cdp ?? DEFAULT_CDP_URL), options.chromeProfile);
+}
+
+/** Open a file with the platform's default handler. */
+export async function openReport(path: string | null, options: CliOptions): Promise<void> {
+  if (!path || !options.open) return;
+  const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+  const { spawn } = await import('node:child_process');
+  spawn(opener, [path], { detached: true, stdio: 'ignore' }).unref();
+}
+
+/**
+ * Where a case's flow file goes.
+ *
+ * `--flow` names one file, and there may now be several. Numbering inside the
+ * name the caller gave keeps their directory and extension and makes the
+ * relationship obvious — silently overwriting it once per case would leave them
+ * with the last case and no sign the others existed.
+ */
+export function catalogFlowPath(
+  options: CliOptions,
+  context: { dir: string; group: string | undefined; name: string; index: number | undefined },
+): string {
+  if (options.flow === undefined) {
+    return join(
+      context.dir,
+      flowFilename({
+        runId: '',
+        name: context.name,
+        status: 'catalog',
+        group: context.group,
+        ...(context.index === undefined ? {} : { index: context.index }),
+      }),
+    );
+  }
+  const target = resolve(options.flow);
+  if (context.index === undefined) return target;
+  return target.replace(/(\.flow)?\.json$/i, '') + `.${context.index}.flow.json`;
+}

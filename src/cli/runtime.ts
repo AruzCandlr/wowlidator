@@ -1,0 +1,140 @@
+/**
+ * Builders for the model-backed collaborators a run needs — healer, agent,
+ * data model — plus the live-progress loggers. Split out of cli.ts verbatim.
+ */
+
+import type { CacheManager } from '../cache/cache-manager.js';
+import { describeRouting } from '../config.js';
+import { LlmDataModel } from '../data/data-model.js';
+import { formatAgentAction, formatStepLine, type ProofStep } from '../engine/proof-bundle.js';
+import type { RunPlan } from '../engine/runner.js';
+import { CAPTURE_PILOT_MAX_STEPS } from '../context/capture-pilot.js';
+import { LlmFlowRepairModel, type FlowRepairModel } from '../repair/flow-repair-model.js';
+import { JitHealer, LlmHealerModel } from '../healer/jit-healer.js';
+import { LlmAgentModel, WorkflowAgent } from '../orchestrator/workflow-agent.js';
+import type { CliOptions } from './options.js';
+
+export function buildHealer(options: CliOptions) {
+  return options.heal
+    ? (cache: CacheManager) =>
+        new JitHealer({ model: new LlmHealerModel({ factory: options.factory }), cache })
+    : undefined;
+}
+
+/** Live per-step console output; suppressed under --json, whose stdout must stay one document. */
+export function stepLogger(options: CliOptions): ((step: ProofStep) => void) | undefined {
+  return options.json ? undefined : (step) => console.log(formatStepLine(step));
+}
+
+/**
+ * How many steps this run intends to take, printed once before the first one.
+ *
+ * The step lines that follow carry `[0]`, `[1]`, … and a numerator on its own
+ * is not progress — anything reading this output can count what has finished
+ * but not what remains. One line up front is the denominator, and the panel's
+ * progress bar and time estimate are both built on it. Suppressed under
+ * `--json` for the same reason every other progress line is: that stdout has to
+ * stay one parseable document.
+ */
+export function planLogger(options: CliOptions): ((plan: RunPlan) => void) | undefined {
+  return options.json
+    ? undefined
+    : (plan) => console.log(`  plan       ${plan.total} step(s)`);
+}
+
+/** Live progress lines for generation/authoring/repair; suppressed under --json. */
+export function lineLogger(options: CliOptions): ((line: string) => void) | undefined {
+  return options.json ? undefined : (line) => console.log(line);
+}
+
+export function buildAgent(options: CliOptions): WorkflowAgent | null {
+  if (!options.agent) return null;
+  return new WorkflowAgent({
+    model: new LlmAgentModel({ factory: options.factory }),
+    // Per-turn live progress — a `workflow` step can run for several seconds
+    // across multiple model calls, and this is the only visibility into it
+    // before the step as a whole finishes. Suppressed under --json: the
+    // response there is a single machine-parseable document on stdout.
+    onAction: options.json
+      ? undefined
+      : async (_page, action) => {
+          console.log(formatAgentAction(action));
+        },
+  });
+}
+
+/**
+ * The agent that reinvestigates a failed step for `--repair-investigate`.
+ * Separate from `buildAgent` on purpose: that one answers "may `workflow`
+ * steps run?" (`--no-agent`), this one answers "may the repair loop act on
+ * the page?" — conflating them would let one opt-in silently grant the other.
+ */
+export function buildInvestigationAgent(options: CliOptions): WorkflowAgent {
+  return new WorkflowAgent({
+    model: new LlmAgentModel({ factory: options.factory }),
+    onAction: options.json
+      ? undefined
+      : async (_page, action) => {
+          console.log(formatAgentAction(action));
+        },
+  });
+}
+
+/**
+ * The repair model for in-run step reconstruction, or null. Same lazy-key
+ * degradation as the capture pilot: without a generator key, runs behave
+ * exactly as they did before reconstruction existed.
+ */
+export function buildStepRepair(options: CliOptions): FlowRepairModel | null {
+  if (!options.reconstruct) return null;
+  if (!options.factory.canResolve('generator')) return null;
+  return new LlmFlowRepairModel({ factory: options.factory });
+}
+
+/**
+ * The agent that steadies a page before its capture (`--no-agent-capture`
+ * turns it off). Null when the `agent` role has no key — a capture without a
+ * pilot is the capture we always took, so a missing key degrades to that
+ * rather than blocking generation. Separate from `buildAgent` for the same
+ * reason `buildInvestigationAgent` is: different act, different switch.
+ */
+export function buildCapturePilot(options: CliOptions): WorkflowAgent | null {
+  if (!options.agentCapture) return null;
+  if (!options.factory.canResolve('agent')) return null;
+  return new WorkflowAgent({
+    model: new LlmAgentModel({ factory: options.factory }),
+    maxSteps: CAPTURE_PILOT_MAX_STEPS,
+    onAction: options.json
+      ? undefined
+      : async (_page, action) => {
+          console.log(formatAgentAction(action));
+        },
+  });
+}
+
+// Lazy like every other role: a flow with no `fillRetry(kind: 'custom')` step
+// never resolves the `data` role or demands its key. No `--no-data` flag —
+// the deterministic kinds cost nothing to leave enabled, and `custom` is
+// opt-in per step by construction.
+export function buildDataModel(options: CliOptions): LlmDataModel {
+  return new LlmDataModel({ factory: options.factory });
+}
+
+/**
+ * Fail before touching a browser when a role that this run needs has no key.
+ * A missing key surfaced 30 seconds into a flow is far worse than one surfaced
+ * on the first line of output.
+ */
+export function assertRolesResolvable(options: CliOptions, roles: readonly ('healer' | 'generator' | 'agent')[]): string | null {
+  for (const role of roles) {
+    if (!options.factory.canResolve(role)) {
+      return (
+        `the "${role}" role has no API key configured.\n\n` +
+        `${describeRouting(options.config)}\n\n` +
+        'Run `wowlidator doctor` for setup instructions, or disable the role ' +
+        '(--no-heal / --no-agent).'
+      );
+    }
+  }
+  return null;
+}

@@ -1,0 +1,279 @@
+{
+  "_README": [
+    "TEMPLATE — copy this file, delete what you don't need, and edit the rest.",
+    "Keys starting with _ are ignored by the runner; they exist because JSON has no comments.",
+    "",
+    "Run it:   wowlidator run my.flow.json",
+    "",
+    "Three sections, and the difference is load-bearing:",
+    "  setup    — preconditions. A failure here ABORTS the flow before steps run,",
+    "             because a test whose preconditions did not hold cannot produce",
+    "             a meaningful result.",
+    "  steps    — the test body.",
+    "  teardown — cleanup. ALWAYS runs, including after a failure, and never",
+    "             masks the real error.",
+    "",
+    "'name' is used for report filenames, visual baseline keys, and run-history",
+    "grouping. Keep it stable across runs or you lose your trend data.",
+    "",
+    "'intent' is optional but write it on anything that might drift: when the",
+    "selector breaks, it is what the healer uses to find the element you meant.",
+    "",
+    "EVERY FLOW NEEDS AN ASSERTION. A flow that only clicks and navigates passes",
+    "whether or not the feature works — worse than no test, because it displaces",
+    "the manual check that would have caught the bug."
+  ],
+  "name": "template — rename me",
+  "baseUrl": "http://localhost:3000",
+  "_setup": "Preconditions. Storage is origin-scoped, so goto MUST come first.",
+  "setup": [
+    {
+      "action": "goto",
+      "url": "/"
+    },
+    {
+      "action": "clearStorage"
+    },
+    {
+      "action": "setLocalStorage",
+      "key": "auth_token",
+      "value": "PUT-A-REAL-TOKEN-HERE"
+    },
+    {
+      "action": "goto",
+      "url": "/en/home"
+    }
+  ],
+  "steps": [
+    {
+      "_": "--- navigation and interaction ---"
+    },
+    {
+      "action": "goto",
+      "url": "/en/admin/benefits/rules"
+    },
+    {
+      "action": "waitFor",
+      "selector": "role=table[name=\"Eligibility rules\"]",
+      "intent": "the eligibility rules table"
+    },
+    {
+      "action": "click",
+      "selector": "role=button[name=\"More filters\"]",
+      "intent": "the More filters button above the table"
+    },
+    {
+      "action": "fill",
+      "selector": "role=textbox[name=\"Search\"]",
+      "value": "annual leave",
+      "intent": "the search box in the filter panel"
+    },
+    {
+      "_": "One step for any dropdown — a native <select> OR a custom combobox. 'value' is the option's VISIBLE LABEL. Never fill a dropdown, and never click it open to guess: this opens it and picks.",
+      "action": "selectOption",
+      "selector": "role=combobox[name=\"Status\"]",
+      "value": "Active",
+      "intent": "the status filter dropdown"
+    },
+    {
+      "_": "check/uncheck verify the state actually CHANGED — prefer them over click when the point is the resulting state. Works on native checkboxes/radios and on aria-checked/aria-pressed toggles.",
+      "action": "check",
+      "selector": "role=checkbox[name=\"Include archived\"]",
+      "intent": "the include-archived filter"
+    },
+    {
+      "_": "Types key by key, firing real keyboard events — for autocomplete/typeahead/masked fields that fill() cannot wake. Use fill everywhere else; it is faster.",
+      "action": "type",
+      "selector": "role=combobox[name=\"Assignee\"]",
+      "value": "Somchai",
+      "intent": "the assignee typeahead"
+    },
+    {
+      "_": "Hands the browser to the LLM agent until the goal is met. Use it to REACH a page, never to assert. Costs tokens; needs the agent role configured.",
+      "action": "workflow",
+      "goal": "Navigate to the benefits eligibility rules admin page. Only click navigation links; do not submit or delete anything."
+    },
+    {
+      "_": "--- keyboard and focus ---"
+    },
+    {
+      "_": "selector is optional — omit it to press on the page rather than an element.",
+      "action": "press",
+      "key": "Enter",
+      "selector": "role=textbox[name=\"Search\"]",
+      "intent": "submit the search with the keyboard"
+    },
+    {
+      "action": "expectFocused",
+      "selector": "role=textbox[name=\"Search\"]",
+      "intent": "focus stays in the search box after submitting"
+    },
+    {
+      "_": "Tabs from the top of the document and asserts focus lands in this order. Cannot be produced by `wowlidator author` — hand-write it.",
+      "action": "expectTabOrder",
+      "selectors": [
+        "role=textbox[name=\"Search\"]",
+        "role=button[name=\"Search\"]",
+        "role=button[name=\"More filters\"]"
+      ]
+    },
+    {
+      "_": "--- assertions: the point of the test ---"
+    },
+    {
+      "_": "CONTAINS, not equals.",
+      "action": "expectText",
+      "selector": "role=status",
+      "value": "1–8 of 8",
+      "intent": "the record count line under the table"
+    },
+    {
+      "action": "expectVisible",
+      "selector": "role=table[name=\"Eligibility rules\"]",
+      "intent": "the results table"
+    },
+    {
+      "_": "expectHidden and expectCount:0 deliberately SKIP healing — repairing a selector whose whole purpose is to not resolve would turn a correct pass into a meaningless one.",
+      "action": "expectHidden",
+      "selector": "role=alert",
+      "intent": "no error banner is shown"
+    },
+    {
+      "action": "expectEnabled",
+      "selector": "role=button[name=\"Search\"]",
+      "intent": "the search button"
+    },
+    {
+      "action": "expectDisabled",
+      "selector": "role=button[name=\"Previous\"]",
+      "intent": "pagination on the first page"
+    },
+    {
+      "action": "expectCount",
+      "selector": "role=row",
+      "count": 9,
+      "intent": "8 data rows plus the header row"
+    },
+    {
+      "_": "CONTAINS, not equals.",
+      "action": "expectUrl",
+      "value": "/admin/benefits/rules"
+    },
+    {
+      "_": "EQUALS, exactly.",
+      "action": "expectValue",
+      "selector": "role=textbox[name=\"Search\"]",
+      "value": "annual leave",
+      "intent": "the search box keeps what was typed"
+    },
+    {
+      "_": "EQUALS, exactly.",
+      "action": "expectAttribute",
+      "selector": "role=textbox[name=\"Search\"]",
+      "name": "aria-invalid",
+      "value": "false",
+      "intent": "the search box is not flagged invalid"
+    },
+    {
+      "_": "--- backend: HTTP the test makes itself ---"
+    },
+    {
+      "_": "Sent through the BROWSER, so it carries whatever session the UI steps above established — log in through the real login form once and these calls are that user. A non-2xx does NOT fail this step; expectStatus is where a status becomes pass/fail, which is what lets you test error paths. 'save' keeps a value for later steps to use as {{name}}.",
+      "action": "request",
+      "method": "POST",
+      "url": "/api/orders",
+      "body": {
+        "sku": "ABC-1",
+        "quantity": 2
+      },
+      "save": {
+        "orderId": "$.data.id"
+      },
+      "intent": "Create an order for this test to work with"
+    },
+    {
+      "_": "A request nobody asserts on proves nothing — it passes whether the endpoint returns the right data or a 500.",
+      "action": "expectStatus",
+      "status": 201,
+      "intent": "The order was created"
+    },
+    {
+      "_": "{{orderId}} came from the 'save' above. An unknown variable fails the step rather than silently becoming an empty string.",
+      "action": "request",
+      "method": "GET",
+      "url": "/api/orders/{{orderId}}"
+    },
+    {
+      "_": "Omit 'value' to assert only that the path EXISTS — right for a server-assigned id whose exact value you cannot know.",
+      "action": "expectJson",
+      "path": "$.status",
+      "value": "new",
+      "intent": "The API stored what the UI said it did"
+    },
+    {
+      "action": "expectHeader",
+      "name": "content-type",
+      "value": "application/json"
+    },
+    {
+      "_": "--- boundary-value analysis ---"
+    },
+    {
+      "_": "One field, many values, an assertion after each. EVERY case runs even after one fails — a partial boundary table is far less useful than the whole one. 'submit' is load-bearing: validation usually fires on submit, not on input, so without it every case asserts against a form that never ran. Cannot be produced by `wowlidator author` — hand-write it.",
+      "action": "fillEach",
+      "selector": "role=textbox[name=\"Quantity\"]",
+      "submit": "role=button[name=\"Update\"]",
+      "intent": "the quantity field",
+      "cases": [
+        {
+          "label": "zero",
+          "value": "0",
+          "expectVisible": "role=alert"
+        },
+        {
+          "label": "one",
+          "value": "1",
+          "expectHidden": "role=alert"
+        },
+        {
+          "label": "max stock",
+          "value": "99",
+          "expectHidden": "role=alert"
+        },
+        {
+          "label": "over stock",
+          "value": "100",
+          "expectText": {
+            "selector": "role=alert",
+            "value": "Only 99 available"
+          }
+        },
+        {
+          "label": "negative",
+          "value": "-1",
+          "expectVisible": "role=alert"
+        },
+        {
+          "label": "non-numeric",
+          "value": "abc",
+          "expectVisible": "role=alert"
+        }
+      ]
+    },
+    {
+      "_": "--- visual regression ---"
+    },
+    {
+      "_": "First run CREATES the baseline and passes, saying nothing was verified. Keyed by flow name + snapshot name, so inserting a step earlier does not invalidate it. Re-baseline with: wowlidator run my.flow.json --update-baselines",
+      "action": "snapshot",
+      "name": "rules-table",
+      "selector": "role=table[name=\"Eligibility rules\"]"
+    }
+  ],
+  "_teardown": "Always runs, even after a failure. Never masks the real error.",
+  "teardown": [
+    {
+      "action": "clearStorage"
+    }
+  ]
+}

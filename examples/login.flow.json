@@ -1,0 +1,10 @@
+{
+  "name": "login smoke",
+  "baseUrl": "http://127.0.0.1:8781",
+  "steps": [
+    { "action": "goto", "url": "/" },
+    { "action": "fill", "selector": "#username", "value": "alice", "intent": "the username field" },
+    { "action": "click", "selector": "#signin", "intent": "the sign in button" },
+    { "action": "expectText", "selector": "#status", "value": "Signed in as alice", "intent": "the sign-in status line" }
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "_README": [
+    "A standalone API test — no browser involved at any point.",
+    "",
+    "Run it:   wowlidator run examples/orders.api.flow.json",
+    "",
+    "There is no flag for this and no separate command. wowlidator looks at the steps:",
+    "if nothing in the flow needs a page, it never opens Chrome. You still get the",
+    "same HTML report, run history and flake detection as a UI test.",
+    "",
+    "Because there is no browser, calls go out through plain fetch and carry no",
+    "session. A flow that needs to be authenticated should either log in with its",
+    "own request step (below), or live alongside UI steps — in which case it",
+    "inherits the browser's session automatically.",
+    "",
+    "EVERY CASE NEEDS AN ASSERTION. A request whose status nobody checks passes",
+    "whether the endpoint returns the right data or a 500."
+  ],
+  "name": "orders api",
+  "baseUrl": "http://localhost:3000",
+  "_setup": "Authenticate once and keep the token for every step below.",
+  "setup": [
+    {
+      "action": "request",
+      "method": "POST",
+      "url": "/api/auth/login",
+      "body": { "email": "test@example.com", "password": "PUT-A-REAL-PASSWORD-HERE" },
+      "save": { "authToken": "$.token" },
+      "intent": "Sign in and keep the token"
+    },
+    {
+      "_": "Setup failures abort the flow — a test whose login did not work cannot tell you anything. Note the token is masked in the report; the run still uses the real value.",
+      "action": "expectStatus",
+      "status": 200,
+      "intent": "Login succeeded"
+    }
+  ],
+  "steps": [
+    {
+      "action": "request",
+      "method": "POST",
+      "url": "/api/orders",
+      "headers": { "authorization": "Bearer {{authToken}}" },
+      "body": { "sku": "ABC-1", "quantity": 2 },
+      "save": { "orderId": "$.data.id" },
+      "intent": "Create an order"
+    },
+    { "action": "expectStatus", "status": 201, "intent": "The order was created" },
+    {
+      "_": "Reading it back is the difference between proving the endpoint accepted the call and proving it did something.",
+      "action": "request",
+      "method": "GET",
+      "url": "/api/orders/{{orderId}}",
+      "headers": { "authorization": "Bearer {{authToken}}" }
+    },
+    { "action": "expectStatus", "status": 200 },
+    {
+      "action": "expectJson",
+      "path": "$.sku",
+      "value": "ABC-1",
+      "intent": "The order stored the SKU we sent"
+    },
+    {
+      "_": "No 'value' — the id is server-assigned, so all we can honestly assert is that it is there.",
+      "action": "expectJson",
+      "path": "$.id",
+      "intent": "The order has an id"
+    },
+    {
+      "_": "The negative case. A 4xx does not fail a request step, which is exactly what makes this expressible.",
+      "action": "request",
+      "method": "GET",
+      "url": "/api/orders/does-not-exist",
+      "headers": { "authorization": "Bearer {{authToken}}" }
+    },
+    {
+      "action": "expectStatus",
+      "status": 404,
+      "intent": "A missing order is a 404, not a 500 and not an empty 200"
+    }
+  ],
+  "_teardown": "Always runs, including after a failure above.",
+  "teardown": [
+    {
+      "action": "request",
+      "method": "POST",
+      "url": "/api/test/cleanup",
+      "headers": { "authorization": "Bearer {{authToken}}" },
+      "intent": "Remove what this run created"
+    }
+  ]
+}

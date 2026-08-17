@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+#
+# wow — the wowlidator engine writes and runs the tests; wowUI shows what
+# happened. One repo now: engine at the root, this launcher in bin/.
+# Fully independent of the GRIM agent in ~/Documents/GitHub.
+#
+#   wow                       start wowUI
+#   wow go <url|flow|"text">  explore a page / run a flow / write a test
+#   wow run <flow.json>       run a flow (--repair to self-heal the script)
+#   wow generate <url>        write tests from a page (--run to run them)
+#   wow catalog <file>        a document of claims → a case per claim
+#                               (--url <page> grounds it, --run proves it)
+#   wow crawl <url>           follow every control, check it comes back
+#   wow doctor                one real call per LLM role
+#   wow status                what is listening
+#   wow stop                  stop it
+#
+# Anything else passes straight through to the wowlidator CLI.
+#
+# One process, two surfaces, one port:
+#
+#   wowUI          :7401/wow   runs, verdicts, screenshots, the calls the page
+#                              made, and the repair the healer proposed
+#   control panel  :7401       the same commands, as a form
+#
+# wowlidator serves both itself, reading its own proof directory off disk. A run
+# is there the moment it finishes — nothing is copied and nothing is converted,
+# so the UI cannot disagree with the engine.
+#
+# The QA evidence UI that used to be started alongside this on :7400 is no
+# longer launched. It was a second server with its own node_modules, rendering
+# CSV artifacts that `grimval sync` copied out of the proof bundles — a lossier
+# view (no screenshots, no network, no repair) of runs wowUI already shows in
+# full. wowUI never read from it: the only thing that ever crossed between them
+# was the theme CSS, and that was copied into the engine at authoring time.
+# Nothing here depends on :7400, so nothing here starts it.
+
+set -euo pipefail
+
+# The port sits in grimval's own block. A separate GRIM agent runs on
+# 9403/5175/5176 and a stray FRONTEND_PORT used to be enough to make the
+# two fight over a socket, so this is not a generic name or a shared default.
+PANEL_PORT="${WOWUI_PANEL_PORT:-${GRIMVAL_PANEL_PORT:-7401}}"
+
+# Only ever freed, never bound: the retired evidence UI's port, so `stop` can
+# clear a server left running from before it was dropped.
+RETIRED_QA_PORT=7400
+
+# --- locate this repo (launcher and engine live in the same checkout) --------
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  target="$(readlink "$self")"
+  [[ "$target" == /* ]] && self="$target" || self="$(dirname "$self")/$target"
+done
+HERE="$(cd "$(dirname "$self")/.." && pwd)"
+
+# The engine is this repo itself. WOWUI_ROOT (or the old GRIMVAL_WOWLIDATOR_ROOT)
+# still overrides, for driving a different checkout.
+ROOT="${WOWUI_ROOT:-${GRIMVAL_WOWLIDATOR_ROOT:-$HERE}}"
+if [[ ! -f "$ROOT/package.json" ]]; then
+  echo "wow: no engine found at $ROOT (no package.json)." >&2
+  echo "  set WOWUI_ROOT=/path/to/engine if you moved this script out of its repo." >&2
+  exit 1
+fi
+
+# Pass through to the wowlidator CLI. Arguments that name an existing file or
+# directory are made absolute first: this runs the CLI from the engine root, so
+# a relative `./flows/x.json` typed in your own directory would otherwise
+# resolve against the wrong place and come back as "no such flow file".
+#
+# The same `cd` is why the flags below need their own rule. Existence is the
+# test for an input, and an *output* path does not exist yet — so `--report-dir
+# ./out` looked like an ordinary word, stayed relative, and was created inside
+# the engine's checkout. That is not a lost file so much as a wrong one: the
+# engine repo fills up with someone else's reports, and they are nowhere near
+# where that person was working.
+PATH_FLAGS=(
+  --report --report-dir --out --cache --flow --suite
+  --claims --claims-out --context-out --context-doc --root --openapi
+)
+
+# Absolute against the caller's own directory. A path that is already absolute,
+# or a URL (--openapi takes either), is left exactly as typed.
+resolve_here() {
+  case "$1" in
+    /* | *://*) printf '%s' "$1" ;;
+    *) printf '%s/%s' "$CALLER_PWD" "$1" ;;
+  esac
+}
+
+run_cli() {
+  local CALLER_PWD="$PWD"
+  local -a args=()
+  local arg flag wants_path=0
+  for arg in "$@"; do
+    # The value of a path flag given as two words: `--out dir`.
+    if (( wants_path )); then
+      wants_path=0
+      args+=("$(resolve_here "$arg")")
+      continue
+    fi
+    for flag in "${PATH_FLAGS[@]}"; do
+      if [[ "$arg" == "$flag" ]]; then wants_path=1; break; fi
+      # …and as one: `--out=dir`.
+      if [[ "$arg" == "$flag="* ]]; then
+        args+=("$flag=$(resolve_here "${arg#*=}")")
+        arg=''
+        break
+      fi
+    done
+    [[ -z "$arg" ]] && continue
+    if (( wants_path )); then args+=("$arg"); continue; fi
+
+    if [[ "$arg" != -* && -e "$arg" ]]; then
+      args+=("$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")")
+    else
+      args+=("$arg")
+    fi
+  done
+  cd "$ROOT"
+  if [[ -f dist/cli.js ]]; then exec node dist/cli.js "${args[@]}"; fi
+  exec npx tsx src/cli.ts "${args[@]}"
+}
+
+port_pids() { lsof -ti ":$1" 2>/dev/null || true; }
+
+# Release a port, giving the holder a chance to exit cleanly first.
+free_port() {
+  local port="$1" pids
+  pids="$(port_pids "$port")"
+  [[ -z "$pids" ]] && return 0
+  # shellcheck disable=SC2086
+  kill $pids 2>/dev/null || true
+  for _ in $(seq 1 25); do
+    [[ -z "$(port_pids "$port")" ]] && return 0
+    sleep 0.2
+  done
+  # shellcheck disable=SC2086
+  kill -9 $(port_pids "$port") 2>/dev/null || true
+}
+
+case "${1:-up}" in
+  catalog)
+    # A catalog is the one command whose cost scales with the document: every
+    # approved claim becomes its own case, its own run and its own report. What
+    # decides whether those are worth reading is **grounding**. With --url the
+    # model is held to controls that appear in the page's accessibility tree;
+    # without one it has only the document, so it invents plausible selectors
+    # ([data-testid="hrbp-error"], role=tab) and every case fails on the
+    # selector rather than on the claim — a folder of red reports that say
+    # nothing about the application. The engine says so afterwards; by then the
+    # browsers have been opened. This says so first, and still runs: a catalog
+    # authored ungrounded is a legitimate skeleton to edit by hand.
+    shift
+    if [[ " $* " == *" --run "* ]] && [[ " $* " != *" --url "* && " $* " != *" --url="* ]]; then
+      echo "wow catalog: --run without --url — every selector will be a guess," >&2
+      echo "  so each case fails on the selector, not on the claim it came from." >&2
+      echo "  add: --url <the page the claims are about>" >&2
+      echo >&2
+    fi
+    run_cli catalog "$@"
+    ;;
+
+  status)
+    printf 'wowUI          '
+    [[ -n "$(port_pids "$PANEL_PORT")" ]] \
+      && printf 'up    http://127.0.0.1:%s/wow\n' "$PANEL_PORT" || printf 'down\n'
+    printf 'control panel  '
+    # Same server as wowUI — if that port is up, so is this.
+    [[ -n "$(port_pids "$PANEL_PORT")" ]] \
+      && printf 'up    http://127.0.0.1:%s\n' "$PANEL_PORT" || printf 'down\n'
+    printf 'chrome (CDP)   '
+    curl -sf -m 2 "${WOWLIDATOR_CDP_URL:-http://localhost:9222}/json/version" >/dev/null 2>&1 \
+      && printf 'up    %s\n' "${WOWLIDATOR_CDP_URL:-http://localhost:9222}" \
+      || printf 'down  (started on demand)\n'
+    printf 'engine         %s\n' "$ROOT"
+    if [[ -n "$(port_pids "$RETIRED_QA_PORT")" ]]; then
+      printf '\n:%s is still held by something — the retired evidence UI is no longer\n' "$RETIRED_QA_PORT"
+      printf 'started here, so this is a leftover process. `wow stop` clears it.\n'
+    fi
+    ;;
+
+  stop)
+    if [[ -n "$(port_pids "$PANEL_PORT")" ]]; then
+      echo "stopping wowUI (:$PANEL_PORT)"
+      free_port "$PANEL_PORT"
+    fi
+    if [[ -n "$(port_pids "$RETIRED_QA_PORT")" ]]; then
+      echo "stopping leftover evidence UI (:$RETIRED_QA_PORT)"
+      free_port "$RETIRED_QA_PORT"
+    fi
+    echo "stopped"
+    ;;
+
+  up|wow)
+    # wowlidator serves both surfaces from its own proof directory, so the only
+    # thing that has to be running is wowlidator itself. No sync, no second app,
+    # no node_modules in this repo.
+    shift || true
+    free_port "$PANEL_PORT"
+    cd "$ROOT"
+    echo "wowUI          http://127.0.0.1:$PANEL_PORT/wow   runs, verdicts, evidence"
+    echo "control panel  http://127.0.0.1:$PANEL_PORT       run, generate, crawl, watch"
+    echo
+    if [[ -f dist/cli.js ]]; then
+      exec node dist/cli.js ui --port "$PANEL_PORT" --wow "$@"
+    fi
+    exec npx tsx src/cli.ts ui --port "$PANEL_PORT" --wow "$@"
+    ;;
+
+  *)
+    run_cli "$@"
+    ;;
+esac

@@ -1,0 +1,60 @@
+{
+  "name": "wowui",
+  "version": "0.3.0",
+  "private": true,
+  "description": "wowlidator + grimval, merged: the hybrid UI automation engine (fast Playwright execution, JIT self-healing, test generation, agentic navigation, HTML reporting, MCP) plus the wowUI launcher and evidence surfaces in one repo.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "bin": {
+    "wowlidator": "./dist/cli.js",
+    "wow": "./bin/wow"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./engine": "./dist/engine/runner.js",
+    "./generator": "./dist/generator/test-generator.js",
+    "./orchestrator": "./dist/orchestrator/workflow-agent.js",
+    "./reporter": "./dist/reporter/html-reporter.js",
+    "./mcp": "./dist/mcp/server.js",
+    "./context": "./dist/context/context-engine.js",
+    "./data": "./dist/data/mock-data.js",
+    "./repair": "./dist/repair/flow-repair-loop.js",
+    "./catalog": "./dist/catalog/catalog.js",
+    "./api": "./dist/api/api-actions.js",
+    "./ui": "./dist/ui/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "test:watch": "tsx --test --watch tests/*.test.ts",
+    "cli": "tsx src/cli.ts",
+    "ui": "tsx src/ui/server.ts",
+    "mcp": "tsx src/mcp/server.ts",
+    "chrome": "/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/wowlidator-chrome-profile"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^4.0.27",
+    "@ai-sdk/groq": "^4.0.15",
+    "@ai-sdk/openai-compatible": "^3.0.29",
+    "@babel/parser": "^7.26.0",
+    "@babel/types": "^7.26.0",
+    "@faker-js/faker": "^10.5.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@openrouter/ai-sdk-provider": "^3.0.0",
+    "ai": "^7.0.41",
+    "pixelmatch": "^7.2.0",
+    "playwright": "^1.62.0",
+    "pngjs": "^7.0.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pngjs": "^6.0.5",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}

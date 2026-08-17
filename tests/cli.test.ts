@@ -1,0 +1,242 @@
+/**
+ * The command line, driven the way a user or a CI job drives it: as a
+ * subprocess (spec T1, A2).
+ *
+ * Nothing here imports wowlidator's internals on purpose. The surface under test is
+ * the *contract* — exit codes, what lands on stdout versus stderr, whether
+ * `--json` stays parseable — and none of that is observable from the inside.
+ * Every one of these promises is something automation depends on and nothing
+ * previously enforced.
+ *
+ * Tiering follows the rest of the suite: commands that need a page run only
+ * when a CDP endpoint answers; argument handling and gating run always.
+ */
+
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { createServer, type Server } from 'node:http';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { after, before, describe, it } from 'node:test';
+import type { AddressInfo } from 'node:net';
+
+const CDP_URL = process.env['WOWLIDATOR_CDP_URL'] ?? 'http://localhost:9222';
+const ROOT = resolve(import.meta.dirname, '..');
+const CLI = join(ROOT, 'src', 'cli.ts');
+/** tsx's ESM loader, by absolute path — so the CLI can be run from any cwd. */
+const TSX_LOADER = join(ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
+
+/** Documented in README and frozen — see `EXIT` in `src/cli.ts`. */
+const EXIT = { ok: 0, failed: 1, usage: 2, environment: 3 } as const;
+
+interface RunResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Run the CLI in a clean environment.
+ *
+ * Provider keys are stripped unless a test asks for them: a suite that only
+ * passes on a developer's machine, because their shell happens to export a
+ * key, is not testing the gating it claims to test.
+ */
+function runCli(
+  args: string[],
+  env: Record<string, string> = {},
+  options: { cwd?: string } = {},
+): Promise<RunResult> {
+  return new Promise((resolvePromise, reject) => {
+    // `node --import <loader>` rather than `npx tsx`, because several tests run
+    // from a scratch directory: the CLI loads `.env` relative to its cwd, so a
+    // test asserting "no key configured" only means anything when it runs
+    // somewhere the project's own `.env` cannot be found.
+    const child = spawn(process.execPath, ['--import', TSX_LOADER, CLI, ...args], {
+      cwd: options.cwd ?? ROOT,
+      env: {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(([key]) => !/API_KEY|^WOWLIDATOR_/.test(key)),
+        ),
+        WOWLIDATOR_DISABLE_REPORT: '1',
+        WOWLIDATOR_CDP_URL: CDP_URL,
+        ...env,
+      } as NodeJS.ProcessEnv,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+    child.on('error', reject);
+    child.on('close', (code) => resolvePromise({ code: code ?? -1, stdout, stderr }));
+  });
+}
+
+async function cdpAvailable(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${url}/json/version`, { signal: AbortSignal.timeout(1500) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+const browserReady = await cdpAvailable(CDP_URL);
+const skipBrowser = browserReady
+  ? false
+  : `no CDP endpoint at ${CDP_URL} — start Chrome with --remote-debugging-port=9222 (npm run chrome)`;
+
+const FIXTURE_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>cli fixture</title></head>
+<body><button id="go">Go</button><p id="out">idle</p>
+<script>document.getElementById('go').addEventListener('click',()=>{document.getElementById('out').textContent='done'});</script>
+</body></html>`;
+
+describe('cli — argument handling and gating', () => {
+  /** A directory with no `.env`, so key-gating tests test the gate. */
+  let keyless: string;
+
+  before(async () => {
+    keyless = await mkdtemp(join(tmpdir(), 'wowlidator-keyless-'));
+  });
+
+  after(async () => {
+    await rm(keyless, { recursive: true, force: true });
+  });
+
+  it('exits 2 with usage on an unknown command, not a stack trace', async () => {
+    const result = await runCli(['definitely-not-a-command']);
+    assert.equal(result.code, EXIT.usage);
+    assert.match(result.stderr, /unknown command/);
+    assert.ok(!/at .*\(.*:\d+:\d+\)/.test(result.stderr), 'a stack trace leaked to the user');
+  });
+
+  it('exits 2 with usage on an unknown flag', async () => {
+    const result = await runCli(['run', 'x.flow.json', '--not-a-flag']);
+    assert.equal(result.code, EXIT.usage);
+  });
+
+  it('exits 2 when the flow file does not exist', async () => {
+    const result = await runCli(['run', '/nope/missing.flow.json']);
+    assert.equal(result.code, EXIT.usage);
+  });
+
+  it('exits 3, naming the role, when a command needs a key it does not have', async () => {
+    // Environment, not usage: the invocation was correct, the machine is not
+    // set up. CI must be able to tell those apart.
+    const result = await runCli(['generate', 'http://localhost:1/x'], {}, { cwd: keyless });
+    assert.equal(result.code, EXIT.environment, result.stdout + result.stderr);
+    assert.match(result.stderr, /"generator" role has no API key/);
+  });
+
+  it('prints usage on --help and exits 0', async () => {
+    const result = await runCli(['--help']);
+    assert.equal(result.code, EXIT.ok);
+    assert.match(result.stdout, /wowlidator/);
+    assert.match(result.stdout, /--probe/, 'documented flags appear in help');
+  });
+});
+
+describe('cli — run contract (CDP)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+  let dir: string;
+
+  before(async () => {
+    server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(FIXTURE_HTML);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    dir = await mkdtemp(join(tmpdir(), 'wowlidator-cli-'));
+
+    await writeFile(
+      join(dir, 'pass.flow.json'),
+      JSON.stringify({
+        name: 'cli pass',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'click', selector: '#go', intent: 'Press the button.' },
+          { action: 'expectText', selector: '#out', value: 'done', intent: 'It reports done.' },
+        ],
+      }),
+      'utf8',
+    );
+    await writeFile(
+      join(dir, 'fail.flow.json'),
+      JSON.stringify({
+        name: 'cli fail',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'expectVisible', selector: '#never-exists', intent: 'Something that is not there.' },
+        ],
+      }),
+      'utf8',
+    );
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((r, j) => server.close((e) => (e ? j(e) : r())));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('exits 0 on a passing flow', async () => {
+    const result = await runCli(['run', join(dir, 'pass.flow.json'), '--no-history']);
+    assert.equal(result.code, EXIT.ok, result.stderr);
+    assert.match(result.stdout, /PASSED/);
+  });
+
+  it('exits 1 on a failing flow — a result, not an error', async () => {
+    const result = await runCli(['run', join(dir, 'fail.flow.json'), '--no-history', '--no-heal']);
+    assert.equal(result.code, EXIT.failed);
+    // An unresolvable selector is reported as DEAD-END, not FAILED — a finer
+    // verdict, same exit code: both are results about the application.
+    assert.match(result.stdout, /DEAD-END/);
+  });
+
+  it('emits exactly one JSON document on stdout under --json', async () => {
+    // The invariant that gates every console.log in the engine: anything else
+    // written to stdout makes the output unparseable for the tools that
+    // consume it.
+    const result = await runCli(['run', join(dir, 'pass.flow.json'), '--json', '--no-history']);
+    assert.equal(result.code, EXIT.ok, result.stderr);
+
+    const parsed = JSON.parse(result.stdout) as {
+      status: string;
+      summary: { frontend: unknown; backend: unknown };
+    };
+    assert.equal(parsed.status, 'passed');
+    assert.ok(parsed.summary.frontend, 'the frontend/backend split is machine-readable');
+    assert.ok(parsed.summary.backend);
+  });
+
+  it('keeps --json parseable when the run fails', async () => {
+    const result = await runCli(['run', join(dir, 'fail.flow.json'), '--json', '--no-history', '--no-heal']);
+    assert.equal(result.code, EXIT.failed);
+    const parsed = JSON.parse(result.stdout) as { status: string; steps: unknown[] };
+    assert.equal(parsed.status, 'dead-end');
+    assert.ok(Array.isArray(parsed.steps));
+  });
+
+  it('reports the full escalation trace when healing is disabled', async () => {
+    // The human summary trims a step's error to its first line; the full
+    // rung-by-rung trace travels on the bundle, which --json puts on stdout.
+    const result = await runCli(['run', join(dir, 'fail.flow.json'), '--json', '--no-heal', '--no-history']);
+    assert.match(result.stdout, /healer disabled/);
+  });
+
+  it('exits 3, not 1, when no browser is reachable', async () => {
+    // A run that never reached the application must not be reported as the
+    // application failing.
+    const result = await runCli(['run', join(dir, 'pass.flow.json'), '--no-history'], {
+      WOWLIDATOR_CDP_URL: 'http://127.0.0.1:9',
+    });
+    assert.equal(result.code, EXIT.environment, result.stdout + result.stderr);
+  });
+});

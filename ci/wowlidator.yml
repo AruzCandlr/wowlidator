@@ -1,0 +1,157 @@
+# wowlidator in CI (spec A3).
+#
+# Written for GitHub Actions; the steps are ordinary shell, so the same three
+# jobs port to GitLab, Buildkite or Jenkins by copying the `run:` blocks.
+#
+# The shape is deliberate:
+#
+#   unit         no browser, no keys, ~5s   — runs on every push, gates the PR
+#   integration  headless Chrome, no keys   — runs on every push
+#   e2e          a real application         — nightly and on demand only
+#
+# Jobs 1 and 2 must stay green with **no provider keys configured at all**. That
+# is not an aspiration: `keyless-check` below runs the suite with the secrets
+# deliberately withheld, because a suite that quietly needs a key is a suite
+# that cannot gate a fork's pull request.
+
+name: wowlidator
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Nightly, so the real-application tier catches drift in the app under test
+    # rather than in the commit that happened to run last.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  # Reports are artifacts here, not files developers open in place.
+  WOWLIDATOR_REPORT_DIR: ${{ github.workspace }}/wowlidator-reports
+  WOWLIDATOR_JUNIT_PATH: ${{ github.workspace }}/wowlidator-reports/junit.xml
+
+jobs:
+  unit:
+    name: unit (no browser, no keys)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.6'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # No CDP endpoint is reachable, so the browser tier skips itself and says
+      # so. The unit tier alone is the fast gate.
+      - name: unit tier
+        run: npm test
+        env:
+          WOWLIDATOR_CDP_URL: http://127.0.0.1:9
+
+  integration:
+    name: integration (headless Chrome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.6'
+          cache: npm
+      - run: npm ci
+
+      # Same flags as `npm run chrome`, plus --headless=new. A CI runner has no
+      # display, and wowlidator never launches a browser itself — it only connects.
+      - name: start Chrome with a debugging port
+        run: |
+          google-chrome --remote-debugging-port=9222 \
+            --user-data-dir=/tmp/wowlidator-chrome-profile \
+            --headless=new --no-first-run --no-default-browser-check \
+            --no-sandbox --disable-dev-shm-usage &
+          # Answering on the port is not the same as being driveable — see the
+          # stale-Chrome case in wowlidator.sh. Wait for a real takeover.
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9222/json/version >/dev/null; then break; fi
+            sleep 1
+          done
+          node --input-type=module -e '
+            const { chromium } = await import("playwright");
+            const b = await chromium.connectOverCDP("http://127.0.0.1:9222");
+            await b.close();
+          '
+
+      - name: full suite
+        run: npm test
+        env:
+          WOWLIDATOR_CDP_URL: http://127.0.0.1:9222
+
+      # Proves the promise in the comment at the top of this file: nothing in
+      # jobs 1–2 may depend on a provider key.
+      - name: keyless-check
+        run: npm test
+        env:
+          WOWLIDATOR_CDP_URL: http://127.0.0.1:9222
+          GOOGLE_GENERATIVE_AI_API_KEY: ''
+          GROQ_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wowlidator-reports-integration
+          path: wowlidator-reports/
+
+  e2e:
+    name: e2e (real application)
+    # Never a required check: this job can go red because the application
+    # changed, which is information, not a reason to block a wowlidator commit.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.6'
+          cache: npm
+      - run: npm ci
+
+      # History and visual baselines are state. A stateless runner would report
+      # "first run" forever and re-create every baseline, which silently
+      # disables both trend analysis and visual regression.
+      - name: restore run history and baselines
+        uses: actions/cache@v4
+        with:
+          path: |
+            .wowlidator/history.jsonl
+            .wowlidator/baselines
+          key: wowlidator-state-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: wowlidator-state-${{ github.ref_name }}-
+
+      - name: start Chrome
+        run: |
+          google-chrome --remote-debugging-port=9222 \
+            --user-data-dir=/tmp/wowlidator-chrome-profile \
+            --headless=new --no-first-run --no-default-browser-check \
+            --no-sandbox --disable-dev-shm-usage &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9222/json/version >/dev/null; then break; fi
+            sleep 1
+          done
+
+      - name: run pinned flows against the app
+        run: npm test
+        env:
+          WOWLIDATOR_CDP_URL: http://127.0.0.1:9222
+          # Set this to a staging URL, or boot the app in a previous step.
+          WOWLIDATOR_E2E_APP_URL: ${{ vars.WOWLIDATOR_E2E_APP_URL }}
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      - name: publish results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wowlidator-reports-e2e
+          path: wowlidator-reports/
