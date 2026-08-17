@@ -1,4 +1,4 @@
-# wowlidator
+# perciVAL (temp name)
 
 **UI tests that repair themselves.**
 
