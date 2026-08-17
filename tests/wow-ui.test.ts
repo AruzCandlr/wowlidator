@@ -153,6 +153,29 @@ describe('the wowUI page', () => {
     assert.ok(html.includes("'catalog-run'"));
   });
 
+  it('lets the gate correct a guessed lane, and keeps the correction', () => {
+    // A sequence diagram's planes decide which claims are checkable, and the
+    // diagram never says which host is the API — so the gate renders the
+    // participant table with the guesses flagged, and an edit recomputes the
+    // claim list live rather than sending someone into the JSON by hand.
+    assert.ok(html.includes('Lanes — who is who in this diagram'));
+    assert.ok(html.includes('guessed — confirm'));
+    assert.ok(html.includes('recomputeLanes'));
+    // The mirrored observability rule — the client cannot import
+    // isObservable, so this pins the copy against silent deletion. The rule
+    // itself is tested where it lives, in tests/sequence.test.ts.
+    assert.ok(html.includes("plane === 'user' || plane === 'page'"));
+    // The write-back must carry the edited participant table, or the lane
+    // corrections the gate just collected are silently discarded.
+    assert.ok(html.includes('sequence: M.claims.sequence'));
+  });
+
+  it('shows a database check and asserted traffic as step evidence', () => {
+    assert.ok(html.includes('Database check'));
+    assert.ok(html.includes('Traffic this step asserted'));
+    assert.ok(html.includes('Forbidden calls it observed'));
+  });
+
   it('shows evidence the way GRIM does: error, trace, fix, kept apart', () => {
     assert.ok(html.includes("'Error'") && html.includes("'Trace'"));
     assert.ok(html.includes('Raw output (the facts)'));

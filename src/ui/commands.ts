@@ -811,7 +811,6 @@ export const COMMANDS: readonly CommandSpec[] = [
         type: 'text',
         placeholder: './schema.sql or ./prisma/schema.prisma',
         help: 'Indexes tables alongside the code, giving catalog authoring a declared inventory for DB checks. Omit and a conventionally-named schema file is used; with WOWLIDATOR_DB_URL set and no file, the live schema is introspected.',
-        advanced: true,
       },
       {
         name: 'force',

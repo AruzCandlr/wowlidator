@@ -22,6 +22,7 @@ import {
   looksLikeSequenceDiagram,
   parseSequenceDiagram,
   sequenceToClaims,
+  toGateInfo,
 } from '../src/catalog/sequence.js';
 import { extractDocument, formatFor } from '../src/catalog/extract.js';
 import {
@@ -154,6 +155,28 @@ describe('sequence → claims', () => {
     // Branch labels survive into the source, so authoring can split cases.
     const declined = claims.find((c) => c.claim.includes('402'))!;
     assert.match(declined.source, /alt: payment declined/);
+  });
+
+  it('hands the gate its machine-readable half: claims mapped 1:1 to messages', async () => {
+    const doc = parseSequenceDiagram(await readFile(join(FIXTURES, 'order.mmd'), 'utf8'));
+    const { claims } = sequenceToClaims(doc);
+    const gate = toGateInfo(doc);
+
+    assert.equal(gate.messages.length, claims.length, 'every claim traces to its message');
+    gate.messages.forEach((message, index) => {
+      assert.equal(message.claim, index);
+      assert.ok(gate.participants.some((p) => p.name === message.from));
+      assert.ok(gate.participants.some((p) => p.name === message.to));
+    });
+    // Re-deriving observability from the gate info must agree with the claims
+    // as derived — this is the contract the panel's lane editor rests on.
+    const planes = new Map(gate.participants.map((p) => [p.name, p.plane]));
+    const visible = (plane: string | undefined): boolean => plane === 'user' || plane === 'page';
+    for (const message of gate.messages) {
+      const observable =
+        visible(planes.get(message.from)) || (message.reply && visible(planes.get(message.to)));
+      assert.equal(observable, claims[message.claim]!.testable);
+    }
   });
 
   it('marks a reply as observable and a backend-to-backend call as not', () => {

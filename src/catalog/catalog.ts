@@ -256,6 +256,13 @@ export interface ApprovedClaim extends CatalogClaim {
 export interface SequenceGateInfo {
   notation: string;
   participants: Array<{ name: string; label: string; plane: string; guessed: boolean }>;
+  /**
+   * Which claim came from which message — `claim` indexes the claims array.
+   * What lets a gate that edits a plane recompute testability instead of
+   * asking the person to re-derive it by hand. Absent in files written before
+   * it existed; everything degrades to the read-only lane display.
+   */
+  messages?: Array<{ claim: number; from: string; to: string; reply: boolean }> | undefined;
 }
 
 export interface ClaimsFile {

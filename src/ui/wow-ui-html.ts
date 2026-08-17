@@ -1577,6 +1577,55 @@ function evidenceTrace(panel, bundle, step) {
         JSON.stringify({ action: step.action, selector: step.selector || undefined }, null, 2)
   }));
 
+  // The database check this step made, when it was one. Everything shown was
+  // redacted before it reached the bundle (redact-row.ts).
+  if (step.db) {
+    panel.appendChild(el('div', { class: 'cap', text: 'Database check' }));
+    var dbMeta = el('div', {});
+    [
+      ['check', step.db.kind + (step.db.table ? ' \u2014 ' + step.db.table : step.db.tables ? ' \u2014 ' + step.db.tables.join(', ') : '')],
+      step.db.where ? ['where', step.db.where] : null,
+      step.db.expected ? ['expected', step.db.expected] : null,
+      step.db.observed ? ['observed', step.db.observed] : null,
+      step.db.polledMs ? ['polled', step.db.polledMs + 'ms \u2014 eventual consistency, on the record'] : null
+    ].forEach(function (pair) {
+      if (!pair) return;
+      dbMeta.appendChild(el('div', { class: 'kv' }, [el('b', { text: pair[0] + ': ' }), document.createTextNode(String(pair[1]))]));
+    });
+    panel.appendChild(dbMeta);
+    if (step.db.note) panel.appendChild(el('div', { class: 'callout', text: step.db.note }));
+    if (step.db.rows && step.db.rows.length) {
+      var sample = el('div', { class: 'calls' });
+      step.db.rows.forEach(function (row) {
+        sample.appendChild(el('div', { text: Object.keys(row).map(function (column) { return column + ' = ' + row[column]; }).join('  \u00b7  ') }));
+      });
+      panel.appendChild(sample);
+    }
+  }
+
+  // expectCalls carries its match table on the step's detail — one line per
+  // expected entry, matched or NOT OBSERVED, plus any forbidden call it saw.
+  var asserted = step.detail && step.detail.calls;
+  if (asserted && asserted.length) {
+    panel.appendChild(el('div', { class: 'cap', text: 'Traffic this step asserted' }));
+    var table = el('div', { class: 'calls' });
+    asserted.forEach(function (line) {
+      table.appendChild(el('div', {
+        style: line.indexOf('NOT OBSERVED') >= 0 ? 'color:var(--bad)' : '',
+        title: line, text: line }));
+    });
+    panel.appendChild(table);
+  }
+  var forbidden = step.detail && step.detail.violations;
+  if (forbidden && forbidden.length) {
+    panel.appendChild(el('div', { class: 'cap', text: 'Forbidden calls it observed' }));
+    var hits = el('div', { class: 'calls' });
+    forbidden.forEach(function (line) {
+      hits.appendChild(el('div', { style: 'color:var(--bad)', title: line, text: line }));
+    });
+    panel.appendChild(hits);
+  }
+
   var calls = allCalls(bundle);
   // "Recorded", not "every": the page's traffic is only kept when it is
   // evidence — the step failed, or one of the calls did. A busy SPA issues
@@ -2638,6 +2687,34 @@ function claimsGate(M) {
     gate.appendChild(el('div', { class: 'err', style: 'margin-bottom:8px', text: M.claims.documentNote }));
   }
 
+  // Sequence-diagram catalogs carry a participant table, and the planes on it
+  // decide which claims are checkable at all — wowlidator can see what the user
+  // and the page do, never what happens behind the API. Guessed lanes are the
+  // gate's to confirm, and correcting one recomputes the list live.
+  if (M.claims.sequence && M.claims.sequence.participants && M.claims.sequence.participants.length) {
+    gate.appendChild(el('div', { class: 'sub', style: 'margin:10px 0 4px; font-weight:600',
+      text: 'Lanes — who is who in this diagram' }));
+    gate.appendChild(el('div', { class: 'sub', style: 'margin-bottom:6px',
+      text: 'Checkability follows the planes: user and page lanes are observable from the browser; backend and external lanes are held as assumptions. Correct a guessed lane and the claims below update.' }));
+    M.claims.sequence.participants.forEach(function (lane) {
+      var row = el('div', { class: 'gate line', style: 'cursor:default; display:flex; align-items:center; gap:8px' });
+      row.appendChild(el('span', { class: 'mono',
+        text: lane.name + (lane.label && lane.label !== lane.name ? ' (' + lane.label + ')' : '') }));
+      var planeSelect = el('select', { onchange: function (e) {
+        lane.plane = e.target.value;
+        lane.guessed = false;
+        recomputeLanes(M);
+        renderModal();
+      } });
+      ['user', 'page', 'backend', 'external'].forEach(function (plane) {
+        planeSelect.appendChild(el('option', { value: plane, selected: plane === lane.plane, text: plane }));
+      });
+      row.appendChild(planeSelect);
+      if (lane.guessed) row.appendChild(el('span', { class: 'chip', text: 'guessed — confirm' }));
+      gate.appendChild(row);
+    });
+  }
+
   claims.forEach(function (claim, index) {
     if (!claim.testable) {
       gate.appendChild(el('div', { class: 'gate line', style: 'cursor:default' }, [
@@ -2664,6 +2741,29 @@ function claimsGate(M) {
 }
 
 function indexOf(list, item) { return list.indexOf(item); }
+
+/**
+ * Mirror of isObservable in src/catalog/sequence.ts — this script cannot
+ * import it, so a change to the rule there must change this too. A message is
+ * checkable when the browser can see it: sent by the user or the page, or a
+ * reply coming back to either. Older claims files without the message map
+ * degrade to a read-only lane display — the honest fallback.
+ */
+function recomputeLanes(M) {
+  var seq = M.claims && M.claims.sequence;
+  if (!seq || !seq.messages) return;
+  var planes = {};
+  (seq.participants || []).forEach(function (lane) { planes[lane.name] = lane.plane; });
+  var visible = function (plane) { return plane === 'user' || plane === 'page'; };
+  seq.messages.forEach(function (m) {
+    var claim = M.claims.claims[m.claim];
+    if (!claim) return;
+    var observable = visible(planes[m.from]) || (m.reply === true && visible(planes[m.to]));
+    claim.testable = observable;
+    claim.source = claim.source.replace(/ \(beyond the browser boundary:[^)]*\)$/, '') +
+      (observable ? '' : ' (beyond the browser boundary: ' + (planes[m.from] || '?') + ' \u2192 ' + (planes[m.to] || '?') + ' \u2014 held as an assumption)');
+  });
+}
 
 function countApproved(M) {
   if (!M.claims) return 0;
@@ -2937,6 +3037,9 @@ function submitModal() {
   M.busy = true; renderModal();
   var approved = { catalog: M.claims.catalog, summary: M.claims.summary,
     documentNote: M.claims.documentNote, model: M.claims.model, extractedAt: M.claims.extractedAt,
+    // The participant table rides along, edits included — dropping it here
+    // would silently discard the lane corrections the gate just collected.
+    sequence: M.claims.sequence || undefined,
     claims: M.claims.claims.map(function (claim, index) {
       return Object.assign({}, claim, { approved: claim.testable ? !M.cut[index] : true });
     }) };

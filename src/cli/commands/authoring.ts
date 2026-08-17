@@ -22,6 +22,7 @@ import { extractDocumentFile } from '../../catalog/extract.js';
 import {
   parseSequenceDiagram,
   sequenceToClaims,
+  toGateInfo,
   type SequenceDoc,
 } from '../../catalog/sequence.js';
 import {
@@ -596,15 +597,9 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         documentNote: document.note,
       },
       new Date().toISOString(),
-      {
-        notation: sequence.notation,
-        participants: sequence.participants.map((participant) => ({
-          name: participant.id,
-          label: participant.label,
-          plane: participant.plane,
-          guessed: participant.guessed,
-        })),
-      },
+      // The whole gate info, message mapping included — it is what lets the
+      // panel's lane editor recompute testability when a plane is corrected.
+      toGateInfo(sequence),
     );
     process.stdout.write(
       `read ${claimsFile.claims.length} claim(s) from ${document.name}\n` +

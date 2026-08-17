@@ -9,6 +9,7 @@ import { join, resolve } from 'node:path';
 import { generateText } from 'ai';
 
 import { CacheManager } from '../../cache/cache-manager.js';
+import { connectDb, defaultDbConfig, maskDsn } from '../../db/client.js';
 import { LLM_ROLES, PROVIDER_META, describeRouting } from '../../config.js';
 import { ContextEngine } from '../../context/context-engine.js';
 import { summarize as summarizeContext } from '../../context/query.js';
@@ -63,6 +64,32 @@ export async function cmdDoctor(options: CliOptions): Promise<number> {
     } catch (error) {
       const detail = error instanceof Error ? error.message.split('\n')[0] : String(error);
       process.stdout.write(`  ✗ ${label}\n      ${detail}\n`);
+      failures += 1;
+    }
+  }
+
+  // The database, on the same make-a-real-call philosophy as the roles: a
+  // SELECT 1 over the exact connection a run would use, plus the schema read
+  // the grounding gate depends on. Printed only when a connection is
+  // configured — silence for the unconfigured majority, the no-spec rule.
+  const dbConfig = defaultDbConfig();
+  if (dbConfig !== null) {
+    const started = Date.now();
+    try {
+      const client = await connectDb(dbConfig);
+      try {
+        await client.query('SELECT 1', []);
+        const schema = await client.introspect();
+        process.stdout.write(
+          `\n  ✓ db        ${maskDsn(dbConfig.url ?? '')}\n` +
+            `      read-only session up in ${Date.now() - started}ms — ${schema.tables.length} table(s) visible\n`,
+        );
+      } finally {
+        await client.close().catch(() => undefined);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message.split('\n')[0] : String(error);
+      process.stdout.write(`\n  ✗ db        ${detail}\n`);
       failures += 1;
     }
   }

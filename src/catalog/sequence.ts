@@ -378,6 +378,39 @@ export function sequenceToClaims(doc: SequenceDoc): { summary: string; claims: C
   return { summary, claims };
 }
 
+/**
+ * The gate's machine-readable half: which claim came from which message, and
+ * between whom. This is what lets wowUI's lane editor recompute a claim's
+ * testability when a person corrects a guessed plane — the claims alone carry
+ * only prose. `claim` indexes into the array `sequenceToClaims` returned,
+ * which is 1:1 with `doc.messages` by construction.
+ *
+ * The observability rule is mirrored in the panel's client script
+ * (`recomputeLanes` in `wow-ui-html.ts`) — it cannot import this module, so
+ * a change to `isObservable` must change both.
+ */
+export function toGateInfo(doc: SequenceDoc): {
+  notation: string;
+  participants: Array<{ name: string; label: string; plane: string; guessed: boolean }>;
+  messages: Array<{ claim: number; from: string; to: string; reply: boolean }>;
+} {
+  return {
+    notation: doc.notation,
+    participants: doc.participants.map((participant) => ({
+      name: participant.id,
+      label: participant.label,
+      plane: participant.plane,
+      guessed: participant.guessed,
+    })),
+    messages: doc.messages.map((message, index) => ({
+      claim: index,
+      from: message.from,
+      to: message.to,
+      reply: message.reply,
+    })),
+  };
+}
+
 const DB_NAME_RE = /\b(db|database|postgres|postgresql|mysql|mongo|mongodb|redis|store|storage)\b/i;
 const PAGE_NAME_RE = /\b(browser|ui|web ?app|webapp|frontend|front-end|page|client|spa|app)\b/i;
 const EXTERNAL_NAME_RE = /\b(mail|email|smtp|payment|stripe|gateway|third|external|queue|kafka|s3)\b/i;
