@@ -20,6 +20,11 @@ import {
 import { LlmDraftModel, draftCatalog } from '../../catalog/draft.js';
 import { extractDocumentFile } from '../../catalog/extract.js';
 import {
+  parseSequenceDiagram,
+  sequenceToClaims,
+  type SequenceDoc,
+} from '../../catalog/sequence.js';
+import {
   describeCase,
   parseTestCaseTable,
   renderTestCaseTable,
@@ -453,6 +458,25 @@ async function authorEachRow(
   return { first, cases };
 }
 
+/**
+ * Declared tables from the cached context graph, for the authoring prompt's
+ * inventory section. Read-only (`load`, never `build`): indexing the schema is
+ * `wowlidator context build --db-schema …`'s job, and authoring silently gaining a
+ * project walk would be a surprise. Empty when no schema was ever indexed —
+ * and with no inventory the author cannot emit a DB step at all.
+ */
+async function tableInventory(): Promise<{ name: string; summary: string }[]> {
+  try {
+    const graph = await new ContextEngine({ warn: false }).load();
+    if (!graph) return [];
+    return graph.nodes
+      .filter((node) => node.kind === 'table')
+      .map((node) => ({ name: node.name, summary: node.meta?.['columns'] ?? '' }));
+  } catch {
+    return [];
+  }
+}
+
 export async function cmdCatalog(file: string | undefined, options: CliOptions): Promise<number> {
   if (!file) {
     process.stderr.write('wowlidator catalog: missing "<file>"\n');
@@ -509,6 +533,24 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     log?.(`${document.name} is a test-case table — ${table.length} case(s), read from its columns`);
   }
 
+  // A sequence diagram is structured the way a table is: read, not
+  // interpreted. One claim per message, plane defaults classified
+  // deterministically, and every guess written into the claims file for the
+  // gate to confirm rather than acted on. No model call.
+  let sequence: SequenceDoc | null = null;
+  if (document.format === 'sequence') {
+    try {
+      sequence = parseSequenceDiagram(document.text);
+    } catch (error) {
+      // `extractDocumentFile` already validated the parse, so getting here
+      // means the two passes disagree — surface it rather than guessing.
+      process.stderr.write(
+        `wowlidator catalog: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return 2;
+    }
+  }
+
   // --- phase 1: what does this document claim? ------------------------------
   let claimsFile: ClaimsFile;
   if (options.claims !== undefined) {
@@ -539,6 +581,45 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         `  format     test-case table — columns read directly, no model call\n` +
         `  summary    ${claimsFile.summary}\n`,
     );
+  } else if (sequence !== null) {
+    // Free and exact, the table path one notch up in structure: one claim per
+    // message. Lanes past the browser boundary come out testable:false with
+    // the boundary named — kept, shown, never checked.
+    const derived = sequenceToClaims(sequence);
+    claimsFile = toClaimsFile(
+      document.name,
+      {
+        summary: derived.summary,
+        claims: derived.claims,
+        model: 'read from the diagram (no model call)',
+        latencyMs: 0,
+        documentNote: document.note,
+      },
+      new Date().toISOString(),
+      {
+        notation: sequence.notation,
+        participants: sequence.participants.map((participant) => ({
+          name: participant.id,
+          label: participant.label,
+          plane: participant.plane,
+          guessed: participant.guessed,
+        })),
+      },
+    );
+    process.stdout.write(
+      `read ${claimsFile.claims.length} claim(s) from ${document.name}\n` +
+        `  format     sequence diagram (${sequence.notation}) — messages read directly, no model call\n` +
+        `  summary    ${claimsFile.summary}\n`,
+    );
+    // The participant table is the gate's new column. A guessed plane decides
+    // which claims are checkable, so it is shown here and stored in the
+    // claims file — confirm or correct it there before running.
+    for (const participant of sequence.participants) {
+      process.stdout.write(
+        `  lane       ${participant.id} (${participant.label}) — ${participant.plane}` +
+          `${participant.guessed ? '   (guessed — confirm in the claims file)' : ''}\n`,
+      );
+    }
   } else {
     log?.('asking the generator role what this document claims…');
     const model = new LlmCatalogModel({ factory: options.factory });
@@ -600,10 +681,15 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   const blocked = await prepare(options, options.url);
   if (blocked !== null) return blocked;
 
+  const tables = await tableInventory();
+  if (tables.length > 0) {
+    log?.(`schema indexed — ${tables.length} table(s) available for DB checks`);
+  }
   const author = new FlowAuthor({
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     policy: options.policy,
     probe: options.probe,
+    ...(tables.length > 0 ? { tables } : {}),
     onLog: log,
   });
 
@@ -766,10 +852,15 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
 
   const log = lineLogger(options);
 
+  const tables = await tableInventory();
+  if (tables.length > 0) {
+    log?.(`schema indexed — ${tables.length} table(s) available for DB checks`);
+  }
   const author = new FlowAuthor({
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     policy: options.policy,
     probe: options.probe,
+    ...(tables.length > 0 ? { tables } : {}),
     onLog: log,
   });
 

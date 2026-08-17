@@ -112,7 +112,12 @@ function normaliseKey(key: string): string {
   return key.toLowerCase().replace(/[-_\s]/g, '');
 }
 
-function isSensitiveKey(key: string): boolean {
+/**
+ * Exported for the consumers that redact *non*-HTTP payloads on the same rule
+ * — a database row's column names (`src/db/redact-row.ts`) carry credentials
+ * exactly as often as a body's keys do, and a second heuristic would drift.
+ */
+export function isSensitiveKey(key: string): boolean {
   const normalised = normaliseKey(key);
   return SENSITIVE_KEY_PATTERNS.some((pattern) => normalised.includes(normaliseKey(pattern)));
 }

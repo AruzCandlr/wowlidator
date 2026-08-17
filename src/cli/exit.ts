@@ -40,7 +40,12 @@ export function exitCodeFor(bundle: { status: string; error?: string | undefined
   // the run never reached. See `BrowserGoneError` in the runner.
   if (
     bundle.error &&
-    /could not attach to a browser|Browser context management|browser went away mid-run/.test(
+    // "database unavailable" and "network observation" join the browser
+    // failures for the same reason: a check the harness could not make says
+    // nothing about the application, and exiting 1 would have CI file a bug
+    // against an app the check never reached. See `DbUnavailableError` in
+    // `src/db/client.ts` and the observer guard on `expectCalls`.
+    /could not attach to a browser|Browser context management|browser went away mid-run|database unavailable|network observation (?:unavailable|truncated)/.test(
       bundle.error,
     )
   ) {
@@ -66,7 +71,7 @@ export function classifyError(error: unknown): number {
   // the application — "regard as system failure" is the contract here: CI
   // must fix the role's routing, not file a bug against the app.
   if (
-    /could not attach to a browser|Browser context management|no API key|ConfigError|failed to produce a valid structured response|structured-output circuit is open/i.test(
+    /could not attach to a browser|Browser context management|no API key|ConfigError|failed to produce a valid structured response|structured-output circuit is open|database unavailable|network observation (?:unavailable|truncated)/i.test(
       message,
     )
   ) {

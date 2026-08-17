@@ -25,6 +25,8 @@ import type { Page } from 'playwright';
 import { z } from 'zod';
 
 import { lenientObject } from '../providers/model-output.js';
+import { parseExpectedCallEntry, type ExpectedCall } from '../api/expect-calls.js';
+import { parseDbConditions } from '../db/db-actions.js';
 
 import { SELECTOR_SYNTAX_RULES, captureAxTree } from '../healer/jit-healer.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
@@ -88,6 +90,14 @@ export const AUTHOR_ACTIONS = [
   'expectValue',
   'expectAttribute',
   'expectFocused',
+  // Backend claims. `expectCalls` entries and the DB conditions ride in the
+  // existing flat string fields (see the field descriptions) — a nested array
+  // here would break the very convention this list's absentees exist for.
+  'expectCalls',
+  'dbSnapshot',
+  'expectDbRow',
+  'expectDbDelta',
+  'expectDbUnchanged',
 ] as const;
 
 export type AuthorAction = (typeof AUTHOR_ACTIONS)[number];
@@ -124,11 +134,27 @@ const AuthoredStepFields = {
   value: z
     .string()
     .describe(
-      'Text to fill or type, the visible label of the option to select, expected substring, expected count as digits, storage value, or the goal for a workflow step. Else empty.',
+      'Text to fill or type, the visible label of the option to select, expected substring, ' +
+        'expected count as digits, storage value, or the goal for a workflow step. For ' +
+        'expectCalls: the expected entries, ";"-separated, each "METHOD /path" with optional ' +
+        '"-> status" and a "never:" prefix for forbidden calls. For expectDbRow: the expected ' +
+        'column values as "col = value AND col = value" (may be empty). For expectDbDelta: ' +
+        'the signed row-count change as digits. Else empty.',
     ),
   url: z.string().describe('URL or path for goto. Else empty.'),
-  key: z.string().describe('Key name for press, or storage key for setLocalStorage. Else empty.'),
-  name: z.string().describe('Snapshot name, or attribute name for expectAttribute. Else empty.'),
+  key: z
+    .string()
+    .describe(
+      'Key name for press, or storage key for setLocalStorage. For DB checks: the WHERE ' +
+        'conditions as "col = value AND col = value" (expectDbRow), or the snapshot name ' +
+        '(dbSnapshot/expectDbDelta/expectDbUnchanged). Else empty.',
+    ),
+  name: z
+    .string()
+    .describe(
+      'Snapshot name, attribute name for expectAttribute, or the table name for DB checks ' +
+        '(comma-separated tables for dbSnapshot/expectDbUnchanged). Else empty.',
+    ),
   intent: z.string().describe('What this step is for, in plain language. Always fill this in.'),
 };
 
@@ -168,6 +194,13 @@ export const AuthoredFlowSchema = z.object({
     ),
 });
 
+/** One declared table, formatted for the prompt's inventory section. */
+export interface TableInventoryEntry {
+  name: string;
+  /** `id:uuid pk · status:text · …` — from the schema ingester's meta. */
+  summary: string;
+}
+
 export interface AuthorRequest {
   /** The author's description of the test they want. */
   prompt: string;
@@ -175,6 +208,14 @@ export interface AuthorRequest {
   url?: string | undefined;
   /** Accessibility tree of the live page. Absent means ungrounded. */
   axTree?: string | undefined;
+  /**
+   * The application's declared database tables, from the indexed schema.
+   * Presence is the permission: with no inventory the prompt never mentions
+   * DB checks and `toFlowStep` drops any the model emits anyway — the model
+   * chooses among declared tables or not at all, the OpenAPI rule pointed at
+   * state.
+   */
+  tables?: readonly TableInventoryEntry[] | undefined;
   /**
    * Controls that exist only after an interaction, from `probeInteractions`.
    * Separate from `axTree` on purpose — "behind a menu" is a different claim
@@ -332,6 +373,31 @@ Actions available:
 - expectValue     an input's value EQUALS "value".
 - expectAttribute attribute "name" EQUALS "value".
 - expectFocused   element currently holds keyboard focus.
+- expectCalls     assert HTTP calls the page itself makes. Entries in "value",
+                  ";"-separated, each "METHOD /path" (path templates like
+                  /api/orders/:id are fine) with an optional "-> 2xx" or
+                  "-> 201" status, and a "never:" prefix for a call that must
+                  NOT happen. Use ONLY when the request itself claims specific
+                  traffic (a sequence diagram's "Page -> API: POST /api/orders");
+                  never invent endpoints — take them from the request or from
+                  the declared operations, and place the step AFTER the user
+                  action said to provoke the calls.
+- dbSnapshot      record row counts of tables (comma-separated in "name";
+                  snapshot name in "key", default "before") so a later DB check
+                  can diff. Put it in setup, before the journey.
+- expectDbRow     assert a row exists. Table in "name"; WHERE conditions in
+                  "key" as "col = value AND col = value"; expected column
+                  values (optional) in "value", same syntax. Prefer keying on a
+                  {{variable}} a request step saved — that ties the row to THIS
+                  run.
+- expectDbDelta   assert a table's row count changed by exactly "value" (signed
+                  digits) since the snapshot named in "key". Table in "name".
+- expectDbUnchanged  assert row counts did not move for the comma-separated
+                  tables in "name" since the snapshot in "key" — the
+                  accidental-write check.
+                  DB checks are allowed ONLY when the request lists declared
+                  database tables, and ONLY against tables from that list —
+                  one not listed there will be refused at run time.
 
 **The body MUST contain at least one expect* step.** A flow that only clicks and
 navigates passes whether or not the feature works, which is worse than no test:
@@ -415,6 +481,15 @@ function buildUserPrompt(request: AuthorRequest): string {
       ...request.feedback.map((entry) => `  - ${entry}`),
     );
   }
+  // Its own labelled section, apart from the tree — "declared in the schema"
+  // and "on the page" are different claims, the probe-report separation.
+  if (request.tables?.length) {
+    lines.push(
+      '',
+      'DECLARED DATABASE TABLES (from the indexed schema — DB checks may use these and no others):',
+      ...request.tables.map((table) => `  ${table.name} (${table.summary})`),
+    );
+  }
   if (request.axTree) lines.push('', 'Accessibility tree:', request.axTree);
   if (request.interactions) lines.push('', request.interactions);
   return lines.join('\n');
@@ -466,11 +541,12 @@ export class LlmFlowAuthorModel implements FlowAuthorModel {
     });
 
     let dropped = 0;
+    const allowDb = (request.tables?.length ?? 0) > 0;
     // Narrow and keep each surviving step next to the case it was labelled with:
     // `toFlowStep` returns the runner's own union, which has no room for a label
     // that means nothing at execution time.
     const narrow = (steps: z.infer<typeof AuthoredStepSchema>[]): LabelledStep[] => {
-      const narrowed = steps.map((raw) => ({ step: toFlowStep(raw), label: (raw.case ?? '').trim() }));
+      const narrowed = steps.map((raw) => ({ step: toFlowStep(raw, allowDb), label: (raw.case ?? '').trim() }));
       dropped += narrowed.filter(({ step }) => step === null).length;
       return narrowed.filter((entry): entry is LabelledStep => entry.step !== null);
     };
@@ -563,8 +639,14 @@ function uniqueNames(cases: AuthoredCase[], flowName: string): AuthoredCase[] {
   });
 }
 
-/** Narrow the flat authored shape back into the runner's step union. */
-function toFlowStep(raw: z.infer<typeof AuthoredStepSchema>): FlowStep | null {
+/**
+ * Narrow the flat authored shape back into the runner's step union.
+ *
+ * `allowDb` is the structural half of the DB permission: with no table
+ * inventory in the request, a DB step the model emitted anyway narrows to
+ * null — a prompt instruction is a request, a filter is a guarantee.
+ */
+function toFlowStep(raw: z.infer<typeof AuthoredStepSchema>, allowDb: boolean): FlowStep | null {
   const intent = raw.intent === '' ? undefined : raw.intent;
   const needsSelector = raw.selector === '';
   // Chrome's accessible names carry CSS `text-transform`, Playwright's matcher
@@ -666,6 +748,70 @@ function toFlowStep(raw: z.infer<typeof AuthoredStepSchema>): FlowStep | null {
             value: raw.value,
             intent,
           };
+    case 'expectCalls': {
+      if (raw.value === '') return null;
+      const calls: ExpectedCall[] = [];
+      const never: ExpectedCall[] = [];
+      for (const entry of raw.value.split(/[;\n]/)) {
+        const line = entry.trim();
+        if (line === '') continue;
+        const parsed = parseExpectedCallEntry(line);
+        // One unparseable entry drops the whole step: a sequence assertion
+        // missing one of its calls silently would check a different claim.
+        if (parsed === null) return null;
+        (parsed.never ? never : calls).push(parsed.call);
+      }
+      if (calls.length === 0 && never.length === 0) return null;
+      return {
+        action: 'expectCalls',
+        ...(calls.length > 0 ? { calls } : {}),
+        ...(never.length > 0 ? { never } : {}),
+        intent,
+      };
+    }
+    case 'dbSnapshot': {
+      if (!allowDb || raw.name === '') return null;
+      const tables = raw.name.split(',').map((t) => t.trim()).filter((t) => t !== '');
+      if (tables.length === 0) return null;
+      return { action: 'dbSnapshot', tables, as: raw.key === '' ? undefined : raw.key, intent };
+    }
+    case 'expectDbRow': {
+      if (!allowDb || raw.name === '' || raw.key === '') return null;
+      const where = parseDbConditions(raw.key);
+      if (where === null || Object.keys(where).length === 0) return null;
+      const values = raw.value === '' ? undefined : parseDbConditions(raw.value);
+      if (values === null) return null;
+      return {
+        action: 'expectDbRow',
+        table: raw.name.trim(),
+        where,
+        ...(values !== undefined && Object.keys(values).length > 0 ? { values } : {}),
+        intent,
+      };
+    }
+    case 'expectDbDelta': {
+      if (!allowDb || raw.name === '') return null;
+      const delta = Number(raw.value);
+      if (!Number.isInteger(delta)) return null;
+      return {
+        action: 'expectDbDelta',
+        table: raw.name.trim(),
+        delta,
+        since: raw.key === '' ? undefined : raw.key,
+        intent,
+      };
+    }
+    case 'expectDbUnchanged': {
+      if (!allowDb || raw.name === '') return null;
+      const tables = raw.name.split(',').map((t) => t.trim()).filter((t) => t !== '');
+      if (tables.length === 0) return null;
+      return {
+        action: 'expectDbUnchanged',
+        tables,
+        since: raw.key === '' ? undefined : raw.key,
+        intent,
+      };
+    }
     default:
       return null;
   }
@@ -712,6 +858,11 @@ export interface FlowAuthorOptions {
   probe?: boolean | undefined;
   maxProbes?: number | undefined;
   policy?: MutationPolicy | undefined;
+  /**
+   * Declared database tables, when a schema is indexed. Presence is the
+   * permission to author DB checks — see `AuthorRequest.tables`.
+   */
+  tables?: readonly TableInventoryEntry[] | undefined;
   /** Called at each authoring lifecycle event — for live progress output. */
   onLog?: ((line: string) => void) | undefined;
 }
@@ -724,6 +875,7 @@ export class FlowAuthor {
   readonly #onLog: ((line: string) => void) | undefined;
   readonly #probe: boolean;
   readonly #maxProbes: number | undefined;
+  readonly #tables: readonly TableInventoryEntry[] | undefined;
 
   constructor(options: FlowAuthorOptions) {
     this.model = options.model;
@@ -731,6 +883,7 @@ export class FlowAuthor {
     this.#maxProbes = options.maxProbes;
     this.#maxAxNodes = options.maxAxNodes ?? DEFAULT_AUTHOR_MAX_NODES;
     this.#policy = options.policy ?? DEFAULT_MUTATION_POLICY;
+    this.#tables = options.tables;
     this.#onLog = options.onLog;
   }
 
@@ -783,6 +936,7 @@ export class FlowAuthor {
         axTree,
         interactions,
         policy: this.#policy,
+        ...(this.#tables?.length ? { tables: this.#tables } : {}),
         ...(feedback.length > 0 ? { feedback } : {}),
       });
       const caseCount = result.cases?.length ?? 1;

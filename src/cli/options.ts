@@ -143,6 +143,8 @@ export interface CliOptions {
   repairRegenerate: boolean;
   /** OpenAPI/Swagger spec to index — a path or an http(s) URL. */
   openapi: string | undefined;
+  /** Path of a schema.sql / schema.prisma for `context build --db-schema`. */
+  dbSchema: string | undefined;
   /** `generate`: write API tests from the indexed spec instead of reading a page. */
   api: boolean;
   /** Watch the page's HTTP traffic over CDP. Default on. */

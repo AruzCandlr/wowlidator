@@ -2429,7 +2429,7 @@ function modalField(label, optional, control, hint) {
   ]);
 }
 
-var DOCUMENT_ACCEPT = '.md,.markdown,.csv,.tsv,.html,.htm,.txt,.text,.log,.json,.yaml,.yml,.xlsx,.xlsm,.pdf';
+var DOCUMENT_ACCEPT = '.md,.markdown,.csv,.tsv,.html,.htm,.txt,.text,.log,.json,.yaml,.yml,.xlsx,.xlsm,.pdf,.mmd,.mermaid,.puml,.plantuml';
 
 /** Read a picked file as base64 without ever holding it as a string twice. */
 function readFileAsBase64(file) {
@@ -2471,7 +2471,7 @@ function renderContextTab(box, M) {
     }
   });
   box.appendChild(modalField('Upload a document', false, file,
-    'md · csv · html · txt · json · yaml · xlsx · pdf'));
+    'md · csv · html · txt · json · yaml · xlsx · pdf · mmd · puml'));
 
   var name = el('input', { type: 'text', placeholder: 'leave-balance-api', value: M.ctxName,
     oninput: function (e) { M.ctxName = e.target.value; syncSubmit(); } });
@@ -2546,7 +2546,7 @@ function renderCatalogTab(box, M) {
     }
   });
   box.appendChild(modalField('The catalog', false, file,
-    'md · csv · html · txt · json · yaml · xlsx · pdf — text is read out of it and sent to the model'));
+    'md · csv · html · txt · json · yaml · xlsx · pdf · mmd · puml — text is read out of it and sent to the model'));
 
   var name = el('input', { type: 'text', placeholder: 'leave-balance-checks', value: M.catName,
     oninput: function (e) { M.catName = e.target.value; syncSubmit(); } });

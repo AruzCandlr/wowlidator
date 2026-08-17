@@ -190,6 +190,11 @@ export async function cmdContext(sub: string | undefined, options: CliOptions): 
     rootDir: options.root,
     cacheFile: options.contextOut,
     openApiSpec: options.openapi,
+    dbSchema: options.dbSchema,
+    // Introspection fallback: when no schema file exists but a connection is
+    // configured, the live database is the source of truth.
+    dbUrl: process.env['WOWLIDATOR_DB_URL'],
+    dbRemoteOk: process.env['WOWLIDATOR_DB_REMOTE_OK'] === '1',
   });
 
   switch (sub) {

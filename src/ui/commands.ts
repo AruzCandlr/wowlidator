@@ -806,6 +806,14 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Indexes endpoints alongside the code, giving API generation a real inventory. Omit and a conventionally-named openapi.*/swagger.* file is used if one exists.',
       },
       {
+        name: 'db-schema',
+        label: 'Database schema',
+        type: 'text',
+        placeholder: './schema.sql or ./prisma/schema.prisma',
+        help: 'Indexes tables alongside the code, giving catalog authoring a declared inventory for DB checks. Omit and a conventionally-named schema file is used; with WOWLIDATOR_DB_URL set and no file, the live schema is introspected.',
+        advanced: true,
+      },
+      {
         name: 'force',
         label: 'Rebuild even if unchanged',
         type: 'boolean',

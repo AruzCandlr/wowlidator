@@ -32,7 +32,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
-import { API_STEP_ACTIONS, type ProofBundle, type ProofStep } from '../engine/proof-bundle.js';
+import { BACKEND_TIER_ACTIONS, type ProofBundle, type ProofStep } from '../engine/proof-bundle.js';
 import { buildVerdict } from './verdict.js';
 
 /** Escape for XML text and attribute values. */
@@ -60,7 +60,7 @@ function caseName(step: ProofStep): string {
 }
 
 function classOf(bundle: ProofBundle, step: ProofStep): string {
-  const side = API_STEP_ACTIONS.has(step.action) ? 'backend' : 'frontend';
+  const side = BACKEND_TIER_ACTIONS.has(step.action) ? 'backend' : 'frontend';
   return `wowlidator.${side}.${bundle.name}`;
 }
 
@@ -176,7 +176,7 @@ export function renderCtrf(bundles: readonly ProofBundle[], version = '0.2.0'): 
         name: caseName(step),
         status,
         duration: step.durationMs,
-        suite: `${bundle.name} / ${API_STEP_ACTIONS.has(step.action) ? 'backend' : 'frontend'}`,
+        suite: `${bundle.name} / ${BACKEND_TIER_ACTIONS.has(step.action) ? 'backend' : 'frontend'}`,
         extra: {
           action: step.action,
           selector: step.selector ?? null,

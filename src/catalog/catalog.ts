@@ -247,6 +247,17 @@ export interface ApprovedClaim extends CatalogClaim {
   approved: boolean;
 }
 
+/**
+ * The gate's participant table, present only for a sequence-diagram catalog.
+ * The diagram never says which host is "the API" — plane assignments start as
+ * deterministic defaults (`guessed` marks the ones the notation did not
+ * state), and this block is where the person confirms or corrects them.
+ */
+export interface SequenceGateInfo {
+  notation: string;
+  participants: Array<{ name: string; label: string; plane: string; guessed: boolean }>;
+}
+
 export interface ClaimsFile {
   /** Name of the document the claims were read out of. */
   catalog: string;
@@ -255,9 +266,15 @@ export interface ClaimsFile {
   model: string;
   extractedAt: string;
   claims: ApprovedClaim[];
+  sequence?: SequenceGateInfo | undefined;
 }
 
-export function toClaimsFile(catalog: string, claims: CatalogClaims, extractedAt: string): ClaimsFile {
+export function toClaimsFile(
+  catalog: string,
+  claims: CatalogClaims,
+  extractedAt: string,
+  sequence?: SequenceGateInfo,
+): ClaimsFile {
   return {
     catalog,
     summary: claims.summary,
@@ -267,6 +284,7 @@ export function toClaimsFile(catalog: string, claims: CatalogClaims, extractedAt
     // Everything starts ticked: the review is for striking things out, and a
     // gate that begins empty is a gate everyone clicks "select all" through.
     claims: claims.claims.map((claim) => ({ ...claim, approved: true })),
+    ...(sequence !== undefined ? { sequence } : {}),
   };
 }
 
@@ -281,12 +299,19 @@ export function parseClaimsFile(raw: string): ClaimsFile {
   if (!Array.isArray(file.claims)) {
     throw new CatalogError('claims file has no "claims" array — is this the file --claims-only wrote?');
   }
+  const sequence =
+    typeof file.sequence === 'object' &&
+    file.sequence !== null &&
+    Array.isArray(file.sequence.participants)
+      ? file.sequence
+      : undefined;
   return {
     catalog: typeof file.catalog === 'string' ? file.catalog : 'catalog',
     summary: typeof file.summary === 'string' ? file.summary : '',
     documentNote: typeof file.documentNote === 'string' ? file.documentNote : '',
     model: typeof file.model === 'string' ? file.model : 'unknown',
     extractedAt: typeof file.extractedAt === 'string' ? file.extractedAt : '',
+    ...(sequence !== undefined ? { sequence } : {}),
     claims: file.claims.map((claim: Partial<ApprovedClaim>) => ({
       claim: String(claim.claim ?? '').trim(),
       priority: normalisePriority(String(claim.priority ?? '')),

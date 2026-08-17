@@ -85,14 +85,10 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
-/**
- * Convert an OpenAPI path template to the `:param` convention route nodes use,
- * so the existing `matchesRoutePattern` matcher works on operations unchanged
- * rather than needing a second, subtly different implementation.
- */
-export function toRoutePattern(path: string): string {
-  return path.replace(/\{([^}]+)\}/g, ':$1');
-}
+// `toRoutePattern` moved to `route-match.ts` with the matcher it exists for;
+// re-exported here so existing imports of this module keep working.
+export { toRoutePattern } from '../route-match.js';
+import { toRoutePattern } from '../route-match.js';
 
 /** Resolve a local `#/components/schemas/Foo` reference. Returns null otherwise. */
 function resolveRef(document: SpecDocument, ref: string): unknown {

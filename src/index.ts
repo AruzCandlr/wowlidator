@@ -472,6 +472,73 @@ export {
 } from './api/api-actions.js';
 
 export {
+  ObservationTruncatedError,
+  ObservationUnavailableError,
+  callSatisfies,
+  describeExpected,
+  matchExpectedCalls,
+  neverViolations,
+  parseExpectedCallEntry,
+  type CallMatch,
+  type ExpectedCall,
+  type FlowExpectCallsSpec,
+  type SequenceMatchResult,
+  type StatusClass,
+} from './api/expect-calls.js';
+
+export {
+  DbGroundingError,
+  DbUnavailableError,
+  connectDb,
+  defaultDbConfig,
+  isLoopbackDsn,
+  maskDsn,
+  type DbClient,
+  type DbColumn,
+  type DbConfig,
+  type DbResult,
+  type DbSchema,
+  type DbTable,
+} from './db/client.js';
+
+export {
+  DEFAULT_DB_TIMEOUT_MS,
+  DbActions,
+  looseEquals,
+  parseDbConditions,
+  quoteIdent,
+  type DbActionsOptions,
+  type DbCheckRecord,
+  type FlowDbCalledSpec,
+  type FlowDbDeltaSpec,
+  type FlowDbRowSpec,
+  type FlowDbSnapshotSpec,
+  type FlowDbUnchangedSpec,
+  type FlowDbValue,
+} from './db/db-actions.js';
+
+export {
+  DB_EVIDENCE_MAX_ROWS,
+  redactRow,
+  redactRows,
+  redactValue,
+  redactWhereSummary,
+} from './db/redact-row.js';
+
+export {
+  SequenceParseError,
+  classifyPlanes,
+  isObservable,
+  looksLikeSequenceDiagram,
+  parseSequenceDiagram,
+  sequenceToClaims,
+  type ParticipantPlane,
+  type SequenceDoc,
+  type SequenceMessage,
+  type SequenceParticipant,
+} from './catalog/sequence.js';
+
+export {
   UnknownVariableError,
   VariableStore,
   extractPath,
@@ -483,6 +550,15 @@ export {
   toRoutePattern,
   type OpenApiIngesterOptions,
 } from './context/ingesters/openapi-ingester.js';
+
+export {
+  SchemaIngester,
+  parsePrismaSchema,
+  parseSqlSchema,
+  type SchemaIngesterOptions,
+} from './context/ingesters/schema-ingester.js';
+
+export { matchesCall } from './context/route-match.js';
 
 export {
   API_GENERATOR_ACTIONS,

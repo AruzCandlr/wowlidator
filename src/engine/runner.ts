@@ -21,8 +21,27 @@ import {
   isBlockingFailure,
   type NetworkCall,
 } from '../api/network-observer.js';
+import {
+  ObservationTruncatedError,
+  ObservationUnavailableError,
+  matchExpectedCalls,
+  matchTable,
+  neverViolations,
+  describeExpected,
+  type ExpectedCall,
+  type FlowExpectCallsSpec,
+} from '../api/expect-calls.js';
 import type { RedactionPolicy } from '../api/redact.js';
-import type { VariableStore } from '../api/variables.js';
+import { VariableStore } from '../api/variables.js';
+import { DbActions } from '../db/db-actions.js';
+import type {
+  FlowDbCalledSpec,
+  FlowDbDeltaSpec,
+  FlowDbRowSpec,
+  FlowDbSnapshotSpec,
+  FlowDbUnchangedSpec,
+} from '../db/db-actions.js';
+import { defaultDbConfig, type DbClient, type DbConfig } from '../db/client.js';
 import {
   DEFAULT_CAPTURE_DELAY_MS,
   captureEvidence,
@@ -63,7 +82,8 @@ import {
 } from './selector.js';
 import { expandFlow, hasIncludes } from './compose.js';
 import {
-  API_STEP_ACTIONS,
+  BACKEND_TIER_ACTIONS,
+  BROWSER_FREE_ACTIONS,
   ProofBundleBuilder,
   type AgentRecord,
   type DataCaseResult,
@@ -169,11 +189,27 @@ export interface SmartRunnerOptions {
   /** How much of an observed request may be recorded. Defaults to redacting. */
   networkRedaction?: RedactionPolicy | undefined;
   /**
+   * Ring-buffer cap for the observer. The default (300) suits per-step
+   * evidence; a long journey ending in an `expectCalls` over the whole run
+   * may need more — a `never` claim over a window that dropped calls is
+   * blocked, not passed, and this is the dial that prevents that.
+   */
+  networkMaxCalls?: number | undefined;
+  /**
    * Transport for `request` steps. Defaults to the browser context's own,
    * which inherits the session the UI steps established — that inheritance is
    * the whole reason API steps live in the same flow as UI steps.
    */
   transport?: ApiTransport | null | undefined;
+  /**
+   * Database connection for DB verification steps. Defaults to
+   * `WOWLIDATOR_DB_URL` (see `defaultDbConfig`); `null` disables. Connection
+   * is lazy — a run with no DB steps never opens one and never demands the
+   * driver be installed.
+   */
+  db?: DbConfig | null | undefined;
+  /** Pre-built DB client — the embedder/test seam. Wins over `db`. */
+  dbClient?: DbClient | null | undefined;
 }
 
 /**
@@ -200,6 +236,13 @@ const MAX_STEP_EVIDENCE = 8;
  * failure mode this whole rung exists to prevent.
  */
 const NETWORK_LOOKBACK_MS = 3_000;
+
+/** How often `expectCalls` re-reads the window while its budget lasts. */
+const SEQUENCE_POLL_MS = 150;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** One value in a data-driven step, with what should hold after filling it. */
 export interface DataCase {
@@ -634,8 +677,18 @@ export class SmartRunner {
   readonly #updateBaselines: boolean;
   readonly #networkEnabled: boolean;
   readonly #networkRedaction: RedactionPolicy;
+  readonly #networkMaxCalls: number | undefined;
   #network: NetworkObserver | null = null;
   readonly #api: ApiActions;
+  readonly #db: DbActions;
+  /**
+   * Where the last `expectCalls` window ended — consecutive `expectCalls`
+   * steps verify consecutive stretches of the journey. Deliberately not the
+   * `#evidenceFloorMs` machinery: that floor reaches back into the previous
+   * step by design, which is right for failure evidence and wrong for a
+   * window that must not double-count.
+   */
+  #sequenceMark = 0;
   #defectSeq = 0;
   #ownsPage = true;
   /** Path of the most recent `goto`, and whether any asked for a sign-in page. */
@@ -674,13 +727,33 @@ export class SmartRunner {
     this.#updateBaselines = options.updateBaselines ?? false;
     this.#networkEnabled = options.network ?? true;
     this.#networkRedaction = options.networkRedaction ?? {};
+    this.#networkMaxCalls = options.networkMaxCalls;
+    this.#sequenceMark = Date.now();
+    // One store, both action families: a `request` step saves `{{orderId}}`
+    // and an `expectDbRow` keys on it — two stores would make one name mean
+    // two different things in one flow.
+    const variables = new VariableStore();
+    const recordDefect = (
+      category: Defect['category'],
+      severity: Defect['severity'],
+      title: string,
+      detail: string,
+    ): void => this.#recordRuntimeDefect(category, severity, title, detail, undefined);
     this.#api = new ApiActions({
       transport: options.transport ?? new BrowserTransport(context),
       bundle: this.bundle,
+      variables,
       redaction: this.#networkRedaction,
       currentUrl: () => this.#currentUrl(),
-      recordDefect: (category, severity, title, detail) =>
-        this.#recordRuntimeDefect(category, severity, title, detail, undefined),
+      recordDefect,
+    });
+    this.#db = new DbActions({
+      db: options.db === undefined ? defaultDbConfig() : options.db,
+      client: options.dbClient,
+      bundle: this.bundle,
+      variables,
+      currentUrl: () => this.#currentUrl(),
+      recordDefect,
     });
   }
 
@@ -790,7 +863,9 @@ export class SmartRunner {
     try {
       this.#network = await NetworkObserver.attach(this.page, {
         redaction: this.#networkRedaction,
+        maxCalls: this.#networkMaxCalls,
       });
+      this.#sequenceMark = this.#network.mark();
     } catch {
       this.#network = null;
     }
@@ -2113,6 +2188,126 @@ export class SmartRunner {
     await this.#api.expectHeader(name, value, intent);
   }
 
+  // --- Database verification (delegated; see `src/db/db-actions.ts`) -------
+
+  async dbSnapshot(spec: FlowDbSnapshotSpec): Promise<void> {
+    await this.#db.dbSnapshot(spec);
+  }
+
+  async expectDbRow(spec: FlowDbRowSpec): Promise<void> {
+    await this.#db.expectDbRow(spec);
+  }
+
+  async expectDbDelta(spec: FlowDbDeltaSpec): Promise<void> {
+    await this.#db.expectDbDelta(spec);
+  }
+
+  async expectDbUnchanged(spec: FlowDbUnchangedSpec): Promise<void> {
+    await this.#db.expectDbUnchanged(spec);
+  }
+
+  async expectDbCalled(spec: FlowDbCalledSpec): Promise<void> {
+    await this.#db.expectDbCalled(spec);
+  }
+
+  /**
+   * Assert the traffic the page made — the sequence lane of a journey.
+   *
+   * Ordered-subsequence over the observer's window (see `expect-calls.ts` for
+   * the matching semantics), polling through the healed budget because the
+   * XHR a click fired is usually still in flight when the assertion starts —
+   * the same reasoning that makes `expectUrl` wait rather than peek.
+   *
+   * Never on the escalation ladder: there is no selector, and "healing" a
+   * traffic claim could only repair it onto different traffic. And two of its
+   * outcomes are harness facts, not page facts: no observer, and a window the
+   * ring buffer truncated — both classify as `error`/environment, file no app
+   * defect, and say what dial to turn.
+   */
+  async expectCalls(spec: FlowExpectCallsSpec): Promise<void> {
+    const expected: ExpectedCall[] = this.variables.interpolateDeep([...(spec.calls ?? [])]);
+    const never: ExpectedCall[] = this.variables.interpolateDeep([...(spec.never ?? [])]);
+    const detail: Record<string, unknown> = {
+      ...(spec.intent !== undefined ? { intent: spec.intent } : {}),
+      window: spec.since ?? 'mark',
+    };
+
+    await this.#bareStep('expectCalls', detail, async () => {
+      if (expected.length === 0 && never.length === 0) {
+        throw new Error(
+          'expectCalls needs at least one entry in `calls` or `never` — an empty check would ' +
+            'pass while proving nothing',
+        );
+      }
+      const observer = this.#network;
+      if (!observer) {
+        throw new ObservationUnavailableError(
+          'the page traffic observer is not attached (network observation off, or the browser ' +
+            'refused a second CDP session) — this says nothing about the application',
+        );
+      }
+
+      const windowStart = spec.since === 'run' ? 0 : this.#sequenceMark;
+      // The window is truncated when eviction has eaten into it: drops
+      // happened AND the oldest retained record starts after the window does.
+      const truncated = (): boolean => {
+        if (observer.dropped === 0) return false;
+        const oldest = observer.all()[0];
+        return oldest === undefined || oldest.startedAt > windowStart;
+      };
+      const truncatedError = (claim: string): ObservationTruncatedError =>
+        new ObservationTruncatedError(
+          `the observer dropped ${observer.dropped} call(s) and the assertion window reaches ` +
+            `past the oldest retained record, so ${claim} cannot be proven — a truncated ` +
+            'capture reads exactly like a quiet page. Raise networkMaxCalls, or assert earlier ' +
+            'in the journey.',
+        );
+
+      const deadline = Date.now() + (spec.timeoutMs ?? this.#healedTimeoutMs);
+      for (;;) {
+        const observed = observer.since(windowStart);
+        detail['observedCalls'] = observed.length;
+        detail['dropped'] = observer.dropped;
+
+        // An observed violation is real whatever the buffer dropped.
+        const violations = neverViolations(observed, never);
+        if (violations.length > 0) {
+          const first = violations[0]!;
+          detail['violations'] = violations.map(
+            ({ expected: entry, call }) =>
+              `${describeExpected(entry)} — observed: ${call ? describeCall(call) : ''}`,
+          );
+          throw new Error(
+            `observed a call the flow forbids: ${describeExpected(first.expected)}` +
+              (first.call ? ` — ${describeCall(first.call)}` : ''),
+          );
+        }
+
+        const result = matchExpectedCalls(observed, expected);
+        detail['calls'] = matchTable(result);
+
+        if (result.complete) {
+          // Presence is proven; absence still needs an intact window.
+          if (never.length > 0 && truncated()) throw truncatedError('a "never" claim');
+          this.#sequenceMark = observer.mark();
+          return;
+        }
+
+        if (Date.now() >= deadline) {
+          // A missing call over a truncated window may simply have been
+          // evicted — failing the step would blame the app for the capture.
+          if (truncated()) throw truncatedError('a missing call');
+          const missing = result.matches.find((match) => match.call === null)!;
+          throw new Error(
+            `expected ${describeExpected(missing.expected)} — not observed ` +
+              `(${observed.length} call(s) in the window, in order; see the match table)`,
+          );
+        }
+        await sleep(SEQUENCE_POLL_MS);
+      }
+    });
+  }
+
   /**
    * Record a step that does not participate in the escalation ladder.
    *
@@ -2130,11 +2325,12 @@ export class SmartRunner {
     const intent = typeof detail['intent'] === 'string' ? detail['intent'] : undefined;
     const netMark = this.#takeNetMark();
 
-    // An HTTP step never touched the page, so a picture of the page is not
-    // evidence about it — the request/response pair already recorded is, and
-    // a screenshot here would only assert that something changed when nothing
-    // did. Evidence proportionate to what the step actually exercised.
-    const touchesPage = !API_STEP_ACTIONS.has(action);
+    // An HTTP or DB step never touched the page, so a picture of the page is
+    // not evidence about it — the request/response pair (or check record)
+    // already recorded is, and a screenshot here would only assert that
+    // something changed when nothing did. Evidence proportionate to what the
+    // step actually exercised.
+    const touchesPage = !BROWSER_FREE_ACTIONS.has(action);
 
     try {
       await run();
@@ -2374,12 +2570,17 @@ export class SmartRunner {
     /** "Step" for an interaction, "Assertion" for a check — kept from before. */
     label: 'Step' | 'Assertion' = 'Step',
   ): void {
+    // A harness fact files no application defect: "the observer was not
+    // attached" and "the buffer truncated the window" say nothing about the
+    // app, and a defect would send someone hunting a bug nobody claimed
+    // exists. Same prefix matching the exit contract uses.
+    if (/^(?:database unavailable|network observation)/.test(message)) return;
     if (failures.length === 0) {
-      // An HTTP step that failed is a backend finding by construction — there
-      // is no selector, no page, and nothing a test author can repair. Filing
-      // it as `functional` would put a 500 on the UI team's pile.
+      // A backend-tier step that failed is a backend finding by construction —
+      // there is no selector, no page, and nothing a test author can repair.
+      // Filing it as `functional` would put a 500 on the UI team's pile.
       this.#recordRuntimeDefect(
-        API_STEP_ACTIONS.has(action) ? 'backend' : 'functional',
+        BACKEND_TIER_ACTIONS.has(action) ? 'backend' : 'functional',
         'high',
         `${label} failed: ${action}${selector ? ` ${selector}` : ''}`,
         message,
@@ -2789,7 +2990,7 @@ export class SmartRunner {
    * label a frame with something that is not in it.
    */
   async narrate(index: number, action: string, intent?: string | undefined): Promise<void> {
-    if (!this.#video || API_STEP_ACTIONS.has(action)) return;
+    if (!this.#video || BROWSER_FREE_ACTIONS.has(action)) return;
     this.#caption = `${index}  ${intent ?? action}`;
     await captionVideo(this.page, this.#caption);
   }
@@ -3459,6 +3660,18 @@ export class SmartRunner {
       this.#network = null;
     }
 
+    // The DB connection is the runner's to close (it opened lazily on the
+    // first DB step; a run with none has nothing to close). Never fatal.
+    await this.#db.close().catch(() => undefined);
+
+    // Saved variables are evidence once a later check keys on one — masked by
+    // name before they leave the store, same rule as every other credential.
+    try {
+      this.bundle.setVariables(this.variables.snapshotForReport());
+    } catch {
+      // Diagnostic, same rule as coverage above.
+    }
+
     await this.#cache.flush();
 
     // Sealing the recording has to happen between closing the context and
@@ -3607,6 +3820,19 @@ export type FlowStep =
   /** Omit `value` to assert only that the path resolves — for a server-assigned id. */
   | { action: 'expectJson'; path: string; value?: string | undefined; intent?: string | undefined }
   | { action: 'expectHeader'; name: string; value: string; intent?: string | undefined }
+  /**
+   * Assert the traffic the page made — ordered subsequence + absence claims
+   * over the network observer's window. Browser-bound (it needs the live
+   * observer) but backend-tier (its subject is HTTP). See `expect-calls.ts`.
+   */
+  | ({ action: 'expectCalls' } & FlowExpectCallsSpec)
+  // --- database verification (read-only; see `src/db/`) ---
+  | ({ action: 'dbSnapshot' } & FlowDbSnapshotSpec)
+  | ({ action: 'expectDbRow' } & FlowDbRowSpec)
+  | ({ action: 'expectDbDelta' } & FlowDbDeltaSpec)
+  | ({ action: 'expectDbUnchanged' } & FlowDbUnchangedSpec)
+  /** Statement-statistics tier — correlational "called as planned", via pg_stat_statements. */
+  | ({ action: 'expectDbCalled' } & FlowDbCalledSpec)
   // --- modals ---
   | { action: 'expectModal'; name?: string | undefined; intent?: string | undefined }
   | { action: 'closeModal'; button?: string | undefined; intent?: string | undefined }
@@ -3655,10 +3881,16 @@ export type FlowStep =
 export const ASSERTION_ACTIONS = [
   // `request` is deliberately NOT here: a call whose status nobody checks
   // passes whether or not the endpoint works, which is precisely the
-  // false-confidence failure mode this list exists to prevent.
+  // false-confidence failure mode this list exists to prevent. `dbSnapshot`
+  // is out for the same reason — it records, it claims nothing.
   'expectStatus',
   'expectJson',
   'expectHeader',
+  'expectCalls',
+  'expectDbRow',
+  'expectDbDelta',
+  'expectDbUnchanged',
+  'expectDbCalled',
   'expectFocused',
   'expectTabOrder',
   'fillEach',
@@ -3730,7 +3962,11 @@ function resolveUrl(url: string, baseUrl: string | undefined): string {
  * `baseUrl` rather than before (see the ordering trap in `src/api/`).
  */
 function interpolateStep(step: FlowStep, variables: VariableStore): FlowStep {
-  if (API_STEP_ACTIONS.has(step.action)) return step;
+  // Browser-free steps interpolate their own fields (`ApiActions` needs the
+  // baseUrl ordering, `DbActions` has nested where/values this shallow walk
+  // could not reach) — and `expectCalls` deep-interpolates its own entries
+  // for the same nesting reason, so its top-level pass here is harmless.
+  if (BROWSER_FREE_ACTIONS.has(step.action)) return step;
   const hasPlaceholder = Object.values(step).some(
     (value) => typeof value === 'string' && value.includes('{{'),
   );
@@ -3761,6 +3997,20 @@ export interface StepIssue {
 function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] {
   if (error instanceof StepResolutionError) return 'dead-end';
   if (error instanceof Error && error.cause instanceof StepResolutionError) return 'dead-end';
+  // Harness and grounding facts are errors even under an `expect` name: an
+  // unreachable database, an unattached observer, a table the schema does not
+  // declare — calling any of them a test failure would blame the app for the
+  // harness's (or the flow's) problem. Matched by error name so this module
+  // does not import the whole db/api families for four classes.
+  if (
+    error instanceof Error &&
+    (error.name === 'DbUnavailableError' ||
+      error.name === 'DbGroundingError' ||
+      error.name === 'ObservationUnavailableError' ||
+      error.name === 'ObservationTruncatedError')
+  ) {
+    return 'error';
+  }
   if (action.startsWith('expect') || action === 'snapshot' || action === 'fillEach' || action === 'fillRetry') {
     return 'failed';
   }
@@ -4143,6 +4393,24 @@ async function executeStep(
       case 'expectHeader':
         await runner.expectHeader(step.name, step.value, step.intent);
         break;
+      case 'expectCalls':
+        await runner.expectCalls(step);
+        break;
+      case 'dbSnapshot':
+        await runner.dbSnapshot(step);
+        break;
+      case 'expectDbRow':
+        await runner.expectDbRow(step);
+        break;
+      case 'expectDbDelta':
+        await runner.expectDbDelta(step);
+        break;
+      case 'expectDbUnchanged':
+        await runner.expectDbUnchanged(step);
+        break;
+      case 'expectDbCalled':
+        await runner.expectDbCalled(step);
+        break;
       case 'expectModal':
         await runner.expectModal(step.name, step.intent);
         break;
@@ -4238,12 +4506,22 @@ export interface RunFlowOptions {
   network?: boolean | undefined;
   /** How much of an observed request may be recorded. Defaults to redacting. */
   networkRedaction?: RedactionPolicy | undefined;
+  /** Ring-buffer cap for the observer — see `SmartRunnerOptions.networkMaxCalls`. */
+  networkMaxCalls?: number | undefined;
   /**
    * Transport for `request` steps. Defaults to the browser context's (so API
    * calls inherit the UI's session), or to Node's `fetch` for a browser-free
    * flow.
    */
   transport?: ApiTransport | null | undefined;
+  /**
+   * Database connection for DB verification steps. Defaults to
+   * `WOWLIDATOR_DB_URL`; `null` disables. Lazy — a flow with no DB steps
+   * never connects and never demands the driver.
+   */
+  db?: DbConfig | null | undefined;
+  /** Pre-built DB client — the embedder/test seam. Wins over `db`. */
+  dbClient?: DbClient | null | undefined;
   /** Append to and compare against this run-history index. Null disables. */
   historyPath?: string | null | undefined;
   /** Build the healer once the cache exists. Ignored when `healer` is given. */
@@ -4271,10 +4549,13 @@ export interface RunFlowOptions {
 }
 
 /**
- * Actions that need no browser at all — shared with the proof bundle's
- * frontend/backend split, so "is this an API step" has exactly one answer.
+ * Actions that need no browser at all — shared with the proof bundle's set
+ * definitions, so "does this step need a page" has exactly one answer. Note
+ * this is `BROWSER_FREE_ACTIONS`, not `BACKEND_TIER_ACTIONS`: `expectCalls`
+ * is backend-tier but needs the live observer, so its presence keeps a flow
+ * on the browser path.
  */
-const API_ONLY_ACTIONS = API_STEP_ACTIONS;
+const API_ONLY_ACTIONS = BROWSER_FREE_ACTIONS;
 
 /**
  * True when nothing in this flow needs a page.
@@ -4290,6 +4571,7 @@ export function isBrowserFree(flow: Flow): boolean {
 
 async function executeApiSteps(
   api: ApiActions,
+  db: DbActions,
   steps: readonly FlowStep[],
   baseUrl: string | undefined,
   issues: StepIssue[],
@@ -4312,13 +4594,30 @@ async function executeApiSteps(
         case 'expectHeader':
           await api.expectHeader(step.name, step.value, step.intent);
           break;
+        case 'dbSnapshot':
+          await db.dbSnapshot(step);
+          break;
+        case 'expectDbRow':
+          await db.expectDbRow(step);
+          break;
+        case 'expectDbDelta':
+          await db.expectDbDelta(step);
+          break;
+        case 'expectDbUnchanged':
+          await db.expectDbUnchanged(step);
+          break;
+        case 'expectDbCalled':
+          await db.expectDbCalled(step);
+          break;
         default:
           // Unreachable via `runFlow`, which checks `isBrowserFree` first — but
           // reachable by an embedder calling this directly, and a clear message
-          // beats a `page is undefined` three frames down.
+          // beats a `page is undefined` three frames down. (`expectCalls` lands
+          // here on purpose: it needs the live observer, so it keeps a flow on
+          // the browser path — see `API_ONLY_ACTIONS`.)
           throw new Error(
             `"${step.action}" needs a browser; this flow was run without one because every ` +
-              'other step was an API step',
+              'other step was an API or DB step',
           );
       }
     } catch (error) {
@@ -4355,31 +4654,56 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
   if (options.defects?.length) bundle.addDefects(options.defects);
 
   let defectSeq = 0;
+  const recordDefect = (
+    category: Defect['category'],
+    severity: Defect['severity'],
+    title: string,
+    detail: string,
+  ): void => {
+    defectSeq += 1;
+    bundle.addDefect({
+      id: `run-${defectSeq}`,
+      source: 'runtime',
+      category,
+      severity,
+      title,
+      detail,
+      stepIndex: bundle.steps.length - 1,
+    });
+  };
+  // One store for both families — same reasoning as the runner's constructor.
+  const variables = new VariableStore();
   const api = new ApiActions({
     transport: options.transport ?? new FetchTransport(),
     bundle,
+    variables,
     redaction: options.networkRedaction,
-    recordDefect: (category, severity, title, detail) => {
-      defectSeq += 1;
-      bundle.addDefect({
-        id: `run-${defectSeq}`,
-        source: 'runtime',
-        category,
-        severity,
-        title,
-        detail,
-        stepIndex: bundle.steps.length - 1,
-      });
-    },
+    recordDefect,
+  });
+  const db = new DbActions({
+    db: options.db === undefined ? defaultDbConfig() : options.db,
+    client: options.dbClient,
+    bundle,
+    variables,
+    recordDefect,
   });
 
   const issues: StepIssue[] = [];
-  if (flow.setup?.length) await executeApiSteps(api, flow.setup, flow.baseUrl, issues, bundle);
-  await executeApiSteps(api, flow.steps, flow.baseUrl, issues, bundle);
-  // Teardown still always runs — its job is to clean up regardless of how the
-  // body went, and that reasoning has nothing to do with browsers.
-  if (flow.teardown?.length) await executeApiSteps(api, flow.teardown, flow.baseUrl, issues, bundle);
+  try {
+    if (flow.setup?.length) {
+      await executeApiSteps(api, db, flow.setup, flow.baseUrl, issues, bundle);
+    }
+    await executeApiSteps(api, db, flow.steps, flow.baseUrl, issues, bundle);
+    // Teardown still always runs — its job is to clean up regardless of how
+    // the body went, and that reasoning has nothing to do with browsers.
+    if (flow.teardown?.length) {
+      await executeApiSteps(api, db, flow.teardown, flow.baseUrl, issues, bundle);
+    }
+  } finally {
+    await db.close().catch(() => undefined);
+  }
 
+  bundle.setVariables(variables.snapshotForReport());
   if (issues.length > 0) bundle.recordRunError(new Error(summarizeIssues(issues)));
   const sealed = bundle.finish();
 
@@ -4478,7 +4802,10 @@ export async function runFlow(
       updateBaselines: options.updateBaselines,
       network: options.network,
       networkRedaction: options.networkRedaction,
+      networkMaxCalls: options.networkMaxCalls,
       transport: options.transport,
+      db: options.db,
+      dbClient: options.dbClient,
     });
   } catch (error) {
     // Died before a single test step could run. The bundle still goes to run

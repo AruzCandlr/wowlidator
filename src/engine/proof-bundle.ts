@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 
 import type { RequestRecord } from '../api/api-client.js';
 import type { NetworkCall } from '../api/network-observer.js';
+import type { DbCheckRecord } from '../db/db-actions.js';
 import type { CoverageReport } from '../coverage/ax-coverage.js';
 import type { RunTrend } from '../history/run-history.js';
 import type { SnapshotResult } from '../visual/baseline.js';
@@ -41,6 +42,40 @@ export const API_STEP_ACTIONS: ReadonlySet<string> = new Set([
   'expectStatus',
   'expectJson',
   'expectHeader',
+]);
+
+/** Actions that speak SQL (read-only) instead of driving the page. */
+export const DB_STEP_ACTIONS: ReadonlySet<string> = new Set([
+  'dbSnapshot',
+  'expectDbRow',
+  'expectDbDelta',
+  'expectDbUnchanged',
+  'expectDbCalled',
+]);
+
+/**
+ * The one flat `API_STEP_ACTIONS` used to do nine jobs at once; these two sets
+ * split them along the line that actually divides the new actions.
+ *
+ * `BROWSER_FREE_ACTIONS` — steps that never touch the page: they need no
+ * browser (`isBrowserFree`), interpolate their own fields (`interpolateStep`
+ * skips them), and get no screenshot, no video offset and no caption, because
+ * nothing about them happened on screen.
+ *
+ * `BACKEND_TIER_ACTIONS` — steps whose *findings* belong to the backend half
+ * of the report: everything browser-free, plus `expectCalls`, which needs the
+ * live network observer (so it is emphatically not browser-free — a flow of
+ * API steps plus one `expectCalls` dispatched without a browser would have no
+ * traffic to assert on) but whose subject is HTTP the page made.
+ */
+export const BROWSER_FREE_ACTIONS: ReadonlySet<string> = new Set([
+  ...API_STEP_ACTIONS,
+  ...DB_STEP_ACTIONS,
+]);
+
+export const BACKEND_TIER_ACTIONS: ReadonlySet<string> = new Set([
+  ...BROWSER_FREE_ACTIONS,
+  'expectCalls',
 ]);
 
 /** How a selector was resolved for a step. */
@@ -229,6 +264,11 @@ export interface ProofStep {
    */
   request?: RequestRecord | undefined;
   /**
+   * The database check this step made, when it was a DB step. Singular, like
+   * `request`: the check the *test* performed, redacted before it got here.
+   */
+  db?: DbCheckRecord | undefined;
+  /**
    * Base64 JPEG, embedded directly into the HTML report.
    *
    * With video recording on this is a *failure* still only: the run is already
@@ -362,6 +402,10 @@ export interface ProofSummary {
   apiRequests: number;
   /** Of those, ones that never got a response (transport failure). */
   apiFailures: number;
+  /** Database checks the test itself made (snapshots included). */
+  dbChecks: number;
+  /** Of those, ones that did not pass. */
+  dbFailures: number;
   /** HTTP calls the page made, as observed over CDP. */
   networkCalls: number;
   /** Of those, ones that failed hard enough to explain a broken step. */
@@ -430,6 +474,12 @@ export interface ProofBundle {
   coverage?: CoverageReport | undefined;
   /** How this run compares to previous runs of the same flow. */
   trend?: RunTrend | undefined;
+  /**
+   * Variables the run saved, masked by name before they got here — see
+   * `VariableStore.snapshotForReport`. A DB check keyed on `{{orderId}}` is
+   * only auditable if the report can say what `orderId` was.
+   */
+  variables?: Record<string, string> | undefined;
   generatedBy?: GenerationProvenance | undefined;
   error?: string | undefined;
 }
@@ -461,6 +511,7 @@ export class ProofBundleBuilder {
   readonly #onStep: ((step: ProofStep) => void) | undefined;
   #coverage: CoverageReport | undefined;
   #trend: RunTrend | undefined;
+  #variables: Record<string, string> | undefined;
   #video: VideoRecording | undefined;
   #videoStartedMs: number | undefined;
   #error: string | undefined;
@@ -515,7 +566,7 @@ export class ProofBundleBuilder {
    */
   #videoOffsetFor(step: Omit<ProofStep, 'index'>): { videoOffsetMs?: number } {
     if (this.#videoStartedMs === undefined) return {};
-    if (API_STEP_ACTIONS.has(step.action)) return {};
+    if (BROWSER_FREE_ACTIONS.has(step.action)) return {};
     const began = Date.parse(step.startedAt);
     if (Number.isNaN(began)) return {};
     return { videoOffsetMs: Math.max(0, began - this.#videoStartedMs) };
@@ -681,6 +732,15 @@ export class ProofBundleBuilder {
     this.#coverage = coverage;
   }
 
+  /**
+   * Attach the run's saved variables, already masked by name. Set once at
+   * seal time; an empty snapshot is left off the bundle entirely so a run
+   * that saved nothing does not grow an empty object that reads like data.
+   */
+  setVariables(snapshot: Record<string, string>): void {
+    if (Object.keys(snapshot).length > 0) this.#variables = snapshot;
+  }
+
   setTrend(trend: RunTrend): void {
     this.#trend = trend;
   }
@@ -742,6 +802,8 @@ export class ProofBundleBuilder {
       dataRetries: 0,
       apiRequests: 0,
       apiFailures: 0,
+      dbChecks: 0,
+      dbFailures: 0,
       networkCalls: this.#network.calls,
       networkFailures: this.#network.failures,
       backendBlocked: this.#backendBlocked,
@@ -768,7 +830,7 @@ export class ProofBundleBuilder {
       const step = defect.stepIndex === undefined ? undefined : this.#steps[defect.stepIndex];
       const isBackend =
         defect.category === 'backend' ||
-        (step !== undefined && API_STEP_ACTIONS.has(step.action));
+        (step !== undefined && BACKEND_TIER_ACTIONS.has(step.action));
       if (isBackend) summary.backend.defects += 1;
       else summary.frontend.defects += 1;
     }
@@ -781,7 +843,7 @@ export class ProofBundleBuilder {
       if (step.status === 'passed') summary.passed += 1;
       else summary.failed += 1;
 
-      const tier = API_STEP_ACTIONS.has(step.action) ? summary.backend : summary.frontend;
+      const tier = BACKEND_TIER_ACTIONS.has(step.action) ? summary.backend : summary.frontend;
       tier.steps += 1;
       if (step.status === 'passed') tier.passed += 1;
       else tier.failed += 1;
@@ -833,6 +895,11 @@ export class ProofBundleBuilder {
         if (step.request.status === null) summary.apiFailures += 1;
       }
 
+      if (step.db) {
+        summary.dbChecks += 1;
+        if (step.status !== 'passed') summary.dbFailures += 1;
+      }
+
       if (step.agent) {
         summary.agentTakeovers += 1;
         summary.agentLatencyMs += step.agent.latencyMs;
@@ -865,6 +932,7 @@ export class ProofBundleBuilder {
       video: this.#video,
       coverage: this.#coverage,
       trend: this.#trend,
+      variables: this.#variables,
       generatedBy: this.#generatedBy,
       error: this.#error,
     };
@@ -984,6 +1052,13 @@ export function formatProofSummary(bundle: ProofBundle): string {
     lines.push(
       `  api        ${summary.apiRequests} request(s), ${summary.apiFailures} with no response`,
     );
+  }
+  if (summary.dbChecks > 0) {
+    lines.push(`  db         ${summary.dbChecks} check(s), ${summary.dbFailures} failed`);
+  }
+  if (bundle.variables && Object.keys(bundle.variables).length > 0) {
+    // Names only on the one-line digest; the masked values are in the bundle.
+    lines.push(`  variables  ${Object.keys(bundle.variables).join(', ')}`);
   }
   if (summary.networkCalls > 0) {
     const dropped = summary.networkDropped > 0 ? `, ${summary.networkDropped} not captured` : '';

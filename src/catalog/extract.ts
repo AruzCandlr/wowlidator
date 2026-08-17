@@ -35,7 +35,18 @@ import { readFile } from 'node:fs/promises';
 import { inflateRawSync, inflateSync } from 'node:zlib';
 import { basename, extname } from 'node:path';
 
-export type DocumentFormat = 'text' | 'markdown' | 'csv' | 'html' | 'json' | 'yaml' | 'xlsx' | 'pdf';
+import { parseSequenceDiagram } from './sequence.js';
+
+export type DocumentFormat =
+  | 'text'
+  | 'markdown'
+  | 'csv'
+  | 'html'
+  | 'json'
+  | 'yaml'
+  | 'xlsx'
+  | 'pdf'
+  | 'sequence';
 
 /** Extensions this module will attempt, and what it treats each as. */
 const FORMATS: Record<string, DocumentFormat> = {
@@ -54,6 +65,13 @@ const FORMATS: Record<string, DocumentFormat> = {
   '.xlsx': 'xlsx',
   '.xlsm': 'xlsx',
   '.pdf': 'pdf',
+  // Sequence diagrams — Mermaid and PlantUML source. Decided by extension
+  // like everything else here; a fenced ```mermaid block inside a `.md` keeps
+  // the markdown path it always had.
+  '.mmd': 'sequence',
+  '.mermaid': 'sequence',
+  '.puml': 'sequence',
+  '.plantuml': 'sequence',
 };
 
 /** Formats worth naming in an error, and in the UI's file picker. */
@@ -151,6 +169,17 @@ export function extractDocument(
     case 'html':
       text = htmlToText(decodeText(bytes));
       break;
+    case 'sequence': {
+      // The text goes through verbatim — the deterministic claims path
+      // re-parses it — but it is validated *here*, where a refusal can name
+      // the file, and anything the parser will skip (unsupported blocks,
+      // ignored lines) comes back on `note` so the person sees it before the
+      // claims do. Parsing twice is cheap; a silent skip is not.
+      text = decodeText(bytes);
+      const doc = parseSequenceDiagram(text); // throws SequenceParseError when unreadable
+      note = joinNotes(...doc.notes);
+      break;
+    }
     default:
       text = decodeText(bytes);
       break;

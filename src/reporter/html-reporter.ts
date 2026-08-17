@@ -14,8 +14,9 @@ import { statSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 import type { RequestRecord } from '../api/api-client.js';
+import type { DbCheckRecord } from '../db/db-actions.js';
 import { classifyCall, isBlockingFailure, type NetworkCall } from '../api/network-observer.js';
-import { API_STEP_ACTIONS,
+import { BACKEND_TIER_ACTIONS,
   meaningfulCoverage,
 } from '../engine/proof-bundle.js';
 import { buildVerdict, escalationTrace, type Verdict } from './verdict.js';
@@ -275,7 +276,8 @@ export const GLOSSARY: Record<string, string> = {
     'The control was not reachable — behind a closed menu, below the fold, or on a view still loading — so an agent drove the browser until it was, and then the step ran the original selector. The test passed on its own terms; it just could not get there unaided. Add the steps that reveal the control.',
   'agent takeover':
     'A model drove the browser directly for this step, deciding one action at a time, rather than the runner following a selector the test supplied.',
-  backend: 'This step spoke HTTP directly rather than driving the page.',
+  backend:
+    'This step exercised the backend directly — HTTP the test made, traffic the page made (expectCalls), or a database check — rather than driving the page.',
   quarantined:
     'Known-flaky: this case alternates between passing and failing, so its result is reported but not counted as a failure.',
   'resolved late':
@@ -374,7 +376,7 @@ function stepBadges(step: ProofStep, afterFailure = false): string {
   // Which side of the system this step exercised. Only marked on API steps:
   // labelling every click "frontend" would be noise on a page where that is
   // the default, and the absence of the badge already says it.
-  if (API_STEP_ACTIONS.has(step.action)) {
+  if (BACKEND_TIER_ACTIONS.has(step.action)) {
     badges.push(`<span class="badge res-backend">${term('backend')}</span>`);
   }
   // `fast` is deliberately unbadged: every ordinary step resolves that way, so
@@ -534,6 +536,44 @@ function requestBlock(record: RequestRecord): string {
       </dl>
       ${section('request', record.requestHeaders, record.requestBody)}
       ${section('response', record.responseHeaders, record.responseBody)}
+    </div>`;
+}
+
+/**
+ * The database check this step made. Everything rendered here was redacted on
+ * the way into the bundle (`redact-row.ts`) — same rule as `requestBlock`:
+ * this function must never reach for a raw value, or the report is the leak.
+ */
+function dbBlock(record: DbCheckRecord): string {
+  const target =
+    record.table !== undefined
+      ? record.table
+      : record.tables !== undefined
+        ? record.tables.join(', ')
+        : '';
+  const sample =
+    record.rows && record.rows.length > 0
+      ? `<table class="agent-trace"><tbody>${record.rows
+          .map(
+            (row) =>
+              `<tr>${Object.entries(row)
+                .map(([column, value]) => `<td>${esc(column)} = ${esc(value)}</td>`)
+                .join('')}</tr>`,
+          )
+          .join('')}</tbody></table>`
+      : '';
+  return `
+    <div class="callout request">
+      <div class="callout-title">DB ${esc(record.kind)}${target ? ` &mdash; ${esc(target)}` : ''}</div>
+      <dl class="kv">
+        ${kv('where', record.where)}
+        ${kv('expected', record.expected)}
+        ${kv('observed', record.observed)}
+        ${kv('duration', ms(record.durationMs))}
+        ${kv('polled', record.polledMs === undefined ? undefined : ms(record.polledMs))}
+      </dl>
+      ${record.note ? `<p class="reason">${esc(record.note)}</p>` : ''}
+      ${sample}
     </div>`;
 }
 
@@ -873,6 +913,7 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
       ${healBlock(step)}
       ${reconstructionBlock(step)}
       ${step.request ? requestBlock(step.request) : ''}
+      ${step.db ? dbBlock(step.db) : ''}
       ${step.dialog ? dialogBlock(step.dialog) : ''}
       ${step.agent ? agentBlock(step.agent) : ''}
       ${step.snapshot ? snapshotBlock(step) : ''}

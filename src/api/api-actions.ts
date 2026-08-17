@@ -44,6 +44,14 @@ export interface FlowRequestSpec {
 export interface ApiActionsOptions {
   transport: ApiTransport;
   bundle: ProofBundleBuilder;
+  /**
+   * The run's variable store. Injected when the run has more than one action
+   * family saving and reading `{{name}}`s — a `request` step saves `orderId`
+   * and an `expectDbRow` keys on it, which only works if both families hold
+   * the same store. Omitted, a private one is created (the original
+   * behaviour, kept for embedders and tests).
+   */
+  variables?: VariableStore | undefined;
   redaction?: RedactionPolicy | undefined;
   /** The page's url, when there is a page. Recorded on each step. */
   currentUrl?: (() => string | null) | undefined;
@@ -69,7 +77,7 @@ function resolveUrl(url: string, baseUrl: string | undefined): string {
 
 export class ApiActions {
   /** Values saved by `request` steps, for `{{name}}` interpolation later. */
-  readonly variables = new VariableStore();
+  readonly variables: VariableStore;
 
   readonly #transport: ApiTransport;
   readonly #bundle: ProofBundleBuilder;
@@ -86,6 +94,7 @@ export class ApiActions {
   #lastResponse: ApiResponse | null = null;
 
   constructor(options: ApiActionsOptions) {
+    this.variables = options.variables ?? new VariableStore();
     this.#transport = options.transport;
     this.#bundle = options.bundle;
     this.#redaction = options.redaction ?? {};

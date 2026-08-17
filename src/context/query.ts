@@ -32,6 +32,8 @@ function describeEdge(from: ProjectNode, kind: ProjectEdgeKind, to: ProjectNode)
       return `  ${from.name} uses ${to.name} (${to.file})`;
     case 'covers':
       return `  covered by "${from.name}" (${from.file})`;
+    case 'references':
+      return `  ${from.name} references ${to.name}`;
     default:
       return `  ${from.name} -> ${to.name}`;
   }

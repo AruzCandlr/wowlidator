@@ -24,7 +24,7 @@ Usage:
   wowlidator cache list [--cache <path>]
   wowlidator cache forget (<key> | --all) [--cache <path>]
   wowlidator history clear [--all] [--out <proof dir>]
-  wowlidator context build [--root <dir>] [--openapi <path|url>] [--force]
+  wowlidator context build [--root <dir>] [--openapi <path|url>] [--db-schema <path>] [--force]
   wowlidator context show  [--root <dir>] [--context-out <path>] [--json]
   wowlidator recall [last | <n>] [--json]  list saved launches, or re-run one —
                                            every launch is saved before it can
@@ -144,7 +144,7 @@ draft — the other way in: a description, some specs, or a page becomes a
                        (default: <report-dir>/catalogs/<subject>.csv)
   --max-cases-drafted <n>  Cap on cases in one draft (default 20)
 
-catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf)
+catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mmd .puml)
                        becomes a test, in two steps you can see between. The
                        approved claims are authored as discrete cases and each
                        is run on its own, so a case that fails is recorded and
@@ -235,6 +235,11 @@ context options:
                        generator a real endpoint inventory. Omit and a
                        conventionally-named openapi.* / swagger.* file is used
                        if one exists.
+  --db-schema <path>   Database schema (schema.sql or schema.prisma) to index
+                       as table nodes, giving catalog authoring a declared
+                       table inventory for DB checks. Omit and a conventionally
+                       named file is used; with WOWLIDATOR_DB_URL set and no
+                       file, the live schema is introspected instead.
   --context-out <path> Where the graph is cached   (default ./${DEFAULT_CONTEXT_CACHE_FILE})
   --force              Rebuild even if nothing appears to have changed
   --json               (context show) print the full graph instead of a summary

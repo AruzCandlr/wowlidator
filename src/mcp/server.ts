@@ -211,6 +211,78 @@ const flowStepSchema = z.discriminatedUnion('action', [
   }),
   // Visual regression.
   z.object({ action: z.literal('snapshot'), name: z.string(), selector: sel.optional() }),
+  // Sequence assertion over the page's observed traffic. This is an MCP
+  // *input* schema, so the structured form is fine here (the flat string form
+  // exists only for model *output* — see `flow-author.ts`).
+  z.object({
+    action: z.literal('expectCalls'),
+    calls: z
+      .array(
+        z.object({
+          method: z.string(),
+          url: z.string().describe('Path template — /api/orders/:id and /api/orders/{id} both work.'),
+          status: z
+            .union([z.number().int(), z.enum(['2xx', '3xx', '4xx', '5xx'])])
+            .optional()
+            .describe('Exact status or class. Omitted means "completed, any status".'),
+        }),
+      )
+      .optional()
+      .describe('Ordered subsequence the window must contain; other traffic interleaves freely.'),
+    never: z
+      .array(z.object({ method: z.string(), url: z.string() }))
+      .optional()
+      .describe('Templates no observed call may match.'),
+    since: z
+      .enum(['mark', 'run'])
+      .optional()
+      .describe('"mark" (default): since the previous expectCalls settled. "run": the whole buffer.'),
+    timeoutMs: z.number().int().min(1).optional(),
+    intent,
+  }),
+  // Database verification — read-only, schema-grounded; see `src/db/`.
+  z.object({
+    action: z.literal('dbSnapshot'),
+    tables: z.array(z.string()).min(1),
+    as: z.string().optional().describe('Snapshot name later deltas refer to. Default "before".'),
+    intent,
+  }),
+  z.object({
+    action: z.literal('expectDbRow'),
+    table: z.string(),
+    where: z
+      .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
+      .describe('Column → value. Prefer a {{variable}} the run saved — that ties the row to this run.'),
+    values: z
+      .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
+      .optional(),
+    count: z.number().int().min(0).optional(),
+    timeoutMs: z.number().int().min(1).optional(),
+    intent,
+  }),
+  z.object({
+    action: z.literal('expectDbDelta'),
+    table: z.string(),
+    delta: z.number().int(),
+    since: z.string().optional(),
+    timeoutMs: z.number().int().min(1).optional(),
+    intent,
+  }),
+  z.object({
+    action: z.literal('expectDbUnchanged'),
+    tables: z.array(z.string()).min(1),
+    since: z.string().optional(),
+    intent,
+  }),
+  z.object({
+    action: z.literal('expectDbCalled'),
+    match: z.string().describe('Case-insensitive substring of the normalized statement.'),
+    since: z.string().optional(),
+    delta: z.number().int().min(0).optional(),
+    atLeast: z.number().int().min(1).optional(),
+    timeoutMs: z.number().int().min(1).optional(),
+    intent,
+  }),
 ]);
 
 export interface ServerConfig {
@@ -526,10 +598,17 @@ export function createServer(config: ServerConfig = configFromEnv()): McpServer 
           .string()
           .optional()
           .describe('Path or URL of an OpenAPI/Swagger spec to index alongside the code.'),
+        dbSchema: z
+          .string()
+          .optional()
+          .describe('Path of a schema.sql / schema.prisma to index alongside the code.'),
       },
     },
-    async ({ url, force, openapi }) => {
-      const engine = new ContextEngine(openapi === undefined ? {} : { openApiSpec: openapi });
+    async ({ url, force, openapi, dbSchema }) => {
+      const engine = new ContextEngine({
+        ...(openapi === undefined ? {} : { openApiSpec: openapi }),
+        ...(dbSchema === undefined ? {} : { dbSchema }),
+      });
       const graph = await engine.build({ force: force ?? false });
 
       if (url === undefined) {
@@ -539,6 +618,7 @@ export function createServer(config: ServerConfig = configFromEnv()): McpServer 
           operations: graph.nodes
             .filter((node) => node.kind === 'operation')
             .map((node) => node.name),
+          tables: graph.nodes.filter((node) => node.kind === 'table').map((node) => node.name),
         });
       }
       return json({ promptContext: toPromptContext(graph, { url }) });

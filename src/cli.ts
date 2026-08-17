@@ -154,6 +154,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'repair-investigate': { type: 'boolean', default: false },
       'repair-regenerate': { type: 'boolean', default: false },
       openapi: { type: 'string' },
+      'db-schema': { type: 'string' },
       api: { type: 'boolean', default: false },
       // Catalogs. `context-doc` rather than `context`: `--context` already
       // means the static repository index, and two things called context would
@@ -325,6 +326,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     repairInvestigate: values['repair-investigate'] === true,
     repairRegenerate: values['repair-regenerate'] === true,
     openapi: values.openapi,
+    dbSchema: values['db-schema'],
     api: values.api,
     network: values['no-network'] !== true,
     claimsOnly: values['claims-only'] === true,
