@@ -52,6 +52,8 @@ function bundle(overrides: Partial<ProofBundle> = {}): ProofBundle {
       dataRetries: 0,
       apiRequests: 0,
       apiFailures: 0,
+    dbChecks: 0,
+    dbFailures: 0,
       networkCalls: 0,
       networkFailures: 0,
       backendBlocked: 0,

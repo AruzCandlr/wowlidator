@@ -1,0 +1,25 @@
+sequenceDiagram
+    autonumber
+    actor U as Customer
+    participant W as Web App
+    participant API as Order API
+    participant DB as PostgreSQL
+    U->>W: open the checkout page
+    W->>API: GET /api/cart
+    API-->>W: 200 cart contents
+    U->>W: click Place order
+    W->>API: POST /api/orders
+    API->>DB: INSERT INTO orders
+    DB-->>API: ok
+    alt payment accepted
+        API-->>W: 201 order created
+        W->>API: GET /api/orders/{id}
+    else payment declined
+        API-->>W: 402 payment required
+    end
+    opt marketing consent
+        W->>API: POST /api/consent
+    end
+    loop poll status
+        W->>API: GET /api/orders/{id}/status
+    end

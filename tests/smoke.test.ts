@@ -232,6 +232,8 @@ describe('proof-bundle', () => {
       dataRetries: 0,
       apiRequests: 0,
       apiFailures: 0,
+      dbChecks: 0,
+      dbFailures: 0,
       // No observer was attached to this builder, so the network totals stay
       // at zero — which is the honest answer for "nothing was watching",
       // distinct from a run that watched and saw nothing.
