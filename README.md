@@ -21,10 +21,11 @@ reading their evidence — started with `bin/wow`.
 | **Run tests fast and free** | Plain Playwright over CDP. Full form interaction — dropdowns (native or custom), checkboxes and toggles, key-by-key typing — with no model call on the happy path, ever. |
 | **Heal broken selectors just-in-time** | When a selector fails, an LLM reads the page's accessibility tree, proposes a repair, and the repair is verified before it is trusted — then cached so the next run is free again. |
 | **Generate tests from a page** | Point it at a URL; a model reads the accessibility tree and writes runnable test cases, each with a real assertion. |
-| **Turn documents into test suites** | Feed it a spreadsheet, PDF, or Markdown checklist; it extracts the document's claims, you approve them, and it writes and runs one case per claim. |
+| **Turn documents into test suites** | Feed it a spreadsheet, PDF, Markdown checklist — or a **Mermaid/PlantUML sequence diagram**, read deterministically with no model call; it extracts the document's claims, you approve them, and it writes and runs one case per claim. |
 | **Navigate the unknown** | An agent drives the browser through interstitials — consent screens, wizards, redirect chains — one budgeted, origin-checked decision at a time. |
 | **Repair whole test scripts** | `--repair` asks a model for a targeted fix to the failing step (optionally reinvestigating the failure live, or regenerating the script from the failed step onward) and retries — never overwriting your file. |
-| **Test the backend too** | `request`/`expectStatus`/`expectJson` steps share the browser's session; passive network observation tells a frontend failure apart from a 500. Browser-free API flows never open Chrome at all. |
+| **Test the backend too** | `request`/`expectStatus`/`expectJson` steps share the browser's session; `expectCalls` asserts the traffic the *page* made — order, endpoints, and calls that must never happen; passive network observation tells a frontend failure apart from a 500. Browser-free API flows never open Chrome at all. |
+| **Verify the database** | Read-only, schema-grounded checks (`expectDbRow`, `expectDbDelta`, `expectDbUnchanged`) prove the API's 201 is backed by a real row — keyed by the very id the run saved — and `expectDbCalled` counts statement executions via `pg_stat_statements`. No SQL from flows, ever; the driver is optional and a missing one blocks the case instead of failing the app. |
 | **Crawl** | Follow every link (and, opt-in, buttons) on a page: does a real page come back, and can you get home again. |
 | **Prove it** | Every run emits a proof bundle (JSON) and a single-file HTML report: verdict, timeline, filmstrip, video of the run up to the failure, escalation traces, network calls, coverage, and trend. |
 | **Watch, quarantine, report to CI** | `watch` re-runs on an interval and notifies only on transitions; flaky tests can be quarantined explicitly; JUnit/CTRF output for CI. |
@@ -125,10 +126,91 @@ wowlidator catalog cases.xlsx --claims-only            # step 1: what does this 
 wowlidator catalog cases.xlsx --claims claims.json --url <page> --run   # step 2: prove them
 ```
 
-Reads Markdown, CSV, HTML, text, JSON, YAML, **Excel and PDF**. Each approved
-claim becomes its own case sharing setup/teardown, so one failure never blocks
-the rest. The review gate is deliberate: nothing is authored or run until a
-person has seen the claims.
+Reads Markdown, CSV, HTML, text, JSON, YAML, **Excel and PDF** — and
+**sequence diagrams** (`.mmd` Mermaid, `.puml` PlantUML), read deterministically
+with no model call: one claim per message. Each approved claim becomes its own
+case sharing setup/teardown, so one failure never blocks the rest. The review
+gate is deliberate: nothing is authored or run until a person has seen the
+claims.
+
+### Backend testing: traffic, sequence diagrams, the database
+
+The boundary rule that shapes all three: wowlidator sits in the browser, so a
+claim is checkable exactly to the extent the browser can see it — and anything
+past that line is *disclosed as an assumption*, never silently promised.
+
+**Assert the traffic the page makes** — `expectCalls`, in any flow, no setup:
+
+```json
+{ "action": "expectCalls",
+  "calls":  [ { "method": "POST", "url": "/api/orders", "status": "2xx" },
+              { "method": "GET",  "url": "/api/orders/:id" } ],
+  "never":  [ { "method": "DELETE", "url": "/api/orders/:id" } ] }
+```
+
+Expected calls must appear in that relative order; analytics and polling
+interleave freely. It polls out in-flight XHRs, and an absence claim over a
+window the ring buffer truncated is **blocked, not passed**.
+
+**A sequence diagram is a catalog:**
+
+```bash
+wowlidator catalog order.mmd --claims-only     # one claim per message — no model call
+```
+
+Participant lanes are classified (`actor` → user, `database` → external, the
+rest flagged as guesses), messages the browser can see become testable claims,
+and backend→DB messages come out `testable: false` with the boundary named.
+In wowUI's gate the lane table is editable — correct a guessed plane and the
+claim list recomputes live. `alt` branches become separate cases.
+
+**Verify the database.** One-time setup:
+
+```bash
+npm install pg                                              # optional by design
+echo 'WOWLIDATOR_DB_URL=postgres://wowlidator_ro:pw@localhost:5432/app' >> .env
+wowlidator doctor                                           # …now also pings the DB read-only
+```
+
+Then in a flow (works browser-free too — `request` + DB steps never open Chrome):
+
+```json
+{
+  "setup": [ { "action": "dbSnapshot", "tables": ["orders", "users"] } ],
+  "steps": [
+    { "action": "request", "method": "POST", "url": "/api/orders",
+      "body": { "sku": "A1" }, "save": { "orderId": "$.id" } },
+    { "action": "expectStatus", "status": 201 },
+    { "action": "expectDbRow", "table": "orders",
+      "where": { "id": "{{orderId}}" }, "values": { "status": "pending" } },
+    { "action": "expectDbDelta", "table": "orders", "delta": 1 },
+    { "action": "expectDbUnchanged", "tables": ["users"] }
+  ]
+}
+```
+
+Keying the row on `{{orderId}}` — the id this run's own request saved — is what
+makes the check causal rather than correlational. The rails, all structural:
+wowlidator never accepts SQL from a flow (every check compiles to a parameterized
+SELECT against schema-validated identifiers), the session opens read-only, a
+non-loopback DSN is refused without `WOWLIDATOR_DB_REMOTE_OK=1`, rows are
+redacted before they reach a bundle, and a missing driver or unreachable
+database exits 3 and scores **blocked** — never a bug filed against an app the
+check never reached. `expectDbRow` polls through a budget, so an async write
+is waited out and the wait is on the record. `expectDbCalled` (statement
+counts since a snapshot, via `pg_stat_statements`) is the "was it *called*"
+tier — statement-level, correlational, and worded so.
+
+**Let authoring write the DB checks** — index the schema once:
+
+```bash
+wowlidator context build --db-schema ./schema.sql   # or schema.prisma; with
+# WOWLIDATOR_DB_URL set and no file, the live schema is introspected instead
+```
+
+Catalog authoring then receives the declared-table inventory and may emit DB
+checks against those tables only — with no schema indexed it structurally
+cannot emit one.
 
 ### Crawling
 
@@ -153,8 +235,8 @@ notification that fires every run gets muted.
 ### Everything else
 
 ```bash
-wowlidator context build [--openapi ./openapi.yaml]  # index the repo, no model call
-wowlidator doctor              # one real call per LLM role
+wowlidator context build [--openapi ./openapi.yaml] [--db-schema ./schema.sql]  # index the repo, no model call
+wowlidator doctor              # one real call per LLM role (+ a read-only DB ping when configured)
 wowlidator cache list|forget   # inspect / invalidate healed selectors
 wowlidator recall              # list and re-run saved launches
 wowlidator mcp                 # serve MCP over stdio
@@ -200,13 +282,14 @@ runs. `intent` is the author's own words, carried verbatim into the report.
 - **Act**: `goto`, `click`, `fill`, `press`, `back`/`forward`, `scrollTo`
 - **Forms**: `selectOption` (any dropdown — native `<select>` or custom combobox — by the option's visible label, one step), `check`/`uncheck` (checkbox, radio, or ARIA toggle, verifying the state actually changed), `type` (key-by-key with real keyboard events, for autocomplete/typeahead/masked fields `fill` can't wake)
 - **Assert**: `expectText`, `expectVisible`, `expectHidden`, `expectUrl`, `expectCount`, `expectFocused`, `expectTabOrder`, `expectScrollable`, `expectModal`/`closeModal`, `snapshot` (visual baseline)
-- **HTTP**: `request` (with `save: { orderId: "$.data.id" }` → `{{orderId}}` anywhere later), `expectStatus`, `expectJson`, `expectHeader`
+- **HTTP**: `request` (with `save: { orderId: "$.data.id" }` → `{{orderId}}` anywhere later), `expectStatus`, `expectJson`, `expectHeader`, `expectCalls` (ordered-subsequence + never-claims over the traffic the *page* made)
+- **Database** (read-only, schema-grounded — see Backend testing above): `dbSnapshot`, `expectDbRow`, `expectDbDelta`, `expectDbUnchanged`, `expectDbCalled`
 - **Compose**: `use` splices another flow file in (with `{{param}}` substitution); `when` branches on `visible`/`hidden`/`enabled`/`disabled`
 - **Data**: `fillEach` (boundary tables — every case runs even after one fails), `fillRetry` (regenerate colliding form data; deterministic faker kinds cost \$0, only `custom` asks a model)
 - **State**: `setLocalStorage`, `clearStorage`, `workflow` (hand the browser to the agent with a goal)
 
-A flow containing only HTTP steps is detected automatically and runs without a
-browser — same report, history, and repair loop.
+A flow containing only HTTP and database steps is detected automatically and
+runs without a browser — same report, history, and repair loop.
 
 ---
 
@@ -220,7 +303,10 @@ Two planes, and the boundary between them is the whole design:
 │                                                                            │
 │  src/engine/    SmartRunner: Playwright over CDP, short timeouts,          │
 │                 the escalation ladder, dialogs, video/screenshots          │
-│  src/api/       deliberate HTTP + passive network observation              │
+│  src/api/       deliberate HTTP + passive network observation,             │
+│                 expectCalls sequence assertions over observed traffic      │
+│  src/db/        read-only DB verification: schema-grounded row/delta       │
+│                 checks, statement counts (lazy optional pg driver)         │
 │  src/browser/   Chrome lifecycle: find, start, recycle, never hijack       │
 │  src/crawl/     link/button crawling                                       │
 │  src/cache/     healed-selector cache (a failing cached repair is deleted) │
@@ -316,6 +402,8 @@ WOWLIDATOR_CACHE_PATH=healed-selectors.json  # the healed-selector cache
 WOWLIDATOR_HEADLESS=1                        # window mode (also --headless/--no-headless)
 WOWLIDATOR_SCREENSHOTS=all|on-failure|off|auto
 WOWLIDATOR_JUNIT_PATH=… / WOWLIDATOR_CTRF_PATH=…   # CI outputs
+WOWLIDATOR_DB_URL=postgres://…               # read-only DB verification (env only, never argv)
+WOWLIDATOR_DB_REMOTE_OK=1                    # required for a non-loopback database host
 ```
 
 See `.env.example` for the full annotated list, and run `wowlidator doctor`
