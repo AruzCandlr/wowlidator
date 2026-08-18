@@ -113,6 +113,9 @@ export async function cmdRun(flowPath: string | undefined, options: CliOptions):
     dataModel: buildDataModel(options),
     updateBaselines: options.updateBaselines,
     network: options.network,
+    // Carried for masking only: a password the person supplied must not
+    // reach the proof bundle or the emailable report in cleartext.
+    credentials: options.credentials,
     historyPath: options.history ? options.historyPath : null,
     onStep: stepLogger(options),
     onPlan: planLogger(options),
@@ -198,6 +201,9 @@ export async function cmdRunWithRepair(flowPath: string, flow: Flow, options: Cl
       dataModel: buildDataModel(options),
       updateBaselines: options.updateBaselines,
       network: options.network,
+      // Carried for masking only: a password the person supplied must not
+      // reach the proof bundle or the emailable report in cleartext.
+      credentials: options.credentials,
       historyPath: options.history ? options.historyPath : null,
       onStep: stepLogger(options),
       onPlan: planLogger(options),
@@ -434,6 +440,9 @@ export async function cmdWatch(flowPath: string | undefined, options: CliOptions
       agent: buildAgent(options),
       dataModel: buildDataModel(options),
       network: options.network,
+      // Carried for masking only: a password the person supplied must not
+      // reach the proof bundle or the emailable report in cleartext.
+      credentials: options.credentials,
       historyPath: options.history ? options.historyPath : null,
     });
 

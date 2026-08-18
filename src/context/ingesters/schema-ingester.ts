@@ -71,11 +71,21 @@ function stripQuotes(name: string): string {
   return name.replace(/^["'`[]|["'`\]]$/g, '');
 }
 
-/** `public.orders` → `orders`; quoting stripped. */
-function bareTableName(raw: string): string {
+/**
+ * `public.orders` → `orders`; `benefit_management.benefit_plan` stays
+ * qualified; quoting stripped. Mirrors `qualifiedName()` in `db/client.ts` —
+ * bare for the default schema, `schema.table` for everything else — because
+ * the run-time grounding gate compares names against the live introspection's:
+ * a file-sourced inventory that stripped a named schema authored flows the
+ * gate then refused, for tables that exist.
+ */
+function qualifiedTableName(raw: string): string {
   const unquoted = stripQuotes(raw.trim());
   const dot = unquoted.lastIndexOf('.');
-  return stripQuotes(dot >= 0 ? unquoted.slice(dot + 1) : unquoted);
+  if (dot < 0) return unquoted;
+  const schema = stripQuotes(unquoted.slice(0, dot));
+  const table = stripQuotes(unquoted.slice(dot + 1));
+  return /^public$/i.test(schema) ? table : `${schema}.${table}`;
 }
 
 /** Remove `--` and `/* *​/` comments so the paren scan cannot be fooled by them. */
@@ -125,7 +135,7 @@ export function parseSqlSchema(text: string): { tables: ParsedTable[]; warnings:
   const re = /CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([^\s(]+)\s*\(/gi;
   let match: RegExpExecArray | null;
   while ((match = re.exec(clean)) !== null) {
-    const name = bareTableName(match[1] ?? '');
+    const name = qualifiedTableName(match[1] ?? '');
     // Scan for the matching close paren from just past the open one.
     let depth = 1;
     let inString = false;
@@ -162,7 +172,7 @@ export function parseSqlSchema(text: string): { tables: ParsedTable[]; warnings:
         const fk = /FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+([^\s(]+)\s*\(([^)]+)\)/i.exec(entry);
         if (fk?.[1] && fk[2] && fk[3]) {
           table.references.push(
-            `${stripQuotes(fk[1].trim())} -> ${bareTableName(fk[2])}.${stripQuotes(fk[3].trim())}`,
+            `${stripQuotes(fk[1].trim())} -> ${qualifiedTableName(fk[2])}.${stripQuotes(fk[3].trim())}`,
           );
         }
         continue;
@@ -178,7 +188,7 @@ export function parseSqlSchema(text: string): { tables: ParsedTable[]; warnings:
       if (isPk) table.pk.push(columnName);
       const ref = /\bREFERENCES\s+([^\s(]+)\s*(?:\(([^)]+)\))?/i.exec(entry);
       if (ref?.[1]) {
-        const target = bareTableName(ref[1]);
+        const target = qualifiedTableName(ref[1]);
         const targetCol = ref[2] ? stripQuotes(ref[2].trim()) : 'id';
         table.references.push(`${columnName} -> ${target}.${targetCol}`);
       }
@@ -204,7 +214,15 @@ export function parsePrismaSchema(text: string): { tables: ParsedTable[]; warnin
     bodies.push({ model, body });
     modelNames.add(model);
     const mapped = /@@map\(\s*"([^"]+)"\s*\)/.exec(body);
-    tableNameOf.set(model, mapped?.[1] ?? model);
+    const base = mapped?.[1] ?? model;
+    // multiSchema: `@@schema("x")` qualifies the table the same way live
+    // introspection does — bare for public, `schema.table` otherwise — so a
+    // file-sourced name and the database's own agree at the grounding gate.
+    const schemaAttr = /@@schema\(\s*"([^"]+)"\s*\)/.exec(body)?.[1];
+    tableNameOf.set(
+      model,
+      schemaAttr !== undefined && !/^public$/i.test(schemaAttr) ? `${schemaAttr}.${base}` : base,
+    );
   }
 
   for (const { model, body } of bodies) {
@@ -275,8 +293,14 @@ function toNodes(
       meta,
     });
     for (const reference of table.references) {
-      const target = /->\s*([^.\s]+)/.exec(reference)?.[1];
-      if (!target) continue;
+      const rawTarget = /->\s*(\S+)/.exec(reference)?.[1];
+      if (!rawTarget) continue;
+      // DDL and introspection references end `.column`, so the table is
+      // everything before the LAST dot — a first-dot read turned a qualified
+      // `schema.table.column` into an edge to `schema`. Prisma references
+      // carry no column at all: the whole target is the table.
+      const lastDot = rawTarget.lastIndexOf('.');
+      const target = source === 'prisma' || lastDot < 0 ? rawTarget : rawTarget.slice(0, lastDot);
       // A dangling target (a table the schema never declares) is pruned by
       // the merge step, not guessed at — the standing rule.
       edges.push({ from: `table:${table.name}`, to: `table:${target}`, kind: 'references' });

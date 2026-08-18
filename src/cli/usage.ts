@@ -26,6 +26,10 @@ Usage:
   wowlidator history clear [--all] [--out <proof dir>]
   wowlidator context build [--root <dir>] [--openapi <path|url>] [--db-schema <path>] [--force]
   wowlidator context show  [--root <dir>] [--context-out <path>] [--json]
+  wowlidator context add <path> [--openapi <path|url>] [--db-schema <path>]
+                                           scan a repository and remember it —
+                                           select it on a run with --repo
+  wowlidator context list                  the saved repositories and their slugs
   wowlidator recall [last | <n>] [--json]  list saved launches, or re-run one —
                                            every launch is saved before it can
                                            fail, so a run that died before any
@@ -144,14 +148,17 @@ draft — the other way in: a description, some specs, or a page becomes a
                        (default: <report-dir>/catalogs/<subject>.csv)
   --max-cases-drafted <n>  Cap on cases in one draft (default 20)
 
-catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mmd .puml)
-                       becomes a test, in two steps you can see between. The
-                       approved claims are authored as discrete cases and each
-                       is run on its own, so a case that fails is recorded and
-                       the remaining ones are still checked. A sheet in this
-                       project's own format is read from its columns instead of
-                       being interpreted — no model call, and the Test Case IDs
-                       survive into the claims:
+catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mmd .puml,
+                       or a sequence-diagram image: .png .jpg .jpeg .webp .svg,
+                       transcribed by a vision model into a reviewable
+                       <image>.transcribed.mmd beside it, then read as an
+                       ordinary diagram) becomes a test, in two steps you can
+                       see between. The approved claims are authored as
+                       discrete cases and each is run on its own, so a case
+                       that fails is recorded and the remaining ones are still
+                       checked. A sheet in this project's own format is read
+                       from its columns instead of being interpreted — no model
+                       call, and the Test Case IDs survive into the claims:
   --claims-only        Stop after listing what the document claims. One cheap
                        model call, no browser. Writes a claims file.
   --claims <path>      Author from an already-reviewed claims file. Strike a
@@ -161,6 +168,14 @@ catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mm
   --context-doc <path> A supporting document — background for the model, never
                        a source of claims. Repeatable. Not --context, which is
                        the static repository index.
+  --context-budget <n> Characters of that background sent per prompt. Off by
+                       default (0 = send every context document whole). Set it
+                       — 24000 is the measured setting — when a long spec is
+                       authored across many rows: over the budget, the sections
+                       that bear on each case are selected and the document's
+                       full heading outline is sent with them, so nothing
+                       elided reads as absent. A document under the budget, or
+                       one the case does not distinguish, is still sent whole.
   --max-claims <n>     Cap on claims read from one catalog (default 40)
   --policy <p>         read-only | forms | mutations      (default forms)
   --no-agent-capture   Capture the page immediately instead of letting the
@@ -213,10 +228,34 @@ Browser lifecycle (wowlidator starts and checks Chrome itself — no wrapper scr
                        that exist only after a click are visible when writing
                        the test. Clicks ARIA-marked disclosures only — never a
                        plain button — and closes each one again.
+  --scope <s>          unit | e2e                          (default unit)
+                       unit: prove one thing on one page. e2e: the whole
+                       journey — reach the page as a user does, act, verify on
+                       the page that results. e2e is enforced, not requested:
+                       it turns --capture-journey on by itself, and an
+                       authored flow that never leaves its first page is
+                       refused rather than handed back as a unit test.
+  --capture-journey    Also read the page the description is ABOUT, not only
+                       the one the run starts on. With --repo, the indexed
+                       routes are ranked against the request and the best one
+                       is opened and captured as a second, separately labelled
+                       section. Off by default because it navigates the
+                       application. One extra page, one navigation, no clicks;
+                       a capture that lands on a sign-in screen signs in once
+                       when --as supplied credentials, and is discarded rather
+                       than mislabelled when it cannot.
   --context            Include repository context (routes, components, what
                        already covers this page) in the generation prompt.
                        Builds/reuses the graph under --context-out. Off by
                        default — generation behaves exactly as before it.
+  --repo <slug|path>   Ground generate, author and catalog in a repository
+                       saved with "wowlidator context add" — its code index
+                       (routes, endpoints, tables) joins the prompt. An
+                       unknown value fails loudly rather than running
+                       ungrounded; see the saved ones: wowlidator context list
+  --as <email>:<pass>  The account an authored flow signs in as. Without it the
+                       model invents a password and the flow cannot sign in;
+                       also settable as WOWLIDATOR_AS.
   --api                Generate API tests from the indexed OpenAPI spec instead
                        of reading a page. Needs "wowlidator context build --openapi
                        <spec>" first: with no spec there is no endpoint

@@ -95,6 +95,9 @@ export async function runCases(
         dataModel: buildDataModel(options),
         updateBaselines: options.updateBaselines,
         network: options.network,
+        // Carried for masking only: a password the person supplied must not
+        // reach the proof bundle or the emailable report in cleartext.
+        credentials: options.credentials,
         historyPath: options.history ? options.historyPath : null,
         onStep: stepLogger(options),
         onPlan: planLogger(options),

@@ -26,11 +26,14 @@ import { LaunchPresets, formatPresetLine } from './history/launch-presets.js';
 import { main as mcpMain } from './mcp/server.js';
 import { LlmFactory } from './providers/llm-factory.js';
 import { DEFAULT_MAX_REPAIR_ATTEMPTS } from './repair/flow-repair-loop.js';
-import { classifyError } from './cli/exit.js';
+import { EXIT, classifyError } from './cli/exit.js';
 import {
   LAUNCH_COMMANDS,
   SCREENSHOT_MODES,
   parseCaptureDelay,
+  parseContextBudget,
+  parseScope,
+  parseCredentials,
   parseScreenshotMode,
   resolveHeadless,
   type CliOptions,
@@ -110,6 +113,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'agent-assist': { type: 'boolean', default: false },
       // parseArgs has no `--no-x` negation, so these are declared as written.
       probe: { type: 'boolean', default: false },
+      'capture-journey': { type: 'boolean', default: false },
       'capture-delay': { type: 'string' },
       'step-delay': { type: 'string' },
       'max-pages': { type: 'string' },
@@ -147,6 +151,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       run: { type: 'boolean', default: false },
       context: { type: 'boolean', default: false },
       root: { type: 'string' },
+      repo: { type: 'string' },
+      as: { type: 'string' },
       'context-out': { type: 'string' },
       force: { type: 'boolean', default: false },
       repair: { type: 'boolean', default: false },
@@ -166,6 +172,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'max-cases-drafted': { type: 'string' },
       'context-doc': { type: 'string', multiple: true },
       'max-claims': { type: 'string' },
+      'context-budget': { type: 'string' },
+      scope: { type: 'string' },
       'no-network': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -219,6 +227,29 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     values['max-claims'] === undefined ? DEFAULT_MAX_CLAIMS : Number(values['max-claims']);
   if (!Number.isInteger(maxClaims) || maxClaims < 1) {
     process.stderr.write('wowlidator: --max-claims must be a positive integer\n');
+    return 2;
+  }
+
+  const credentials = parseCredentials(values.as);
+  if (credentials === null) {
+    process.stderr.write(
+      'wowlidator: --as must be <email>:<password> — both halves are required ' +
+        '(the password may contain colons; the first colon separates them)\n',
+    );
+    return 2;
+  }
+
+  const scope = parseScope(values.scope);
+  if (scope === null) {
+    process.stderr.write('wowlidator: --scope must be unit or e2e\n');
+    return 2;
+  }
+
+  const contextBudget = parseContextBudget(values['context-budget']);
+  if (contextBudget === null) {
+    process.stderr.write(
+      'wowlidator: --context-budget must be a non-negative integer (characters; 0 sends every context document whole)\n',
+    );
     return 2;
   }
 
@@ -299,6 +330,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     history: values['no-history'] !== true,
     context: values.context,
     probe: values.probe,
+    captureJourney: values['capture-journey'] === true,
     maxPages: values['max-pages'] === undefined ? undefined : Number(values['max-pages']),
     maxHeal: values['max-heal'] === undefined ? undefined : Number(values['max-heal']),
     followButtons: values['follow-buttons'] === true,
@@ -316,6 +348,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     junit: values.junit ?? process.env['WOWLIDATOR_JUNIT_PATH'],
     ctrf: values.ctrf ?? process.env['WOWLIDATOR_CTRF_PATH'],
     root: values.root,
+    repo: values.repo,
+    credentials,
     contextOut: values['context-out'],
     force: values.force,
     // Either refinement implies the loop itself — asking for an investigated
@@ -339,6 +373,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         ? DEFAULT_MAX_DRAFT_CASES
         : Number(values['max-cases-drafted']),
     contextDocs: values['context-doc'] ?? [],
+    contextBudget,
+    scope,
     maxClaims,
   };
 
@@ -359,7 +395,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     case 'history':
       return cmdHistory(positionals[1], options);
     case 'context':
-      return cmdContext(positionals[1], options);
+      return cmdContext(positionals[1], options, positionals[2]);
     case 'go':
       return cmdGo(positionals.slice(1).join(' ') || undefined, options);
     case 'crawl':
@@ -382,11 +418,31 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // The drained-loop watchdog. A CDP websocket that dies mid-await can leave
+  // a promise that never settles; with nothing else keeping the loop alive,
+  // node just exits — code 0, zero output, a run that reports SUCCESS about
+  // work it silently abandoned (seen live: a concurrent wowlidator run recycled
+  // Chrome mid-authoring and the suite "passed" out of existence). `beforeExit`
+  // fires exactly then, and an unfinished main() there is an environment fact.
+  let mainSettled = false;
+  process.on('beforeExit', () => {
+    if (mainSettled) return;
+    mainSettled = true; // say it once — beforeExit can fire again
+    process.stderr.write(
+      'wowlidator: the event loop drained before the command finished — a connection died ' +
+        'without rejecting its waiters (usually the browser being closed or recycled under ' +
+        'the run, e.g. by a second wowlidator run sharing the same Chrome). Nothing after ' +
+        'that point ran; treat this run as blocked, not as a result.\n',
+    );
+    process.exitCode = EXIT.environment;
+  });
   main().then(
     (code) => {
+      mainSettled = true;
       process.exitCode = code;
     },
     (error: unknown) => {
+      mainSettled = true;
       process.stderr.write(`wowlidator: ${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = classifyError(error);
     },

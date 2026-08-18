@@ -1,14 +1,29 @@
 /**
- * Redaction for anything HTTP that reaches a proof bundle.
+ * Redaction for anything that reaches a proof bundle carrying a secret.
  *
  * This is load-bearing, not a nicety. The HTML report is deliberately
  * self-contained — inline CSS, inline JS, screenshots as `data:` URIs, "opens
  * off a USB stick" — which is exactly what makes it easy to email, attach to a
- * ticket, or drop in a shared drive. Before this module existed nothing that
- * landed in a bundle could carry a credential; a `request` step can carry a
- * session cookie, a bearer token, and a password in a login body all in one
- * step. So the default is redact, and revealing anything is per-request and
- * explicit.
+ * ticket, or drop in a shared drive. A `request` step can carry a session
+ * cookie, a bearer token, and a password in a login body all in one step, and
+ * a `fill` step carries whatever the flow typed. So the default is redact, and
+ * revealing anything is per-request and explicit.
+ *
+ * **The typed-value half was missing until 2026-08-18, and the omission was
+ * the wider of the two.** This module was written for `src/api/`'s HTTP
+ * payloads, and an earlier version of this comment claimed that before it
+ * "nothing that landed in a bundle could carry a credential" — false for as
+ * long as `fill` has existed. Measured on a real bundle on disk:
+ * `{"action":"fill","selector":"input[type=\"password\"]","detail":{"value":"admin2026"}}`.
+ * Every login flow wrote its password to `.wowlidator/proofs/<runId>.json` and
+ * into the emailable report. `maskSecret` / `looksLikeCredentialField` below
+ * are that half; the runner applies them at the same recording boundary.
+ *
+ * **Screenshots and video are out of scope, and no redaction here changes
+ * that.** A password typed into a field that does not mask it on screen is in
+ * the frame and in the recording. `--video off` and `--screenshots off` are the
+ * only controls for that; saying so is better than implying a guarantee this
+ * module cannot give.
  *
  * The rule that keeps it honest: **never emit a payload we could not inspect.**
  * An opaque body (not JSON, not form-encoded) is replaced with a description of
@@ -221,4 +236,89 @@ function truncate(text: string, max: number): string {
 
 function byteLength(text: string): number {
   return Buffer.byteLength(text, 'utf8');
+}
+
+// --- Typed values -----------------------------------------------------------
+
+/**
+ * What a masked value looks like in a record.
+ *
+ * Mask, never drop. A reader still needs to know that a value was typed and
+ * roughly what shape it had — the same compromise `redactBody` makes when it
+ * replaces an unrecognised body with its size and type rather than removing
+ * the field. A step whose `value` simply vanished reads like a step that
+ * typed nothing.
+ */
+export const SECRET_MASK = '••••';
+
+/** Pure: the mask plus the length, and nothing else about the value. */
+export function maskSecret(value: string): string {
+  return `${SECRET_MASK} (${value.length} chars)`;
+}
+
+/**
+ * Does this step look like it is typing a credential, judged from the step
+ * rather than from the value?
+ *
+ * The **fallback** only. The reliable evidence is the field's own
+ * `type="password"`, which is a fact about the document; this is what remains
+ * when the DOM cannot answer — most often because the step failed to resolve
+ * at all, where the value was never typed anywhere and yet is still recorded.
+ *
+ * Deliberately narrower than the authoring-side `isCredentialFill`, which also
+ * treats the taught `role=textbox >> nth=N` idiom as credential-shaped. That
+ * idiom addresses *any* nameless textbox — `nth=0` is the email field in the
+ * very same login form — so masking on it would destroy exactly the evidence a
+ * later assertion depends on (this codebase's own rule: identify a record by a
+ * value the flow typed). The real password behind that idiom is caught by the
+ * `type="password"` read, and a credential the person supplied through `--as`
+ * is masked unconditionally wherever it lands, so the narrow form loses
+ * nothing that matters.
+ */
+export function looksLikeCredentialField(selector: string, intent?: string): boolean {
+  return /password|passwd|pwd/i.test(`${selector} ${intent ?? ''}`);
+}
+
+/** Everything the masking decision needs, and nothing it can look up itself. */
+export interface StepValueContext {
+  action: string;
+  selector: string;
+  intent?: string | undefined;
+  value: string;
+  /**
+   * Did the resolved field report `type="password"`? `null` means the DOM
+   * could not answer — gone, detached, not an input, or the read threw — and
+   * is deliberately distinct from `false`, so silence falls back to the
+   * wording heuristic instead of being read as a denial.
+   */
+  fieldIsPassword: boolean | null;
+  /** Values the person named as secret via `--as`. Exact-match, never substring. */
+  secretValues: ReadonlySet<string>;
+}
+
+/**
+ * Should this typed value be masked in the record?
+ *
+ * Pure, so the whole decision is testable without a browser; the runner does
+ * the one DOM read and hands the answer in. Evidence first, wording second:
+ *
+ *   1. a value the person supplied through `--as` — unconditional, any field,
+ *      any action. Their statement outranks anything inferred here.
+ *   2. the field's own `type="password"` — a fact about the document.
+ *   3. `looksLikeCredentialField` — the fallback for when the DOM cannot
+ *      answer, which is most often a step that never resolved and whose value
+ *      was therefore typed nowhere, yet is still written to the record.
+ *
+ * Rules 2 and 3 apply only to the actions that type into a field. A
+ * `selectOption` value is a visible dropdown label, and a boundary table's
+ * values are the step's own evidence — masking either would destroy what the
+ * record exists to show.
+ */
+export function isSecretStepValue(context: StepValueContext): boolean {
+  if (context.value === '') return false;
+  if (context.secretValues.has(context.value)) return true;
+  if (context.action !== 'fill' && context.action !== 'type') return false;
+  return (
+    context.fieldIsPassword ?? looksLikeCredentialField(context.selector, context.intent)
+  );
 }

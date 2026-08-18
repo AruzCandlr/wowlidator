@@ -430,14 +430,24 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .req-card .what { font-size: var(--fs-sm); line-height: 1.5; }
 .req-card .note { margin-top: 9px; display: flex; gap: 8px; align-items: center; }
 
-/* ---- modal ---- */
+/* ---- modal (kept for the flow player) and the inline launcher ---- */
 .overlay-backdrop { position: fixed; inset: 0; background: rgba(28,33,38,.32); z-index: 1000; display: grid; place-items: center; padding: var(--s6); }
 .modal {
   background: var(--panel); border-radius: var(--r-lg); padding: var(--s6); width: 460px;
   max-width: 90vw; max-height: 88vh; overflow-y: auto; box-shadow: var(--shadow-over);
   border: 1px solid var(--line);
 }
-.modal h2 { font-size: var(--fs-lg); font-weight: 600; letter-spacing: -.01em; margin: 0 0 var(--s1); }
+/* The start-verification form, inline in the page flow rather than an overlay:
+   a card like every other, so it reuses the modal's field styles below and the
+   GRIM card dialect instead of growing a third one. Width-capped because a
+   form stretched across the whole main column reads as a page, not a form. */
+.launcher {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg);
+  box-shadow: var(--shadow); padding: var(--s6); margin-bottom: var(--s6); max-width: 560px;
+}
+.launcher .top { display: flex; align-items: center; gap: var(--s2); }
+.launcher .top h2 { flex: 1; }
+.modal h2, .launcher h2 { font-size: var(--fs-lg); font-weight: 600; letter-spacing: -.01em; margin: 0 0 var(--s1); }
 /* ---- actual-flow player ---- */
 .flow-subtitle { margin-top: var(--s3); padding: var(--s2) var(--s3); border-radius: var(--r-md, 8px);
   background: var(--panel-2); border: 1px solid var(--line); font-size: var(--fs-sm); line-height: 1.5; }
@@ -447,25 +457,29 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .flow-subtitle .sub-how { display: block; margin-top: 3px; font-family: var(--mono); font-size: var(--fs-xs); opacity: .9; }
 .flow-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--s3); }
 .flow-chips .chip { cursor: pointer; }
-.modal .sub { font-size: var(--fs-xs); color: var(--muted); margin-bottom: var(--s5); line-height: 1.6; }
-.modal label { display: block; font-size: var(--fs-xs); font-weight: 600; color: var(--muted); margin: var(--s4) 0 var(--s2); }
-.modal select, .modal input, .modal textarea {
+.modal .sub, .launcher .sub { font-size: var(--fs-xs); color: var(--muted); margin-bottom: var(--s5); line-height: 1.6; }
+.modal label, .launcher label { display: block; font-size: var(--fs-xs); font-weight: 600; color: var(--muted); margin: var(--s4) 0 var(--s2); }
+.modal select, .modal input, .modal textarea,
+.launcher select, .launcher input, .launcher textarea {
   display: block; width: 100%; font: inherit; font-size: var(--fs-sm);
   border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: var(--s2) var(--s3);
   color: var(--ink); background: var(--panel); line-height: 1.5;
 }
-.modal input[type=checkbox], .modal input[type=radio] { display: inline-block; width: auto; }
-.modal select { height: 38px; padding: 0 var(--s3); }
-.modal textarea { min-height: 72px; resize: vertical; line-height: 1.6; font-family: var(--mono); font-size: var(--fs-mono); }
-.modal input:focus, .modal select:focus, .modal textarea:focus { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent-line); }
+.modal input[type=checkbox], .modal input[type=radio],
+.launcher input[type=checkbox], .launcher input[type=radio] { display: inline-block; width: auto; }
+.modal select, .launcher select { height: 38px; padding: 0 var(--s3); }
+.modal textarea, .launcher textarea { min-height: 72px; resize: vertical; line-height: 1.6; font-family: var(--mono); font-size: var(--fs-mono); }
+.modal input:focus, .modal select:focus, .modal textarea:focus,
+.launcher input:focus, .launcher select:focus, .launcher textarea:focus { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent-line); }
 /* A field that does not apply to the chosen mode has to look inert, or it
    reads as a field you forgot to fill in. Its title says why. */
-.modal input:disabled, .modal select:disabled, .modal textarea:disabled {
+.modal input:disabled, .modal select:disabled, .modal textarea:disabled,
+.launcher input:disabled, .launcher select:disabled, .launcher textarea:disabled {
   background: var(--panel-2); color: var(--faint); cursor: not-allowed;
 }
-.modal .optional { font-weight: 400; color: var(--faint); }
-.modal .acts { display: flex; gap: var(--s2); margin-top: var(--s6); justify-content: flex-end; }
-.modal .inline { display: flex; align-items: center; gap: 6px; font-weight: 400; color: var(--ink); cursor: pointer; margin: 0; }
+.modal .optional, .launcher .optional { font-weight: 400; color: var(--faint); }
+.modal .acts, .launcher .acts { display: flex; gap: var(--s2); margin-top: var(--s6); justify-content: flex-end; }
+.modal .inline, .launcher .inline { display: flex; align-items: center; gap: 6px; font-weight: 400; color: var(--ink); cursor: pointer; margin: 0; }
 .segmented { display: flex; gap: 6px; margin-bottom: var(--s4); }
 .segmented .btn { flex: 1; }
 .gate { margin-top: 10px; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px 12px; max-height: 220px; overflow-y: auto; }
@@ -482,12 +496,12 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 }
 .drawer .top { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s3); }
 .drawer .top b { font-size: var(--fs-lg); font-weight: 600; letter-spacing: -.01em; }
-.drawer .x {
+.drawer .x, .launcher .x {
   margin-left: auto; display: grid; place-items: center; width: 28px; height: 28px;
   border: 0; background: none; border-radius: var(--r-sm); color: var(--faint);
   font-size: 16px; line-height: 1; cursor: pointer;
 }
-.drawer .x:hover { background: var(--panel-2); color: var(--ink); }
+.drawer .x:hover, .launcher .x:hover { background: var(--panel-2); color: var(--ink); }
 .drawer .claim { font-size: var(--fs-md); font-weight: 600; line-height: 1.5; }
 .drawer .cap { margin: var(--s5) 0 var(--s2); }
 .drawer .tabs { display: flex; gap: 6px; margin: 10px 0; }
@@ -543,7 +557,8 @@ var S = {
   proofs: [], flows: [], jobs: [], reports: [], cache: [],
   keys: { providers: [], roles: [] },
   models: { providers: [], roles: [] },  /* the model catalogue, and each role's pick */
-  contextDocs: [],   /* stored background documents — see the launch modal */
+  contextDocs: [],   /* stored background documents — see the launcher */
+  repos: [],         /* saved repositories (context add) — see Machinery › Repositories */
   bundles: {},       /* runId -> the full bundle, fetched when a run is opened */
   openTask: null,    /* which flow's detail is expanded */
   cycleOf: {},       /* flow name -> the run being shown in its detail */
@@ -552,9 +567,13 @@ var S = {
   signature: null,   /* fingerprint of the last data drawn — see dataSignature */
   bars: [],          /* live progress bars on screen — see progressBar */
   jobsAt: 0,         /* when /api/jobs last answered, for counting the eta down */
-  outOpen: {},       /* runId -> whether its command-output section is expanded */
-  jobLines: {},      /* jobId -> fetched output lines, so expanding twice is free */
-  modal: null, drawer: null, es: null
+  outOpen: {},       /* section key -> whether its command-output section is expanded */
+  jobLines: {},      /* jobId -> output lines, fetched once or streamed live */
+  jobArts: {},       /* jobId -> artifacts streamed so far, for the live section */
+  streams: {},       /* jobId -> EventSource, live while that job runs */
+  outLive: [],       /* mounted live output panes, written in place — see streamJob */
+  launcher: null,    /* the inline start-verification section's state, null = collapsed */
+  drawer: null
 };
 
 /* ------------------------------------------------------------------ dom */
@@ -782,12 +801,36 @@ function progressBar(job) {
 
   var live = { jobId: job.id, node: node, bar: bar, fill: fill, steps: steps, eta: eta, etaText: etaText };
   S.bars.push(live);
-  paintProgress(live, job.progress, 0);
+  paintProgress(live, job, 0);
   return node;
 }
 
+/*
+ * Mirror of formatProgressReadout in ui/jobs.ts — the client is a template
+ * string and cannot import it. The algorithm and the format are tqdm's (the
+ * Python progress library): "done/total [elapsed<remaining, rate]", the rate
+ * flipping to it/s past one step per second, the remaining side fed by the
+ * EMA-smoothed pace the server computed.
+ */
+function tqdmReadout(done, total, elapsedMs, leftMs, rateMsPerStep) {
+  if (rateMsPerStep === null || rateMsPerStep === undefined) return null;
+  var rate = rateMsPerStep > 0 && rateMsPerStep < 1000
+    ? (1000 / rateMsPerStep).toFixed(1) + 'it/s'
+    : (rateMsPerStep / 1000).toFixed(1) + 's/it';
+  var remaining = leftMs === null || leftMs === undefined ? '?' : clockMs(leftMs);
+  return done + '/' + total + ' [' + clockMs(elapsedMs) + '<' + remaining + ', ' + rate + ']';
+}
+
+/* tqdm's clock: MM:SS under an hour, H:MM:SS over it. */
+function clockMs(ms) {
+  var t = Math.max(0, Math.round(ms / 1000));
+  var base = String(Math.floor(t / 60) % 60).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0');
+  return t >= 3600 ? Math.floor(t / 3600) + ':' + base : base;
+}
+
 /** Write one bar's current state. "age" is ms since the server last spoke. */
-function paintProgress(live, progress, age) {
+function paintProgress(live, job, age) {
+  var progress = job.progress;
   var done = (progress && progress.done) || 0;
   var total = progress && progress.total;
 
@@ -795,7 +838,12 @@ function paintProgress(live, progress, age) {
     var pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
     live.bar.classList.remove('wait');
     live.fill.style.width = pct + '%';
-    live.steps.textContent = pct + '% · ' + done + ' / ' + total + ' steps';
+    // tqdm's readout, ticking locally between polls: elapsed from the job's
+    // own start time, remaining counted down by "age" like the eta text.
+    var elapsedMs = Math.max(0, Date.now() - new Date(job.startedAt).getTime());
+    var leftNow = progress.etaMs === null || progress.etaMs === undefined ? null : Math.max(0, progress.etaMs - age);
+    var readout = done > 0 ? tqdmReadout(done, total, elapsedMs, leftNow, progress.rateMsPerStep) : null;
+    live.steps.textContent = readout !== null ? readout : pct + '% · ' + done + ' / ' + total + ' steps';
     live.node.setAttribute('aria-valuenow', String(pct));
   } else if (typeof (progress && progress.percent) === 'number') {
     // No steps to divide, but the command names the phase it has reached — see
@@ -853,7 +901,7 @@ function tickProgress() {
     if (!live.node.isConnected) return false;
     var job = S.jobs.filter(function (j) { return j.id === live.jobId; })[0];
     if (!job || job.status !== 'running') return false;
-    paintProgress(live, job.progress, age);
+    paintProgress(live, job, age);
     return true;
   });
 }
@@ -902,6 +950,8 @@ var NAV = [
   { id: 'keys', label: 'Models and keys', count: function () { return keyCount(); },
     alert: function () { return unkeyedRoles().length > 0; },
     icon: ['M15.5 7.5a3.5 3.5 0 1 1-4.6 3.32L4 18l-1.5-1.5L4 15l1.5 1.5L7 15l1.5 1.5 2.4-2.4A3.5 3.5 0 0 1 15.5 7.5z'] },
+  { id: 'repos', label: 'Repositories', count: function () { return S.repos.length; },
+    icon: ['M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'] },
   { section: 'Elsewhere' },
   { id: 'panel', label: 'Command panel', href: '/', count: function () { return S.meta ? S.meta.commands.length : 0; },
     icon: ['M4 17h6', 'm4 7 4 4-4 4', 'M14 7h6', 'M14 12h6', 'M14 17h6'] }
@@ -957,7 +1007,8 @@ function startButton(size) {
   return el('button', {
     type: 'button', class: 'btn primary' + (size === 'md' ? ' md' : ''),
     disabled: !S.online, title: S.online ? null : 'the panel cannot reach its own server — nothing can be started',
-    onclick: openStartModal, text: '+ Start verification'
+    'aria-expanded': S.launcher ? 'true' : 'false',
+    onclick: toggleLauncher, text: '+ Start verification'
   });
 }
 
@@ -967,12 +1018,14 @@ function render() {
   // Every node below is about to be rebuilt, so anything registered against the
   // old ones is gone. They re-register as they are built.
   S.bars = [];
+  S.outLive = [];
   if (S.view === 'runs') renderRuns(main);
   else if (S.view === 'history') renderHistory(main);
   else if (S.view === 'healed') renderHealed(main);
   else if (S.view === 'attention') renderAttention(main);
   else if (S.view === 'reports') renderReports(main);
   else if (S.view === 'keys') renderKeys(main);
+  else if (S.view === 'repos') renderRepos(main);
 }
 
 /* ------------------------------------------------------- runs and proof */
@@ -983,6 +1036,14 @@ function renderRuns(main) {
     'Every flow wowlidator has run, with its latest verdict and the evidence behind it — the last three runs are the rail on the left.',
     startButton('md')
   ));
+
+  // The launcher lives in the page flow, directly under the header — an
+  // expandable section, not an overlay. Its host is always present so
+  // renderLauncher() can rebuild it in place from input handlers without a
+  // full render.
+  var launcherHost = el('div', { id: 'launcher' });
+  main.appendChild(launcherHost);
+  if (S.launcher) launcherHost.appendChild(launcherBox(S.launcher));
 
   if (!S.online) {
     main.appendChild(el('div', { class: 'warn-banner', role: 'status' }, [
@@ -1011,7 +1072,8 @@ function renderRuns(main) {
     live.forEach(function (job) {
       rows.appendChild(el('div', {
         class: 'row', role: 'button', tabindex: '0',
-        onclick: function () { openJobDrawer(job); }
+        'aria-expanded': outIsOpen(job.id, job) ? 'true' : 'false',
+        onclick: function () { toggleOut(job.id, job); }
       }, [
         loopRail(['run', 'empty', 'empty']),
         el('div', { class: 'task-cell' }, [
@@ -1022,10 +1084,12 @@ function renderRuns(main) {
         progressBar(job),
         el('span', { class: 'when', text: 'started ' + shortTime(job.startedAt) }),
         el('div', { class: 'actions' }, [
-          el('button', { type: 'button', class: 'btn', text: 'Output', onclick: function (e) { e.stopPropagation(); openJobDrawer(job); } }),
+          el('button', { type: 'button', class: 'btn', text: 'Output', onclick: function (e) { e.stopPropagation(); toggleOut(job.id, job); } }),
           el('button', { type: 'button', class: 'btn', text: 'Stop', onclick: function (e) { e.stopPropagation(); stopJob(job.id); } })
         ])
       ]));
+      // The console lives under the card it explains, not in a side pane.
+      rows.appendChild(el('div', { class: 'detail' }, [outputSection(job.id, job)]));
     });
     section.appendChild(rows);
     main.appendChild(section);
@@ -1299,16 +1363,51 @@ function jobForRun(runId) {
   return null;
 }
 
-/** Collapsed by default: the evidence above is the point, the console is the receipts. */
-function outputSection(runId, job) {
-  var open = S.outOpen[runId] === true;
-  var section = el('div', { class: 'card', style: 'margin-top:var(--s3)' });
-  section.appendChild(el('button', {
+/**
+ * The one way command output is shown: an expandable section under the card it
+ * belongs to — the running job's row while it runs, the finished run's report
+ * card afterwards. Auto-expanded while the job is running, because until the
+ * proof lands the console IS the run; collapsed once it has finished, because
+ * then the evidence is the point and the console is the receipts. The section
+ * key differs between the two homes (job id live, run id finished), which is
+ * what makes the finished section start collapsed regardless of how the live
+ * one was left.
+ */
+function outIsOpen(key, job) {
+  var running = job.status === 'running';
+  return S.outOpen[key] === undefined ? running : S.outOpen[key] === true;
+}
+
+function toggleOut(key, job) {
+  S.outOpen[key] = !outIsOpen(key, job);
+  render();
+}
+
+function outLine(line) {
+  return el('div', { style: line.stream === 'err' ? 'color:var(--bad)' : null, text: line.text || ' ' });
+}
+
+function artifactButton(artifact) {
+  return el('button', {
+    type: 'button', class: 'btn', title: artifact.path,
+    text: artifact.kind + ' · ' + artifact.path.split('/').pop(),
+    onclick: function (e) { e.stopPropagation(); window.open('/view?path=' + encodeURIComponent(artifact.path), '_blank'); }
+  });
+}
+
+function outputSection(key, job) {
+  var running = job.status === 'running';
+  var open = outIsOpen(key, job);
+  var lines = S.jobLines[job.id];
+  var count = lines ? lines.length : (job.lineCount || 0);
+  var section = el('div', { class: 'card', style: 'margin-top:var(--s3)', onclick: function (e) { e.stopPropagation(); } });
+  var toggle = el('button', {
     type: 'button', class: 'btn', 'aria-expanded': open ? 'true' : 'false',
-    text: (open ? '▾' : '▸') + ' Command output (' + (job.lineCount || 0) + ' lines)',
+    text: (open ? '▾' : '▸') + ' Command output (' + count + ' lines)',
     onclick: function () {
-      S.outOpen[runId] = !open;
-      if (!open && !S.jobLines[job.id]) {
+      // A finished job's lines are fetched once, on first expand — the jobs
+      // poll deliberately strips them, so the list stays light.
+      if (!open && !running && !S.jobLines[job.id]) {
         api('/api/jobs/' + encodeURIComponent(job.id)).then(function (body) {
           S.jobLines[job.id] = (body.job && body.job.lines) || [];
           render();
@@ -1317,28 +1416,162 @@ function outputSection(runId, job) {
           render();
         });
       }
-      render();
+      toggleOut(key, job);
     }
-  }));
+  });
+  section.appendChild(toggle);
   if (open) {
-    var lines = S.jobLines[job.id];
     var pane = el('div', { class: 'mono', style: 'max-height:300px;overflow:auto;padding:8px 12px;white-space:pre-wrap;font-size:var(--fs-xs)' });
-    if (!lines) {
+    if (!lines && !running) {
       pane.appendChild(el('div', { style: 'color:var(--faint)', text: 'reading the output…' }));
     } else {
-      lines.forEach(function (line) {
-        pane.appendChild(el('div', {
-          style: line.stream === 'err' ? 'color:var(--bad)' : null,
-          text: line.text
-        }));
-      });
+      (lines || []).forEach(function (line) { pane.appendChild(outLine(line)); });
     }
     section.appendChild(pane);
+    if (running) {
+      // Live: subscribe once, and let the stream write onto this pane in
+      // place. The artifacts the run announces land as buttons as they arrive.
+      var arts = el('div', { class: 'acts', style: 'padding:8px 12px' });
+      artifactsFor(job).forEach(function (artifact) { arts.appendChild(artifactButton(artifact)); });
+      section.appendChild(arts);
+      S.outLive.push({ jobId: job.id, pane: pane, toggle: toggle, arts: arts });
+      streamJob(job.id);
+      setTimeout(function () { pane.scrollTop = pane.scrollHeight; }, 0);
+    }
   }
   return section;
 }
 
+function artifactsFor(job) {
+  return S.jobArts[job.id] || job.artifacts || [];
+}
+
+/** The live panes currently on screen for one job; stale ones fall away here. */
+function mountedOut(jobId) {
+  S.outLive = S.outLive.filter(function (out) { return out.pane.isConnected; });
+  return S.outLive.filter(function (out) { return out.jobId === jobId; });
+}
+
+/** Rebuild every mounted pane for a job from the buffered lines (after a replay). */
+function repaintOut(jobId) {
+  mountedOut(jobId).forEach(function (out) {
+    clear(out.pane);
+    (S.jobLines[jobId] || []).forEach(function (line) { out.pane.appendChild(outLine(line)); });
+    out.pane.scrollTop = out.pane.scrollHeight;
+    out.toggle.textContent = '▾ Command output (' + (S.jobLines[jobId] || []).length + ' lines)';
+    clear(out.arts);
+    (S.jobArts[jobId] || []).forEach(function (artifact) { out.arts.appendChild(artifactButton(artifact)); });
+  });
+}
+
+/**
+ * One EventSource per running job, opened when its output section is on
+ * screen and closed when the job finishes. The replay event fills in whatever
+ * a reloaded page missed; every later line is appended straight onto the
+ * mounted pane — never through render(), because lines arrive far faster than
+ * the poll and rebuilding the page per line would steal the click that lands
+ * in the same tick. Same reasoning that keeps progress outside dataSignature().
+ */
+function streamJob(jobId) {
+  if (S.streams[jobId]) return;
+  var es = new EventSource('/api/jobs/' + encodeURIComponent(jobId) + '/events');
+  S.streams[jobId] = es;
+  es.addEventListener('replay', function (event) {
+    var data = JSON.parse(event.data);
+    S.jobLines[jobId] = data.lines.slice();
+    S.jobArts[jobId] = data.artifacts.slice();
+    repaintOut(jobId);
+  });
+  es.addEventListener('line', function (event) {
+    var line = JSON.parse(event.data);
+    (S.jobLines[jobId] = S.jobLines[jobId] || []).push(line);
+    mountedOut(jobId).forEach(function (out) {
+      out.pane.appendChild(outLine(line));
+      out.pane.scrollTop = out.pane.scrollHeight;
+      out.toggle.textContent = '▾ Command output (' + S.jobLines[jobId].length + ' lines)';
+    });
+  });
+  es.addEventListener('artifact', function (event) {
+    var artifact = JSON.parse(event.data);
+    (S.jobArts[jobId] = S.jobArts[jobId] || []).push(artifact);
+    mountedOut(jobId).forEach(function (out) { out.arts.appendChild(artifactButton(artifact)); });
+  });
+  es.addEventListener('done', function () {
+    es.close();
+    delete S.streams[jobId];
+    // The proof has landed (or the job died); the poll's re-render swaps the
+    // live card for the finished one, whose output starts collapsed.
+    refresh();
+  });
+}
+
+/* ------------------------------------------------ saved repositories */
+
+/**
+ * Machinery › Repositories: scan a repo once, and every verification can
+ * ground itself in it via the launcher's dropdown. Saving runs the
+ * whitelisted "context add" — a job like any other, so the scan's output
+ * lands in the ordinary drawer and the panel reimplements nothing.
+ */
+function renderRepos(main) {
+  main.appendChild(pageHead('Repositories',
+    'Code wowlidator has scanned and remembers. Select one on a run and the authored steps ground themselves in what that code declares — routes, endpoints, tables. Scanning is static: no model call, no browser.',
+    startButton()));
+
+  var path = el('input', { type: 'text', class: 'mono', style: 'flex:1',
+    placeholder: '/absolute/path/to/the/app-under-test' });
+  var save = el('button', {
+    type: 'button', class: 'btn accent', text: 'Scan and save',
+    onclick: function () {
+      var value = path.value.trim();
+      if (!value) { toast('give the repository path to scan'); return; }
+      post('context-add', { path: value }, null);
+    }
+  });
+  main.appendChild(el('div', { class: 'card', style: 'padding:16px;margin-bottom:16px' }, [
+    el('div', { style: 'display:flex;gap:8px;align-items:center' }, [path, save]),
+    el('div', { class: 'sub', style: 'margin:8px 0 0', text:
+      'Re-scanning the same path updates it in place. An OpenAPI spec or DB schema can be added from the command panel’s "Save a repository" form.' })
+  ]));
+
+  if ((S.repos || []).length === 0) {
+    main.appendChild(el('div', { class: 'mono', style: 'padding:12px',
+      text: 'nothing saved yet — scan the repository of the site under test above' }));
+    return;
+  }
+
+  var body = el('tbody');
+  (S.repos || []).forEach(function (repo) {
+    body.appendChild(el('tr', {}, [
+      el('td', {}, [el('code', { text: repo.slug })]),
+      el('td', { class: 'mono', text: repo.path }),
+      el('td', { class: 'col-r mono', text: String(repo.nodes) }),
+      el('td', { class: 'mono', text: (repo.indexedAt || '').slice(0, 16).replace('T', ' ') }),
+      el('td', { class: 'col-r' }, [
+        el('button', { type: 'button', class: 'link', text: 'Re-scan',
+          onclick: function () { post('context-add', { path: repo.path }, null); } })
+      ])
+    ]));
+  });
+  main.appendChild(el('table', { class: 'tbl' }, [
+    el('thead', {}, [el('tr', {}, [
+      el('th', { text: 'Repository' }),
+      el('th', { text: 'Path' }),
+      el('th', { class: 'col-r', style: 'width:90px', text: 'Nodes' }),
+      el('th', { style: 'width:150px', text: 'Scanned' }),
+      el('th', { style: 'width:90px' })
+    ])]),
+    body
+  ]));
+}
+
 /* --------------------------------------------------------- checks table */
+
+/* Mirror of BACKEND_TIER_ACTIONS in engine/proof-bundle.ts — the client is a
+   template string and cannot import it, so tests/wow-ui.test.ts pins every
+   member of the real set against this page to stop the two drifting apart. */
+var BACKEND_ACTIONS = { request: 1, expectStatus: 1, expectJson: 1, expectHeader: 1,
+  expectCalls: 1, dbSnapshot: 1, expectDbRow: 1, expectDbDelta: 1, expectDbUnchanged: 1, expectDbCalled: 1 };
 
 function checksTable(bundle) {
   if (!bundle.steps || bundle.steps.length === 0) {
@@ -1352,6 +1585,13 @@ function checksTable(bundle) {
     var failedCalls = blockers(step);
 
     var what = el('td', {}, [document.createTextNode(stepClaim(step))]);
+    // "It failed" routes to different people depending on the side it
+    // exercised — same split summary.frontend/backend makes for the run.
+    if (BACKEND_ACTIONS[step.action] === 1) {
+      what.appendChild(el('span', { class: 'tag',
+        title: 'a backend step — it exercised HTTP, observed traffic, or the database, not the page',
+        text: 'backend' }));
+    }
     if (family) what.appendChild(el('span', { class: 'tag', title: 'the kind of problem this is — a label from the run, not the raw evidence', text: family }));
 
     var how = el('td', { style: 'color:var(--muted)' });
@@ -1433,16 +1673,17 @@ function openEvidence(bundle, step, tab) {
 }
 
 function closeDrawer() {
-  if (S.es) { S.es.close(); S.es = null; }
   S.drawer = null;
   renderDrawer();
 }
 
+/* The drawer shows step evidence only. A job's console lives under its own
+   card — see outputSection — so there is exactly one way output is shown. */
 function renderDrawer() {
   var host = byId('drawer');
   clear(host);
   if (!S.drawer) return;
-  var panel = S.drawer.kind === 'evidence' ? evidencePanel(S.drawer) : jobPanel(S.drawer);
+  var panel = evidencePanel(S.drawer);
   var backdrop = el('div', { class: 'drawer-backdrop', onclick: function (e) { if (e.target === backdrop) closeDrawer(); } }, [panel]);
   host.appendChild(backdrop);
 }
@@ -1703,86 +1944,6 @@ function evidenceFix(panel, bundle, step) {
   }
 }
 
-/* ------------------------------------------------------------ job drawer */
-
-function openJobDrawer(job) {
-  S.drawer = { kind: 'job', job: job, lines: [], status: job.status, artifacts: [] };
-  renderDrawer();
-
-  if (S.es) S.es.close();
-  var es = new EventSource('/api/jobs/' + encodeURIComponent(job.id) + '/events');
-  S.es = es;
-  es.addEventListener('replay', function (event) {
-    var data = JSON.parse(event.data);
-    if (!S.drawer || S.drawer.kind !== 'job') return;
-    S.drawer.lines = data.lines.slice();
-    S.drawer.artifacts = data.artifacts.slice();
-    S.drawer.status = data.status;
-    renderDrawer();
-  });
-  es.addEventListener('line', function (event) {
-    if (!S.drawer || S.drawer.kind !== 'job') return;
-    S.drawer.lines.push(JSON.parse(event.data));
-    renderDrawer();
-  });
-  es.addEventListener('artifact', function (event) {
-    if (!S.drawer || S.drawer.kind !== 'job') return;
-    S.drawer.artifacts.push(JSON.parse(event.data));
-    renderDrawer();
-  });
-  es.addEventListener('done', function (event) {
-    var data = JSON.parse(event.data);
-    if (S.drawer && S.drawer.kind === 'job') { S.drawer.status = data.status; renderDrawer(); }
-    es.close();
-    if (S.es === es) S.es = null;
-    refresh();
-  });
-}
-
-function jobPanel(view) {
-  var job = view.job;
-  var panel = el('aside', { class: 'drawer', role: 'dialog', 'aria-label': 'Run output', onclick: function (e) { e.stopPropagation(); } });
-  panel.appendChild(el('div', { class: 'top' }, [
-    el('b', { text: 'Run output' }),
-    el('span', { class: 'chip ' + (view.status === 'running' ? 'running' : view.status === 'passed' ? 'verified' : 'feedback'), text: view.status }),
-    el('button', { type: 'button', class: 'x', 'aria-label': 'Close', text: '✕', onclick: closeDrawer })
-  ]));
-  panel.appendChild(el('div', { class: 'claim', text: job.title }));
-
-  panel.appendChild(el('div', { class: 'cap', text: 'How this would have been typed' }));
-  panel.appendChild(el('div', { class: 'repro', text: job.commandLine }));
-
-  panel.appendChild(el('div', { class: 'cap', text: 'Output' }));
-  var out = el('div', { class: 'repro', style: 'max-height:46vh' });
-  view.lines.forEach(function (line) {
-    out.appendChild(el('div', { style: line.stream === 'err' ? 'color:var(--bad)' : null, text: line.text || ' ' }));
-  });
-  panel.appendChild(out);
-  // Follow the tail: the interesting line of a live run is the last one.
-  setTimeout(function () { out.scrollTop = out.scrollHeight; }, 0);
-
-  if (view.artifacts.length > 0) {
-    panel.appendChild(el('div', { class: 'cap', text: 'What it wrote' }));
-    var acts = el('div', { class: 'acts' });
-    view.artifacts.forEach(function (artifact) {
-      acts.appendChild(el('button', {
-        type: 'button', class: 'btn', title: artifact.path,
-        text: artifact.kind + ' · ' + artifact.path.split('/').pop(),
-        onclick: function () { window.open('/view?path=' + encodeURIComponent(artifact.path), '_blank'); }
-      }));
-    });
-    panel.appendChild(acts);
-  }
-
-  panel.appendChild(el('div', { class: 'acts' }, [
-    el('button', { type: 'button', class: 'btn', text: 'Copy the command', onclick: function () { copy(job.commandLine, 'command'); } }),
-    view.status === 'running'
-      ? el('button', { type: 'button', class: 'btn', text: 'Stop', onclick: function () { stopJob(job.id); } })
-      : null
-  ]));
-  return panel;
-}
-
 /* -------------------------------------------------------------- history */
 
 function renderHistory(main) {
@@ -1801,8 +1962,9 @@ function renderHistory(main) {
     live.forEach(function (job) {
       pending.appendChild(el('div', {
         class: 'row', role: 'button', tabindex: '0',
-        onclick: function () { openJobDrawer(job); },
-        onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openJobDrawer(job); } }
+        'aria-expanded': outIsOpen(job.id, job) ? 'true' : 'false',
+        onclick: function () { toggleOut(job.id, job); },
+        onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleOut(job.id, job); } }
       }, [
         loopRail(['run', 'empty', 'empty']),
         el('div', { class: 'task-cell' }, [
@@ -1813,9 +1975,10 @@ function renderHistory(main) {
         progressBar(job),
         el('span', { class: 'when', text: 'started ' + shortTime(job.startedAt) }),
         el('div', { class: 'actions', onclick: function (e) { e.stopPropagation(); } }, [
-          el('button', { type: 'button', class: 'btn', text: 'Output', onclick: function () { openJobDrawer(job); } })
+          el('button', { type: 'button', class: 'btn', text: 'Output', onclick: function () { toggleOut(job.id, job); } })
         ])
       ]));
+      pending.appendChild(el('div', { class: 'detail' }, [outputSection(job.id, job)]));
     });
     main.appendChild(pending);
   }
@@ -2405,7 +2568,11 @@ function renderReports(main) {
 /* --------------------------------------------------------- start a check */
 
 /**
- * The launch modal.
+ * The launcher — an inline, expandable section in the page flow, directly
+ * under the "Runs and proof" header. It used to be a modal; the same form now
+ * opens in place, because starting a verification is part of working the page,
+ * not an interruption of it — and an overlay hid the runs it was about to add
+ * to. Collapsing it resets everything, exactly as closing the modal did.
  *
  * Nobody picks a flow file here, and that is the point: a flow is something
  * wowlidator writes, not something a person maintains by hand. What a team
@@ -2413,7 +2580,10 @@ function renderReports(main) {
  *
  *   Add Context   background the model may read — an API doc, a design note,
  *                 a page saved as HTML. Stored, reusable, and never a source of
- *                 claims. Saving one starts nothing.
+ *                 claims. Saving one starts nothing. (The app's repository is
+ *                 context too, but it is MEMORY, not an upload: Machinery ›
+ *                 Repositories scans and remembers it, and the Catalog and
+ *                 Describe tabs offer the saved repos in a dropdown.)
  *   Add Catalog   the document that says what must be true. Its claims are
  *                 listed first, in a gate you tick through, and only what
  *                 survives becomes steps and a run.
@@ -2425,8 +2595,13 @@ function renderReports(main) {
  * sentences in front of a person in between is what stops a claim the model
  * read out of a heading from quietly becoming a green test.
  */
-function openStartModal() {
-  S.modal = {
+function toggleLauncher() {
+  if (S.launcher) { closeLauncher(); return; }
+  openLauncher();
+}
+
+function openLauncher() {
+  S.launcher = {
     mode: 'catalog',
     // Add Context
     ctxName: '',
@@ -2443,9 +2618,11 @@ function openStartModal() {
     reading: false,
     // Describe
     describe: '',
+    scope: 'unit',     /* unit | e2e — see --scope; e2e is enforced, not hinted */
     // shared
     focus: '',
     url: '',
+    repo: '',          /* slug of a saved repository to ground the run in */
     advanced: false,
     video: 'on',
     screenshots: 'auto',
@@ -2455,19 +2632,26 @@ function openStartModal() {
     busy: false
   };
   loadDocuments();
-  renderModal();
+  // The section lives on the runs view; a start button pressed anywhere else
+  // (the empty repos page, say) goes there, where the form actually is.
+  if (S.view !== 'runs') { show('runs'); return; }
+  render();
 }
 
-function closeModal() { S.modal = null; renderModal(); }
+/** Collapsing resets the whole form — the same clean slate closing the modal gave. */
+function closeLauncher() {
+  S.launcher = null;
+  render();
+}
 
 function loadDocuments() {
   return api('/api/documents?kind=context').then(function (body) {
     S.contextDocs = body.documents;
-    renderModal();
+    renderLauncher();
   })['catch'](function () {});
 }
 
-function modalField(label, optional, control, hint) {
+function formField(label, optional, control, hint) {
   return el('div', {}, [
     el('label', {}, [
       document.createTextNode(label),
@@ -2479,6 +2663,12 @@ function modalField(label, optional, control, hint) {
 }
 
 var DOCUMENT_ACCEPT = '.md,.markdown,.csv,.tsv,.html,.htm,.txt,.text,.log,.json,.yaml,.yml,.xlsx,.xlsm,.pdf,.mmd,.mermaid,.puml,.plantuml';
+/* Catalogs additionally take an IMAGE (or SVG render) of a sequence diagram —
+   a model transcribes it to Mermaid text first (pixels for rasters, markup
+   for .svg), and the transcript (not the picture) is what the gate reviews
+   and the run reads. Context documents stay text: the server refuses an
+   image there, so the picker must not offer one. */
+var CATALOG_ACCEPT = DOCUMENT_ACCEPT + ',.png,.jpg,.jpeg,.webp,.svg';
 
 /** Read a picked file as base64 without ever holding it as a string twice. */
 function readFileAsBase64(file) {
@@ -2512,24 +2702,30 @@ function renderContextTab(box, M) {
     onchange: function (e) {
       var chosen = e.target.files && e.target.files[0];
       if (!chosen) return;
-      M.busy = true; M.error = ''; renderModal();
+      M.busy = true; M.error = ''; renderLauncher();
       readFileAsBase64(chosen)
         .then(function (base64) { return saveDocument('context', { name: chosen.name, contentBase64: base64 }); })
         .then(function () { M.busy = false; toast('context added'); return loadDocuments(); })
-        ['catch'](function (error) { M.busy = false; M.error = error.message; renderModal(); });
+        ['catch'](function (error) { M.busy = false; M.error = error.message; renderLauncher(); });
     }
   });
-  box.appendChild(modalField('Upload a document', false, file,
+  box.appendChild(formField('Upload a document', false, file,
     'md · csv · html · txt · json · yaml · xlsx · pdf · mmd · puml'));
 
   var name = el('input', { type: 'text', placeholder: 'leave-balance-api', value: M.ctxName,
     oninput: function (e) { M.ctxName = e.target.value; syncSubmit(); } });
-  box.appendChild(modalField('…or name some text and paste it', false, name));
+  box.appendChild(formField('…or name some text and paste it', false, name));
 
   var text = el('textarea', { rows: '5', placeholder: 'Paste anything that explains the application: endpoints, terms, rules.',
     oninput: function (e) { M.ctxText = e.target.value; syncSubmit(); } });
   text.value = M.ctxText;
-  box.appendChild(modalField('The text', false, text));
+  box.appendChild(formField('The text', false, text));
+
+  // The code itself is context too, but it is remembered rather than
+  // re-uploaded: save it once under Machinery › Repositories, then ground any
+  // run in it from the dropdown on the Catalog and Describe tabs.
+  box.appendChild(el('div', { class: 'sub', style: 'margin-top:8px', text:
+    'The repository of the site under test is saved elsewhere — Machinery › Repositories scans and remembers it, and any run can then select it.' }));
 
   box.appendChild(contextList(M, false));
 }
@@ -2549,7 +2745,7 @@ function contextList(M, attachable) {
     if (attachable) {
       var tick = el('input', { type: 'checkbox', onchange: function () {
         M.attach[doc.path] = !M.attach[doc.path];
-        renderModal();
+        renderLauncher();
       } });
       tick.checked = M.attach[doc.path] === true;
       row.appendChild(tick);
@@ -2581,30 +2777,30 @@ function renderCatalogTab(box, M) {
     'A document of things that must be true. wowlidator reads out its claims first — nothing is tested until you have seen them.' }));
 
   var file = el('input', {
-    type: 'file', accept: DOCUMENT_ACCEPT,
+    type: 'file', accept: CATALOG_ACCEPT,
     onchange: function (e) {
       var chosen = e.target.files && e.target.files[0];
       if (!chosen) return;
-      M.busy = true; M.error = ''; M.claims = null; renderModal();
+      M.busy = true; M.error = ''; M.claims = null; renderLauncher();
       readFileAsBase64(chosen)
         .then(function (base64) { return saveDocument('catalog', { name: chosen.name, contentBase64: base64 }); })
         .then(function (doc) {
-          M.catalog = doc; M.catName = doc.name; M.busy = false; renderModal();
+          M.catalog = doc; M.catName = doc.name; M.busy = false; renderLauncher();
         })
-        ['catch'](function (error) { M.busy = false; M.error = error.message; renderModal(); });
+        ['catch'](function (error) { M.busy = false; M.error = error.message; renderLauncher(); });
     }
   });
-  box.appendChild(modalField('The catalog', false, file,
-    'md · csv · html · txt · json · yaml · xlsx · pdf · mmd · puml — text is read out of it and sent to the model'));
+  box.appendChild(formField('The catalog', false, file,
+    'md · csv · html · txt · json · yaml · xlsx · pdf · mmd · puml — text is read out of it and sent to the model. A png/jpg/webp/svg of a sequence diagram works too: a model transcribes it to Mermaid first (pixels for pictures, markup for svg), and the claims below come from that transcript.'));
 
   var name = el('input', { type: 'text', placeholder: 'leave-balance-checks', value: M.catName,
     oninput: function (e) { M.catName = e.target.value; syncSubmit(); } });
-  box.appendChild(modalField('…or name some text and paste it', false, name));
+  box.appendChild(formField('…or name some text and paste it', false, name));
 
   var text = el('textarea', { rows: '4', placeholder: '- the balance table renders with one row per leave type\n- filtering by month narrows the rows',
     oninput: function (e) { M.catText = e.target.value; M.claims = null; syncSubmit(); } });
   text.value = M.catText;
-  box.appendChild(modalField('The text', false, text));
+  box.appendChild(formField('The text', false, text));
 
   if (M.catalog) {
     box.appendChild(el('div', { class: 'mono', style: 'margin-top:6px' }, [
@@ -2625,7 +2821,7 @@ function renderCatalogTab(box, M) {
 
   // While it runs, and only while it runs. A bar left on screen after the work
   // finished is furniture; this one is replaced by the claims it produced.
-  if (M.reading) box.appendChild(modalProgress(M));
+  if (M.reading) box.appendChild(readingProgress(M));
 
   if (M.claims) box.appendChild(claimsGate(M));
 
@@ -2645,7 +2841,7 @@ function renderCatalogTab(box, M) {
  * Before the first phase line arrives there is nothing to divide, so it says
  * so and paces instead of claiming a fraction.
  */
-function modalProgress(M) {
+function readingProgress(M) {
   var progress = M.progress || {};
   var pct = typeof progress.percent === 'number' ? progress.percent : null;
 
@@ -2704,7 +2900,7 @@ function claimsGate(M) {
         lane.plane = e.target.value;
         lane.guessed = false;
         recomputeLanes(M);
-        renderModal();
+        renderLauncher();
       } });
       ['user', 'page', 'backend', 'external'].forEach(function (plane) {
         planeSelect.appendChild(el('option', { value: plane, selected: plane === lane.plane, text: plane }));
@@ -2725,7 +2921,7 @@ function claimsGate(M) {
     var row = el('label', { class: 'gate line' + (M.cut[index] ? ' cut' : '') });
     var tick = el('input', { type: 'checkbox', onchange: function () {
       M.cut[index] = !M.cut[index];
-      renderModal();
+      renderLauncher();
     } });
     tick.checked = !M.cut[index];
     row.appendChild(tick);
@@ -2774,7 +2970,7 @@ function countApproved(M) {
 
 /** Phase one: ask the CLI what the document claims, then read the file it wrote. */
 function readClaims() {
-  var M = S.modal;
+  var M = S.launcher;
   M.error = '';
 
   ensureCatalogStored()
@@ -2783,7 +2979,7 @@ function readClaims() {
       M.claimsPath = '.wowlidator/catalogs/' + doc.name.replace(/\.[^.]+$/, '') + '.claims.json';
       M.reading = true;
       M.progress = { percent: null, phase: 'reading the catalog…' };
-      renderModal();
+      renderLauncher();
       return api('/api/jobs', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -2799,7 +2995,7 @@ function readClaims() {
     .then(function (body) {
       return awaitJob(body.job.id, function (progress) {
         M.progress = progress;
-        if (M.reading) renderModal();
+        if (M.reading) renderLauncher();
       });
     })
     .then(function (job) {
@@ -2807,7 +3003,7 @@ function readClaims() {
         throw new Error('reading the catalog failed — open Runs and proof to see the output of "' + job.title + '"');
       }
       M.progress = { percent: 95, phase: 'reading the claims it wrote' };
-      renderModal();
+      renderLauncher();
       return api('/api/file?path=' + encodeURIComponent(M.claimsPath));
     })
     .then(function (body) {
@@ -2815,19 +3011,19 @@ function readClaims() {
       M.cut = {};
       M.reading = false;
       M.progress = null;
-      renderModal();
+      renderLauncher();
     })
     ['catch'](function (error) {
       M.reading = false;
       M.progress = null;
       M.error = error.message;
-      renderModal();
+      renderLauncher();
     });
 }
 
 /** The catalog as a file on disk, whether it was uploaded or typed. */
 function ensureCatalogStored() {
-  var M = S.modal;
+  var M = S.launcher;
   if (M.catalog && M.catText.trim() === '') return Promise.resolve(M.catalog);
   if (M.catText.trim() === '') return Promise.reject(new Error('choose a file or paste the catalog text'));
   if (M.catName.trim() === '') return Promise.reject(new Error('give the catalog a name'));
@@ -2839,7 +3035,7 @@ function attachedContext(M) {
 }
 
 /**
- * Poll one job to the end. The modal stays put, so there is no stream to join.
+ * Poll one job to the end. The launcher stays put, so there is no stream to join.
  *
  * onProgress fires on every poll, including the last: a job that finishes
  * between two polls would otherwise leave the bar showing whatever it read
@@ -2861,23 +3057,34 @@ function awaitJob(id, onProgress) {
   });
 }
 
-/* -------------------------------------------------------------- the modal */
+/* ----------------------------------------------- the inline launcher form */
 
-function renderModal() {
-  var host = byId('modal');
+/**
+ * Rebuild the launcher host in place. Input handlers call this instead of
+ * render() so a keystroke never rebuilds the rest of the page; the host is
+ * only present on the runs view, and state simply waits when it is not.
+ */
+function renderLauncher() {
+  var host = byId('launcher');
+  if (!host) return;
   clear(host);
-  if (!S.modal) return;
-  var M = S.modal;
+  if (!S.launcher) return;
+  host.appendChild(launcherBox(S.launcher));
+}
 
-  var box = el('div', { class: 'modal', role: 'dialog', 'aria-labelledby': 'mt', onclick: function (e) { e.stopPropagation(); } });
-  box.appendChild(el('h2', { id: 'mt', text: 'Start verification' }));
+function launcherBox(M) {
+  var box = el('section', { class: 'launcher', 'aria-labelledby': 'lt' });
+  box.appendChild(el('div', { class: 'top' }, [
+    el('h2', { id: 'lt', text: 'Start verification' }),
+    el('button', { type: 'button', class: 'x', 'aria-label': 'Close', text: '✕', disabled: M.busy, onclick: closeLauncher })
+  ]));
   box.appendChild(el('div', { class: 'sub', text: 'wowlidator writes the test; you say what must be true. Everything here runs the CLI — the command it builds is shown while it runs.' }));
 
   var seg = el('div', { class: 'segmented' });
   [['context', 'Add Context'], ['catalog', 'Add Catalog'], ['describe', 'Describe']].forEach(function (pair) {
     seg.appendChild(el('button', {
       type: 'button', class: 'btn' + (M.mode === pair[0] ? ' primary' : ''),
-      text: pair[1], onclick: function () { M.mode = pair[0]; M.error = ''; renderModal(); }
+      text: pair[1], onclick: function () { M.mode = pair[0]; M.error = ''; renderLauncher(); }
     }));
   });
   box.appendChild(seg);
@@ -2888,25 +3095,62 @@ function renderModal() {
     var describe = el('textarea', { rows: '3', placeholder: 'check that pagination is disabled when there is a single page — or paste a URL to write tests for the whole page',
       oninput: function (e) { M.describe = e.target.value; syncSubmit(); } });
     describe.value = M.describe;
-    box.appendChild(modalField('What should be proved?', false, describe,
+    box.appendChild(formField('What should be proved?', false, describe,
       'A URL generates tests for that page; anything else is one test to write, against the page below.'));
+
+    /* Radios, not a select: two mutually exclusive answers where the choice
+       changes what the run DOES — e2e reads a second page and refuses a flow
+       that never leaves the first — so both options stay on screen with their
+       consequence next to them, rather than one hiding behind a dropdown. */
+    var scopes = el('div', {});
+    [['unit', 'Unit test', 'One thing, on the page below. Nothing navigates away.'],
+     ['e2e', 'End-to-end', 'The whole journey: reach the page as a user does, act, verify where it lands. Reads the destination page too, and refuses a flow that stays put.']
+    ].forEach(function (choice) {
+      var input = el('input', {
+        type: 'radio', name: 'launch-scope', value: choice[0],
+        checked: M.scope === choice[0],
+        onchange: function () { M.scope = choice[0]; renderLauncher(); }
+      });
+      scopes.appendChild(el('label', { style: 'display:flex;gap:8px;align-items:flex-start;margin-top:6px;font-weight:400' }, [
+        input,
+        el('span', {}, [
+          el('span', { text: choice[1] }),
+          el('span', { class: 'mono', style: 'display:block;opacity:.75', text: choice[2] })
+        ])
+      ]));
+    });
+    box.appendChild(formField('How far should it reach?', false, scopes));
   }
 
   if (M.mode !== 'context') {
     var focus = el('textarea', { rows: '2', placeholder: 'the filter controls',
       oninput: function (e) { M.focus = e.target.value; } });
     focus.value = M.focus;
-    box.appendChild(modalField('Anything to look at especially', true, focus));
+    box.appendChild(formField('Anything to look at especially', true, focus));
 
     var url = el('input', { type: 'text', class: 'mono', placeholder: 'http://localhost:3000/some/page',
       value: M.url, oninput: function (e) { M.url = e.target.value; } });
-    box.appendChild(modalField('Page to prove it against', true, url,
+    box.appendChild(formField('Page to prove it against', true, url,
       'Strongly recommended: with it the selectors come from the page, not from the document.'));
+
+    // Any run type can ground itself in scanned code — the memory lives under
+    // Machinery › Repositories, selection lives here, per run.
+    if ((S.repos || []).length > 0) {
+      var repoSel = el('select', { onchange: function (e) { M.repo = e.target.value; } });
+      repoSel.appendChild(el('option', { value: '', selected: M.repo === '',
+        text: 'none — the page and the document alone' }));
+      (S.repos || []).forEach(function (repo) {
+        repoSel.appendChild(el('option', { value: repo.slug, selected: M.repo === repo.slug,
+          text: repo.slug + ' · ' + repo.nodes + ' nodes' }));
+      });
+      box.appendChild(formField('Ground in a saved repository', true, repoSel,
+        'The repo’s indexed routes, endpoints and tables ride along in the authoring prompt, clearly labelled as what the code declares. Save one under Machinery › Repositories.'));
+    }
 
     box.appendChild(el('button', {
       type: 'button', class: 'btn', style: 'margin-top:8px',
       text: (M.advanced ? '▾' : '▸') + ' Options for this run only — nothing here is stored',
-      onclick: function () { M.advanced = !M.advanced; renderModal(); }
+      onclick: function () { M.advanced = !M.advanced; renderLauncher(); }
     }));
     if (M.advanced) {
       var adv = el('div', { class: 'gate', style: 'max-height:none' });
@@ -2914,26 +3158,26 @@ function renderModal() {
       ['on', 'off'].forEach(function (mode) {
         film.appendChild(el('option', { value: mode, selected: mode === M.video, text: mode }));
       });
-      adv.appendChild(modalField('Record the run', false, film,
+      adv.appendChild(formField('Record the run', false, film,
         'Films the run with a pointer drawn into the page, so you can see the clicks — a still only shows the page either side of one. Recording needs its own browser context, so a filmed run does not inherit cookies from a session you signed into by hand.'));
 
       var shots = el('select', { onchange: function (e) { M.screenshots = e.target.value; } });
       ['auto', 'all', 'on-event', 'on-failure', 'off'].forEach(function (mode) {
         shots.appendChild(el('option', { value: mode, selected: mode === M.screenshots, text: mode }));
       });
-      adv.appendChild(modalField('Stills', false, shots,
+      adv.appendChild(formField('Stills', false, shots,
         'auto follows the recording: failures only while filming, every step when not. all gives both — the same run twice, at several times the size.'));
 
       var policy = el('select', { onchange: function (e) { M.policy = e.target.value; } });
       ['read-only', 'forms', 'mutations'].forEach(function (mode) {
         policy.appendChild(el('option', { value: mode, selected: mode === M.policy, text: mode }));
       });
-      adv.appendChild(modalField('What the written test may do', false, policy,
+      adv.appendChild(formField('What the written test may do', false, policy,
         'read-only never submits. forms submits invalid input to exercise validation. Nothing deletes, at any tier.'));
 
       var wait = el('input', { type: 'text', class: 'mono', placeholder: 'http://localhost:3000', value: M.waitFor,
         oninput: function (e) { M.waitFor = e.target.value; } });
-      adv.appendChild(modalField('Wait for this to answer first', true, wait, 'For a dev server that is still booting.'));
+      adv.appendChild(formField('Wait for this to answer first', true, wait, 'For a dev server that is still booting.'));
       box.appendChild(adv);
     }
   }
@@ -2943,29 +3187,28 @@ function renderModal() {
   var submit = el('button', {
     type: 'button', class: 'btn primary', disabled: M.busy || M.reading || submitBlocked() !== null,
     title: submitBlocked(), text: submitLabel(M),
-    onclick: submitModal
+    onclick: submitLauncher
   });
   M.submitNode = submit;
   box.appendChild(el('div', { class: 'acts' }, [
-    el('button', { type: 'button', class: 'btn', text: 'Close', disabled: M.busy, onclick: closeModal }),
+    el('button', { type: 'button', class: 'btn', text: 'Close', disabled: M.busy, onclick: closeLauncher }),
     submit
   ]));
 
-  var backdrop = el('div', { class: 'overlay-backdrop', onclick: function (e) { if (e.target === backdrop) closeModal(); } }, [box]);
-  host.appendChild(backdrop);
+  return box;
 }
 
 /**
  * Keep the submit button honest while someone types.
  *
  * Its label and its disabled state are derived from fields that change on every
- * keystroke, and re-rendering the modal to update them would take the caret and
+ * keystroke, and re-rendering the launcher to update them would take the caret and
  * the focus with it. So the button — the only node whose state depends on what
  * is currently typed — is updated in place instead. Every oninput that can
  * change the answer calls this.
  */
 function syncSubmit() {
-  var M = S.modal;
+  var M = S.launcher;
   if (!M || !M.submitNode) return;
   var blocked = submitBlocked();
   M.submitNode.disabled = M.busy || M.reading || blocked !== null;
@@ -2984,7 +3227,7 @@ function submitLabel(M) {
 }
 
 function submitBlocked() {
-  var M = S.modal;
+  var M = S.launcher;
   if (M.mode === 'context') {
     if (M.ctxText.trim() === '') return 'paste some text, or upload a file above';
     if (M.ctxName.trim() === '') return 'give it a name';
@@ -2998,19 +3241,19 @@ function submitBlocked() {
   return M.describe.trim() ? null : 'say what should be proved';
 }
 
-function submitModal() {
-  var M = S.modal;
+function submitLauncher() {
+  var M = S.launcher;
   M.error = '';
 
   if (M.mode === 'context') {
-    M.busy = true; renderModal();
+    M.busy = true; renderLauncher();
     saveDocument('context', { name: M.ctxName.trim() + '.md', text: M.ctxText })
       .then(function (doc) {
         M.busy = false; M.ctxText = ''; M.ctxName = '';
         toast('stored ' + doc.name);
         return loadDocuments();
       })
-      ['catch'](function (error) { M.busy = false; M.error = error.message; renderModal(); });
+      ['catch'](function (error) { M.busy = false; M.error = error.message; renderLauncher(); });
     return;
   }
 
@@ -3018,13 +3261,17 @@ function submitModal() {
   if (M.video !== 'on') extras.video = M.video;
   if (M.screenshots !== 'auto') extras.screenshots = M.screenshots;
   if (M.waitFor.trim()) extras['wait-for'] = M.waitFor.trim();
+  if (M.repo) extras.repo = M.repo;
 
   if (M.mode === 'describe') {
     var go = { target: M.describe.trim() };
     if (M.url.trim()) go.url = M.url.trim();
     if (M.focus.trim()) go.target = go.target + ' — ' + M.focus.trim();
     if (M.policy !== 'forms') go.policy = M.policy;
-    M.busy = true; renderModal();
+    /* Sent only when it is not the default, exactly as policy is: the argv a
+       run announces should carry what was chosen, not what was left alone. */
+    if (M.scope !== 'unit') go.scope = M.scope;
+    M.busy = true; renderLauncher();
     fire('go', Object.assign(go, extras), null);
     return;
   }
@@ -3034,7 +3281,7 @@ function submitModal() {
   // taken twice, not two features.
   if (!M.claims) { readClaims(); return; }
 
-  M.busy = true; renderModal();
+  M.busy = true; renderLauncher();
   var approved = { catalog: M.claims.catalog, summary: M.claims.summary,
     documentNote: M.claims.documentNote, model: M.claims.model, extractedAt: M.claims.extractedAt,
     // The participant table rides along, edits included — dropping it here
@@ -3057,15 +3304,14 @@ function submitModal() {
     if (M.url.trim()) values.url = M.url.trim();
     if (M.policy !== 'forms') values.policy = M.policy;
     fire('catalog-run', Object.assign(values, extras), null);
-  })['catch'](function (error) { M.busy = false; M.error = error.message; renderModal(); });
+  })['catch'](function (error) { M.busy = false; M.error = error.message; renderLauncher(); });
 }
 
 function fire(commandId, values, flowPath) {
   post(commandId, values, flowPath).then(function () {
-    S.modal = null;
-    renderModal();
+    closeLauncher();
   })['catch'](function (error) {
-    if (S.modal) { S.modal.busy = false; S.modal.error = error.message; renderModal(); }
+    if (S.launcher) { S.launcher.busy = false; S.launcher.error = error.message; renderLauncher(); }
   });
 }
 
@@ -3078,8 +3324,11 @@ function post(commandId, values, flowPath) {
       var name = (S.flows.filter(function (f) { return f.path === flowPath; })[0] || {}).name;
       if (name) S.runningFor[name] = body.job.id;
     }
+    // The run's card appears in "Running now" with its output auto-expanded,
+    // so a job started from a view that has no such section moves to one that
+    // does — the console must never start somewhere it cannot be seen.
+    if (S.view !== 'runs' && S.view !== 'history') show('runs');
     refresh();
-    openJobDrawer(body.job);
     return body.job;
   })['catch'](function (error) {
     toast(error.message);
@@ -3208,6 +3457,7 @@ function dataSignature() {
     S.proofs.map(function (p) { return p.runId + p.status + p.finishedAt; }),
     S.jobs.map(function (j) { return j.id + j.status; }),
     S.flows.length, S.reports.length, S.cache.length,
+    S.repos.map(function (r) { return r.slug + r.indexedAt; }),
     S.keys.providers && S.keys.providers.map(function (p) { return p.provider + p.activeIndex + p.keys.length; }),
     S.models.roles && S.models.roles.map(function (r) { return r.role + r.provider + r.modelId; }),
     S.models.providers && S.models.providers.map(function (p) { return p.provider + p.models.length + p.note; })
@@ -3222,7 +3472,8 @@ function refresh() {
     api('/api/reports').then(function (b) { S.reports = b.reports; })['catch'](function () {}),
     api('/api/cache').then(function (b) { S.cache = b.entries || []; })['catch'](function () {}),
     api('/api/keys').then(function (b) { S.keys = b; })['catch'](function () {}),
-    api('/api/models').then(function (b) { S.models = b; })['catch'](function () {})
+    api('/api/models').then(function (b) { S.models = b; })['catch'](function () {}),
+    api('/api/repos').then(function (b) { S.repos = b.repos || []; })['catch'](function () {})
   ]).then(function () {
     var wasOffline = !S.online;
     S.online = true;
@@ -3261,7 +3512,7 @@ function boot() {
   });
   window.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
-    if (S.modal) closeModal();
+    if (S.launcher) closeLauncher();
     else if (S.drawer) closeDrawer();
   });
   // Polling, not a socket: the page has to be right after a CLI run finishes in
@@ -3303,7 +3554,6 @@ export function renderWowUi(): string {
   </aside>
   <main class="main" id="main"></main>
 </div>
-<div id="modal"></div>
 <div id="drawer"></div>
 <div class="toast-container" id="toasts"></div>
 <script>${WOW_SCRIPT}</script>

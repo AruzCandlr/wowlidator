@@ -45,6 +45,7 @@ import {
   type WowlidatorConfig,
 } from '../config.js';
 import { DEFAULT_CONTEXT_CACHE_FILE } from '../context/context-engine.js';
+import { listRepos } from '../context/repo-registry.js';
 import { COMMANDS, UiCommandError, buildArgv, commandById } from './commands.js';
 import { JobRunner } from './jobs.js';
 import { KeySelection, KeySelectionError } from './keys.js';
@@ -501,6 +502,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   if (path === '/api/documents' && req.method === 'GET') {
     const kind = (url.searchParams.get('kind') ?? 'context') as UploadKind;
     json(res, { documents: await listDocuments(kind === 'catalog' ? 'catalog' : 'context') });
+    return;
+  }
+
+  // Saved repositories — read-only: saving one goes through the ordinary job
+  // machinery (`context add` via the whitelist), never a bespoke write here.
+  if (path === '/api/repos' && req.method === 'GET') {
+    json(res, { repos: await listRepos() });
     return;
   }
 

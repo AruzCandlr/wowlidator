@@ -229,6 +229,15 @@ const COMMON_BROWSER_FIELDS: readonly Field[] = [
   },
 ];
 
+const SCOPE_FIELD: Field = {
+  name: 'scope',
+  label: 'Test scope',
+  type: 'enum',
+  choices: ['unit', 'e2e'],
+  default: 'unit',
+  help: 'unit: prove one thing on the page given. e2e: the whole journey — reach the page as a user does, act, verify on the page that results. e2e is enforced: it reads the destination page too, and refuses a flow that never leaves the first one.',
+};
+
 const POLICY_FIELD: Field = {
   name: 'policy',
   label: 'Mutation policy',
@@ -263,6 +272,14 @@ export const COMMANDS: readonly CommandSpec[] = [
         placeholder: 'http://localhost:3000/some/page',
         help: 'Required only when the box above is a description. Without it every selector would be a guess.',
       },
+      {
+        name: 'repo',
+        label: 'Saved repository',
+        type: 'text',
+        placeholder: 'slug or path from context add',
+        help: 'Ground the written test in a saved repository’s indexed routes, endpoints and tables. Save one with "context add"; an unknown value fails loudly rather than authoring ungrounded.',
+      },
+      SCOPE_FIELD,
       POLICY_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
@@ -421,6 +438,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         default: true,
         help: 'Execute the authored flow as soon as it is written.',
       },
+      SCOPE_FIELD,
       POLICY_FIELD,
       {
         name: 'probe',
@@ -576,6 +594,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         type: 'text',
         placeholder: 'http://localhost:3000/some/page',
         help: 'Strongly recommended: with it the selectors come from the page rather than from the document, which is the difference between a test and a guess.',
+      },
+      {
+        name: 'repo',
+        label: 'Saved repository',
+        type: 'text',
+        placeholder: 'slug or path from context add',
+        help: 'Ground the authored steps in a saved repository’s indexed routes, endpoints and tables. Save one with "context add"; an unknown value fails loudly rather than authoring ungrounded.',
       },
       {
         name: 'run',
@@ -827,6 +852,55 @@ export const COMMANDS: readonly CommandSpec[] = [
         advanced: true,
       },
     ],
+  },
+
+  {
+    id: 'context-add',
+    argv: ['context', 'add'],
+    title: 'Save a repository',
+    blurb:
+      'Scan a repository and remember it, so any verification can ground itself in what that code declares — routes, components, API operations, existing tests. No model call is made; re-running on the same path re-scans it.',
+    browser: false,
+    fields: [
+      {
+        name: 'path',
+        label: 'Repository path',
+        type: 'text',
+        positional: 1,
+        required: true,
+        placeholder: '/absolute/path/to/the/app-under-test',
+        help: 'The application repository, not wowlidator itself. Saved under a slug you select on later runs.',
+      },
+      {
+        name: 'openapi',
+        label: 'OpenAPI spec',
+        type: 'text',
+        placeholder: './openapi.yaml or an https URL',
+        help: 'Indexes endpoints alongside the code. Remembered, so every later re-scan keeps them.',
+      },
+      {
+        name: 'db-schema',
+        label: 'Database schema',
+        type: 'text',
+        placeholder: './schema.sql or ./prisma/schema.prisma',
+        help: 'Indexes tables alongside the code. With WOWLIDATOR_DB_URL set and no file, the live schema is introspected.',
+      },
+      {
+        name: 'force',
+        label: 'Rebuild even if unchanged',
+        type: 'boolean',
+        help: 'Ignores the cached signature and walks everything again.',
+      },
+    ],
+  },
+
+  {
+    id: 'context-list',
+    argv: ['context', 'list'],
+    title: 'Saved repositories',
+    blurb: 'List every repository saved with context add — slug, path, size, last scan.',
+    browser: false,
+    fields: [],
   },
 
   {

@@ -45,12 +45,21 @@ export interface FlowDbSnapshotSpec {
 
 export interface FlowDbRowSpec {
   table: string;
-  /** Column → value. Prefer a `{{variable}}` the run saved — that is causal. */
+  /**
+   * Column → value. Prefer a `{{variable}}` the run saved — that is causal.
+   * May be empty (`{}`): the check then counts the whole table, which is how
+   * "the API's number equals the database's number" is spelled — a `request`
+   * saves the API count, and `count: '{{n}}'` compares it to SQL's.
+   */
   where: Record<string, FlowDbValue>;
   /** Additional column values the matched row(s) must hold. */
   values?: Record<string, FlowDbValue> | undefined;
-  /** Exact number of matching rows; omitted means "at least one". */
-  count?: number | undefined;
+  /**
+   * Exact number of matching rows; omitted means "at least one". A string
+   * interpolates `{{variables}}` first — the cross-check above — and one
+   * that does not come out a number fails the step loudly.
+   */
+  count?: number | string | undefined;
   /** Eventual-consistency allowance — the check polls until this expires. */
   timeoutMs?: number | undefined;
   intent?: string | undefined;
@@ -114,6 +123,12 @@ export interface DbActionsOptions {
   /** The run's shared store — `{{orderId}}` saved by a request keys rows here. */
   variables: VariableStore;
   currentUrl?: (() => string | null) | undefined;
+  /**
+   * What the page has been seen asking the network for. Read only when a
+   * check has already failed, and only to tell "the backend refused the write"
+   * from "nothing ever sent one". See `WriteWitness`.
+   */
+  writeWitness?: (() => WriteWitness) | undefined;
   recordDefect?:
     | ((category: DefectCategory, severity: DefectSeverity, title: string, detail: string) => void)
     | undefined;
@@ -137,6 +152,16 @@ const CORRELATION_NOTE =
  */
 export function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
+}
+
+/**
+ * A table name as introspection produced it — bare, or `schema.table` for a
+ * table outside the current schema — quoted part by part. Membership in the
+ * introspected schema is still the gate; this only spells the passing name
+ * the way SQL needs it.
+ */
+export function quoteTable(name: string): string {
+  return name.split('.').map(quoteIdent).join('.');
 }
 
 /**
@@ -224,12 +249,41 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * What the page was seen asking the network for, while this run was going on.
+ *
+ * A failed database check answers "the row is not there". It cannot, by
+ * itself, answer *why* — and the two candidate whys route to different people:
+ * the backend rejected the write, or **nothing ever asked it to**. Plenty of
+ * screens persist to client-side storage and speak to no server at all; a
+ * database assertion against one of those fails on every run of a perfectly
+ * working feature, and filing it as `backend`/high sends someone hunting a
+ * bug in an API the page has never once called. Measured on a live app whose
+ * overtime feature is a Zustand store persisted to localStorage: an authored
+ * `expectDbDelta` would have reported a high-severity backend defect forever.
+ *
+ * The witness is deliberately coarse — the whole run, not a window — because
+ * the only claim it is allowed to make is the unambiguous one: *this page sent
+ * no state-changing request at any point*. Anything less certain says nothing,
+ * which is the same understate-never-overstate rule attribution follows
+ * everywhere else in this codebase.
+ */
+export interface WriteWitness {
+  /** False when nothing was watching — an environment fact, not a page fact. */
+  observing: boolean;
+  /** Every call seen. */
+  total: number;
+  /** Calls that could have changed state: anything but GET and HEAD. */
+  mutating: number;
+}
+
 export class DbActions {
   readonly #config: DbConfig | null;
   readonly #injected: DbClient | null;
   readonly #bundle: ProofBundleBuilder;
   readonly #variables: VariableStore;
   readonly #currentUrl: () => string | null;
+  readonly #writeWitness: () => WriteWitness;
   readonly #recordDefect: (
     category: DefectCategory,
     severity: DefectSeverity,
@@ -249,6 +303,11 @@ export class DbActions {
     this.#bundle = options.bundle;
     this.#variables = options.variables;
     this.#currentUrl = options.currentUrl ?? (() => null);
+    // No witness is the browser-free case (an API flow has no page to watch)
+    // and the "not observing" case alike: both mean no attribution is possible,
+    // and the check behaves exactly as it did before this existed.
+    this.#writeWitness =
+      options.writeWitness ?? (() => ({ observing: false, total: 0, mutating: 0 }));
     this.#recordDefect = options.recordDefect ?? (() => undefined);
   }
 
@@ -290,6 +349,24 @@ export class DbActions {
       this.#requireColumns(table, Object.keys(where));
       if (values) this.#requireColumns(table, Object.keys(values));
 
+      // A string count interpolates first — `count: '{{persons}}'` is the
+      // API-vs-database cross-check. One that does not come out numeric fails
+      // here, loudly: comparing rows against NaN would "fail" every run with
+      // an error message about the wrong thing.
+      let wanted: number | undefined;
+      if (typeof spec.count === 'string') {
+        const interpolated = this.#variables.interpolate(spec.count).trim();
+        const parsed = Number(interpolated);
+        if (!Number.isFinite(parsed)) {
+          throw new DbGroundingError(
+            `expectDbRow count "${spec.count}" resolved to "${interpolated}", which is not a number`,
+          );
+        }
+        wanted = parsed;
+      } else {
+        wanted = spec.count;
+      }
+
       const deadline = Date.now() + (spec.timeoutMs ?? DEFAULT_DB_TIMEOUT_MS);
       const started = Date.now();
       let polledMs: number | undefined;
@@ -315,8 +392,22 @@ export class DbActions {
           ).length;
         }
 
-        const wanted = spec.count;
         const passed = wanted === undefined ? matches >= 1 : matches === wanted;
+        // The values filter is half the check, so it must be half the story.
+        // DB_07_01 live: 1 row matched the where, 0 held the expected values,
+        // and the old message — "where rule_id = RULE-TRV-001; found 0" —
+        // read as "the row is missing" when the row was there and merely
+        // un-updated. Naming both halves is what points the reader at the
+        // half that actually failed.
+        const expectedSummary =
+          (wanted === undefined ? 'at least 1 row' : `exactly ${wanted} row(s)`) +
+          (values !== undefined && Object.keys(values).length > 0
+            ? ` holding ${redactWhereSummary(values)}`
+            : '');
+        const observedSummary =
+          values !== undefined && Object.keys(values).length > 0
+            ? `${matches} of ${whereCount} row(s) matching the where`
+            : `${matches} row(s)`;
         if (passed) {
           const waited = Date.now() - started;
           if (waited > POLL_INTERVAL_MS) polledMs = waited;
@@ -325,8 +416,8 @@ export class DbActions {
               kind: 'row',
               table: table.name,
               where: redactWhereSummary(where),
-              expected: wanted === undefined ? 'at least 1 row' : `exactly ${wanted} row(s)`,
-              observed: `${matches} row(s)`,
+              expected: expectedSummary,
+              observed: observedSummary,
               rows: redactRows(rows),
               polledMs,
               note: CORRELATION_NOTE,
@@ -337,15 +428,15 @@ export class DbActions {
 
         if (Date.now() >= deadline) {
           throw new DbCheckFailure(
-            `expected ${wanted === undefined ? 'at least 1 row' : `exactly ${wanted} row(s)`} in ` +
-              `"${table.name}" where ${redactWhereSummary(where)}; found ${matches} ` +
+            `expected ${expectedSummary} in ` +
+              `"${table.name}" where ${redactWhereSummary(where)}; found ${observedSummary} ` +
               `(polled ${Date.now() - started}ms)`,
             {
               kind: 'row',
               table: table.name,
               where: redactWhereSummary(where),
-              expected: wanted === undefined ? 'at least 1 row' : `exactly ${wanted} row(s)`,
-              observed: `${matches} row(s)`,
+              expected: expectedSummary,
+              observed: observedSummary,
               rows: redactRows(rows),
               note: CORRELATION_NOTE,
             },
@@ -642,7 +733,7 @@ export class DbActions {
   ): Promise<number> {
     const built = this.#buildWhere(where);
     const result = await client.query(
-      `SELECT count(*)::text AS n FROM ${quoteIdent(table)}${built.clause}`,
+      `SELECT count(*)::text AS n FROM ${quoteTable(table)}${built.clause}`,
       built.params,
     );
     return Number(result.rows[0]?.['n'] ?? 0);
@@ -655,7 +746,7 @@ export class DbActions {
   ): Promise<Record<string, unknown>[]> {
     const built = this.#buildWhere(where);
     const result = await client.query(
-      `SELECT * FROM ${quoteIdent(table)}${built.clause} LIMIT ${ROW_FETCH_LIMIT}`,
+      `SELECT * FROM ${quoteTable(table)}${built.clause} LIMIT ${ROW_FETCH_LIMIT}`,
       built.params,
     );
     return result.rows;
@@ -712,11 +803,25 @@ export class DbActions {
       // the application's — no defect is filed for them, and the executor
       // reclassifies the step to `error` by the error's name.
       if (!(error instanceof DbUnavailableError) && !(error instanceof DbGroundingError)) {
+        const witness = this.#writeWitness();
+        const nothingWasAsked = witness.observing && witness.mutating === 0;
         this.#recordDefect(
-          'backend',
-          'high',
-          `DB check failed: ${action}`,
-          `${message}\nState was ${CORRELATION_NOTE}.`,
+          // "The database did not change" and "nothing asked it to" are
+          // different findings for different people. Only the first is the
+          // backend's.
+          nothingWasAsked ? 'functional' : 'backend',
+          nothingWasAsked ? 'medium' : 'high',
+          nothingWasAsked
+            ? `DB check failed, and the page sent no write: ${action}`
+            : `DB check failed: ${action}`,
+          nothingWasAsked
+            ? `${message}\nThe page made ${witness.total} request(s) during this run and not one ` +
+              'of them could have changed state (no POST, PUT, PATCH or DELETE), so the ' +
+              'database was never asked to change. Either this feature keeps its state in the ' +
+              'browser and has no backend at all — in which case assert what the page shows and ' +
+              'drop the database claim — or the action that should have sent the write never ' +
+              `fired.\nState was ${CORRELATION_NOTE}.`
+            : `${message}\nState was ${CORRELATION_NOTE}.`,
         );
       }
       throw error;

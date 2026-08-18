@@ -53,9 +53,37 @@ export const VERDICT_COPY = {
 
   // What broke — chosen by the shape of the failure, not by guesswork.
   couldNotFind: (what: string) => `${what} — the control it needed was never found.`,
+  /**
+   * A step the agent had to judge its way past.
+   *
+   * PB_01_01 met a PDPA consent screen the flow never mentioned; without this
+   * the report showed a bare `agent` badge and a reader had no way to learn
+   * that a decision had been taken on their behalf. The agent's own words are
+   * quoted, never paraphrased — the same rule the report follows for text
+   * captured from the application.
+   */
+  agentDecided: (observed: string, decided: string) =>
+    observed
+      ? `The run met something the flow does not describe — the agent judged "${observed}" and decided to ${decided}.`
+      : `The run met something the flow does not describe; the agent decided to ${decided}.`,
+  // A content mismatch is the OPPOSITE of not-found: the element resolved and
+  // answered, just not with the expected text. Calling it "never found" sent
+  // readers hunting a missing control that was on screen the whole time.
+  contentMismatch: (what: string) =>
+    `${what} — the element was found, but the text it shows is not what the test expected.`,
+  // Same inversion for an absence check: a timeout there means the element
+  // STAYED VISIBLE, which is as far from "never found" as a failure gets.
+  stayedVisible: (what: string) =>
+    `${what} — the element the test expected to be absent was still on the page.`,
   assertionFailed: (what: string) => `${what} — the check did not hold.`,
   backendAnswered: (what: string) => `${what} — the endpoint did not answer as expected.`,
   stepFailed: (what: string) => `${what} — this step failed.`,
+  // Where the failure happened outranks how: a step that ran against a
+  // sign-in page says nothing about the feature it meant to test.
+  strandedSide: (url: string) =>
+    `The failing step ran against a sign-in page (${url}). If the flow did not mean to be ` +
+    `testing that page, the session was never established and this failure says nothing ` +
+    `about the feature — fix the flow's sign-in before reading anything else here.`,
 
   // Which side.
   frontendSide: (calls: number) =>
@@ -82,6 +110,15 @@ export const VERDICT_COPY = {
 /** Actions whose failure is an assertion not holding, rather than a lost control. */
 const ASSERTION_PREFIX = /^expect/;
 
+/** The pathname, or the whole string when it is not a URL — regex fodder only. */
+function pathnameOf(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
+}
+
 /** Describe a step the way its author would: their intent, else what it did. */
 export function describeStep(step: ProofStep): string {
   if (step.intent) return `"${step.intent.replace(/\s+$/, '')}"`;
@@ -92,18 +129,34 @@ export function describeStep(step: ProofStep): string {
 function whatBroke(step: ProofStep): string {
   const described = describeStep(step);
   const error = step.error ?? '';
-  const base = /could not resolve|did not resolve|Timeout .* exceeded/i.test(error)
-    ? VERDICT_COPY.couldNotFind(described)
-    : /expected status|expected .* to (contain|be)|did not match/i.test(error)
-      ? VERDICT_COPY.backendAnswered(described)
-      : ASSERTION_PREFIX.test(step.action)
-        ? VERDICT_COPY.assertionFailed(described)
-        : VERDICT_COPY.stepFailed(described);
+  // Order is load-bearing. A content mismatch is frequently WRAPPED in a
+  // "could not resolve" header (the ladder retried and every rung saw the
+  // same wrong text), so the mismatch check must come first or the reader is
+  // told a control on screen was "never found". An absence check's timeout is
+  // the same inversion: the element was found and stayed.
+  const base = /expected text to contain/i.test(error)
+    ? VERDICT_COPY.contentMismatch(described)
+    : step.action === 'expectHidden' && /Timeout .* exceeded/i.test(error)
+      ? VERDICT_COPY.stayedVisible(described)
+      : /could not resolve|did not resolve|Timeout .* exceeded/i.test(error)
+        ? VERDICT_COPY.couldNotFind(described)
+        : /expected status|expected .* to (contain|be)|did not match/i.test(error)
+          ? VERDICT_COPY.backendAnswered(described)
+          : ASSERTION_PREFIX.test(step.action)
+            ? VERDICT_COPY.assertionFailed(described)
+            : VERDICT_COPY.stepFailed(described);
   // What the page was showing outranks how the machinery failed to find
   // things on it — "the page said Access Denied" is the diagnosis, "could not
   // resolve" is a symptom. Quoted verbatim: evidence, never paraphrase.
   const showing = step.pageContext?.[0];
-  return showing ? `The page was showing "${showing}" at the moment of failure. ${base}` : base;
+  const account = showing ? `The page was showing "${showing}" at the moment of failure. ${base}` : base;
+  // A decision taken on the reader's behalf outranks the machinery's account
+  // of how it failed to find things: "the agent accepted a consent screen and
+  // it still did not resolve" is the diagnosis, "could not resolve" is the
+  // symptom. Appended rather than prefixed — the page's own words still lead.
+  return step.decision
+    ? `${account} ${VERDICT_COPY.agentDecided(step.decision.observed, step.decision.decided)}`
+    : account;
 }
 
 const HISTORY_COPY: Record<string, (bundle: ProofBundle) => string> = {
@@ -159,7 +212,17 @@ export function buildVerdict(bundle: ProofBundle): Verdict {
       : VERDICT_COPY.noSteps;
 
   let side: string | null = null;
-  if (owner === 'backend') side = VERDICT_COPY.backendSide(summary.networkFailures);
+  // A failing step recorded on a sign-in URL outranks the frontend/backend
+  // split: whatever the summary attributes, a step asserted against a login
+  // page indicts the flow's sign-in, not the feature — the same evidence the
+  // session guard reads, applied to the report's own copy. (Mirrors the
+  // runner's looksLikeSignIn; the bundle is all this module may read.)
+  const strandedUrl =
+    failing?.url && /(^|\/)(login|signin|sign-in|auth|sso)(\/|$)/i.test(pathnameOf(failing.url))
+      ? failing.url
+      : null;
+  if (strandedUrl !== null) side = VERDICT_COPY.strandedSide(strandedUrl);
+  else if (owner === 'backend') side = VERDICT_COPY.backendSide(summary.networkFailures);
   else if (owner === 'frontend') side = VERDICT_COPY.frontendSide(summary.networkCalls);
   else if (owner === 'mixed') side = VERDICT_COPY.mixedSide;
 
@@ -193,7 +256,7 @@ export interface TraceRung {
 const RUNG_PROSE: Record<string, string> = {
   fast: 'Tried the selector exactly as the test wrote it',
   case: 'Retried it ignoring letter-case',
-  narrow: 'Retried the ambiguous text selector as exact text',
+  narrow: "Re-matched the author's text selector against what the page actually renders",
   cache: 'Tried a selector repaired on an earlier run',
   late: 'Gave the content one longer window to render',
   backend: 'Stopped without attempting a repair — a request had already failed',

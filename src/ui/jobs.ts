@@ -62,6 +62,14 @@ export interface JobProgress {
    */
   etaMs: number | null;
   /**
+   * The smoothed pace, in ms per step — an exponential moving average, seeded
+   * from the first observed step and updated with tqdm's default smoothing
+   * (0.3) after that. Null until a step has finished, same rule as `etaMs`.
+   */
+  rateMsPerStep: number | null;
+  /** `elapsedMs` when `done` last advanced — the anchor the next step's dt is measured from. */
+  lastStepMs: number;
+  /**
    * How far along, 0-100, for a command that has no steps to count.
    *
    * Reading a catalog is one model call and a file read — there is no step
@@ -225,7 +233,7 @@ export class JobRunner {
       finishedAt: null,
       lines: [],
       artifacts: [],
-      progress: { done: 0, total: null, etaMs: null, percent: null, phase: null },
+      progress: { done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0 },
     };
     this.#jobs.set(id, job);
     this.#order.push(id);
@@ -347,6 +355,17 @@ export class JobRunner {
 }
 
 /**
+ * tqdm's default smoothing factor, and tqdm (the Python progress library) is
+ * the reference algorithm for the whole estimator below: an exponential moving
+ * average of the per-step pace, seeded from the first observation —
+ * `rate = smoothing * rate_instant + (1 - smoothing) * rate_prev`. A plain
+ * average weighs the first step forever, so a run that healed three selectors
+ * early carries that cost in its estimate to the end; the EMA follows the pace
+ * the run has *now*, without the whiplash of trusting only the last step.
+ */
+const SMOOTHING = 0.3;
+
+/**
  * Read one output line for progress. True when it changed anything.
  *
  * Pure, and separate from the runner, because this is the part with a rule in
@@ -394,15 +413,58 @@ export function applyProgressLine(
 
   const done = Math.max(progress.done, Number(step[1]) + 1);
   if (done === progress.done) return false;
+
+  // tqdm's rate_instant: the dt of the last completed unit. The first observed
+  // line may cover several units (a run joined at step [3]), so the delta is
+  // divided across them rather than read as one very slow step.
+  const advanced = done - progress.done;
+  const dtPerStep = Math.max(0, elapsedMs - progress.lastStepMs) / advanced;
+  progress.rateMsPerStep = progress.rateMsPerStep === null
+    ? dtPerStep // seeded from the first observation, as tqdm seeds its EMA
+    : SMOOTHING * dtPerStep + (1 - SMOOTHING) * progress.rateMsPerStep;
+  progress.lastStepMs = elapsedMs;
   progress.done = done;
 
   const total = progress.total;
   if (total !== null && done < total) {
-    progress.etaMs = Math.round((elapsedMs / done) * (total - done));
+    // ETA = remaining / rate, expressed as remaining × ms-per-step so a
+    // zero-pace burst (two step lines in the same millisecond) rounds to an
+    // honest 0 instead of dividing into Infinity.
+    progress.etaMs = Math.round(progress.rateMsPerStep * (total - done));
   } else if (total !== null) {
     // Every planned step is accounted for; what remains is the report and the
     // disconnect, which this cannot time and must not pretend to.
     progress.etaMs = 0;
   }
   return true;
+}
+
+/**
+ * tqdm's readout, verbatim: `3/10 [00:12<00:28, 4.0s/it]` — done over total,
+ * elapsed `<` remaining, then the pace, flipping to `it/s` when the run is
+ * faster than a step per second, exactly as tqdm prints it. Null whenever any
+ * half is missing (no denominator, no completed step yet): a partial readout
+ * in this format would read as a measurement that was never made.
+ *
+ * The page renders this next to the bar and cannot import it (the client is a
+ * template string), so `tqdmReadout` in wow-ui-html.ts is a pinned mirror.
+ */
+export function formatProgressReadout(progress: JobProgress, elapsedMs: number): string | null {
+  if (progress.total === null || progress.done === 0 || progress.rateMsPerStep === null) return null;
+  const rate = progress.rateMsPerStep;
+  const rateText = rate > 0 && rate < 1000
+    ? (1000 / rate).toFixed(1) + 'it/s'
+    : (rate / 1000).toFixed(1) + 's/it';
+  const remaining = progress.etaMs === null ? '?' : clock(progress.etaMs);
+  return progress.done + '/' + progress.total + ' [' + clock(elapsedMs) + '<' + remaining + ', ' + rateText + ']';
+}
+
+/** tqdm's clock: MM:SS under an hour, H:MM:SS over it. */
+function clock(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  const base = pad(minutes) + ':' + pad(total % 60);
+  return hours > 0 ? hours + ':' + base : base;
 }

@@ -13,7 +13,14 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { ContextEngine, matchesRoutePattern, pathnameOf } from '../src/context/context-engine.js';
-import { DEFAULT_CONTEXT_MAX_NODES, findRouteForUrl, summarize, toPromptContext } from '../src/context/query.js';
+import { concreteRouteUrl } from '../src/context/route-match.js';
+import {
+  DEFAULT_CONTEXT_MAX_NODES,
+  findRouteForUrl,
+  routesForDescription,
+  summarize,
+  toPromptContext,
+} from '../src/context/query.js';
 import { ManifestIngester } from '../src/context/ingesters/manifest-ingester.js';
 import { ComponentIngester } from '../src/context/ingesters/component-ingester.js';
 import { RouteIngester } from '../src/context/ingesters/route-ingester.js';
@@ -397,6 +404,48 @@ describe('context engine', () => {
       assert.equal(toPromptContext(graph), '');
     });
 
+    it('finds the routes a described journey is about', () => {
+      const routes = routesForDescription(graph, 'open the blog post for a slug');
+      assert.ok(
+        routes.some((route) => route.name === '/blog/:slug'),
+        `the description names the blog route; got ${routes.map((r) => r.name).join(', ')}`,
+      );
+    });
+
+    it('names no route for a description the repository has nothing to do with', () => {
+      assert.deepEqual(routesForDescription(graph, 'reconcile the quarterly warehouse manifest'), []);
+      assert.deepEqual(routesForDescription(graph, ''), []);
+    });
+
+    it('walks from the described routes as well as the starting page', () => {
+      // The journey the describe path actually gets: it STARTS on one page and
+      // is ABOUT another. Seeded from the start URL alone this section carried
+      // two lines about a login screen while everything the test was about sat
+      // unread in the same graph — measured on a real `go` invocation against
+      // a 1,874-node index.
+      const text = toPromptContext(graph, {
+        url: 'http://localhost:3000/employees/42',
+        query: 'open an employee, then read the blog post about them',
+      });
+      assert.match(text, /Project context for \/employees\/:id/, 'the page it starts on');
+      assert.match(text, /\/blog\/:slug/, 'and the page the description names');
+      assert.match(
+        text,
+        /not the page you are on/,
+        'the two claims are labelled apart, or a flow clicks its way to a page it never opened',
+      );
+    });
+
+    it('is byte-for-byte the url-only walk when no description is given', () => {
+      const url = 'http://localhost:3000/employees/42';
+      assert.equal(toPromptContext(graph, { url, query: '' }), toPromptContext(graph, { url }));
+    });
+
+    it('still reports a url no route matches, so callers can tell it apart from silence', () => {
+      const text = toPromptContext(graph, { url: 'http://localhost:3000/nowhere' });
+      assert.match(text, /^Project context: no indexed route matches/);
+    });
+
     it('truncates at the node budget and says so', () => {
       const text = toPromptContext(graph, { url: 'http://localhost:3000/employees/42', maxNodes: 2 });
       assert.match(text, /context truncated at 2 nodes/);
@@ -406,6 +455,61 @@ describe('context engine', () => {
       const text = summarize(graph);
       assert.match(text, /nodes\s+\d+ \(/);
       assert.match(text, /edges\s+\d+/);
+    });
+  });
+
+  describe('turning a route pattern into a page to open', () => {
+    // The resolver behind `--capture-journey`. Its refusals are the feature:
+    // every parameter it cannot fill from evidence is a segment that would
+    // otherwise be invented, and an invented `:id` navigates somewhere
+    // meaningless while looking exactly like a real destination.
+    const start = 'http://localhost:3200/en/login';
+
+    it('fills :locale from the start url, at the same position', () => {
+      assert.deepEqual(concreteRouteUrl('/:locale/overtime', start), {
+        ok: true,
+        url: 'http://localhost:3200/en/overtime',
+      });
+    });
+
+    it('accepts a wholly static pattern', () => {
+      assert.deepEqual(concreteRouteUrl('/admin/employees', start), {
+        ok: true,
+        url: 'http://localhost:3200/admin/employees',
+      });
+    });
+
+    it('refuses a parameter that is not the locale', () => {
+      const got = concreteRouteUrl('/:locale/employees/:id', start);
+      assert.equal(got.ok, false);
+      assert.match(got.ok === false ? got.reason : '', /:id/);
+    });
+
+    it('refuses a catch-all', () => {
+      const got = concreteRouteUrl('/blog/*slug', start);
+      assert.equal(got.ok, false);
+      assert.match(got.ok === false ? got.reason : '', /catch-all/);
+    });
+
+    it('refuses when the start url has no locale where one is needed', () => {
+      // "/login" is not a locale, and filling :locale with it would produce
+      // /login/overtime — a URL that grounds nothing and reads like one that does.
+      const got = concreteRouteUrl('/:locale/overtime', 'http://localhost:3200/login');
+      assert.equal(got.ok, false);
+      assert.match(got.ok === false ? got.reason : '', /locale/);
+    });
+
+    it('accepts a regional locale and keeps the origin, port and all', () => {
+      assert.deepEqual(concreteRouteUrl('/:locale/overtime', 'https://app.test:8443/en-GB/login'), {
+        ok: true,
+        url: 'https://app.test:8443/en-GB/overtime',
+      });
+    });
+
+    it('refuses a start url that is not absolute', () => {
+      const got = concreteRouteUrl('/:locale/overtime', '/en/login');
+      assert.equal(got.ok, false);
+      assert.match(got.ok === false ? got.reason : '', /not absolute/);
     });
   });
 

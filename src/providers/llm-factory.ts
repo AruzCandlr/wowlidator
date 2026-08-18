@@ -305,6 +305,13 @@ export class LlmFactory {
 
 // --- Structured generation --------------------------------------------------
 
+/** An image the model must read — a diagram photo, a screenshot of a spec. */
+export interface StructuredImage {
+  data: Uint8Array;
+  /** IANA media type, e.g. `image/png`. */
+  mediaType: string;
+}
+
 export interface StructuredRequest<T> {
   model: LanguageModel;
   /** `provider:modelId`, used to make failures name the model that failed. */
@@ -312,6 +319,12 @@ export interface StructuredRequest<T> {
   schema: z.ZodType<T>;
   system: string;
   prompt: string;
+  /**
+   * Images sent alongside the prompt, for vision-capable models. A model
+   * without vision fails the call with its label in the message — the useful
+   * question is which role to repoint, same as every other failure here.
+   */
+  images?: readonly StructuredImage[] | undefined;
   maxOutputTokens?: number | undefined;
   maxRetries?: number | undefined;
   /** Raw provider request fields, keyed by the provider's registry name. */
@@ -469,7 +482,25 @@ async function attemptStructured<T>(
       model: request.model,
       schema: request.schema,
       system: request.system,
-      prompt: request.prompt,
+      // With images the prompt travels as a text part beside them — the SDK
+      // takes `prompt` or `messages`, never both.
+      ...(request.images?.length
+        ? {
+            messages: [
+              {
+                role: 'user' as const,
+                content: [
+                  { type: 'text' as const, text: request.prompt },
+                  ...request.images.map((image) => ({
+                    type: 'file' as const,
+                    data: image.data,
+                    mediaType: image.mediaType,
+                  })),
+                ],
+              },
+            ],
+          }
+        : { prompt: request.prompt }),
       // Zero, explicitly, for every structured call. Nothing here is creative
       // writing: a healer repairing a selector, an author turning a claim
       // into steps, an agent picking one action — each has a most-likely

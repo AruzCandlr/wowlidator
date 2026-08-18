@@ -1,0 +1,28 @@
+sequenceDiagram
+    title Eligibility rule lifecycle — cnext-hrms (fortest) against the HRCenter-DEV replica
+    actor HR as HR Admin
+    participant UI as Web App (localhost:3200)
+    participant API as Next routes /api/workflow/admin/benefits/medical-reimbursement/eligibility
+    participant DB as PostgreSQL HRCenter-DEV
+    HR->>UI: open Benefits › Entitlement Rules
+    UI->>API: GET /api/workflow/admin/benefits/medical-reimbursement/eligibility
+    API->>DB: SELECT rules for the key's plans WHERE deleted_at IS NULL
+    DB-->>API: the replica's seeded STANDARD rules
+    API-->>UI: 200 rules list
+    HR->>UI: create a new entitlement rule
+    UI->>API: POST /api/workflow/admin/benefits/medical-reimbursement/eligibility
+    API->>DB: INSERT INTO benefit_management.benefit_eligibility_rule
+    DB-->>API: new row id
+    API-->>UI: 200 rule carrying its database id
+    HR->>UI: rename the rule and set it inactive
+    UI->>API: PUT /api/workflow/admin/benefits/medical-reimbursement/eligibility/:id
+    alt rule exists
+        API->>DB: UPDATE the rule row, updated_by cnext-ui
+        API-->>UI: 200 the updated rule
+    else unknown id
+        API-->>UI: 404 rule not found
+    end
+    HR->>UI: delete the rule
+    UI->>API: DELETE /api/workflow/admin/benefits/medical-reimbursement/eligibility/:id
+    API->>DB: DELETE FROM benefit_management.benefit_eligibility_rule
+    API-->>UI: 200 ok

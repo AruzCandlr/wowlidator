@@ -85,6 +85,104 @@ describe('Prisma schema parsing', () => {
   });
 });
 
+describe('schema-qualified table names', () => {
+  // The shape pg_dump emits for a multi-schema database — the first real
+  // multi-schema target kept its tables in named schemas, and stripping the
+  // qualifier here made the grounding gate refuse tables that exist. The rule
+  // mirrors `qualifiedName()` in db/client.ts: bare for the default schema,
+  // `schema.table` for everything else.
+  const MULTI_SCHEMA_DDL = `
+    CREATE TABLE public.users (
+        id uuid NOT NULL PRIMARY KEY
+    );
+
+    CREATE TABLE benefit_management.benefit_category (
+        id uuid NOT NULL PRIMARY KEY
+    );
+
+    CREATE TABLE benefit_management.benefit_plan (
+        id uuid NOT NULL PRIMARY KEY,
+        owner_id uuid NOT NULL REFERENCES public.users (id),
+        category_id uuid NOT NULL,
+        CONSTRAINT plan_category_fk FOREIGN KEY (category_id)
+          REFERENCES benefit_management.benefit_category (id)
+    );
+  `;
+
+  it('keeps a non-public schema on DDL tables and FK targets; public stays bare', () => {
+    const { tables, warnings } = parseSqlSchema(MULTI_SCHEMA_DDL);
+    assert.equal(warnings.length, 0);
+    assert.deepEqual(
+      tables.map((t) => t.name),
+      ['users', 'benefit_management.benefit_category', 'benefit_management.benefit_plan'],
+    );
+
+    const plan = tables.find((t) => t.name === 'benefit_management.benefit_plan')!;
+    // A cross-schema FK strips public…
+    assert.ok(plan.references.includes('owner_id -> users.id'));
+    // …and keeps a named schema, on the table-level constraint spelling too.
+    assert.ok(plan.references.includes('category_id -> benefit_management.benefit_category.id'));
+  });
+
+  it('emits qualified node ids and reference edges the introspected graph would agree with', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'wowlidator-schema-q-'));
+    try {
+      await writeFile(join(scratch, 'schema.sql'), MULTI_SCHEMA_DDL);
+      const result = await new SchemaIngester().ingest({ rootDir: scratch, files: ['schema.sql'] });
+
+      assert.ok(result.nodes.some((n) => n.id === 'table:benefit_management.benefit_plan'));
+      assert.ok(result.nodes.some((n) => n.id === 'table:users'), 'public.users is bare');
+      // The edge target is the qualified table, not the schema half of it —
+      // a first-dot read would have pointed this at `table:benefit_management`.
+      assert.ok(
+        result.edges.some(
+          (e) =>
+            e.from === 'table:benefit_management.benefit_plan' &&
+            e.to === 'table:benefit_management.benefit_category' &&
+            e.kind === 'references',
+        ),
+      );
+      assert.ok(
+        result.edges.some(
+          (e) => e.from === 'table:benefit_management.benefit_plan' && e.to === 'table:users',
+        ),
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it('qualifies a Prisma model by @@schema; public and unschema-ed models stay bare', () => {
+    const { tables } = parsePrismaSchema(`
+model BenefitPlan {
+  id      String @id
+  owner   User   @relation(fields: [ownerId], references: [id])
+  ownerId String @map("owner_id")
+
+  @@map("benefit_plan")
+  @@schema("benefit_management")
+}
+
+model User {
+  id    String        @id
+  plans BenefitPlan[]
+
+  @@map("users")
+  @@schema("public")
+}
+`);
+    assert.deepEqual(
+      tables.map((t) => t.name),
+      ['benefit_management.benefit_plan', 'users'],
+    );
+    // Relation targets go through the same naming, in both directions.
+    const plan = tables.find((t) => t.name === 'benefit_management.benefit_plan')!;
+    assert.ok(plan.references.includes('owner -> users'));
+    const users = tables.find((t) => t.name === 'users')!;
+    assert.ok(users.references.includes('plans -> benefit_management.benefit_plan'));
+  });
+});
+
 describe('the ingester and the graph', () => {
   let dir: string;
 

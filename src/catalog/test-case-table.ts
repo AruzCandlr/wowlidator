@@ -67,6 +67,15 @@ export interface TestCaseRow {
   priority: string;
   /** One line: what this case checks. */
   testCase: string;
+  /**
+   * Who signs in and how — a column real sheets carry ("Login / Persona")
+   * and this parser used to drop, which cost the author exactly the
+   * credentials, selector advice and sign-out choreography the sheet's
+   * writer took the trouble to spell out.
+   */
+  persona: string;
+  /** Environment the case assumes — dev server, seeds, viewport ("Preconditions"). */
+  preconditions: string;
   /** Inputs, personas, boundary values. */
   testData: string;
   /** Where in the application, as numbered menu levels. */
@@ -91,6 +100,8 @@ const EMPTY_ROW: TestCaseRow = {
   polarity: '',
   priority: '',
   testCase: '',
+  persona: '',
+  preconditions: '',
   testData: '',
   menu: '',
   steps: '',
@@ -112,6 +123,12 @@ const FIELD_BY_HEADER = new Map<string, keyof TestCaseRow>([
   ['positive/negative', 'polarity'],
   ['priority', 'priority'],
   ['testcase', 'testCase'],
+  ['login/persona', 'persona'],
+  ['loginpersona', 'persona'],
+  ['login', 'persona'],
+  ['persona', 'persona'],
+  ['preconditions', 'preconditions'],
+  ['precondition', 'preconditions'],
   ['testdata', 'testData'],
   ['menu', 'menu'],
   ['testscript/steps', 'steps'],
@@ -204,21 +221,63 @@ export function parseTestCaseTable(raw: string): TestCaseRow[] | null {
  * time they ran it by hand. Reading it would let a sheet marked Fail arrive
  * pre-judged, and the run about to happen is the thing that decides.
  */
+/**
+ * Steps only a hand on the machine can take. Deliberately narrow — literal
+ * service-lifecycle commands, or a claim whose own title pivots on a direct
+ * SQL write — because a broad guess here would strike testable rows. The
+ * browser can neither stop a database nor write SQL (the DB session is
+ * read-only by design), so authoring such a claim as assertions guarantees
+ * they fail against the healthy environment — seen live as a dead-end run
+ * filing high frontend defects for an outage nobody caused.
+ */
+const ENVIRONMENT_STEP_RE =
+  /\b(brew services (stop|start)|systemctl (stop|start|restart)|pg_ctl\s+(stop|start)|docker (stop|kill)|service \S+ (stop|start))\b/i;
+const SQL_WRITE_PIVOT_RE = /\bdirect sql\b/i;
+
+/** Why a row cannot be checked from the browser, or null when it can. */
+export function beyondHarnessReason(row: TestCaseRow): string | null {
+  const steps = `${row.steps}\n${row.preconditions}`;
+  if (ENVIRONMENT_STEP_RE.test(steps)) {
+    return 'requires stopping or starting services — beyond the browser; held for a human';
+  }
+  if (SQL_WRITE_PIVOT_RE.test(row.testCase) || SQL_WRITE_PIVOT_RE.test(row.scenario)) {
+    return "pivots on a direct SQL write — wowlidator's database access is read-only by design; held for a human";
+  }
+  return null;
+}
+
 export function tableToClaims(rows: readonly TestCaseRow[]): CatalogClaim[] {
-  return rows.map((row) => ({
-    claim: claimTextOf(row),
-    priority: row.priority.trim().toLowerCase() || 'medium',
-    source: row.caseId || row.scenarioId || row.testCase.slice(0, 40),
-    // Every row of this sheet is a case someone wrote to be run. A row that only
-    // sets the scene does not get a Test Case ID and a set of expectations.
-    testable: true,
-  }));
+  return rows.map((row) => {
+    const beyond = beyondHarnessReason(row);
+    return {
+      claim: claimTextOf(row),
+      priority: row.priority.trim().toLowerCase() || 'medium',
+      source:
+        (row.caseId || row.scenarioId || row.testCase.slice(0, 40)) +
+        (beyond === null ? '' : ` (${beyond})`),
+      // Every row of this sheet is a case someone wrote to be run. A row that
+      // only sets the scene does not get a Test Case ID and a set of
+      // expectations. The exception is a row whose steps only a hand on the
+      // machine can take — kept, shown at the gate with the boundary named,
+      // never authored into assertions that must fail. Re-tick `testable` in
+      // the claims file to run its checkable subset anyway.
+      testable: beyond === null,
+    };
+  });
 }
 
 function claimTextOf(row: TestCaseRow): string {
   const expected = row.expected.trim();
   const title = row.testCase.trim() || row.scenario.trim() || row.caseId;
-  return expected === '' ? title : `${title} — expected: ${oneLine(expected)}`;
+  const note = row.note.trim();
+  // The Note column is where the sheet's writer parked the caveats — a KNOWN
+  // FAIL, "the SQL is the only authoritative proof", a pending BA decision.
+  // Dropping it authored claims stripped of exactly the context that decides
+  // what an honest assertion looks like.
+  return (
+    (expected === '' ? title : `${title} — expected: ${oneLine(expected)}`) +
+    (note === '' ? '' : ` — note: ${oneLine(note)}`)
+  );
 }
 
 const oneLine = (value: string): string => value.split('\n').map((l) => l.trim()).filter(Boolean).join('; ');
@@ -236,12 +295,21 @@ export function describeCase(row: TestCaseRow): string {
   const parts = [`${row.caseId || row.scenarioId}: ${row.testCase}`];
   if (row.scenario !== '') parts.push(`Scenario: ${row.scenario}`);
   if (row.polarity !== '') parts.push(`Type: ${row.polarity}`);
+  // The sheet's own sign-in and environment columns, verbatim: the writer
+  // spelled out which account, which selectors resolve, and what the
+  // deployment looks like — precisely what an authored setup gets wrong when
+  // it has to guess.
+  if (row.persona !== '') parts.push(`Login / persona:\n${indent(row.persona)}`);
+  if (row.preconditions !== '') parts.push(`Preconditions:\n${indent(row.preconditions)}`);
   if (row.menu !== '') parts.push(`Menu path:\n${indent(row.menu)}`);
   if (row.testData !== '' && row.testData.toUpperCase() !== 'N/A') {
     parts.push(`Test data: ${oneLine(row.testData)}`);
   }
   if (row.steps !== '') parts.push(`Steps:\n${indent(row.steps)}`);
   if (row.expected !== '') parts.push(`Expected output:\n${indent(row.expected)}`);
+  // Last on purpose: the caveats read best once the case is understood — a
+  // KNOWN FAIL note is the difference between filing a defect and pinning one.
+  if (row.note !== '') parts.push(`Note (from the sheet):\n${indent(row.note)}`);
   return parts.join('\n');
 }
 

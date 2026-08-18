@@ -1,0 +1,17 @@
+sequenceDiagram
+    title Create Plan — cnext-hrms (fortest) against the HRCenter-DEV replica
+    actor HR as HR Admin
+    participant UI as Web App (localhost:3200)
+    participant API as Next route /api/benefit-plans
+    participant DB as PostgreSQL HRCenter-DEV
+    HR->>UI: open Benefits › Plans and click Create Plan
+    HR->>UI: fill the plan form and save
+    UI->>API: POST /api/benefit-plans
+    API->>DB: INSERT INTO benefit_management.benefit_plan
+    DB-->>API: id
+    alt valid plan
+        API-->>UI: 200 { ok: true, dbId }
+        UI->>API: GET /api/benefit-plans
+    else missing id or name
+        API-->>UI: 400 { ok: false }
+    end

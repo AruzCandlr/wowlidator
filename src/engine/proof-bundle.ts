@@ -164,6 +164,40 @@ export interface AgentAction {
   durationMs: number;
 }
 
+/**
+ * What the agent judged, chose, and did when a step met something the flow
+ * does not describe.
+ *
+ * The rung above this one (`modal.ts`) is deliberately ARIA-only, and the
+ * overlay rung needs Playwright to name a pointer-interception. Neither can
+ * see the shape that actually stopped a run: PB_01_01 against localhost:3000
+ * met a full-page PDPA consent screen — "Accept and continue" — that is
+ * neither a `role="dialog"` nor an interceptor. In that run the click only
+ * existed because a person had written it into the flow; with nobody
+ * anticipating it the run dies on "could not resolve" and files defects about
+ * a feature it never reached.
+ *
+ * So the agent is asked to look and choose, and what it chose is kept here.
+ * The separation is the point: `observed`/`decided`/`because` are the agent's
+ * own words — claims — while `actions` are what it actually did and
+ * `resolved` is whether the author's own selector then worked. Only the last
+ * of those is evidence, and the report must never present the first three as
+ * anything else.
+ */
+export interface StepDecision {
+  /** What the agent judged was in the way, in its own words. Empty when it saw nothing. */
+  observed: string;
+  /** What it chose to do — including choosing to do nothing. */
+  decided: string;
+  /** Its stated reason. */
+  because: string;
+  /** What it actually did. Claims are not evidence; these are the acts. */
+  actions: AgentAction[];
+  /** Whether the author's own selector resolved afterwards. THE evidence. */
+  resolved: boolean;
+  model: string;
+}
+
 /** Record of a multi-page navigation the agent completed on the runner's behalf. */
 export interface AgentRecord {
   goal: string;
@@ -242,6 +276,14 @@ export interface ProofStep {
   /** Populated when an unexpected dialog was dismissed before this step could retry. */
   dialog?: DialogRecord | undefined;
   agent?: AgentRecord | undefined;
+  /**
+   * What the agent decided when this step met an interaction the flow does not
+   * describe — recorded whether it acted, acted in vain, or declined. A
+   * decision not to act is exactly the fact a later reader needs; dropping it
+   * makes "the agent was consulted and saw nothing" indistinguishable from
+   * "the agent was never tried".
+   */
+  decision?: StepDecision | undefined;
   /** Visual-regression result, when this step was a `snapshot`. */
   snapshot?: SnapshotResult | undefined;
   /** Per-value outcomes, when this step was a data-driven `fillEach`. */
@@ -515,6 +557,7 @@ export class ProofBundleBuilder {
   #video: VideoRecording | undefined;
   #videoStartedMs: number | undefined;
   #error: string | undefined;
+  #sessionLost = false;
   #network = { calls: 0, failures: 0, dropped: 0 };
   #backendBlocked = 0;
   #healUnavailable = 0;
@@ -765,6 +808,22 @@ export class ProofBundleBuilder {
   }
 
   /**
+   * The session guard fired: this run proved nothing about the application.
+   *
+   * A flag rather than a defect-title match, because the verdict must not
+   * depend on wording. It exists because DB_04_02 finalised **passed, 7/7**
+   * while carrying the high defect "the session is not established, so
+   * nothing after this point can say anything about the feature under test" —
+   * the guard fired on a step whose `SessionLostError` was swallowed on a
+   * path that is right to swallow it (teardown's, where the body's outcome is
+   * the story), so no step failed and no run error was recorded. Whichever
+   * path swallows the throw, the verdict cannot be `passed` afterwards.
+   */
+  noteSessionLost(): void {
+    this.#sessionLost = true;
+  }
+
+  /**
    * Refine the last recorded step's non-passed status — the runner records
    * `failed` at the point of failure, and the step executor (which knows
    * *why* it failed) reclassifies it as `error` or `dead-end` right after.
@@ -915,6 +974,10 @@ export class ProofBundleBuilder {
     if (counted.some((s) => s.status === 'error')) status = 'error';
     else if (counted.some((s) => s.status === 'dead-end')) status = 'dead-end';
     else if (summary.failed > 0 || this.#error !== undefined) status = 'failed';
+    // A run whose session guard fired proved nothing, whatever its steps say.
+    // `error` and not `failed`: the application was never reached, so this is
+    // the harness's own environment fact, not a verdict about the feature.
+    if (status === 'passed' && this.#sessionLost) status = 'error';
 
     return {
       runId: this.runId,

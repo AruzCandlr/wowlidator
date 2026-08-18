@@ -1,0 +1,23 @@
+{
+  "name": "HRMS — plans screen reflects the replica",
+  "baseUrl": "http://localhost:3200",
+  "setup": [
+    { "action": "dbSnapshot", "tables": ["benefit_management.benefit_plan"], "as": "before" },
+    { "action": "goto", "url": "/en/login" },
+    { "action": "fill", "selector": "input[type=\"email\"]", "value": "admin@cnext.test", "intent": "the demo admin persona (from the app's own e2e fixtures)" },
+    { "action": "fill", "selector": "input[type=\"password\"]", "value": "admin2026", "intent": "its demo password" },
+    { "action": "press", "key": "Enter", "selector": "input[type=\"password\"]", "intent": "submit the sign-in form" },
+    { "action": "waitFor", "selector": "role=navigation", "intent": "the signed-in shell has rendered" }
+  ],
+  "steps": [
+    { "action": "goto", "url": "/en/admin/benefits/plans" },
+    { "action": "expectText", "selector": "body", "value": "Dental Care Plan", "anyOf": ["Dental Care Plan", "แผนประกันทันตกรรม", "BP-DENTAL-01"],
+      "intent": "the Dental plan from the replica is on screen, in either language" },
+    { "action": "expectText", "selector": "body", "value": "Annual Health Checkup", "anyOf": ["Annual Health Checkup", "ตรวจสุขภาพประจำปี", "BP-PHYSICAL-CHECK-01"],
+      "intent": "the Physical-check plan too" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_plan", "where": { "status": "A" }, "count": 3,
+      "intent": "…and the screen's source of truth still holds exactly three active plans" },
+    { "action": "expectDbUnchanged", "tables": ["benefit_management.benefit_plan"], "since": "before",
+      "intent": "signing in and viewing the screen wrote nothing" }
+  ]
+}

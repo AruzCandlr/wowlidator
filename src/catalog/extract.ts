@@ -46,7 +46,15 @@ export type DocumentFormat =
   | 'yaml'
   | 'xlsx'
   | 'pdf'
-  | 'sequence';
+  | 'sequence'
+  /**
+   * An IMAGE of a sequence diagram. Deliberately absent from `FORMATS`: this
+   * extractor is deterministic and never calls a model, so it cannot read
+   * pixels — `catalog` routes images through the vision transcriber in
+   * `diagram-image.ts` first, and what reaches extraction is the transcribed
+   * `.mmd`. The member exists so uploads can carry the format label.
+   */
+  | 'sequence-image';
 
 /** Extensions this module will attempt, and what it treats each as. */
 const FORMATS: Record<string, DocumentFormat> = {

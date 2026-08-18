@@ -12,6 +12,14 @@ import { CacheManager } from '../../cache/cache-manager.js';
 import { connectDb, defaultDbConfig, maskDsn } from '../../db/client.js';
 import { LLM_ROLES, PROVIDER_META, describeRouting } from '../../config.js';
 import { ContextEngine } from '../../context/context-engine.js';
+import {
+  graphFileFor,
+  listRepos,
+  mergedScanInputs,
+  resolveRepo,
+  slugFor,
+  upsertRepo,
+} from '../../context/repo-registry.js';
 import { summarize as summarizeContext } from '../../context/query.js';
 import { RunHistory } from '../../history/run-history.js';
 import type { CliOptions } from '../options.js';
@@ -212,7 +220,11 @@ export async function cmdHistory(sub: string | undefined, options: CliOptions): 
   }
 }
 
-export async function cmdContext(sub: string | undefined, options: CliOptions): Promise<number> {
+export async function cmdContext(
+  sub: string | undefined,
+  options: CliOptions,
+  arg?: string,
+): Promise<number> {
   const engine = new ContextEngine({
     rootDir: options.root,
     cacheFile: options.contextOut,
@@ -225,6 +237,60 @@ export async function cmdContext(sub: string | undefined, options: CliOptions): 
   });
 
   switch (sub) {
+    // Scan a repository and REMEMBER it — the difference from `build`, whose
+    // single cache file is last-writer-wins. Saved repos are selected on a run
+    // with `--repo <slug|path>` (or the wowUI dropdown).
+    case 'add': {
+      if (!arg) {
+        process.stderr.write('wowlidator context add: missing <path> to the repository\n');
+        return 2;
+      }
+      const slug = slugFor(arg);
+      // A re-add without flags falls back to what the entry remembered —
+      // wowUI's Re-scan posts only the path, and building bare would drop
+      // every operation/table node. See `mergedScanInputs`: the one merged
+      // pair feeds both the build and the entry, so they cannot drift.
+      const { openapi, dbSchema } = mergedScanInputs(await resolveRepo(arg), {
+        openapi: options.openapi,
+        dbSchema: options.dbSchema,
+      });
+      const repoEngine = new ContextEngine({
+        rootDir: arg,
+        cacheFile: graphFileFor(slug),
+        openApiSpec: openapi,
+        dbSchema,
+        dbUrl: process.env['WOWLIDATOR_DB_URL'],
+        dbRemoteOk: process.env['WOWLIDATOR_DB_REMOTE_OK'] === '1',
+      });
+      const graph = await repoEngine.build({ force: options.force });
+      await upsertRepo({
+        slug,
+        path: resolve(arg),
+        indexedAt: new Date().toISOString(),
+        nodes: graph.nodes.length,
+        openapi,
+        dbSchema,
+      });
+      process.stdout.write(
+        `${summarizeContext(graph)}\n\nsaved as ${slug} — ground a run in it with --repo ${slug}\n`,
+      );
+      return 0;
+    }
+
+    case 'list': {
+      const repos = await listRepos();
+      if (repos.length === 0) {
+        process.stdout.write('no repositories saved — wowlidator context add <path>\n');
+        return 0;
+      }
+      for (const repo of repos) {
+        process.stdout.write(
+          `${repo.slug}\n  ${repo.path}\n  ${repo.nodes} node(s), scanned ${repo.indexedAt}\n`,
+        );
+      }
+      return 0;
+    }
+
     case 'build': {
       const graph = await engine.build({ force: options.force });
       process.stdout.write(`${summarizeContext(graph)}\n\nwritten to ${engine.cacheFile}\n`);
@@ -238,7 +304,7 @@ export async function cmdContext(sub: string | undefined, options: CliOptions): 
     }
 
     default:
-      process.stderr.write(`wowlidator context: unknown subcommand ${sub ?? '(none)'} (expected build or show)\n`);
+      process.stderr.write(`wowlidator context: unknown subcommand ${sub ?? '(none)'} (expected build, show, add or list)\n`);
       return 2;
   }
 }

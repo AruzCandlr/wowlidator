@@ -100,6 +100,15 @@ const flowStepSchema = z.discriminatedUnion('action', [
   // State seeding, for preconditions such as authentication.
   z.object({ action: z.literal('setLocalStorage'), key: z.string(), value: z.string() }),
   z.object({ action: z.literal('clearStorage') }),
+  z.object({
+    action: z.literal('setClock'),
+    time: z
+      .string()
+      .describe(
+        'ISO date or date-time to pin the page clock to. Put it in setup, before the first goto.',
+      ),
+    intent,
+  }),
   // Assertions.
   z.object({
     action: z.literal('expectText'),
@@ -256,7 +265,13 @@ const flowStepSchema = z.discriminatedUnion('action', [
     values: z
       .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
       .optional(),
-    count: z.number().int().min(0).optional(),
+    count: z
+      .union([z.number().int().min(0), z.string()])
+      .optional()
+      .describe(
+        'Exact matching-row count; omitted means "at least one". A string interpolates ' +
+          '{{variables}} first — how an API-reported number is compared to the database.',
+      ),
     timeoutMs: z.number().int().min(1).optional(),
     intent,
   }),

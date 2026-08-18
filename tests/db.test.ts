@@ -62,6 +62,18 @@ const SCHEMA: DbSchema = {
       pk: ['id'],
       references: [],
     },
+    // A table outside the current schema, addressed the way introspection
+    // names it — the first real target (cnext-hrms, `benefit_management.*`)
+    // kept every table it writes out of `public`.
+    {
+      name: 'benefit_management.benefit_plan',
+      columns: [
+        { name: 'id', type: 'integer', nullable: false, pk: true },
+        { name: 'status', type: 'text', nullable: false, pk: false },
+      ],
+      pk: ['id'],
+      references: [],
+    },
   ],
 };
 
@@ -84,7 +96,7 @@ class StubDbClient implements DbClient {
       if (this.statements === null) throw new Error('relation "pg_stat_statements" does not exist');
       return { rows: this.statements.map((s) => ({ ...s })), rowCount: this.statements.length, durationMs: 1 };
     }
-    const table = /FROM "([^"]+)"/.exec(sql)?.[1] ?? '';
+    const table = (/FROM ((?:"[^"]+"\.)?"[^"]+")/.exec(sql)?.[1] ?? '').replace(/"/g, '');
     if (sql.includes('count(*)')) {
       const hasWhere = sql.includes('WHERE');
       const n = hasWhere
@@ -278,7 +290,7 @@ describe('DbActions state checks', () => {
     await db.dbSnapshot({ tables: ['orders', 'users'] });
     client.counts = { orders: 3, users: 5 };
 
-    await db.expectDbDelta({ table: 'orders', delta: 1 });
+    await db.expectDbDelta({ table: 'orders', delta: 1, timeoutMs: 10 });
     await db.expectDbUnchanged({ tables: ['users'] });
 
     const unchanged = bundle.steps[bundle.steps.length - 1]!;
@@ -309,6 +321,21 @@ describe('DbActions state checks', () => {
     client.counts = { users: 6 };
 
     await assert.rejects(db.expectDbUnchanged({ tables: ['users'] }), /users \(5 → 6\)/);
+  });
+
+  it('addresses a table in another schema as schema.table, quoted part by part', async () => {
+    const client = new StubDbClient();
+    client.rows['benefit_management.benefit_plan'] = [{ id: 7, status: 'A' }];
+    const { db, bundle } = harness(client);
+
+    await db.expectDbRow({ table: 'benefit_management.benefit_plan', where: { id: 7 }, values: { status: 'A' } });
+
+    const step = bundle.steps[bundle.steps.length - 1]!;
+    assert.equal(step.status, 'passed');
+    // `"benefit_management"."benefit_plan"` — never `"benefit_management.benefit_plan"`,
+    // which is a single (nonexistent) identifier.
+    assert.ok(client.queries.some((q) => q.sql.includes('"benefit_management"."benefit_plan"')));
+    assert.ok(client.queries.every((q) => !q.sql.includes('"benefit_management.benefit_plan"')));
   });
 
   it('refuses a table or column the schema does not declare, listing what it does', async () => {
@@ -496,3 +523,162 @@ describe(
     });
   },
 );
+
+// --- count as a variable: the API-number-vs-database-number cross-check ------
+
+describe('expectDbRow count as a string', () => {
+  function countHarness(count: number): { db: DbActions; bundle: ProofBundleBuilder; store: VariableStore } {
+    const client = new StubDbClient();
+    client.counts['orders'] = count;
+    const bundle = new ProofBundleBuilder({ name: 'db-test' });
+    const store = new VariableStore();
+    const db = new DbActions({ db: null, client, bundle, variables: store });
+    return { db, bundle, store };
+  }
+
+  it('a {{variable}} count interpolates and compares — the cross-check passes when they agree', async () => {
+    const { db, bundle, store } = countHarness(98);
+    store.set('persons', '98');
+    await db.expectDbRow({ table: 'orders', where: {}, count: '{{persons}}', timeoutMs: 50 });
+    assert.equal(bundle.steps[0]?.status, 'passed');
+  });
+
+  it('and fails when they disagree', async () => {
+    const { db, bundle, store } = countHarness(97);
+    store.set('persons', '98');
+    await assert.rejects(
+      () => db.expectDbRow({ table: 'orders', where: {}, count: '{{persons}}', timeoutMs: 50 }),
+      /expected exactly 98 row/,
+    );
+    assert.equal(bundle.steps[0]?.status, 'failed');
+  });
+
+  it('an unknown variable is an error, never an empty count', async () => {
+    const { db } = countHarness(98);
+    await assert.rejects(
+      () => db.expectDbRow({ table: 'orders', where: {}, count: '{{nobody}}', timeoutMs: 50 }),
+      /nobody/,
+    );
+  });
+
+  it('a count that does not resolve to a number fails loudly, naming both forms', async () => {
+    const { db, store } = countHarness(98);
+    store.set('persons', 'many');
+    await assert.rejects(
+      () => db.expectDbRow({ table: 'orders', where: {}, count: '{{persons}}', timeoutMs: 50 }),
+      /not a number/,
+    );
+  });
+
+  it('an empty where with a numeric count reads the whole table', async () => {
+    const { db, bundle } = countHarness(36);
+    await db.expectDbRow({ table: 'orders', where: {}, count: 36, timeoutMs: 50 });
+    assert.equal(bundle.steps[0]?.status, 'passed');
+  });
+});
+
+// --- the values half of a row check must be half the story -------------------
+
+describe('expectDbRow failure wording with a values filter', () => {
+  it('names both halves: the values expected, and how many rows matched the where', async () => {
+    // DB_07_01 live: 1 row matched the where and 0 held the expected values,
+    // and the old message — "where rule_id = …; found 0" — read as "the row
+    // is missing" when the row was there and merely un-updated.
+    const client = new StubDbClient();
+    client.rows['orders'] = [{ id: '42', status: 'pending' }];
+
+    const { db, bundle } = harness(client);
+    await assert.rejects(
+      () =>
+        db.expectDbRow({
+          table: 'orders',
+          where: { id: '42' },
+          values: { status: 'paid' },
+          timeoutMs: 100,
+        }),
+      (error: Error) => {
+        assert.match(error.message, /holding status = paid/);
+        assert.match(error.message, /found 0 of 1 row\(s\) matching the where/);
+        return true;
+      },
+    );
+    const step = bundle.steps[bundle.steps.length - 1]!;
+    assert.match(step.db?.expected ?? '', /holding status = paid/);
+    assert.match(step.db?.observed ?? '', /0 of 1 row\(s\)/);
+  });
+
+  it('a check with no values keeps the plain count wording', async () => {
+    const client = new StubDbClient();
+    client.rows['orders'] = [];
+    const { db } = harness(client);
+    await assert.rejects(
+      () => db.expectDbRow({ table: 'orders', where: { id: '9' }, timeoutMs: 100 }),
+      (error: Error) => {
+        assert.match(error.message, /expected at least 1 row in "orders" where id = 9; found 0 row\(s\) \(/);
+        assert.doesNotMatch(error.message, /holding|matching the where/);
+        return true;
+      },
+    );
+  });
+});
+
+
+/**
+ * Which side a failed database check belongs to.
+ *
+ * "The row is not there" is one observation with two candidate causes that go
+ * to different people: the backend refused the write, or nothing ever sent
+ * one. The second is not hypothetical — it is what a screen that keeps its
+ * state in the browser looks like from the database's point of view, and
+ * against one of those a DB assertion files a high backend defect on every
+ * run of a feature that works exactly as built.
+ */
+describe('a failed DB check is attributed by what the page actually sent', () => {
+  function attributed(witness: { observing: boolean; total: number; mutating: number }) {
+    const bundle = new ProofBundleBuilder({ name: 'db-attribution' });
+    const filed: { category: string; severity: string; title: string; detail: string }[] = [];
+    const db = new DbActions({
+      db: null,
+      client: (() => {
+        const client = new StubDbClient();
+        client.counts = { orders: 7 };
+        return client;
+      })(),
+      bundle,
+      variables: new VariableStore(),
+      writeWitness: () => witness,
+      recordDefect: (category, severity, title, detail) =>
+        filed.push({ category, severity, title, detail }),
+    });
+    return { db, filed };
+  }
+
+  it('blames the backend when the page did send writes', async () => {
+    const { db, filed } = attributed({ observing: true, total: 12, mutating: 3 });
+    await db.dbSnapshot({ tables: ['orders'] });
+    await assert.rejects(db.expectDbDelta({ table: 'orders', delta: 1, timeoutMs: 10 }));
+    assert.equal(filed[0]?.category, 'backend');
+    assert.equal(filed[0]?.severity, 'high');
+  });
+
+  it('does not blame the backend when nothing asked it to change', async () => {
+    const { db, filed } = attributed({ observing: true, total: 12, mutating: 0 });
+    await db.dbSnapshot({ tables: ['orders'] });
+    await assert.rejects(db.expectDbDelta({ table: 'orders', delta: 1, timeoutMs: 10 }));
+    assert.equal(filed[0]?.category, 'functional');
+    assert.equal(filed[0]?.severity, 'medium');
+    assert.match(filed[0]?.detail ?? '', /no POST, PUT, PATCH or DELETE/);
+    assert.match(filed[0]?.detail ?? '', /keeps its state in the browser/);
+  });
+
+  it('says nothing about attribution when nothing was watching', async () => {
+    // No observer is an environment fact, not a page fact — claiming "the page
+    // sent no write" on the strength of not having looked would be the
+    // overstatement every other attribution in this codebase refuses.
+    const { db, filed } = attributed({ observing: false, total: 0, mutating: 0 });
+    await db.dbSnapshot({ tables: ['orders'] });
+    await assert.rejects(db.expectDbDelta({ table: 'orders', delta: 1, timeoutMs: 10 }));
+    assert.equal(filed[0]?.category, 'backend');
+    assert.doesNotMatch(filed[0]?.detail ?? '', /no POST/);
+  });
+});

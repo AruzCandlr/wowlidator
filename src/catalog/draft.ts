@@ -207,6 +207,11 @@ export async function draftCatalog(
       testCase: one.testCase.trim(),
       polarity: one.polarity,
       priority: one.priority,
+      // The draft schema has no sign-in/environment columns (its cases are
+      // drafted from specs, not run); the fields exist so a drafted sheet
+      // round-trips through the same row shape the parser reads.
+      persona: '',
+      preconditions: '',
       testData: one.testData.trim(),
       menu: one.menu.trim(),
       steps: one.steps.trim(),

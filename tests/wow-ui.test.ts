@@ -15,13 +15,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 
-import type { ProofBundle } from '../src/engine/proof-bundle.js';
+import { BACKEND_TIER_ACTIONS, type ProofBundle } from '../src/engine/proof-bundle.js';
 import { SUPPORTED_EXTENSIONS } from '../src/catalog/extract.js';
 import { UiCommandError, buildArgv, commandById } from '../src/ui/commands.js';
-import { UploadError, deleteDocument, safeName } from '../src/ui/uploads.js';
+import { UploadError, deleteDocument, safeName, saveDocument } from '../src/ui/uploads.js';
 import { clearProofCache, readProof, readProofIndex, toCard } from '../src/ui/proofs.js';
 import { renderWowUi } from '../src/ui/wow-ui-html.js';
-import { applyProgressLine, type JobProgress } from '../src/ui/jobs.js';
+import { applyProgressLine, formatProgressReadout, type JobProgress } from '../src/ui/jobs.js';
 import { ModelSelection, ModelSelectionError } from '../src/ui/models.js';
 
 function bundle(overrides: Partial<ProofBundle> = {}): ProofBundle {
@@ -123,8 +123,19 @@ describe('the wowUI page', () => {
   it('takes documents, in GRIM’s three-mode launcher', () => {
     for (const field of ['Start verification', 'Add Context', 'Add Catalog', 'Describe',
       'Anything to look at especially', 'Page to prove it against', 'Options for this run only']) {
-      assert.ok(html.includes(field), `the modal lost "${field}"`);
+      assert.ok(html.includes(field), `the launcher lost "${field}"`);
     }
+  });
+
+  it('opens the launcher inline in the page flow, never as an overlay', () => {
+    // The start form is an expandable section directly under the header: the
+    // same fields, the same POST payloads, but the runs it is about to add to
+    // stay visible behind it. Collapsing resets the same state the old
+    // modal's close did, so reopening always starts clean.
+    assert.ok(html.includes("id: 'launcher'"), 'the inline host is missing');
+    assert.ok(html.includes('toggleLauncher'), 'the start button must toggle the section');
+    assert.ok(html.includes('closeLauncher'), 'collapsing must reset the form state');
+    assert.doesNotMatch(html, /openStartModal/);
   });
 
   it('never asks anyone to supply a flow', () => {
@@ -137,12 +148,59 @@ describe('the wowUI page', () => {
     assert.doesNotMatch(html, /commandId: 'run'/);
   });
 
+  it('remembers repositories under Machinery, and any run can select one', () => {
+    // Saving is memory, not an upload: the Machinery view scans through the
+    // whitelisted `context add` (never a shell string), and the launch modal
+    // offers the saved repos in a dropdown on every run type. If any of these
+    // strings vanish, either the way in or the way to use it is gone.
+    assert.ok(html.includes("'Repositories'"));
+    assert.match(html, /post\('context-add'/);
+    assert.ok(html.includes('Ground in a saved repository'));
+    assert.ok(html.includes('extras.repo'));
+    // Add Context points at the new home rather than duplicating the scan.
+    assert.ok(html.includes('Machinery › Repositories'));
+  });
+
+  it('labels backend steps as backend, and the mirror cannot drift', () => {
+    // The client is a template string and cannot import BACKEND_TIER_ACTIONS,
+    // so it carries a mirror — and this test pins every member of the real
+    // set against the page, which is what makes the mirror safe to have.
+    assert.ok(html.includes("text: 'backend'"));
+    for (const action of BACKEND_TIER_ACTIONS) {
+      assert.ok(html.includes(`${action}: 1`), `BACKEND_ACTIONS mirror is missing ${action}`);
+    }
+  });
+
   it('offers every format the extractor can actually read', () => {
     // A picker that accepts a .docx the extractor refuses is a picker that
     // produces an error after the upload rather than before it.
     for (const extension of SUPPORTED_EXTENSIONS) {
       assert.ok(html.includes(extension), `the file picker does not offer ${extension}`);
     }
+  });
+
+  it('takes a sequence diagram as an image, for catalogs only', async () => {
+    // The catalog picker offers the image containers the transcriber reads;
+    // the context picker must NOT, because the server refuses an image there
+    // (context documents reach the extractor directly, which reads no pixels).
+    assert.ok(html.includes('CATALOG_ACCEPT'), 'the catalog picker lost its own accept list');
+    assert.match(html, /CATALOG_ACCEPT = DOCUMENT_ACCEPT \+ ',\.png,\.jpg,\.jpeg,\.webp,\.svg'/);
+    assert.doesNotMatch(html, /DOCUMENT_ACCEPT = [^;]*\.png/);
+    // And the server-side half of the same rule (thrown before any write):
+    await assert.rejects(
+      saveDocument({ kind: 'context', name: 'flow.png', contentBase64: Buffer.from('x').toString('base64') }),
+      /only be a catalog/,
+    );
+    // An image name survives upload with its extension intact — including
+    // .svg, which must NEVER fall back to .txt: a rendered diagram read as
+    // raw XML prose produced 30 ungated "claims" live. It routes through the
+    // same transcription gate as a picture instead.
+    assert.equal(safeName('whiteboard photo.PNG'), 'whiteboard-photo.png');
+    assert.equal(safeName('seqimg.svg'), 'seqimg.svg');
+    await assert.rejects(
+      saveDocument({ kind: 'context', name: 'seqimg.svg', contentBase64: Buffer.from('<svg/>').toString('base64') }),
+      /only be a catalog/,
+    );
   });
 
   it('shows the claims before anything is proved', () => {
@@ -193,6 +251,16 @@ describe('the wowUI page', () => {
     assert.match(html, /active\.failed && active\.error/);
   });
 
+  it('streams a running job’s console into its own card, not a side pane', () => {
+    // The SSE and replay wiring is unchanged server-side; only the pane moved.
+    // One way output is shown: an expandable section under the card it
+    // explains — live while the job runs, the finished-run section afterwards.
+    assert.ok(html.includes('streamJob'), 'the live stream feeds the card section');
+    assert.ok(html.includes("'/events'"), 'the SSE endpoint is still how lines arrive');
+    assert.ok(html.includes('outputSection'), 'the one shared output section');
+    assert.doesNotMatch(html, /jobPanel|openJobDrawer/, 'the sidebar output pane must stay gone');
+  });
+
   it('keeps a finished run’s command output reachable, collapsed under its card', () => {
     // The live row disappears the moment the proof lands; without this the
     // stream it carried (authoring narration, agent turns, progress lines)
@@ -235,6 +303,11 @@ describe('the wowUI page', () => {
     // dataSignature() — so the bars are written to in place instead.
     assert.ok(html.includes('tickProgress'));
     assert.doesNotMatch(html, /S\.jobs\.map\(function \(j\) \{ return j\.id \+ j\.status \+ j\.progress/);
+    // tqdm's readout, mirrored from formatProgressReadout in ui/jobs.ts —
+    // the client is a template string and cannot import it, so this pins the
+    // mirror against silent deletion.
+    assert.ok(html.includes('tqdmReadout'), 'the tqdm readout mirror is missing');
+    assert.ok(html.includes("'s/it'") && html.includes("'it/s'"), 'the rate must flip units as tqdm does');
   });
 
   it('builds every node through el(), never from an HTML string', () => {
@@ -243,11 +316,35 @@ describe('the wowUI page', () => {
     // command panel there is no `trustedHtml` escape hatch here at all.
     assert.doesNotMatch(html, /innerHTML|trustedHtml|insertAdjacentHTML|document\.write/);
   });
+
+  it('asks how far the test should reach, with real radios', () => {
+    // A select hides the option not chosen; these two change what the run
+    // DOES, so both stay on screen with their consequence beside them.
+    assert.match(html, /How far should it reach\?/);
+    assert.match(html, /type: 'radio', name: 'launch-scope'/);
+    assert.match(html, /End-to-end/);
+  });
 });
 
 describe('the command whitelist', () => {
   const claims = commandById('catalog-claims')!;
   const run = commandById('catalog-run')!;
+
+  it('declares the scope the launcher offers, so the server accepts it', () => {
+    // The radio in the Describe launcher sends `scope`, and a value this file
+    // does not declare is refused by the server — commands.ts is the single
+    // declaration the form and the argv builder share.
+    for (const id of ['go', 'author']) {
+      const field = commandById(id)!.fields.find((one) => one.name === 'scope');
+      assert.ok(field, `${id} must declare scope`);
+      assert.deepEqual(field?.choices, ['unit', 'e2e']);
+      assert.equal(field?.default, 'unit');
+    }
+    assert.deepEqual(
+      buildArgv(commandById('go')!, { target: 'check the journey', scope: 'e2e' }),
+      ['go', 'check the journey', '--scope', 'e2e'],
+    );
+  });
 
   it('carries a fixed flag the form has no control for', () => {
     // "List the claims" and "prove the approved ones" are two panel actions
@@ -411,7 +508,8 @@ describe('the card projection', () => {
 });
 
 describe('live progress, read out of the command\'s own output', () => {
-  const fresh = (): JobProgress => ({ done: 0, total: null, etaMs: null, percent: null, phase: null });
+  const fresh = (): JobProgress =>
+    ({ done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0 });
 
   it('takes the denominator from the plan line the run announces', () => {
     const progress = fresh();
@@ -433,9 +531,55 @@ describe('live progress, read out of the command\'s own output', () => {
     applyProgressLine(progress, '  plan       10 step(s)', 0);
     applyProgressLine(progress, '\u2713 [0] click (1ms)', 1_000);
     assert.equal(progress.etaMs, 9_000, '1s for 1 of 10 -> 9s left');
-    // The run slows down; the estimate follows rather than holding a constant.
+    // The run slows down; the estimate follows \u2014 smoothly. tqdm's EMA
+    // (smoothing 0.3): 0.3\u00b73000 + 0.7\u00b71000 = 1600ms/step, \u00d7 8 left = 12.8s,
+    // between the old pace (8s) and what a raw average would claim (16s).
     applyProgressLine(progress, '\u2713 [1] click (1ms)', 4_000);
-    assert.equal(progress.etaMs, 16_000);
+    assert.equal(Math.round(progress.rateMsPerStep!), 1_600);
+    assert.equal(progress.etaMs, 12_800);
+  });
+
+  it('moves the estimate smoothly when the pace bursts, never instantly', () => {
+    // tqdm's smoothing is the reference: after two 5s steps, a 100ms step must
+    // pull the ETA down without collapsing it to the last dt alone.
+    const progress = fresh();
+    applyProgressLine(progress, '  plan       10 step(s)', 0);
+    applyProgressLine(progress, '\u2713 [0] click (1ms)', 5_000);
+    applyProgressLine(progress, '\u2713 [1] click (1ms)', 10_000);
+    assert.equal(progress.etaMs, 40_000, 'steady 5s/step, 8 left');
+    applyProgressLine(progress, '\u2713 [2] click (1ms)', 10_100);
+    // 0.3\u00b7100 + 0.7\u00b75000 = 3530ms/step \u2014 far above the burst's own 100ms,
+    // well below the old pace: the average is moving, not teleporting.
+    assert.equal(Math.round(progress.rateMsPerStep!), 3_530);
+    assert.equal(progress.etaMs, 24_710);
+    applyProgressLine(progress, '\u2713 [3] click (1ms)', 10_200);
+    assert.equal(Math.round(progress.rateMsPerStep!), 2_501, 'each fast step pulls it further down');
+    assert.equal(progress.etaMs, 15_006);
+  });
+
+  it('prints tqdm\u2019s readout: done/total [elapsed<remaining, rate]', () => {
+    const progress = fresh();
+    applyProgressLine(progress, '  plan       10 step(s)', 0);
+    applyProgressLine(progress, '\u2713 [0] click (1ms)', 4_000);
+    assert.equal(formatProgressReadout(progress, 4_000), '1/10 [00:04<00:36, 4.0s/it]');
+  });
+
+  it('flips the rate to it/s past one step per second, as tqdm does', () => {
+    const progress = fresh();
+    applyProgressLine(progress, '  plan       10 step(s)', 0);
+    applyProgressLine(progress, '\u2713 [0] click (1ms)', 400);
+    assert.equal(formatProgressReadout(progress, 400), '1/10 [00:00<00:04, 2.5it/s]');
+  });
+
+  it('renders no readout before there is anything to read', () => {
+    // Half a readout \u2014 a total with no pace, a pace with no total \u2014 would look
+    // like a measurement that was never made.
+    const noTotal = fresh();
+    applyProgressLine(noTotal, '\u2713 [0] visitLink (900ms)', 900);
+    assert.equal(formatProgressReadout(noTotal, 900), null, 'a crawl has no denominator');
+    const noStep = fresh();
+    applyProgressLine(noStep, '  plan       10 step(s)', 0);
+    assert.equal(formatProgressReadout(noStep, 500), null, 'no step has finished');
   });
 
   it('does not estimate before there is anything to extrapolate from', () => {

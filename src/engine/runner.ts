@@ -31,6 +31,7 @@ import {
   type ExpectedCall,
   type FlowExpectCallsSpec,
 } from '../api/expect-calls.js';
+import { isSecretStepValue, maskSecret } from '../api/redact.js';
 import type { RedactionPolicy } from '../api/redact.js';
 import { VariableStore } from '../api/variables.js';
 import { DbActions } from '../db/db-actions.js';
@@ -78,6 +79,7 @@ import {
   isTextSelector,
   qualifyBareRole,
   relaxRoleName,
+  relaxTextSelector,
   sanitizeSelector,
 } from './selector.js';
 import { expandFlow, hasIncludes } from './compose.js';
@@ -86,6 +88,7 @@ import {
   BROWSER_FREE_ACTIONS,
   ProofBundleBuilder,
   type AgentRecord,
+  type StepDecision,
   type DataCaseResult,
   type DataRetryAttempt,
   type DataRetryRecord,
@@ -102,6 +105,14 @@ import {
 export const DEFAULT_CDP_URL = 'http://localhost:9222';
 /** Fast-path timeout. Short by design — see the module comment. */
 export const DEFAULT_FAST_TIMEOUT_MS = 2_000;
+
+/**
+ * Budget for the one-attribute read that decides whether a field is a
+ * password. Deliberately tiny: the element has just been resolved and acted
+ * on, so it is there now or the answer does not matter — and a masking
+ * decision must never be able to slow a step down, let alone fail one.
+ */
+const ATTRIBUTE_READ_TIMEOUT_MS = 250;
 /** Timeout for a cached or freshly healed selector, which we expect to work. */
 export const DEFAULT_HEALED_TIMEOUT_MS = 10_000;
 
@@ -189,6 +200,16 @@ export interface SmartRunnerOptions {
   /** How much of an observed request may be recorded. Defaults to redacting. */
   networkRedaction?: RedactionPolicy | undefined;
   /**
+   * The credentials this run was told to sign in with (`--as`).
+   *
+   * Held for ONE purpose: masking. A value the person named as a credential is
+   * masked wherever it lands in a record, whatever the field looks like and
+   * whatever the DOM says — their statement outranks any inference this code
+   * could make. The email is deliberately NOT masked: it is not a secret, and
+   * it is frequently the evidence that says which persona a run signed in as.
+   */
+  credentials?: { email: string; password: string } | undefined;
+  /**
    * Ring-buffer cap for the observer. The default (300) suits per-step
    * evidence; a long journey ending in an `expectCalls` over the whole run
    * may need more — a `never` claim over a window that dropped calls is
@@ -262,6 +283,8 @@ interface ResolveResult<T> {
   dialog?: DialogRecord | undefined;
   /** What the agent did to make the control reachable, when it was called in. */
   agent?: AgentRecord | undefined;
+  /** What the agent judged and chose, when it was asked to decide for itself. */
+  decision?: StepDecision | undefined;
 }
 
 /**
@@ -378,9 +401,27 @@ export class StepResolutionError extends Error {
   pageContext?: string[] | undefined;
   /** Repair candidates the healer proposed and the ladder refused. */
   rejectedHeals?: RejectedHeal[] | undefined;
+  /**
+   * What the agent decided here, when it was consulted and the step still
+   * failed. Carried on the error because that is the only channel a failing
+   * step has — and "the agent looked and chose to do nothing" is precisely
+   * what a reader of a dead-ended step needs to see.
+   */
+  decision?: StepDecision | undefined;
 
   constructor(selector: string, attempts: string[]) {
-    super(`could not resolve "${selector}" after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`);
+    // "Could not resolve" must not headline a failure where every rung DID
+    // resolve the selector and the content behind it was wrong — that header
+    // reads as "the control is missing" and files the wrong defect. Seen
+    // live: `expectText role=main` resolved instantly on every rung, failed
+    // on text, and the report said the control was never found.
+    const contentOnly =
+      attempts.length > 0 && attempts.every((line) => /expected text to contain/i.test(line));
+    super(
+      contentOnly
+        ? `"${selector}" resolved, but its content did not hold after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`
+        : `could not resolve "${selector}" after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`,
+    );
     this.name = 'StepResolutionError';
     this.selector = selector;
     this.attempts = attempts;
@@ -444,6 +485,45 @@ async function applyViewport(page: Page): Promise<void> {
   const size = configuredViewport();
   if (size === null) return;
   await page.setViewportSize(size).catch(() => undefined);
+}
+
+/**
+ * Turn what the agent actually returned into the decision recorded on a step.
+ *
+ * Deliberately derivative: every word here comes from the agent's own output —
+ * `AgentRecord.summary` and the per-action `reasoning` it already produces —
+ * rather than a second model call asked to narrate the first. A field that
+ * cannot be filled honestly is left empty; synthesising words the agent never
+ * said would put a claim in the report wearing the agent's voice.
+ *
+ * The split matters more than the wording. `observed`/`decided`/`because` are
+ * claims; `actions` are the acts; `resolved` is whether the author's own
+ * selector then worked, and is the only one of the four that is evidence.
+ */
+export function decisionFrom(
+  record: AgentRecord,
+  resolved: boolean,
+): StepDecision {
+  // The first acting turn is the decision — `finish` is the agent stopping,
+  // not choosing. An agent that only ever called `finish` decided to do
+  // nothing, and that is recorded as exactly that rather than as an absence.
+  const acted = record.actions.filter((a) => a.action !== 'finish');
+  const first = acted[0];
+  return {
+    // What it saw is only ever stated in the reasoning of the turn it acted
+    // on; with no acting turn there is nothing it claimed to see, and an
+    // empty string says so without inventing a sighting.
+    observed: first?.reasoning ?? '',
+    decided: first
+      ? `${first.action}${first.selector ? ` ${first.selector}` : ''}${
+          first.value ? ` = ${first.value}` : ''
+        }`
+      : 'nothing — the agent judged that no interaction was in the way',
+    because: record.summary,
+    actions: [...record.actions],
+    resolved,
+    model: record.model,
+  };
 }
 
 function describe(error: unknown): string {
@@ -533,6 +613,14 @@ export function parseInterception(
  * that merely mentions permissions — understate, never overstate, the same
  * rule `ax-coverage.ts` applies to attribution.
  */
+/**
+ * How much of a live-region message is kept, and how many. A toast is a
+ * sentence; a page mid-error can hold several, and `pageContext` is read by a
+ * human at the top of a failure, not scrolled through.
+ */
+const PAGE_MESSAGE_MAX = 2;
+const PAGE_MESSAGE_MAX_CHARS = 160;
+
 const DENIAL_HEADING_PATTERN =
   /access denied|forbidden|not authori[sz]ed|unauthori[sz]ed|permission denied|no permission|ไม่มีสิทธิ์|\b403\b/i;
 
@@ -677,6 +765,13 @@ export class SmartRunner {
   readonly #updateBaselines: boolean;
   readonly #networkEnabled: boolean;
   readonly #networkRedaction: RedactionPolicy;
+  /**
+   * Values the person named as secret via `--as`. Masked wherever they land in
+   * a record — see `#maskValue`. A set, so the check stays exact-match: no
+   * substring cleverness, which would mask an unrelated field that happened to
+   * contain the password as a fragment.
+   */
+  readonly #secretValues: ReadonlySet<string>;
   readonly #networkMaxCalls: number | undefined;
   #network: NetworkObserver | null = null;
   readonly #api: ApiActions;
@@ -691,11 +786,19 @@ export class SmartRunner {
   #sequenceMark = 0;
   #defectSeq = 0;
   #ownsPage = true;
-  /** Path of the most recent `goto`, and whether any asked for a sign-in page. */
+  /** Path of the most recent `goto`, and whether that goto asked for a sign-in page. */
   #lastGotoPath: string | null = null;
-  #askedForSignIn = false;
+  #lastGotoAskedSignIn = false;
   #lastAction: string | null = null;
   #strandedReported = false;
+  /**
+   * A credential submit fired, the hydration race ate it, and the replay did
+   * not rescue it — so this run holds no session. Positive evidence only: set
+   * from the same signatures `nativeFormResubmitDetected` and
+   * `fillsLostToHydration` produce, never from a page merely looking like a
+   * login screen. See `#strandedMessage`.
+   */
+  #signInDidNotTake = false;
   /** Only a context this runner created may be closed by it — see `close()`. */
   #ownsContext = false;
 
@@ -727,6 +830,11 @@ export class SmartRunner {
     this.#updateBaselines = options.updateBaselines ?? false;
     this.#networkEnabled = options.network ?? true;
     this.#networkRedaction = options.networkRedaction ?? {};
+    // Only the password. The email is not a secret and is the evidence that
+    // says which persona signed in.
+    this.#secretValues = new Set(
+      options.credentials?.password ? [options.credentials.password] : [],
+    );
     this.#networkMaxCalls = options.networkMaxCalls;
     this.#sequenceMark = Date.now();
     // One store, both action families: a `request` step saves `{{orderId}}`
@@ -753,6 +861,22 @@ export class SmartRunner {
       bundle: this.bundle,
       variables,
       currentUrl: () => this.#currentUrl(),
+      // Read only after a DB check has already failed, and only to separate
+      // "the write was refused" from "no write was ever sent". GET and HEAD
+      // cannot change state, so they are not evidence that anything tried.
+      // The browser-free construction below passes none of this: an API flow
+      // has no page to watch, and no witness means no attribution, which is
+      // exactly the behaviour this had before.
+      writeWitness: () => {
+        const observer = this.#network;
+        if (!observer) return { observing: false, total: 0, mutating: 0 };
+        const calls = observer.all();
+        return {
+          observing: true,
+          total: calls.length,
+          mutating: calls.filter((call) => !/^(GET|HEAD)$/i.test(call.method)).length,
+        };
+      },
       recordDefect,
     });
   }
@@ -898,9 +1022,16 @@ export class SmartRunner {
     try {
       const asked = new URL(url, this.page.url() || undefined);
       this.#lastGotoPath = asked.pathname;
-      if (looksLikeSignIn(asked.href)) this.#askedForSignIn = true;
+      // Per-goto, not sticky-for-the-run: a flow that signs in FIRST always
+      // has a login goto in its past, and a run-wide flag then exempted the
+      // exact case the guard exists for — a post-login goto to a protected
+      // page bounced straight back to /login, followed by every body step
+      // dead-ending against login furniture as "frontend" defects. Only the
+      // most recent goto says what the flow means to be looking at now.
+      this.#lastGotoAskedSignIn = looksLikeSignIn(asked.href);
     } catch {
       this.#lastGotoPath = null;
+      this.#lastGotoAskedSignIn = false;
     }
     try {
       await this.page.goto(url, { waitUntil: 'domcontentloaded' });
@@ -1194,6 +1325,31 @@ export class SmartRunner {
           (globalThis as unknown as BrowserGlobals).localStorage.setItem(k, v),
         [key, value] as [string, string],
       );
+    });
+  }
+
+  /**
+   * Pin the page's clock to a fixed moment, via Playwright's clock API.
+   *
+   * This is the capability that makes time-dependent claims checkable at all:
+   * "14 days remaining shows the Urgent chip" is a claim about a boundary,
+   * and a run on the wall clock exercises whatever day it happens to be —
+   * usually none of the boundaries, while the report reads as though it
+   * checked them (seen live: a 13/13 "pass" of an urgency-tier case whose
+   * four probe dates were all in the past by run day). No selector, nothing
+   * to heal — `#bareStep`, like the other state seeding. An unparseable time
+   * fails loudly: a clock silently NOT installed turns every later assertion
+   * back into that vacuous pass.
+   */
+  async setClock(time: string, intent?: string): Promise<void> {
+    await this.#bareStep('setClock', { time, ...(intent !== undefined ? { intent } : {}) }, async () => {
+      const parsed = new Date(time);
+      if (Number.isNaN(parsed.getTime())) {
+        throw new Error(
+          `setClock: "${time}" is not a date the clock can be pinned to — use ISO, e.g. 2026-08-01 or 2026-08-01T00:00:00Z`,
+        );
+      }
+      await this.page.clock.install({ time: parsed });
     });
   }
 
@@ -1533,6 +1689,14 @@ export class SmartRunner {
    * after one fails — a partial boundary table is far less useful than the
    * whole one when you are trying to find where behaviour changes.
    */
+  /**
+   * Boundary values are the step's own evidence, so they are NOT masked by the
+   * credential heuristics that guard `fill`/`type` — a table showing which
+   * inputs a form accepted is worthless with its inputs hidden, and these
+   * values come from the author's table or from `mock-data.ts`, never from a
+   * real account. A value the person supplied through `--as` is still masked:
+   * that statement outranks this reasoning wherever the two meet.
+   */
   async fillEach(
     selector: string,
     cases: readonly DataCase[],
@@ -1556,9 +1720,14 @@ export class SmartRunner {
           await this.page.locator(submit).first().click({ timeout: this.#healedTimeoutMs });
         }
         await this.#checkDataExpectation(testCase);
-        results.push({ label, value: testCase.value, ok: true });
+        results.push({ label, value: this.#maskSuppliedSecret(testCase.value), ok: true });
       } catch (error) {
-        results.push({ label, value: testCase.value, ok: false, error: describe(error) });
+        results.push({
+          label,
+          value: this.#maskSuppliedSecret(testCase.value),
+          ok: false,
+          error: describe(error),
+        });
       }
     }
 
@@ -1687,7 +1856,7 @@ export class SmartRunner {
           await this.page.locator(options.submit).first().click({ timeout: this.#healedTimeoutMs });
         }
       } catch (error) {
-        attempts.push({ attempt, kind, value, succeeded: false });
+        attempts.push({ attempt, kind, value: this.#maskSuppliedSecret(value), succeeded: false });
         fatalError = describe(error);
         break;
       }
@@ -1703,7 +1872,7 @@ export class SmartRunner {
         .catch(() => false);
 
       succeeded = !stillConflicting;
-      attempts.push({ attempt, kind, value, succeeded });
+      attempts.push({ attempt, kind, value: this.#maskSuppliedSecret(value), succeeded });
       observedError = succeeded ? undefined : `"${failureSelector}" still visible after attempt ${attempt}`;
     }
 
@@ -2298,9 +2467,19 @@ export class SmartRunner {
           // evicted — failing the step would blame the app for the capture.
           if (truncated()) throw truncatedError('a missing call');
           const missing = result.matches.find((match) => match.call === null)!;
+          // The plane hazard, named at the moment it bites: expectCalls can
+          // only see traffic the page fires. An endpoint only the test (or a
+          // backend service) would call is never observed here however
+          // healthy it is — seen live as a high "backend" defect against a
+          // seed endpoint nothing on the page calls. The wording must leave
+          // the reader with that possibility in hand.
           throw new Error(
             `expected ${describeExpected(missing.expected)} — not observed ` +
-              `(${observed.length} call(s) in the window, in order; see the match table)`,
+              `(${observed.length} call(s) in the window, in order; see the match table). ` +
+              `expectCalls watches traffic the page itself makes: if nothing on the page ` +
+              `fires this call — because only the test should make it, or a server makes ` +
+              `it server-side — author it as a \`request\` step (or drop the claim) rather ` +
+              `than reading this as the endpoint being broken.`,
           );
         }
         await sleep(SEQUENCE_POLL_MS);
@@ -2442,6 +2621,109 @@ export class SmartRunner {
 
   // --- Escalation ladder ---------------------------------------------------
 
+  // --- Secret masking ------------------------------------------------------
+
+  /**
+   * The step's detail with a credential-shaped `value` masked.
+   *
+   * Applied at the recording boundary — the point a live value becomes a
+   * stored artefact — which is the same rule and the same moment
+   * `src/api/redact.ts` applies to an HTTP payload. The run keeps using the
+   * real value throughout; only the record is masked.
+   *
+   * Measured flaw this closes: a real bundle on disk held
+   * `{"action":"fill","selector":"input[type=\"password\"]","detail":{"value":"admin2026"}}`,
+   * and the HTML report inlines it — a report deliberately built to be
+   * emailable. `--as` made it worse by design, since it exists so a person
+   * supplies a REAL credential rather than the model inventing one.
+   *
+   * Evidence first, wording second:
+   *   1. a value the person named via `--as` — unconditional, any field;
+   *   2. the field's own `type="password"` — a fact about the document;
+   *   3. `looksLikeCredentialField` — the fallback for when the DOM cannot
+   *      answer, which is most often a step that failed to resolve at all and
+   *      whose value was therefore never typed anywhere, yet is still recorded.
+   *
+   * Never throws and never waits meaningfully: a masking decision must not be
+   * able to fail a step, so an unreadable field simply falls through to (3).
+   */
+  async #maskValue(
+    action: string,
+    selector: string,
+    intent: string | undefined,
+    detail: Record<string, unknown> | undefined,
+    resolvedSelector: string | null,
+  ): Promise<Record<string, unknown> | undefined> {
+    if (detail === undefined) return detail;
+    const value = detail['value'];
+    if (typeof value !== 'string' || value === '') return detail;
+
+    // The DOM read is skipped when the answer cannot change the outcome — a
+    // supplied secret is masked regardless, and a non-typing action is never
+    // masked by inference.
+    const needsDom =
+      !this.#secretValues.has(value) && (action === 'fill' || action === 'type');
+    const secret = isSecretStepValue({
+      action,
+      selector,
+      intent,
+      value,
+      fieldIsPassword: needsDom ? await this.#fieldIsPassword(resolvedSelector) : null,
+      secretValues: this.#secretValues,
+    });
+    return secret ? { ...detail, value: maskSecret(value) } : detail;
+  }
+
+  /**
+   * Is the resolved field an `<input type="password">`?
+   *
+   * `null` means "could not tell" — gone, detached, not an input, or the read
+   * threw — which is deliberately distinct from `false` so the caller can fall
+   * back to the wording heuristic rather than treating silence as a denial.
+   */
+  async #fieldIsPassword(resolvedSelector: string | null): Promise<boolean | null> {
+    if (resolvedSelector === null) return null;
+    try {
+      const type = await this.page
+        .locator(resolvedSelector)
+        .first()
+        .getAttribute('type', { timeout: ATTRIBUTE_READ_TIMEOUT_MS });
+      return type === null ? null : type.toLowerCase() === 'password';
+    } catch {
+      return null;
+    }
+  }
+
+  /** Mask any `--as` value inside a composite record's own values. */
+  #maskSuppliedSecret(value: string): string {
+    return this.#secretValues.has(value) ? maskSecret(value) : value;
+  }
+
+  /**
+   * A whole step with any credential-shaped `value` masked, for the records
+   * that store a step verbatim rather than as `detail` — `ReconstructionRecord`
+   * serialises `from`/`to` in full, so masking the recorded step's own detail
+   * leaves that copy untouched.
+   *
+   * No DOM read here: this runs after the fact, on a step that may never have
+   * resolved, so it is the wording heuristic and the `--as` set — exactly the
+   * evidence available at this point.
+   */
+  maskStepSecrets<T>(step: T): T {
+    const candidate = step as { value?: unknown; selector?: unknown; intent?: unknown };
+    const value = candidate.value;
+    if (typeof value !== 'string' || value === '') return step;
+    const secret = isSecretStepValue({
+      action: String((step as { action?: unknown }).action ?? ''),
+      selector: typeof candidate.selector === 'string' ? candidate.selector : '',
+      intent: typeof candidate.intent === 'string' ? candidate.intent : undefined,
+      value,
+      fieldIsPassword: null,
+      secretValues: this.#secretValues,
+    });
+    return secret ? ({ ...step, value: maskSecret(value) } as T) : step;
+  }
+
   async #step(
     action: string,
     selector: string,
@@ -2465,10 +2747,11 @@ export class SmartRunner {
         startedAt,
         durationMs: Date.now() - started,
         url: this.page.url(),
-        detail,
+        detail: await this.#maskValue(action, selector, intent, detail, result.resolvedSelector),
         heal: result.heal,
         dialog: result.dialog,
         agent: result.agent,
+        decision: result.decision,
         screenshot: await this.#shoot(
           // A heal, a dismissed dialog or an agent intervention is a passing
           // step that still changed what the test exercised; the rest are
@@ -2509,6 +2792,10 @@ export class SmartRunner {
     } catch (error) {
       const evidence = this.#networkEvidence(netMark);
       const resolution = error instanceof StepResolutionError ? error : undefined;
+      // What the page is saying, read once on the failure path. A denial
+      // heading still leads when the ladder found one — it is the harder stop
+      // — and a live-region message follows, or leads when there is no denial.
+      const pageContext = [...(resolution?.pageContext ?? []), ...(await this.#pageMessages())];
       this.bundle.addStep({
         action,
         intent,
@@ -2519,7 +2806,10 @@ export class SmartRunner {
         startedAt,
         durationMs: Date.now() - started,
         url: this.page.url(),
-        detail,
+        // A failed step never resolved, so there is no field to read a type
+        // from — the wording fallback carries this path alone, which is
+        // exactly the case it exists for.
+        detail: await this.#maskValue(action, selector, intent, detail, null),
         // A StepResolutionError's later lines are the escalation trace — the
         // rung-by-rung account `escalationTrace()` in the reporter parses.
         // `describe()` keeps only the first line, which is right for prose
@@ -2529,8 +2819,9 @@ export class SmartRunner {
         // showing, and which repairs were proposed and refused. Both are
         // evidence a reader needs and neither survives as anything but a
         // trace substring otherwise.
-        pageContext: resolution?.pageContext,
+        pageContext: pageContext.length > 0 ? pageContext : undefined,
         rejectedHeals: resolution?.rejectedHeals,
+        decision: resolution?.decision,
         network: evidence.calls.length > 0 ? evidence.calls : undefined,
         screenshot: await this.#shoot('failure'),
       });
@@ -2666,6 +2957,42 @@ export class SmartRunner {
         `than the ${this.#fastTimeoutMs}ms fast-path budget. The heal to "${healed}" hides a ` +
         'race condition rather than fixing it. Add an explicit wait for the state this step ' +
         'depends on instead of relying on the repair.',
+      original,
+    );
+  }
+
+  /**
+   * Report a text selector that was written tighter than the page renders.
+   *
+   * The relax rung is a rescue, not an absolution: the flow quoted a rendering
+   * the application does not use, and left alone it will pay this rung on
+   * every run forever. `low` because nothing about the application is wrong —
+   * DB_07_01's `text="75,000"` against a page rendering `฿75,000.00` was two
+   * `high` defects filed at a working feature, and the honest replacement is
+   * one small note telling the author what the page actually says.
+   *
+   * The matched text is read back so the finding names the real rendering
+   * rather than describing the shape of the problem. Best-effort: a read that
+   * fails must not turn a rescued step into a failed one.
+   */
+  async #flagOverExactText(original: string, relaxed: string): Promise<void> {
+    let shown: string | null = null;
+    try {
+      const text = await this.page.locator(relaxed).first().innerText({ timeout: 1_000 });
+      shown = text.trim().replace(/\s+/g, ' ').slice(0, 120) || null;
+    } catch {
+      shown = null;
+    }
+
+    this.#recordRuntimeDefect(
+      'functional',
+      'low',
+      `Text selector was more exact than the page: ${original}`,
+      `"${original}" matches an element's WHOLE text, and the page renders that value with ` +
+        `more around it${shown ? ` — it shows "${shown}"` : ''}. Matched instead as ` +
+        `"${relaxed}". The assertion holds; the selector was written tighter than the ` +
+        'rendering. Quote what the page actually shows (or use the unquoted substring form) ' +
+        'so the suite stops paying this rung every run.',
       original,
     );
   }
@@ -2876,7 +3203,12 @@ export class SmartRunner {
    * page is never stopped:
    *
    * - the page is on a sign-in URL now;
-   * - no `goto` in this run asked for one, so being here was not the plan;
+   * - the MOST RECENT `goto` did not ask for a sign-in page — per-goto, not
+   *   "any goto in this run": a flow that logs in first always has a login
+   *   goto in its past, and the run-wide version of this exemption is what
+   *   let a bounced post-login navigation spend six steps dead-ending
+   *   against login furniture (seen live: the whole DB_04 create-plan body
+   *   filed high frontend defects from /en/login);
    * - the last `goto` asked for a different page, i.e. we were sent here.
    *
    * A `click` is exempt: following a "Sign out" control is a legitimate way to
@@ -2887,10 +3219,15 @@ export class SmartRunner {
     if (message === null) return;
     if (!this.#strandedReported) {
       this.#strandedReported = true;
+      // Before the defect and before the throw: the verdict must hold even
+      // when a later path swallows the error. See `noteSessionLost`.
+      this.bundle.noteSessionLost();
       this.#recordRuntimeDefect(
         'functional',
         'high',
-        'The run lost its session and was sent to the sign-in page',
+        this.#signInDidNotTake
+          ? 'The sign-in never took effect — the run held no session'
+          : 'The run lost its session and was sent to the sign-in page',
         message,
         undefined,
       );
@@ -2906,7 +3243,32 @@ export class SmartRunner {
    * must decline to heal, but it is still an ordinary failed step.
    */
   #strandedMessage(): string | null {
-    if (this.#askedForSignIn || this.#lastAction === 'click') return null;
+    // The sign-in that never took, as opposed to the session that was lost.
+    // `#strandedMessage`'s original question is "were we bounced AWAY from
+    // what we asked for?", which needs `path !== #lastGotoPath` — and in a
+    // flow that logs in first, the most recent goto IS the login page, so it
+    // correctly declines and the run carries on unauthenticated. That is how
+    // DB_04_01 filed six high frontend defects, DB_06_01 five, DB_07_01 five
+    // and DB_08_01 three, every one of them about an application that was
+    // fine: the login silently failed and everything after it ran on a page
+    // the flow had no session for.
+    //
+    // This branch asks the other question — "did the sign-in work at all?" —
+    // and it never guesses: `#signInDidNotTake` is set only from the hydration
+    // signatures, after a replay that failed to rescue them. It deliberately
+    // does NOT require the current page to look like a sign-in page: this app
+    // renders a protected route for a beat before its client guard bounces
+    // it, so "where are we now" is the wrong evidence. The trigger is the
+    // flow asking for a page that needs a session — which is also what
+    // exempts a negative sign-in test, since one that stays on the login page
+    // to assert an error message never sets `#lastGotoAskedSignIn` false.
+    const neverSignedIn = signInDidNotTakeMessage({
+      signInDidNotTake: this.#signInDidNotTake,
+      lastGotoAskedSignIn: this.#lastGotoAskedSignIn,
+      lastGotoPath: this.#lastGotoPath,
+    });
+    if (neverSignedIn !== null) return neverSignedIn;
+    if (this.#lastGotoAskedSignIn || this.#lastAction === 'click') return null;
     const current = this.page.url();
     if (!looksLikeSignIn(current)) return null;
     if (this.#lastGotoPath === null) return null;
@@ -2940,9 +3302,67 @@ export class SmartRunner {
     await this.page.waitForTimeout(this.#stepDelayMs).catch(() => undefined);
   }
 
+  /**
+   * Record how a credential submit ended.
+   *
+   * Called for every credential-shaped click: `true` when a hydration
+   * signature fired AND the page is still on the sign-in URL afterwards —
+   * the submit demonstrably did not take. `false` clears it, so a flow that
+   * retries its login and succeeds is not haunted by the first attempt.
+   */
+  noteSignInOutcome(didNotTake: boolean): void {
+    this.#signInDidNotTake = didNotTake;
+  }
+
   /** Remember what just ran, for `assertSessionHeld`. */
   noteAction(action: string): void {
     this.#lastAction = action;
+  }
+
+  /**
+   * A form submitted natively before the app hydrated — see
+   * `nativeFormResubmitDetected`. Two findings in one: the harness raced the
+   * page (and recovered by replaying), and the application let a credential
+   * form degrade to a native GET, which puts what was typed — passwords
+   * included — into URLs, browser history and server logs.
+   */
+  recordNativeResubmitFinding(step: FlowStep, param: string): void {
+    this.#recordRuntimeDefect(
+      'usability',
+      'medium',
+      'Form submitted natively before the app hydrated',
+      `Clicking ${(step as { selector?: string }).selector ?? step.action} landed before the ` +
+        `application attached its submit handler, so the browser performed the form's default ` +
+        `GET submission — ${
+          param === NATIVE_SUBMIT_UNNAMED
+            ? "the URL gained a query string it did not have when the credentials were typed (the form's inputs carry no name attribute, so it submitted a bare \"?\")"
+            : `form values (parameter "${param}") appeared in the page URL`
+        } and no ` +
+        `session was created. The run waited for hydration and replayed the fill block and the ` +
+        `click once. This is also an application finding: a form that degrades to a native GET ` +
+        `submission exposes what was typed in the URL.`,
+      (step as { selector?: string }).selector,
+    );
+  }
+
+  /**
+   * The race's second signature — see `fillsLostToHydration`. Same class of
+   * finding as `recordNativeResubmitFinding`: the harness typed faster than
+   * the app could listen, and the recovery is disclosed, never silent.
+   */
+  recordLostFillFinding(step: FlowStep, lostSelector: string): void {
+    this.#recordRuntimeDefect(
+      'usability',
+      'medium',
+      'Filled fields were reset by hydration before the submit',
+      `The fills landed before the application hydrated, and hydration reset its controlled ` +
+        `inputs — ${lostSelector} no longer held what the flow typed when ` +
+        `${(step as { selector?: string }).selector ?? step.action} was clicked, so the form ` +
+        `submitted without it and no session was created. The run waited for hydration and ` +
+        `replayed the fill block and the click once. This is also an application finding: a ` +
+        `form a fast user can fill before hydration silently discards their input.`,
+      (step as { selector?: string }).selector,
+    );
   }
 
   /** A rescued step is also a finding: the flow is drifting from the app. */
@@ -2974,6 +3394,52 @@ export class SmartRunner {
       return denial?.trim() || null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * What the page is telling the user right now — its live-region messages.
+   *
+   * A failure's diagnosis is frequently written on the screen in words, and
+   * wowlidator was not reading it. Adjudicated live on DB_06_01: the flow
+   * filled two of the rule form's required fields and clicked Save;
+   * `RuleForm.tsx` refuses the save and raises a warning toast naming the
+   * missing field, so the row never appeared and `expectVisible` was filed as
+   * a `high` application defect. The application was working correctly *and
+   * said so* — that sentence is the finding, and the report showed "could not
+   * resolve" instead.
+   *
+   * ARIA only (`role="alert"` / `role="status"`), the same understate-never-
+   * overstate rule `modal.ts` applies to dialog detection: a hand-rolled
+   * toast `<div>` with no live-region role is a disclosed gap, not something
+   * guessed at from class names. Non-waiting and hard-capped — this runs on a
+   * path that has already failed, and anything that goes wrong reads as "the
+   * page said nothing", because a diagnostic that can fail a step by itself
+   * would be worse than the miss it prevents.
+   */
+  async #pageMessages(): Promise<string[]> {
+    try {
+      // Two reads, not one comma-separated selector: Playwright's `role=`
+      // engine takes a single role, so `role=alert, role=status` is parsed as
+      // the role literally named "alert, role=status" and matches nothing —
+      // silently, which is exactly the failure mode this method exists to
+      // prevent. Found by the test asserting the message reaches the step.
+      const texts = [
+        ...(await this.page.locator('role=alert').allInnerTexts()),
+        ...(await this.page.locator('role=status').allInnerTexts()),
+      ];
+      const seen = new Set<string>();
+      const messages: string[] = [];
+      for (const raw of texts) {
+        const text = raw.trim().replace(/\s+/g, ' ').slice(0, PAGE_MESSAGE_MAX_CHARS);
+        if (text === '' || seen.has(text)) continue;
+        seen.add(text);
+        messages.push(text);
+        if (messages.length >= PAGE_MESSAGE_MAX) break;
+      }
+      return messages;
+    } catch {
+      return [];
     }
   }
 
@@ -3158,6 +3624,46 @@ export class SmartRunner {
       }
     }
 
+    // 1.35. Over-exact text — the same rung's mirror, and the same $0 move.
+    //
+    // Playwright's quoted `text="X"` matches an element's WHOLE normalised
+    // text, so it resolves nothing the instant the page renders that value
+    // with anything around it. Adjudicated live on DB_07_01: the flow asserted
+    // `text="75,000"` and the app renders `฿{v.toLocaleString('th-TH', {
+    // minimumFractionDigits: 2 })}` — `฿75,000.00`. The number was on screen
+    // the whole time; the step reported "could not resolve" and two `high`
+    // defects were filed against a working application. The healer cannot help
+    // for the same reason it cannot help with a case mismatch: it reads the
+    // same page and proposes the same text.
+    //
+    // Gated on a plain not-found (a strict-mode violation means the text is
+    // already ambiguous, and rung 1.3 above is the correct answer there), and
+    // on PRESENCE assertions only — the rule rung 1.3 already states for its
+    // own any-of half: a text-engine match contains the asserted text by
+    // construction, so "this text is shown" is satisfied by any of them, while
+    // a click acting on a loosened match would change what the test exercises.
+    if (
+      isTextSelector(selector) &&
+      PRESENCE_ACTIONS.has(action) &&
+      !lastAttempt.includes('strict mode violation')
+    ) {
+      const loose = relaxTextSelector(selector);
+      if (loose) {
+        // Ambiguity is expected here — the whole point is that the page wraps
+        // the value in more text — so the first visible match is taken in the
+        // same breath rather than as a second rung.
+        for (const candidate of [loose, `${loose} >> visible=true >> nth=0`]) {
+          try {
+            const value = await run(this.page.locator(candidate), this.#fastTimeoutMs);
+            await this.#flagOverExactText(selector, candidate);
+            return { value, resolution: 'narrow', resolvedSelector: candidate };
+          } catch (error) {
+            attempts.push(`relax "${candidate}": ${describe(error)}`);
+          }
+        }
+      }
+    }
+
     // 1.5. Blocking-dialog recovery — still $0. A surprising share of
     // "selector" failures are really "something is blocking the page"
     // failures: a cookie banner, a promo modal, a newsletter signup,
@@ -3165,13 +3671,32 @@ export class SmartRunner {
     // retry the ORIGINAL selector once before paying for a heal — a heal
     // here would either fail the same way, or worse, "successfully" repair
     // onto a control inside the dialog itself.
-    const dialog = await this.#dismissBlockingDialog();
-    if (dialog) {
-      try {
-        const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
-        return { value, resolution: 'dialog', resolvedSelector: selector, dialog };
-      } catch (error) {
-        attempts.push(`fast (after dismissing "${dialog.name}") "${selector}": ${describe(error)}`);
+    //
+    // EXCEPT when the previous step was a click or a keypress: a dialog that
+    // opened off the flow's own action is almost always the intended context
+    // — an edit modal the step is trying to fill — and dismissing it destroys
+    // the very state the test built (seen live: the ladder closed a
+    // deliberately-opened "Edit rule" dialog, and every later step failed
+    // downstream of the wreckage). Left open, the failing step still fails
+    // honestly, and the healer then reads a tree that CONTAINS the dialog —
+    // which is exactly where the right candidate lives.
+    if (this.#lastAction === 'click' || this.#lastAction === 'press') {
+      const openNow = await openDialogNow(this.page);
+      if (openNow) {
+        attempts.push(
+          `dialog: a "${await describeDialog(openNow).catch(() => 'dialog')}" opened by the ` +
+            `previous ${this.#lastAction} is treated as the intended context, not a blocker — not dismissed`,
+        );
+      }
+    } else {
+      const dialog = await this.#dismissBlockingDialog();
+      if (dialog) {
+        try {
+          const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
+          return { value, resolution: 'dialog', resolvedSelector: selector, dialog };
+        } catch (error) {
+          attempts.push(`fast (after dismissing "${dialog.name}") "${selector}": ${describe(error)}`);
+        }
       }
     }
 
@@ -3432,13 +3957,31 @@ export class SmartRunner {
       throw new StepResolutionError(selector, attempts);
     }
 
+    // The old goal — "make this control reachable" — presumed the control was
+    // merely hidden, and that presumption is what made PB_01_01's PDPA
+    // consent screen unreachable: a full-page "Accept and continue"
+    // interstitial is not a closed menu, not an ARIA dialog (so `modal.ts`
+    // cannot see it) and not a pointer-interception (so the overlay rung
+    // cannot either). Nothing in the ladder was equipped to even ask what was
+    // on the page. So the agent is asked to look first and choose — including
+    // choosing to do nothing, which is a legitimate answer and is recorded as
+    // one.
     const goal =
-      `Make this control reachable and visible on the page, then stop: ` +
-      `${intent ?? `the target of "${selector}"`}.\n` +
-      `The test will click or type into it itself — do NOT perform the action, ` +
-      `just get the page into the state where "${selector}" exists. ` +
-      `Open the menu, tab, or disclosure it lives behind, scroll it into view, ` +
-      `or wait for the view to finish loading. Call finish as soon as it is present.`;
+      `The test expected this and it is not on the page: ` +
+      `${intent ?? `the target of "${selector}"`} (selector: "${selector}").\n` +
+      `FIRST look at what IS on the page and decide whether something ` +
+      `unexpected is standing in the way — a consent or privacy screen, an ` +
+      `interstitial, a notice, an onboarding step, or a modal the test does ` +
+      `not mention.\n` +
+      `If something is: decide what an ordinary user would do about it, do ` +
+      `ONLY that, and stop.\n` +
+      `If nothing is in the way, the control may simply be out of reach — ` +
+      `open the menu, tab or disclosure it lives behind, scroll it into view, ` +
+      `or wait for the view to finish loading.\n` +
+      `If nothing is in the way and nothing would reveal it, do NOT act at ` +
+      `all: call finish and say so. Declining is a correct answer here.\n` +
+      `Either way, do NOT perform the test's own step — the test will click ` +
+      `or type into "${selector}" itself. Call finish as soon as you are done.`;
 
     let record: AgentRecord;
     try {
@@ -3460,14 +4003,22 @@ export class SmartRunner {
         this.#recordRuntimeDefect(
           'usability',
           'medium',
-          'A step only worked after the agent opened the page up',
-          `"${selector}" was not reachable until the agent acted: ${record.summary}. ` +
-            `The control exists but the flow does not say how to get to it — add the ` +
-            `steps that reveal it (open the menu, switch the tab, scroll) so the run ` +
-            `stops depending on a model to find its way.`,
+          'A step only worked after the agent decided what was in the way',
+          `"${selector}" was not reachable until the agent acted. It judged: ` +
+            `${decisionFrom(record, true).observed || record.summary}. It chose: ` +
+            `${decisionFrom(record, true).decided}. ` +
+            `The flow does not describe this interaction — add the step that handles ` +
+            `it (accept the notice, open the menu, switch the tab, scroll) so the run ` +
+            `stops paying a model to rediscover it every time.`,
           selector,
         );
-        return { value, resolution: 'agent', resolvedSelector: candidate, agent: record };
+        return {
+          value,
+          resolution: 'agent',
+          resolvedSelector: candidate,
+          agent: record,
+          decision: decisionFrom(record, true),
+        };
       } catch {
         // Try the next variant; the aggregate failure is reported below.
       }
@@ -3510,6 +4061,7 @@ export class SmartRunner {
           resolution: 'agent',
           resolvedSelector: outcome.selector,
           agent: record,
+          decision: decisionFrom(record, true),
           heal: {
             from: selector,
             to: outcome.selector,
@@ -3531,7 +4083,13 @@ export class SmartRunner {
       `agent: ${record.success ? 'reported success' : 'gave up'} (${record.summary}) but ` +
         `"${selector}" still does not resolve`,
     );
-    throw new StepResolutionError(selector, attempts);
+    // The step is failing, and the decision goes with it. "The agent looked
+    // and chose to do nothing" and "the agent was never consulted" are
+    // different facts about a dead-ended step, and only one of them tells a
+    // reader the ladder was exhausted honestly.
+    const failure = new StepResolutionError(selector, attempts);
+    failure.decision = decisionFrom(record, false);
+    throw failure;
   }
 
   /**
@@ -3618,7 +4176,17 @@ export class SmartRunner {
           step.status !== 'passed' &&
           step.selector !== null &&
           step.resolution === null &&
-          step.url === here
+          step.url === here &&
+          // Only genuine resolution failures may be downgraded to timing. A
+          // content mismatch resolved fine and failed on what the element
+          // SAYS ("expected text to contain…"), and an intercepted click
+          // resolved fine and failed on what covered it — re-probing either
+          // selector proves only what was never in doubt, and the "TIMING,
+          // not absence" downgrade then papers over the real finding. Seen
+          // live: a failed `expectText body` (content absent because the
+          // journey never created it) downgraded to timing because `body`,
+          // of course, resolves.
+          !/expected text to contain|intercepts pointer events/i.test(step.error ?? '')
         ) {
           deadEnded.add(step.selector);
         }
@@ -3841,6 +4409,14 @@ export type FlowStep =
   // --- state seeding (setup/teardown) ---
   | { action: 'setLocalStorage'; key: string; value: string }
   | { action: 'clearStorage' }
+  /**
+   * Pin the page's clock to a fixed moment (ISO date or date-time), so a
+   * claim that depends on "today" — an urgency tier, a due-date boundary, an
+   * expiry — is checkable instead of drifting with the wall clock. Belongs in
+   * setup, BEFORE the first `goto`: an application reads the clock as it
+   * renders, and installing after the fact changes nothing already drawn.
+   */
+  | { action: 'setClock'; time: string; intent?: string | undefined }
   // --- history and scrolling ---
   /** Go back one history entry — for "open it, check it, come back". */
   | { action: 'back'; intent?: string | undefined }
@@ -4058,12 +4634,220 @@ function reconstructionFutile(error: unknown): boolean {
   );
 }
 
+/**
+ * Did that click's form submit natively, before the app hydrated?
+ *
+ * The live failure this catches: a login page's Sign in is clicked ~140ms
+ * after load, before React attaches the submit handler, so the browser
+ * performs the `<form>`'s default GET submission — the URL becomes
+ * `/en/login?email=…&password=…`, no session is created, and every later
+ * step runs against the login page filing "frontend" defects about an app
+ * that works. Detection is evidence-based: a query parameter whose name
+ * reads as a password, or whose value equals something a preceding fill
+ * typed. Checked only when the preceding fill block looks credential-shaped,
+ * so ordinary clicks never pay the recheck window.
+ *
+ * **A form whose inputs have no `name` submits nothing but a bare `?`**, and
+ * that is the shape this missed for a whole catalog run. The app under test
+ * writes `<input type="email">` / `<input type="password">` with no `name`
+ * attribute, so its pre-hydration GET produced `/en/login?` — no parameters at
+ * all, no evidence for either check above, no replay, and a silently failed
+ * login. Measured across DB_01_01…DB_09_01: 21 of the 25 defects those runs
+ * filed were downstream of exactly this. So a query string that **appeared
+ * across the click** on a sign-in URL is the third signature. It is compared
+ * against the URL as it stood when the fill block began — never "a login URL
+ * happens to have a query string", which would trip on an ordinary
+ * `/login?redirect=/somewhere`.
+ *
+ * Returns the offending parameter name, `NATIVE_SUBMIT_UNNAMED` for the bare
+ * form, or null.
+ */
+export async function nativeFormResubmitDetected(
+  urlOf: () => string,
+  fills: readonly FlowStep[],
+  recheckMs = 600,
+  /** The URL when the credential fill block began. Absent disables the third signature. */
+  urlBefore?: string | null,
+): Promise<string | null> {
+  if (fills.length === 0) return null;
+  const credentialShaped = fills.some((step) =>
+    /password|passwd|pwd/i.test(
+      `${(step as { selector?: string }).selector ?? ''} ${(step as { intent?: string }).intent ?? ''}`,
+    ),
+  );
+  if (!credentialShaped) return null;
+  const typedValues = new Set(
+    fills
+      .map((step) => (step as { value?: string }).value)
+      .filter((value): value is string => typeof value === 'string' && value !== ''),
+  );
+  // The native GET navigation commits within milliseconds on a healthy page,
+  // but the click returns as soon as it lands — give the URL a short window
+  // to show its hand before declaring the submit real.
+  let before: URL | null = null;
+  if (typeof urlBefore === 'string') {
+    try {
+      before = new URL(urlBefore);
+    } catch {
+      before = null;
+    }
+  }
+  // A bare "?" is invisible to `URL.search`, which normalises an empty query
+  // to '' — and the bare "?" IS the whole signature for a form whose inputs
+  // have no name. `href` keeps it, so the query evidence is read from the
+  // serialised form. (Found by writing the test: `new URL('http://x/a?')`
+  // gives `search: ""`, `href: "http://x/a?"`.)
+  const hasQuery = (u: URL): boolean => u.href.includes('?');
+  const deadline = Date.now() + recheckMs;
+  for (;;) {
+    let url: URL;
+    try {
+      url = new URL(urlOf());
+    } catch {
+      return null;
+    }
+    for (const [name, value] of url.searchParams) {
+      if (/password|passwd|pwd/i.test(name)) return name;
+      if (typedValues.has(value)) return name;
+    }
+    // The unnamed-fields form: still on the sign-in page, and a query string
+    // that was not there when the credentials were typed. Both halves are
+    // required — the search must have APPEARED, and we must not have left.
+    if (
+      before !== null &&
+      !hasQuery(before) &&
+      hasQuery(url) &&
+      url.pathname === before.pathname &&
+      looksLikeSignIn(url.href)
+    ) {
+      return NATIVE_SUBMIT_UNNAMED;
+    }
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 150));
+  }
+}
+
+/**
+ * The "sign-in never took effect" diagnosis, or null.
+ *
+ * Pure and exported so the decision can be tested without a browser — the
+ * message itself reads the page nowhere, which is the point: this app renders
+ * a protected route for a beat before its client guard bounces it, so "what
+ * does the URL look like now" is the wrong evidence and only the recorded
+ * outcome of the submit will do.
+ */
+export function signInDidNotTakeMessage(state: {
+  signInDidNotTake: boolean;
+  lastGotoAskedSignIn: boolean;
+  lastGotoPath: string | null;
+}): string | null {
+  // All three required. `lastGotoAskedSignIn` false plus a path is "the flow
+  // has since asked for a page that needs a session" — which is exactly what
+  // exempts a negative sign-in test that stays put to assert an error.
+  if (!state.signInDidNotTake || state.lastGotoAskedSignIn || state.lastGotoPath === null) {
+    return null;
+  }
+  return (
+    `the sign-in did not take effect — the run is not signed in, and it has since asked ` +
+    `for ${state.lastGotoPath}, which needs a session. Nothing after this point can say ` +
+    `anything about the feature under test.\n` +
+    `  This is not a redirect: the page never left the sign-in screen when the credentials ` +
+    `were submitted. The click landed before the application hydrated, so the form ` +
+    `submitted natively (or hydration reset the fields), and the replay did not recover it.\n` +
+    `  Fix the flow's sign-in: assert something only a signed-in page shows immediately ` +
+    `after the submit click, so the failure is caught here rather than as a pile of ` +
+    `defects about the feature.`
+  );
+}
+
+/**
+ * Does this fill block type a credential? The shared shape behind both
+ * hydration signatures and the sign-in verdict — one spelling, so the three
+ * cannot drift apart.
+ */
+function credentialShapedBlock(fills: readonly FlowStep[]): boolean {
+  return fills.some((step) =>
+    /password|passwd|pwd/i.test(
+      `${(step as { selector?: string }).selector ?? ''} ${(step as { intent?: string }).intent ?? ''}`,
+    ),
+  );
+}
+
+/**
+ * The evidence marker for a native submit whose form named none of its fields
+ * — see `nativeFormResubmitDetected`. Not a parameter name, because there
+ * were none; the finding's wording branches on it.
+ */
+export const NATIVE_SUBMIT_UNNAMED = '(unnamed form fields)';
+
+/** The replayed copy of a step, labelled so the bundle reads as what happened. */
+function markReplayed(
+  step: FlowStep,
+  reason = 'the form submitted natively before hydration',
+): FlowStep {
+  return {
+    ...step,
+    intent: `${(step as { intent?: string }).intent ?? step.action} — replayed after ${reason}`,
+  } as FlowStep;
+}
+
+/**
+ * Did hydration EAT the fills? The second signature of the same race, seen
+ * live on DB_04_01/DB_06_01/DB_07_01: the Sign-in click lands pre-hydration
+ * but the form does NOT navigate (so `nativeFormResubmitDetected` has no URL
+ * evidence) — instead React hydrates after the fills and resets its
+ * controlled inputs, the click submits an empty password, and the page just
+ * sits on the login screen. Even reconstruction's re-clicks then fail,
+ * because nothing re-fills what hydration wiped.
+ *
+ * Evidence-based like its sibling: a credential-shaped field that reads back
+ * a DIFFERENT value than the step typed (typically empty) is the signature.
+ * Checked only when the block is credential-shaped, and each read is a
+ * single immediate `inputValue` — the click already settled, so there is
+ * nothing to wait for. A field that cannot be read (gone, not an input) is
+ * skipped, never guessed at.
+ *
+ * Returns the lost field's selector (the evidence), or null.
+ */
+export async function fillsLostToHydration(
+  valueOf: (selector: string) => Promise<string | null>,
+  fills: readonly FlowStep[],
+): Promise<string | null> {
+  const credentialShaped = (step: FlowStep): boolean =>
+    /password|passwd|pwd/i.test(
+      `${(step as { selector?: string }).selector ?? ''} ${(step as { intent?: string }).intent ?? ''}`,
+    );
+  // No credential fill anywhere in the block → no reads at all: ordinary
+  // form interactions must not pay a page round-trip per fill.
+  if (!fills.some(credentialShaped)) return null;
+  for (const step of fills) {
+    if (!credentialShaped(step)) continue;
+    const selector = (step as { selector?: string }).selector;
+    const typed = (step as { value?: string }).value;
+    if (!selector || typeof typed !== 'string' || typed === '') continue;
+    const now = await valueOf(selector);
+    if (now !== null && now !== typed) return selector;
+  }
+  return null;
+}
+
 async function executeSteps(
   runner: SmartRunner,
   steps: readonly FlowStep[],
   baseUrl: string | undefined,
   issues: StepIssue[],
 ): Promise<void> {
+  // The contiguous fill/type block immediately behind the step now running —
+  // what a hydration replay would have to repeat. See
+  // `nativeFormResubmitDetected`; one replay per section, ever, so a page
+  // that keeps racing cannot loop the run.
+  const recentFills: FlowStep[] = [];
+  // The URL as it stood when the block began — the baseline for the
+  // unnamed-fields signature in `nativeFormResubmitDetected`. Captured at the
+  // block's FIRST fill so "the URL gained a query string" is a real
+  // observation rather than an assumption about what a login URL looks like.
+  let urlBeforeFills: string | null = null;
+  let hydrationReplayed = false;
   for (const raw of steps) {
     // A step that does not pass no longer aborts the run: it is recorded and
     // classified (fail / error / dead end), and the next step gets its turn.
@@ -4191,13 +4975,99 @@ async function executeSteps(
         runner.bundle.supersedeSteps(supersededIndexes);
         runner.bundle.noteReconstruction({
           attempt: failures + 1,
-          from: JSON.stringify(original),
-          to: JSON.stringify(lastProposal.replacement),
+          // A second recording boundary, and one the first fix missed: these
+          // serialise the WHOLE step, so a masked `detail.value` on the step
+          // itself does nothing for the copy stored here. Found by grepping a
+          // real bundle after the fill masking landed and finding the password
+          // still present under `reconstruction.from`.
+          from: JSON.stringify(runner.maskStepSecrets(original)),
+          to: JSON.stringify(runner.maskStepSecrets(lastProposal.replacement)),
           inserted: lastProposal.inserted,
           reasoning: lastProposal.reasoning,
           model: repairModelId(runner),
         });
         runner.recordReconstructionDefect(original, failures);
+      }
+
+      // Hydration-race recovery, after the plan ran clean: a click that
+      // "passed" may still have submitted its form natively (pre-hydration),
+      // which no per-step check can see — the click landed, the page just did
+      // the wrong thing with it. Detect it from the URL's own evidence, file
+      // the finding (it is an app fact too: credentials reached the URL), and
+      // replay the fill block + click once against the hydrated page.
+      if (original.action === 'fill' || original.action === 'type') {
+        if (recentFills.length === 0) urlBeforeFills = runner.page.url();
+        recentFills.push(original);
+      } else if (original.action === 'click') {
+        const param = hydrationReplayed
+          ? null
+          : await nativeFormResubmitDetected(
+              () => runner.page.url(),
+              recentFills,
+              undefined,
+              urlBeforeFills,
+            );
+        // Same race, second signature: no URL evidence because the form never
+        // navigated — hydration reset the controlled inputs instead, and the
+        // click submitted emptiness (DB_04_01/DB_06_01/DB_07_01 live). Only
+        // consulted when the first signature is absent, and it reads the
+        // fields once, immediately.
+        const lostField =
+          param !== null || hydrationReplayed
+            ? null
+            : await fillsLostToHydration(async (selector) => {
+                try {
+                  return await runner.page.locator(selector).inputValue({ timeout: 1_000 });
+                } catch {
+                  return null;
+                }
+              }, recentFills);
+        if (param !== null || lostField !== null) {
+          hydrationReplayed = true;
+          const reason =
+            param !== null
+              ? 'the form submitted natively before hydration'
+              : 'hydration reset the filled fields';
+          if (param !== null) runner.recordNativeResubmitFinding(original, param);
+          else runner.recordLostFillFinding(original, lostField as string);
+          await runner.page
+            .waitForLoadState('networkidle', { timeout: 10_000 })
+            .catch(() => undefined);
+          await runner.page.waitForTimeout(300).catch(() => undefined);
+          try {
+            for (const fill of recentFills) {
+              await executeStep(runner, markReplayed(fill, reason), baseUrl, issues);
+            }
+            await executeStep(runner, markReplayed(original, reason), baseUrl, issues);
+          } catch (error) {
+            if (error instanceof SessionLostError) throw error;
+            // A failed replay classifies like any failed step; the original
+            // finding already says what went wrong the first time.
+            const kind = classifyStepFailure(original.action, error);
+            runner.bundle.reclassifyLastStep(kind, original.action);
+            issues.push({
+              action: original.action,
+              selector: (original as { selector?: string }).selector ?? null,
+              kind,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+          // Did the recovery work? Only a credential block can answer, and
+          // only after the replay: still on the sign-in page means this run
+          // holds no session, and every later step is about to be asserted
+          // against a page it has no right to be on. See `#strandedMessage`.
+          runner.noteSignInOutcome(looksLikeSignIn(runner.page.url()));
+        } else if (credentialShapedBlock(recentFills)) {
+          // A credential submit with no hydration evidence and no sign-in URL
+          // left behind is a submit that worked — clear any earlier verdict,
+          // so a flow that retries its login is judged on the retry.
+          runner.noteSignInOutcome(false);
+        }
+        recentFills.length = 0;
+        urlBeforeFills = null;
+      } else {
+        recentFills.length = 0;
+        urlBeforeFills = null;
       }
       break;
     }
@@ -4316,6 +5186,9 @@ async function executeStep(
         break;
       case 'clearStorage':
         await runner.clearStorage();
+        break;
+      case 'setClock':
+        await runner.setClock(step.time, step.intent);
         break;
       case 'back':
         await runner.back(step.intent);
@@ -4506,6 +5379,8 @@ export interface RunFlowOptions {
   network?: boolean | undefined;
   /** How much of an observed request may be recorded. Defaults to redacting. */
   networkRedaction?: RedactionPolicy | undefined;
+  /** Credentials for `--as`; carried only so their password can be masked. */
+  credentials?: { email: string; password: string } | undefined;
   /** Ring-buffer cap for the observer — see `SmartRunnerOptions.networkMaxCalls`. */
   networkMaxCalls?: number | undefined;
   /**
@@ -4802,6 +5677,7 @@ export async function runFlow(
       updateBaselines: options.updateBaselines,
       network: options.network,
       networkRedaction: options.networkRedaction,
+      credentials: options.credentials,
       networkMaxCalls: options.networkMaxCalls,
       transport: options.transport,
       db: options.db,

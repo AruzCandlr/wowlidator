@@ -1,0 +1,56 @@
+{
+  "name": "HRMS — Entitlement rule lifecycle writes and cleans benefit_eligibility_rule",
+  "baseUrl": "http://localhost:3200",
+  "setup": [
+    { "action": "dbSnapshot", "tables": ["benefit_management.benefit_eligibility_rule", "benefit_management.benefit_plan"], "as": "before",
+      "intent": "row counts before the lifecycle" }
+  ],
+  "steps": [
+    { "action": "request", "method": "GET", "url": "/api/workflow/admin/benefits/medical-reimbursement/eligibility",
+      "intent": "list the rules the Entitlement Rules manager shows" },
+    { "action": "expectStatus", "status": 200, "intent": "the list route answers ok" },
+
+    { "action": "request", "method": "POST", "url": "/api/workflow/admin/benefits/medical-reimbursement/eligibility",
+      "body": { "rule_id": "RULE-WOW-0001", "rule_name": "wowlidator lifecycle rule", "rule_type": "special",
+                "plan_id": "BP-DENTAL-01", "scope_value": "WOW_TEST_GRP", "status": "active",
+                "waiting_period": 30, "effective_from": "2026-01-01" },
+      "save": { "ruleDbId": "$.id" },
+      "intent": "create a rule the way the manager's form does, keeping the database id it returns" },
+    { "action": "expectStatus", "status": 200, "intent": "the create is accepted" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_eligibility_rule",
+      "where": { "id": "{{ruleDbId}}" },
+      "values": { "rule_id": "RULE-WOW-0001", "rule_name": "wowlidator lifecycle rule", "rule_type": "SPECIAL",
+                  "benefit_plan_id": "BP-DENTAL-01", "group": "WOW_TEST_GRP", "is_active": true,
+                  "waiting_period": 30, "effective_type": "HIRE_DATE", "company_code": "ALL",
+                  "created_by": "cnext-ui", "deleted_at": null },
+      "intent": "the row keyed by the id the API returned holds every value the route maps from the form shape" },
+    { "action": "expectDbDelta", "table": "benefit_management.benefit_eligibility_rule", "delta": 1, "since": "before",
+      "intent": "exactly one rule row was added" },
+    { "action": "expectDbUnchanged", "tables": ["benefit_management.benefit_plan"], "since": "before",
+      "intent": "creating a rule does not touch the plans" },
+
+    { "action": "request", "method": "PUT", "url": "/api/workflow/admin/benefits/medical-reimbursement/eligibility/{{ruleDbId}}",
+      "body": { "rule_name": "wowlidator lifecycle rule (renamed)", "status": "inactive" },
+      "intent": "rename the rule and set it inactive" },
+    { "action": "expectStatus", "status": 200, "intent": "the update is accepted" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_eligibility_rule",
+      "where": { "id": "{{ruleDbId}}" },
+      "values": { "rule_name": "wowlidator lifecycle rule (renamed)", "is_active": false, "updated_by": "cnext-ui" },
+      "intent": "the same row now carries the new name, the inactive flag, and the app's audit stamp" },
+
+    { "action": "request", "method": "PUT", "url": "/api/workflow/admin/benefits/medical-reimbursement/eligibility/99999999",
+      "body": { "rule_name": "should never land" },
+      "intent": "an update against an id nobody has" },
+    { "action": "expectStatus", "status": 404, "intent": "refused as not found, not silently created" },
+
+    { "action": "request", "method": "DELETE", "url": "/api/workflow/admin/benefits/medical-reimbursement/eligibility/{{ruleDbId}}",
+      "intent": "delete the rule this run created" },
+    { "action": "expectStatus", "status": 200, "intent": "the delete is accepted" },
+    { "action": "expectJson", "path": "$.ok", "value": "true" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_eligibility_rule",
+      "where": { "rule_id": "RULE-WOW-0001" }, "count": 0, "timeoutMs": 500,
+      "intent": "the row is really gone — the route hard-deletes" },
+    { "action": "expectDbUnchanged", "tables": ["benefit_management.benefit_eligibility_rule", "benefit_management.benefit_plan"], "since": "before",
+      "intent": "the whole lifecycle nets to zero — the replica ends exactly where it started" }
+  ]
+}

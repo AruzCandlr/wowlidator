@@ -21,9 +21,11 @@ import {
   isObservable,
   looksLikeSequenceDiagram,
   parseSequenceDiagram,
+  recomputeLaneTestability,
   sequenceToClaims,
   toGateInfo,
 } from '../src/catalog/sequence.js';
+import type { ClaimsFile } from '../src/catalog/catalog.js';
 import { extractDocument, formatFor } from '../src/catalog/extract.js';
 import {
   matchExpectedCalls,
@@ -188,6 +190,107 @@ describe('sequence → claims', () => {
     assert.equal(isObservable(doc, request!), true);
     assert.equal(isObservable(doc, enqueue!), false);
     assert.equal(isObservable(doc, reply!), true);
+  });
+});
+
+// --- the ignored counter ----------------------------------------------------
+
+describe('what the parser could not read', () => {
+  it('counts every ignored line, past the capped per-line notes', () => {
+    // 10 readable messages, 12 junk lines. The notes list caps per-line
+    // entries at 8 plus one overflow note; a consumer judging "was most of
+    // this lost?" must read the counter, or a mostly-lost transcript with 8+
+    // parsed messages reads as barely lossy.
+    const messages = Array.from({ length: 10 }, (_, i) => `  A->>B: message ${i}`);
+    const junk = Array.from({ length: 12 }, (_, i) => `  unreadable scribble ${i}`);
+    const doc = parseSequenceDiagram(
+      ['sequenceDiagram', '  participant A', '  participant B', ...messages, ...junk].join('\n'),
+    );
+
+    assert.equal(doc.messages.length, 10);
+    assert.equal(doc.ignored, 12, 'the counter carries the full count');
+    const perLine = doc.notes.filter((n) => /line \d+ ignored/.test(n));
+    assert.equal(perLine.length, 8, 'per-line notes stay capped');
+    assert.ok(doc.notes.some((n) => n.includes('4 more line(s) ignored')));
+  });
+});
+
+// --- recomputing testability from the lane table ------------------------------
+
+describe('recomputing testability from the lane table', () => {
+  // A real parse, so the file under test is exactly what the CLI writes: the
+  // claims and the gate info describe the same messages by construction.
+  const build = (): ClaimsFile => {
+    const doc = parseSequenceDiagram(
+      [
+        'sequenceDiagram',
+        '  participant W as Browser',
+        '  participant A as API',
+        '  participant D as EC-DB',
+        '  W->>A: POST /x',
+        '  A->>D: INSERT row',
+        '  A-->>W: 200',
+      ].join('\n'),
+    );
+    const { claims } = sequenceToClaims(doc);
+    return {
+      catalog: 'lanes',
+      summary: '',
+      documentNote: '',
+      model: 'read from the diagram (no model call)',
+      extractedAt: '',
+      claims: claims.map((claim) => ({ ...claim, approved: true })),
+      sequence: toGateInfo(doc),
+    };
+  };
+
+  it('a lane corrected to user turns its claims testable and drops the boundary suffix', () => {
+    const file = build();
+    assert.equal(file.claims[1]!.testable, false, 'API → DB starts as an assumption');
+    assert.match(file.claims[1]!.source, /beyond the browser boundary/);
+
+    file.sequence!.participants.find((p) => p.name === 'A')!.plane = 'user';
+    const result = recomputeLaneTestability(file);
+
+    assert.equal(file.claims[1]!.testable, true);
+    assert.doesNotMatch(
+      file.claims[1]!.source,
+      /beyond the browser boundary/,
+      'a claim flipped testable must not keep a sentence saying it is held as an assumption',
+    );
+    assert.ok(result.changed >= 1);
+  });
+
+  it('a lane corrected away from the browser turns its claims back into assumptions', () => {
+    const file = build();
+    assert.equal(file.claims[0]!.testable, true);
+
+    file.sequence!.participants.find((p) => p.name === 'W')!.plane = 'backend';
+    const result = recomputeLaneTestability(file);
+
+    assert.equal(file.claims[0]!.testable, false);
+    assert.match(file.claims[0]!.source, /beyond the browser boundary: backend → backend/);
+    assert.equal(file.claims[2]!.testable, false, 'the reply back to a backend lane is unobservable too');
+    assert.equal(result.changed, 2);
+  });
+
+  it('warns when a database-named lane is marked as the browser', () => {
+    const file = build();
+    file.sequence!.participants.find((p) => p.name === 'D')!.plane = 'user';
+    const result = recomputeLaneTestability(file);
+
+    assert.equal(result.warnings.length, 1);
+    assert.match(result.warnings[0]!, /database/);
+    assert.match(result.warnings[0]!, /EC-DB/);
+  });
+
+  it('leaves a file without a lane table untouched', () => {
+    const file = build();
+    delete file.sequence;
+    const before = JSON.stringify(file.claims);
+    const result = recomputeLaneTestability(file);
+    assert.deepEqual(result, { changed: 0, warnings: [] });
+    assert.equal(JSON.stringify(file.claims), before);
   });
 });
 

@@ -25,7 +25,18 @@ import { jsonModel, nonJsonModel } from './helpers.js';
 import { CacheManager, type HealedSelectorCacheFile } from '../src/cache/cache-manager.js';
 import { PROVIDER_META, loadConfig } from '../src/config.js';
 import { ProofBundleBuilder, formatStepLine, type ProofStep } from '../src/engine/proof-bundle.js';
-import { parseInterception, runFlow, scriptMismatchNote, type Flow } from '../src/engine/runner.js';
+import {
+  NATIVE_SUBMIT_UNNAMED,
+  StepResolutionError,
+  fillsLostToHydration,
+  nativeFormResubmitDetected,
+  signInDidNotTakeMessage,
+  parseInterception,
+  runFlow,
+  scriptMismatchNote,
+  type Flow,
+  type FlowStep,
+} from '../src/engine/runner.js';
 import {
   LlmHealerModel,
   JitHealer,
@@ -1330,5 +1341,253 @@ describe(`healer (live ${healerRole.provider} API)`, {
     assert.equal(bundle.status, 'passed', bundle.error ?? 'live healed run should pass');
     assert.equal(bundle.summary.jitHeals, 1);
     assert.ok((bundle.summary.inputTokens ?? 0) > 0, 'usage should be reported');
+  });
+});
+
+describe('a failure message must describe the failure it carries', () => {
+  it('all-content-mismatch attempts headline as content, not resolution', () => {
+    // "Could not resolve" over attempts that each RESOLVED and failed on text
+    // reads as "the control is missing" and files the wrong defect.
+    const error = new StepResolutionError('role=main', [
+      'fast "role=main": expected text to contain "PB-001", got "Probation Review…"',
+      'late "role=main": expected text to contain "PB-001", got "Probation Review…"',
+    ]);
+    assert.match(error.message, /^"role=main" resolved, but its content did not hold/);
+  });
+
+  it('mixed attempts keep the resolution header', () => {
+    const error = new StepResolutionError('role=main', [
+      'fast "role=main": locator.waitFor: Timeout 2000ms exceeded.',
+      'late "role=main": expected text to contain "PB-001", got "…"',
+    ]);
+    assert.match(error.message, /^could not resolve "role=main"/);
+  });
+});
+
+describe('native form resubmit detection', () => {
+  const passwordFill: FlowStep = {
+    action: 'fill',
+    selector: 'role=textbox >> nth=1',
+    value: 's3cret',
+    intent: 'Fill admin password',
+  };
+
+  it('reads a password parameter off the URL', async () => {
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/login?email=a%40b.c&password=s3cret',
+      [passwordFill],
+      50,
+    );
+    assert.equal(param, 'password', 'the first parameter carrying evidence names the submit');
+  });
+
+  it('recognises a typed value under any parameter name', async () => {
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/login?user_secret=s3cret',
+      [passwordFill],
+      50,
+    );
+    assert.equal(param, 'user_secret');
+  });
+
+  it('never fires without a credential-shaped fill — and returns without waiting', async () => {
+    const started = Date.now();
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/search?q=anything',
+      [{ action: 'fill', selector: 'role=searchbox', value: 'anything', intent: 'search' }],
+      600,
+    );
+    assert.equal(param, null);
+    assert.ok(Date.now() - started < 100, 'ordinary clicks must not pay the recheck window');
+  });
+
+  it('a clean URL after the recheck window is a clean submit', async () => {
+    const param = await nativeFormResubmitDetected(() => 'http://x/en/home', [passwordFill], 50);
+    assert.equal(param, null);
+  });
+
+  it('a bare "?" that appeared across the click is the unnamed-fields submit', async () => {
+    // The signature this missed for a whole catalog run: the app's login
+    // inputs carry no name attribute, so its pre-hydration GET submitted
+    // "/en/login?" — no parameters, no evidence, no replay, and a silently
+    // failed login behind 21 of the 25 defects DB_01_01…DB_09_01 filed.
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/login?',
+      [passwordFill],
+      50,
+      'http://x/en/login',
+    );
+    assert.equal(param, NATIVE_SUBMIT_UNNAMED);
+  });
+
+  it('does not fire when the login URL already carried a query string', async () => {
+    // /login?redirect=/somewhere is an ordinary way to arrive. The evidence is
+    // that the search APPEARED, never that a login URL has one.
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/login?redirect=%2Fadmin',
+      [passwordFill],
+      50,
+      'http://x/en/login?redirect=%2Fadmin',
+    );
+    assert.equal(param, null);
+  });
+
+  it('does not fire once the submit has left the sign-in page', async () => {
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/home?welcome=1',
+      [passwordFill],
+      50,
+      'http://x/en/login',
+    );
+    assert.equal(param, null);
+  });
+
+  it('needs the baseline — without it the third signature is off', async () => {
+    const param = await nativeFormResubmitDetected(() => 'http://x/en/login?', [passwordFill], 50);
+    assert.equal(param, null);
+  });
+});
+
+describe('a run whose session guard fired cannot pass', () => {
+  const base = { startedAt: new Date().toISOString(), durationMs: 1, url: 'http://x/en/login' };
+
+  it('turns an otherwise clean run into an error', () => {
+    // DB_04_02 finalised passed, 7/7, carrying the high defect "the session
+    // is not established, so nothing after this point can say anything about
+    // the feature under test". Its SessionLostError was swallowed on a path
+    // that is right to swallow it, so no step failed and no run error was
+    // recorded — the verdict has to come from the guard itself.
+    const builder = new ProofBundleBuilder({ name: 'stranded' });
+    builder.addStep({
+      action: 'expectCount', selector: 'text="BE-MED-001"', resolvedSelector: 'text="BE-MED-001"',
+      resolution: 'fast', status: 'passed', ...base,
+    });
+    assert.equal(builder.finish().status, 'passed', 'the premise: nothing else fails this run');
+
+    const stranded = new ProofBundleBuilder({ name: 'stranded' });
+    stranded.addStep({
+      action: 'expectCount', selector: 'text="BE-MED-001"', resolvedSelector: 'text="BE-MED-001"',
+      resolution: 'fast', status: 'passed', ...base,
+    });
+    stranded.noteSessionLost();
+    assert.equal(
+      stranded.finish().status,
+      'error',
+      'the application was never reached — an environment fact, not a verdict about the feature',
+    );
+  });
+
+  it('leaves a worse status alone', () => {
+    const builder = new ProofBundleBuilder({ name: 'stranded-and-broken' });
+    builder.addStep({
+      action: 'click', selector: '#a', resolvedSelector: '#a', resolution: 'fast',
+      status: 'dead-end', ...base,
+    });
+    builder.noteSessionLost();
+    assert.equal(builder.finish().status, 'dead-end', 'worst-first still decides');
+  });
+});
+
+describe('the sign-in that never took effect', () => {
+  it('fires once the flow asks for a page that needs a session', () => {
+    // DB_04_01/DB_06_01/DB_07_01/DB_08_01: the login silently failed and the
+    // run carried on, filing 19 high "functional" defects between them about
+    // an application that was working. The existing stranded guard cannot see
+    // this — it asks "were we bounced away from what we asked for?", and here
+    // the most recent goto WAS the login page.
+    const message = signInDidNotTakeMessage({
+      signInDidNotTake: true,
+      lastGotoAskedSignIn: false,
+      lastGotoPath: '/en/admin/benefits/rules',
+    });
+    assert.match(message ?? '', /the sign-in did not take effect/);
+    assert.match(message ?? '', /\/en\/admin\/benefits\/rules/);
+    assert.match(message ?? '', /not a redirect/, 'the wording must not claim a bounce');
+  });
+
+  it('never fires for a flow that stays on the sign-in page', () => {
+    // A negative sign-in test asserting "Incorrect password" is a legitimate
+    // flow and must not be stopped.
+    assert.equal(
+      signInDidNotTakeMessage({
+        signInDidNotTake: true,
+        lastGotoAskedSignIn: true,
+        lastGotoPath: '/en/login',
+      }),
+      null,
+    );
+  });
+
+  it('never fires without positive evidence that the submit failed', () => {
+    assert.equal(
+      signInDidNotTakeMessage({
+        signInDidNotTake: false,
+        lastGotoAskedSignIn: false,
+        lastGotoPath: '/en/admin',
+      }),
+      null,
+    );
+  });
+
+  it('never fires before the flow has navigated anywhere', () => {
+    assert.equal(
+      signInDidNotTakeMessage({
+        signInDidNotTake: true,
+        lastGotoAskedSignIn: false,
+        lastGotoPath: null,
+      }),
+      null,
+    );
+  });
+});
+
+describe('lost-fill detection — the hydration race, second signature', () => {
+  const emailFill: FlowStep = {
+    action: 'fill',
+    selector: 'input[type=email]',
+    value: 'admin@cnext.test',
+    intent: 'Enter work email',
+  };
+  const passwordFill: FlowStep = {
+    action: 'fill',
+    selector: 'input[type=password]',
+    value: 'admin2026',
+    intent: 'Enter password',
+  };
+
+  it('a credential field that reads back different is the evidence', async () => {
+    // DB_04_01/DB_06_01/DB_07_01 live: the click landed pre-hydration, the
+    // form did not navigate, and React reset the password to empty.
+    const lost = await fillsLostToHydration(
+      async (selector) => (selector.includes('password') ? '' : 'admin@cnext.test'),
+      [emailFill, passwordFill],
+    );
+    assert.equal(lost, 'input[type=password]');
+  });
+
+  it('fields that kept their values are a clean submit', async () => {
+    const lost = await fillsLostToHydration(
+      async (selector) => (selector.includes('password') ? 'admin2026' : 'admin@cnext.test'),
+      [emailFill, passwordFill],
+    );
+    assert.equal(lost, null);
+  });
+
+  it('a non-credential block never reads the page at all', async () => {
+    let reads = 0;
+    const lost = await fillsLostToHydration(
+      async () => {
+        reads += 1;
+        return '';
+      },
+      [{ action: 'fill', selector: 'role=searchbox', value: 'leave', intent: 'search' }],
+    );
+    assert.equal(lost, null);
+    assert.equal(reads, 0, 'ordinary form interactions must not pay a page round-trip');
+  });
+
+  it('an unreadable field is skipped, never guessed lost', async () => {
+    const lost = await fillsLostToHydration(async () => null, [passwordFill]);
+    assert.equal(lost, null);
   });
 });

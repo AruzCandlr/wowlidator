@@ -25,7 +25,7 @@
  * reason.
  */
 
-import type { CatalogClaim } from './catalog.js';
+import type { CatalogClaim, ClaimsFile } from './catalog.js';
 
 export type ParticipantPlane = 'user' | 'page' | 'backend' | 'external';
 
@@ -68,6 +68,14 @@ export interface SequenceDoc {
   messages: SequenceMessage[];
   /** Everything skipped, refused or ignored — surfaced, never logged away. */
   notes: string[];
+  /**
+   * How many lines the parser ignored, in full. The notes list caps its
+   * per-line entries at MAX_IGNORED_NOTES, so a consumer judging "was most of
+   * this diagram lost?" must read this counter, never count the notes — a
+   * transcript with 8 noted lines and 50 more behind the overflow note would
+   * otherwise read as barely-lossy.
+   */
+  ignored: number;
 }
 
 export class SequenceParseError extends Error {
@@ -226,6 +234,7 @@ function parseLines(
     participants: [...participants.values()],
     messages,
     notes,
+    ignored,
   };
   classifyPlanes(doc);
   return doc;
@@ -414,6 +423,67 @@ export function toGateInfo(doc: SequenceDoc): {
 const DB_NAME_RE = /\b(db|database|postgres|postgresql|mysql|mongo|mongodb|redis|store|storage)\b/i;
 const PAGE_NAME_RE = /\b(browser|ui|web ?app|webapp|frontend|front-end|page|client|spa|app)\b/i;
 const EXTERNAL_NAME_RE = /\b(mail|email|smtp|payment|stripe|gateway|third|external|queue|kafka|s3)\b/i;
+
+const BOUNDARY_SUFFIX_RE = /\s*\(beyond the browser boundary:.*\)\s*$/;
+
+/**
+ * Re-derive every claim's `testable` from the claims file's own lane table —
+ * the single semantics both gates share. wowUI's lane editor recomputes
+ * client-side when a plane is corrected there; this is the same rule applied
+ * where the CLI reads the file, so a plane corrected by hand in the JSON (or
+ * by any other tool) takes effect instead of silently changing nothing. The
+ * boundary suffix on `source` is re-derived too — a claim flipped testable
+ * must not keep a sentence saying it is held as an assumption.
+ *
+ * The warnings are the honesty half: a lane whose name reads as a database
+ * or an external system, marked `user`/`page`, makes the browser the claimed
+ * caller of traffic a server almost certainly makes — every claim that lane
+ * turns testable would then fail against a perfectly working app ("not
+ * observed"), which is precisely the false claim this pipeline must not
+ * manufacture. The correction is not refused — the gate's judgement wins —
+ * but it is never silent.
+ */
+export function recomputeLaneTestability(file: ClaimsFile): { changed: number; warnings: string[] } {
+  const gate = file.sequence;
+  if (!gate?.messages || gate.messages.length === 0) return { changed: 0, warnings: [] };
+
+  const planeOf = new Map<string, string>();
+  for (const participant of gate.participants) planeOf.set(participant.name, participant.plane);
+  const browserSide = (id: string): boolean => {
+    const plane = planeOf.get(id);
+    return plane === 'user' || plane === 'page';
+  };
+
+  let changed = 0;
+  for (const message of gate.messages) {
+    const claim = file.claims[message.claim];
+    if (!claim) continue;
+    const observable = browserSide(message.from) || (message.reply && browserSide(message.to));
+    if (claim.testable !== observable) {
+      claim.testable = observable;
+      changed += 1;
+    }
+    const base = claim.source.replace(BOUNDARY_SUFFIX_RE, '');
+    claim.source = observable
+      ? base
+      : `${base} (beyond the browser boundary: ${planeOf.get(message.from) ?? 'backend'} → ${planeOf.get(message.to) ?? 'backend'} — held as an assumption)`;
+  }
+
+  const warnings: string[] = [];
+  for (const participant of gate.participants) {
+    if (participant.plane !== 'user' && participant.plane !== 'page') continue;
+    const name = `${participant.name} ${participant.label}`;
+    if (DB_NAME_RE.test(name) || EXTERNAL_NAME_RE.test(name)) {
+      warnings.push(
+        `lane "${participant.label}" is marked ${participant.plane} but its name reads as a ` +
+          `${DB_NAME_RE.test(name) ? 'database' : 'external system'} — the browser can only observe ` +
+          `traffic the page itself makes, so claims this lane turns testable will fail against a ` +
+          `working app if the call really happens server-side`,
+      );
+    }
+  }
+  return { changed, warnings };
+}
 
 /**
  * Fill in plane defaults. Notation facts are not guesses (`actor` → user,

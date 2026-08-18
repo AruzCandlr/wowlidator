@@ -417,3 +417,96 @@ describe('what a stored document looks like on disk', () => {
     assert.equal(pdf.subarray(0, 5).toString('latin1'), '%PDF-');
   });
 });
+
+// --- the project's own sheet format: the columns that decide honesty ---------
+
+import {
+  beyondHarnessReason,
+  describeCase,
+  parseTestCaseTable,
+  tableToClaims,
+} from '../src/catalog/test-case-table.js';
+
+describe('the test-case table, read whole', () => {
+  const HEADER =
+    'No.,Scenario ID,Test Scenario,Test Case ID,Positive/Negative,Priority,Test Case,' +
+    'Login / Persona,Preconditions,Test Data,Menu,Test Script / Steps,Expected Output,Note';
+
+  it('reads the Login / Persona and Preconditions columns instead of dropping them', () => {
+    // Those two columns are where the sheet's writer parked the credentials,
+    // the working selectors and the deployment facts — losing them is how an
+    // authored setup ends up guessing at a login the sheet had spelled out.
+    const rows = parseTestCaseTable(
+      `${HEADER}\n` +
+        '1,DB_01,Health,DB_01_01,Positive,High,counts match,' +
+        '"admin@cnext.test — real login","dev server on :3200; seed applied",n/a,,1. curl the endpoint,counts equal SQL,run first',
+    );
+    assert.ok(rows);
+    assert.equal(rows[0]?.persona, 'admin@cnext.test — real login');
+    assert.equal(rows[0]?.preconditions, 'dev server on :3200; seed applied');
+  });
+
+  it('carries the Note column into the claim text — the caveats decide the assertion', () => {
+    const rows = parseTestCaseTable(
+      `${HEADER}\n` +
+        '1,PB_01,Due date,PB_01_01,Positive,High,due = hire + 120,,,,,1. read the card,card says 120 days,' +
+        '"KNOWN FAIL: code uses 119 — encode as test.fail()"',
+    );
+    assert.ok(rows);
+    const [claim] = tableToClaims(rows);
+    assert.match(claim?.claim ?? '', /— note: KNOWN FAIL: code uses 119/);
+  });
+
+  it('marks a row whose steps stop services as beyond the harness, boundary named', () => {
+    const rows = parseTestCaseTable(
+      `${HEADER}\n` +
+        '1,DB_10,Outage,DB_10_01,Negative,High,graceful fallback when the DB is down,,,,,' +
+        '"1. brew services stop postgresql@18\n2. open the catalog",falls back to the registry,run last',
+    );
+    assert.ok(rows);
+    assert.equal(beyondHarnessReason(rows[0]!)?.includes('stopping or starting services'), true);
+    const [claim] = tableToClaims(rows);
+    assert.equal(claim?.testable, false);
+    assert.match(claim?.source ?? '', /beyond the browser/);
+  });
+
+  it('marks a claim that pivots on a direct SQL write as held for a human', () => {
+    const rows = parseTestCaseTable(
+      `${HEADER}\n` +
+        '1,DB_03,Propagation,DB_03_01,Positive,High,' +
+        '"A direct SQL status change on a registry-matching row is reflected in the catalog",,,,,' +
+        '1. psql update the row,the row renders Inactive,',
+    );
+    assert.ok(rows);
+    assert.match(beyondHarnessReason(rows[0]!) ?? '', /read-only by design/);
+    assert.equal(tableToClaims(rows)[0]?.testable, false);
+  });
+
+  it('ordinary rows stay testable — the detector is narrow on purpose', () => {
+    const rows = parseTestCaseTable(
+      `${HEADER}\n` +
+        '1,DB_04,Create,DB_04_01,Positive,High,creating a plan inserts a row,,,,,' +
+        '"1. click Create Plan\n2. psql -Atc ""select count(*) from plans"" to validate\n3. delete from plans where id=1 returning id",the row exists,cleanup via psql',
+    );
+    assert.ok(rows);
+    // A psql SELECT for validation — and even a cleanup DELETE in the steps —
+    // does not make the CLAIM untestable; only the service-stop commands and a
+    // title that pivots on the write do.
+    assert.equal(beyondHarnessReason(rows[0]!), null);
+    assert.equal(tableToClaims(rows)[0]?.testable, true);
+  });
+
+  it('describeCase hands the author the sheet whole: persona, preconditions, note', () => {
+    const rows = parseTestCaseTable(
+      `${HEADER}\n` +
+        '1,DB_02,Union,DB_02_01,Positive,High,catalog renders the union,' +
+        'admin@cnext.test / admin2026,dev server :3200,BE-MED-001,Benefits Admin,1. open the catalog,both rows render,' +
+        'the union is the sync contract',
+    );
+    assert.ok(rows);
+    const described = describeCase(rows[0]!);
+    assert.match(described, /Login \/ persona:\n {2}admin@cnext.test \/ admin2026/);
+    assert.match(described, /Preconditions:\n {2}dev server :3200/);
+    assert.match(described, /Note \(from the sheet\):\n {2}the union is the sync contract/);
+  });
+});

@@ -105,6 +105,47 @@ export function exactTextSelector(selector: string): string | null {
 }
 
 /**
+ * The substring form of a *quoted* text selector, or `null` when there is
+ * nothing to relax.
+ *
+ * The exact mirror of `exactTextSelector`, and it exists for the opposite
+ * failure. Playwright's quoted `text="X"` matches the whole normalised text of
+ * an element, so it resolves **nothing** the moment the page renders that
+ * value with anything around it. Found by adjudicating DB_07_01 against a live
+ * app: the flow asserted `text="75,000"` and the page renders the amount as
+ * `฿{v.toLocaleString('th-TH', { minimumFractionDigits: 2 })}` — that is
+ * `฿75,000.00`, so the exact form matched zero elements while the number was
+ * plainly on screen. Two `high` defects were filed against an application that
+ * was working, and the healer cannot rescue it: it would read the same page
+ * and propose the same text.
+ *
+ * Relaxing is a loosening, so the guards are in the caller (presence
+ * assertions only — see the rung in `SmartRunner.#resolve`) and in the two
+ * refusals here:
+ *
+ * - text containing `>>` is never relaxed: unquoted, it would be re-read as
+ *   Playwright's selector-chaining operator and mean something else entirely;
+ * - text that itself begins with a quote or `/` is never relaxed, for the
+ *   same reason — the unquoted form would be re-parsed as a quoted string or
+ *   a regex.
+ *
+ * Same `null`-rather-than-input contract as `relaxRoleName`, so the runner can
+ * skip a redundant retry instead of paying the fast-path timeout twice.
+ */
+export function relaxTextSelector(selector: string): string | null {
+  const match = /^(\s*text=)(.*)$/s.exec(selector);
+  if (!match) return null;
+  const body = match[2]!.trim();
+  const quoted = /^"((?:[^"\\]|\\.)*)"$/s.exec(body) ?? /^'((?:[^'\\]|\\.)*)'$/s.exec(body);
+  if (!quoted) return null;
+  const inner = quoted[1]!.replace(/\\(.)/g, '$1');
+  if (inner.trim() === '') return null;
+  if (inner.includes('>>')) return null;
+  if (/^\s*["'/]/.test(inner)) return null;
+  return `${match[1]}${inner}`;
+}
+
+/**
  * ARIA roles wowlidator may see in a captured tree.
  *
  * Used only to decide whether a bare leading token *was meant to be a role* —

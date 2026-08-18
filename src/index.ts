@@ -181,6 +181,19 @@ export {
 } from './catalog/extract.js';
 
 export {
+  CONTEXT_BUDGET_CHARS,
+  CONTEXT_DOC_MAX_CHARS,
+  CONTEXT_RETRIEVAL_MIN_CHARS,
+  chunkDocument,
+  rankChunks,
+  selectRelevantContext,
+  tokenize,
+  type ContextChunk,
+  type ContextSelection,
+  type ScoredChunk,
+} from './catalog/retrieve.js';
+
+export {
   CatalogError,
   DEFAULT_MAX_CLAIMS,
   LlmCatalogModel,

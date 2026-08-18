@@ -22,6 +22,7 @@ import { BACKEND_TIER_ACTIONS,
 import { buildVerdict, escalationTrace, type Verdict } from './verdict.js';
 import type {
   AgentRecord,
+  StepDecision,
   DataCaseResult,
   DataRetryRecord,
   Defect,
@@ -245,7 +246,7 @@ function ms(value: number): string {
  */
 const RESOLUTION_LABEL: Record<string, string> = {
   case: 'matched ignoring letter-case',
-  narrow: 'matched as exact text',
+  narrow: 're-matched against the page text',
   late: 'resolved late',
   cache: 'reused an earlier repair',
   jit: 'selector auto-repaired',
@@ -265,7 +266,7 @@ export const GLOSSARY: Record<string, string> = {
   'matched ignoring letter-case':
     'The selector matched once letter-case was ignored. Chrome and Playwright compute accessible names differently when CSS changes text case.',
   'matched as exact text':
-    'The unquoted text selector is a substring match and hit several elements, so it was narrowed to the exact text (or, for a presence assertion, the first visible match). The asserted text is on the page; the selector was just broader than the author knew.',
+    'A text selector that did not match as written, re-matched for free against what the page actually contains: an unquoted substring form narrowed to exact text when it hit several elements, or a quoted exact form relaxed to a substring when the page renders the value with formatting around it (a currency prefix, decimals). Either way the asserted text is on the page; the selector was written tighter or broader than the rendering.',
   'reused an earlier repair':
     'A selector repaired on a previous run was reused here, at no cost.',
   'selector auto-repaired':
@@ -276,6 +277,8 @@ export const GLOSSARY: Record<string, string> = {
     'The control was not reachable — behind a closed menu, below the fold, or on a view still loading — so an agent drove the browser until it was, and then the step ran the original selector. The test passed on its own terms; it just could not get there unaided. Add the steps that reveal the control.',
   'agent takeover':
     'A model drove the browser directly for this step, deciding one action at a time, rather than the runner following a selector the test supplied.',
+  'agent decided':
+    'The step met something the flow does not describe — a consent screen, a notice, an onboarding step — so the agent was asked to look, judge what was in the way, and choose what to do. What it judged and chose is recorded below in its own words; whether the step then worked is the separate, harder fact. Add the step that handles this interaction so the run stops paying a model to rediscover it.',
   backend:
     'This step exercised the backend directly — HTTP the test made, traffic the page made (expectCalls), or a database check — rather than driving the page.',
   quarantined:
@@ -386,6 +389,10 @@ function stepBadges(step: ProofStep, afterFailure = false): string {
     badges.push(`<span class="badge res-${esc(step.resolution)}">${term(label)}</span>`);
   }
   if (step.agent) badges.push('<span class="badge res-agent">agent takeover</span>');
+  // Distinct from the takeover badge: that one says a model drove the step,
+  // this one says a model was asked to JUDGE something the flow never
+  // mentioned. A reader needs to know a decision was taken on their behalf.
+  if (step.decision) badges.push('<span class="badge res-agent">agent decided</span>');
   if (step.snapshot) {
     badges.push(
       `<span class="badge ${step.snapshot.outcome === 'matched' ? 'res-fast' : 'res-jit'}">visual: ${esc(step.snapshot.outcome)}</span>`,
@@ -615,6 +622,49 @@ function networkBlock(calls: readonly NetworkCall[]): string {
             'correlation, not a proof of cause.</p>'
           : ''
       }
+    </div>`;
+}
+
+/**
+ * What the agent judged and chose, kept visibly apart from what it did.
+ *
+ * The three prose lines are the agent's own words — claims about the page —
+ * and the last line is the only evidence in the block: whether the author's
+ * own selector resolved afterwards. Rendering them together without that
+ * separation would let a confident-sounding "I accepted the consent screen"
+ * read as proof the step was sound.
+ */
+function decisionBlock(decision: StepDecision): string {
+  const rows = decision.actions
+    .map(
+      (a) => `
+      <tr class="${a.ok ? '' : 'bad'}">
+        <td class="num">${a.index + 1}</td>
+        <td><span class="act">${esc(a.action)}</span></td>
+        <td><code>${esc(a.selector ?? a.value ?? '—')}</code></td>
+        <td class="reason-cell">${esc(a.reasoning)}${a.error ? `<div class="err">${esc(a.error)}</div>` : ''}</td>
+      </tr>`,
+    )
+    .join('');
+
+  return `
+    <div class="callout agent ${decision.resolved ? '' : 'failed'}">
+      <div class="callout-title">The run met something the flow does not describe${
+        decision.resolved ? '' : ' — and the step still did not work'
+      }</div>
+      ${decision.observed ? `<p class="reason"><span>the agent judged</span> ${esc(decision.observed)}</p>` : ''}
+      <p class="reason"><span>it decided</span> ${esc(decision.decided)}</p>
+      ${decision.because ? `<p class="reason"><span>because</span> ${esc(decision.because)}</p>` : ''}
+      <table class="agent-trace">
+        <thead><tr><th>#</th><th>action</th><th>target</th><th>reasoning</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4" class="muted">it chose not to act</td></tr>'}</tbody>
+      </table>
+      <dl class="kv">
+        <div><dt>the test\u2019s own selector then</dt><dd>${
+          decision.resolved ? 'resolved' : 'still did not resolve'
+        }</dd></div>
+        <div><dt>model</dt><dd>${esc(decision.model)}</dd></div>
+      </dl>
     </div>`;
 }
 
@@ -915,6 +965,7 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
       ${step.request ? requestBlock(step.request) : ''}
       ${step.db ? dbBlock(step.db) : ''}
       ${step.dialog ? dialogBlock(step.dialog) : ''}
+      ${step.decision ? decisionBlock(step.decision) : ''}
       ${step.agent ? agentBlock(step.agent) : ''}
       ${step.snapshot ? snapshotBlock(step) : ''}
       ${step.dataCases ? dataBlock(step.dataCases) : ''}

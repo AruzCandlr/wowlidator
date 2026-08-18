@@ -3,8 +3,10 @@
  * helpers. Split out of cli.ts verbatim.
  */
 
+import { CONTEXT_BUDGET_CHARS } from '../catalog/retrieve.js';
 import type { WowlidatorConfig } from '../config.js';
 import type { ScreenshotMode, VideoMode } from '../engine/runner.js';
+import { TEST_SCOPES, type TestScope } from '../generator/flow-author.js';
 import type { MutationPolicy } from '../generator/test-generator.js';
 import type { LlmFactory } from '../providers/llm-factory.js';
 
@@ -76,6 +78,18 @@ export interface CliOptions {
    * controls that only exist after a click are visible to the model.
    */
   probe: boolean;
+  /**
+   * Also capture the page the DESCRIPTION is about, not only the page the run
+   * starts on. Opt-in: it navigates the application under test, which is a
+   * decision about someone's system — the `--probe`/`--agent-assist` rule.
+   */
+  captureJourney: boolean;
+  /**
+   * How far an authored test must reach — see `TestScope`. `e2e` is not a
+   * hint: it turns the journey capture on whether or not `--capture-journey`
+   * was passed, and `notEndToEnd` refuses a flow confined to one page.
+   */
+  scope: TestScope;
   /** How many links `wowlidator crawl` may follow. */
   maxPages: number | undefined;
   /** Healer calls allowed per link during a crawl. */
@@ -125,10 +139,26 @@ export interface CliOptions {
   maxDraftCases: number;
   /** Supporting documents — background for the model, never a source of claims. */
   contextDocs: string[];
+  /**
+   * The account an authored flow should sign in as. Absent means the model has
+   * to invent one, which it does badly — see `parseCredentials`.
+   */
+  credentials: { email: string; password: string } | undefined;
+  /**
+   * Characters of `--context-doc` background allowed in one prompt. `0` — the
+   * default — sends every context document whole, which is what this did
+   * before relevance selection existed.
+   */
+  contextBudget: number;
   /** Cap on claims read out of one catalog. */
   maxClaims: number;
   /** Project root to index for `context build`/`show` and `generate --context`. */
   root: string | undefined;
+  /**
+   * A saved repository (`context add`) to ground this run in, by slug or path.
+   * Explicit selection: unknown values are a loud error, never a silent skip.
+   */
+  repo: string | undefined;
   /** Where the context graph is cached. */
   contextOut: string | undefined;
   /** Rebuild the context graph even if its signature is unchanged. */
@@ -207,6 +237,74 @@ export function parseCaptureDelay(raw: string | undefined, configured: number): 
     return null;
   }
   return parsed;
+}
+
+/**
+ * `--context-budget` in characters, then `WOWLIDATOR_CONTEXT_BUDGET`, then the
+ * default.
+ *
+ * A number rather than a boolean on purpose. `--context` (the static
+ * repository index) and `--context-doc` (background documents) are already
+ * one flag apart from doing each other's job, and a third context-shaped
+ * noun — `--no-context-retrieval`, `--full-context` — is how that hazard gets
+ * worse. `0` says "off" without inventing one.
+ *
+ * Rejects rather than clamps, the `parseCaptureDelay` rule: a budget typed
+ * wrong is either a prompt with no background in it or one with all of it, and
+ * both are quieter than they should be.
+ */
+export function parseContextBudget(raw: string | undefined): number | null {
+  const value = raw ?? process.env['WOWLIDATOR_CONTEXT_BUDGET'];
+  if (value === undefined || value === '') return CONTEXT_BUDGET_CHARS;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
+/**
+ * `--as <email>:<password>`, then `WOWLIDATOR_AS`, then nothing.
+ *
+ * A model must never guess a secret, and measured over nine authoring runs it
+ * guessed one every single time — `Password123!`, `password123` — because
+ * nothing in the prompt could have told it otherwise. The cost is not
+ * theoretical: one run died on "agent reported the goal is unreachable:
+ * Sign-in failed with 'Incorrect password'", and a worse one reported 12/12
+ * passed, having failed the login and then completed the journey on a session
+ * a previous run had left behind. Real credentials live in the application's
+ * own source (a demo-users module, a seed file) that no ingester reads, so the
+ * only honest place for them to come from is the person running the command.
+ *
+ * Rejects rather than guesses, the `parseCaptureDelay` rule: a malformed pair
+ * silently ignored would put us straight back to an invented password.
+ *
+ * Split on the FIRST colon only. A password may contain colons; an email may
+ * not, so the first one is unambiguously the separator.
+ */
+export function parseCredentials(
+  raw: string | undefined,
+): { email: string; password: string } | null | undefined {
+  const value = raw ?? process.env['WOWLIDATOR_AS'];
+  if (value === undefined || value === '') return undefined;
+  const at = value.indexOf(':');
+  if (at < 0) return null;
+  const email = value.slice(0, at).trim();
+  const password = value.slice(at + 1);
+  if (email === '' || password === '') return null;
+  return { email, password };
+}
+
+/**
+ * `--scope`, defaulting to `unit`.
+ *
+ * `unit` is the default because it is what authoring has always produced, and
+ * a default that silently changed the shape of every existing invocation would
+ * be wrong. Rejects rather than falling back, the `parseCaptureDelay` rule:
+ * `--scope e2ee` quietly authoring a unit test is exactly the surprise this
+ * flag exists to remove.
+ */
+export function parseScope(raw: string | undefined): TestScope | null {
+  if (raw === undefined) return 'unit';
+  return (TEST_SCOPES as readonly string[]).includes(raw) ? (raw as TestScope) : null;
 }
 
 /** Commands whose invocation is worth saving as a recallable preset. */

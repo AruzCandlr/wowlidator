@@ -128,24 +128,42 @@ export function defaultDbConfig(): DbConfig | null {
   };
 }
 
+/**
+ * Every readable, non-system schema — not just `current_schema()`. Real
+ * applications keep their tables in named schemas (`benefit_management.*`,
+ * `employee_center.*` — the first multi-schema target found this), and a
+ * grounding gate that only saw `public` would refuse every table the app
+ * actually writes. Tables in the current schema keep their bare name so
+ * existing flows read the same; every other table is addressed
+ * `schema.table`, and `information_schema` already hides what the role may
+ * not read.
+ */
 const INTROSPECT_COLUMNS = `
-  SELECT c.table_name, c.column_name, c.data_type, c.is_nullable
+  SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable
   FROM information_schema.columns c
   JOIN information_schema.tables t
     ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-  WHERE c.table_schema = current_schema() AND t.table_type = 'BASE TABLE'
-  ORDER BY c.table_name, c.ordinal_position`;
+  WHERE t.table_type = 'BASE TABLE'
+    AND c.table_schema NOT IN ('pg_catalog', 'information_schema')
+    AND c.table_schema NOT LIKE 'pg_toast%'
+  ORDER BY c.table_schema, c.table_name, c.ordinal_position`;
 
 const INTROSPECT_KEYS = `
-  SELECT tc.table_name, kcu.column_name, tc.constraint_type,
-         ccu.table_name AS foreign_table, ccu.column_name AS foreign_column
+  SELECT tc.table_schema, tc.table_name, kcu.column_name, tc.constraint_type,
+         ccu.table_schema AS foreign_schema, ccu.table_name AS foreign_table,
+         ccu.column_name AS foreign_column
   FROM information_schema.table_constraints tc
   JOIN information_schema.key_column_usage kcu
     ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema
   LEFT JOIN information_schema.constraint_column_usage ccu
     ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
-  WHERE tc.table_schema = current_schema()
+  WHERE tc.table_schema NOT IN ('pg_catalog', 'information_schema')
     AND tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY')`;
+
+/** `benefit_management.benefit_plan`, or the bare name for the current schema. */
+function qualifiedName(schema: string, table: string, currentSchema: string): string {
+  return schema === currentSchema ? table : `${schema}.${table}`;
+}
 
 class PgDbClient implements DbClient {
   readonly id = 'pg';
@@ -166,12 +184,15 @@ class PgDbClient implements DbClient {
   }
 
   async introspect(): Promise<DbSchema> {
+    const current = String(
+      (await this.query('SELECT current_schema() AS s', [])).rows[0]?.['s'] ?? 'public',
+    );
     const columns = await this.query(INTROSPECT_COLUMNS, []);
     const keys = await this.query(INTROSPECT_KEYS, []);
 
     const tables = new Map<string, DbTable>();
     for (const row of columns.rows) {
-      const tableName = String(row['table_name']);
+      const tableName = qualifiedName(String(row['table_schema']), String(row['table_name']), current);
       let table = tables.get(tableName);
       if (!table) {
         table = { name: tableName, columns: [], pk: [], references: [] };
@@ -185,7 +206,9 @@ class PgDbClient implements DbClient {
       });
     }
     for (const row of keys.rows) {
-      const table = tables.get(String(row['table_name']));
+      const table = tables.get(
+        qualifiedName(String(row['table_schema']), String(row['table_name']), current),
+      );
       if (!table) continue;
       const columnName = String(row['column_name']);
       if (row['constraint_type'] === 'PRIMARY KEY') {
@@ -193,9 +216,12 @@ class PgDbClient implements DbClient {
         const column = table.columns.find((c) => c.name === columnName);
         if (column) column.pk = true;
       } else if (row['foreign_table'] !== null && row['foreign_table'] !== undefined) {
-        table.references.push(
-          `${columnName} -> ${String(row['foreign_table'])}.${String(row['foreign_column'])}`,
+        const target = qualifiedName(
+          String(row['foreign_schema'] ?? current),
+          String(row['foreign_table']),
+          current,
         );
+        table.references.push(`${columnName} -> ${target}.${String(row['foreign_column'])}`);
       }
     }
 
