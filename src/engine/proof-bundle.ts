@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import type { PolaritySource, TestPolarity } from './polarity.js';
 
 import type { RequestRecord } from '../api/api-client.js';
 import type { NetworkCall } from '../api/network-observer.js';
@@ -27,7 +28,120 @@ import { join, resolve } from 'node:path';
  *            still could not be resolved; there is nothing left to try.
  */
 export type StepStatus = 'passed' | 'failed' | 'error' | 'dead-end';
-export type RunStatus = 'passed' | 'failed' | 'error' | 'dead-end';
+export type RunStatus =
+  | 'passed'
+  | 'passed-with-issues'
+  /**
+   * proved-? — the claim's SHAPE held and only its wording did not, closely
+   * enough that a machine must not rule. Every broken step is a failed
+   * assertion whose recorded `actual` is a near-miss of its `expected`
+   * ("Create Plan" vs a dialog titled "Create Benefit Plan"), and whether
+   * that is a spec violation or an authoring paraphrase is a human call. The
+   * run awaits confirmation (`ProofBundle.review`); until it arrives it is
+   * NOT a pass anywhere — `isPassing` says no — and not a product failure
+   * either.
+   */
+  | 'needs-review'
+  | 'failed'
+  | 'error'
+  | 'dead-end';
+
+/**
+ * Did the run's claims hold?
+ *
+ * `passed` and `passed-with-issues` both answer yes. The second is the run
+ * whose **assertions all held** while one or more of its *actions* did not —
+ * a click that dead-ended on a consent gate and was then made redundant by a
+ * later step, an agent leg that gave up after the page had already arrived.
+ * Measured (BE_Test2.csv, 2026-08-19 18:16): PL_02_03 dead-ended at step 3
+ * clicking "Create Plan", then clicked the same control at step 6, passed,
+ * and passed both of its assertions — and was reported `dead-end`, with its
+ * film cut at step 1. The claim the row makes was proved; the flow's path to
+ * it was not clean. Those are two different facts and the verdict now says
+ * both.
+ *
+ * Every consumer that asks "did it pass" — exit code, trend, quarantine,
+ * suite index, the panel's filters — asks through this predicate, so the
+ * qualified pass is a pass everywhere and an issue everywhere, never one or
+ * the other by accident.
+ */
+/**
+ * The actions whose outcome IS a claim — the same set `classifyStepFailure`
+ * files as `failed` rather than `error`, restated here because this module
+ * cannot import the runner (the runner imports it).
+ */
+function isAssertionAction(action: string): boolean {
+  return (
+    action.startsWith('expect') ||
+    action === 'snapshot' ||
+    action === 'fillEach' ||
+    action === 'fillRetry'
+  );
+}
+
+export function isPassing(status: RunStatus | string): boolean {
+  return status === 'passed' || status === 'passed-with-issues';
+}
+
+/**
+ * The status a consumer should act on: a human ruling on a `needs-review`
+ * run outranks the machine's deferral. Everything that displays or scores a
+ * bundle should ask this, not `bundle.status`, once reviews exist.
+ */
+export function effectiveStatus(bundle: {
+  status: RunStatus | string;
+  review?: { verdict: 'proved' | 'failed'; at?: string | undefined } | undefined;
+}): RunStatus | string {
+  if (bundle.status === 'needs-review' && bundle.review !== undefined) {
+    return bundle.review.verdict === 'proved' ? 'passed' : 'failed';
+  }
+  return bundle.status;
+}
+
+/**
+ * Should a failed comparison be JUDGED rather than scored failed on the spot?
+ *
+ * The history of the threshold is the point of the function. It began as a
+ * ≥50%-word-overlap near-miss detector — only comparisons that close reached
+ * the review layer, and everything below flat-failed. Broadened 2026-08-24 at
+ * the person's request: after the deterministic comparison has read the
+ * actual, any mismatch that is not accurate (≥90% / containment territory
+ * passes or proves trivially anyway) goes to the agent judge to rule on —
+ * the wording call belongs to a reader of both strings, not to a token
+ * ratio, and the false failures this suite produced were precisely the
+ * mismatches the ratio flat-failed ("Reimbursement by HR" against a page
+ * that renders "การเบิกจ่ายโดย HR" scores 0% and was never shown to anything
+ * that could read Thai).
+ *
+ * What still refuses to soften are facts, not wording:
+ * - **Purely numeric expectations are never judged**: 119 days against a
+ *   promised 120 is the catalog's own documented defect (PB_01_01), and
+ *   softening a number is how an instrument teaches people to ignore it.
+ * - **A numeric token inside the expectation must appear in the actual** —
+ *   "120 days" against "119 days remaining" is a defect about the number,
+ *   however well the words overlap.
+ * - **Identical strings do not fail** — that is a bug elsewhere, not a
+ *   wording call — and an empty side says nothing worth judging.
+ */
+export function nearMiss(expected: unknown, actual: unknown): boolean {
+  const e = typeof expected === 'string' ? expected : JSON.stringify(expected) ?? '';
+  const a = typeof actual === 'string' ? actual : JSON.stringify(actual) ?? '';
+  if (e === '' || a === '') return false;
+  const el = e.toLowerCase().trim();
+  const al = a.toLowerCase().trim();
+  if (el === al) return false; // identical strings do not fail — this is not a near-miss, it is a bug elsewhere
+  const tokens = el.split(/[^\p{L}\p{N}]+/u).filter((t) => t.length > 0);
+  if (tokens.length === 0) return false;
+  if (tokens.every((t) => /^\p{N}+$/u.test(t))) return false;
+  // A numeric token is exact or nothing: "120 days" against "119 days
+  // remaining" is a defect about the number, however well the words overlap.
+  const hayAll = ` ${al} `;
+  if (tokens.some((t) => /^\p{N}+$/u.test(t) && !hayAll.includes(` ${t} `) && !hayAll.includes(t))) {
+    return false;
+  }
+  // Every other wording mismatch is the judge's to rule on.
+  return true;
+}
 
 /**
  * Actions that speak HTTP directly instead of driving the page.
@@ -207,7 +321,9 @@ export interface AgentRecord {
   actions: AgentAction[];
   /** Model turns consumed out of the step budget. */
   turns: number;
-  maxSteps: number;
+  /** The configured turn ceiling, or null when the run was unbounded and the
+   *  loop's own logic (arrival, stall, no-progress) was the only judge. */
+  maxSteps: number | null;
   latencyMs: number;
   inputTokens?: number | undefined;
   outputTokens?: number | undefined;
@@ -263,6 +379,12 @@ export interface ProofStep {
   action: string;
   /** The author's plain-language description of this step, verbatim from `FlowStep.intent`. */
   intent?: string | undefined;
+  /**
+   * Set when this step is the reason a run is `needs-review`: the assertion
+   * failed on a near-miss of wording, and this is the proof of the unsure
+   * part — expected vs actual, in one line, for the human who must rule.
+   */
+  unsure?: string | undefined;
   selector: string | null;
   /** The selector that actually resolved — differs from `selector` when healed. */
   resolvedSelector: string | null;
@@ -477,10 +599,54 @@ export interface ProofSummary {
 /** Where a flow came from, when it wasn't hand-written. */
 export interface GenerationProvenance {
   model: string;
+  /**
+   * When the authoring pass that produced this case ran.
+   *
+   * Identical across every case of one pass and different for the next one,
+   * which is what makes it the identity of a *batch*: running the same catalog
+   * twice produces two values, so the two runs of a case never collapse into
+   * one group. wowUI groups the run list on exactly this.
+   */
   generatedAt: string;
   sourceUrl: string;
   kind: string;
   rationale: string;
+  /**
+   * The sheet's own recorded outcome for this case (`Actual Result`,
+   * normalised): what a person found when they last ran it by hand. This is
+   * the ground truth wowUI's accuracy compares a run's verdict against —
+   * Positive/Negative says what the case means to prove, only this says how
+   * the application actually behaved. Absent when the sheet recorded nothing
+   * (blank, Cancelled, Pending) or the source was not a test-case table.
+   */
+  knownResult?: 'passed' | 'failed' | undefined;
+  /**
+   * The document this was authored from — a catalog's file name.
+   *
+   * `sourceUrl` is the *page* the flow was grounded against, which for a
+   * catalog run is the same login screen for every case of every catalog, so
+   * it cannot name what a reader is actually looking at. Absent for anything
+   * not authored from a document.
+   */
+  source?: string | undefined;
+  /**
+   * The sheet's scenario this case belongs to (`<scenarioId> <title>`), and
+   * the row's own test-case title. Per case, not per pass — wowUI groups a
+   * catalog's cases by scenario and shows the title beside the case id.
+   * Absent for anything not authored from a test-case table.
+   */
+  scenario?: string | undefined;
+  caseTitle?: string | undefined;
+  /**
+   * The catalog run's unique key: `<catalog name, slugged>@<generatedAt>`,
+   * minted when the run is initialised and reused verbatim by every resume of
+   * it (the ledger stores it; `cmdCatalog` reads it back). It is the pass
+   * identity made legible — the stamp above stays the grouping key, since
+   * bundles written before this field existed carry only the stamp, and the
+   * key embeds it, so the two group identically. Absent for anything not run
+   * as a catalog.
+   */
+  runKey?: string | undefined;
 }
 
 export interface ProofBundle {
@@ -493,6 +659,13 @@ export interface ProofBundle {
   quarantined?: boolean | undefined;
   runId: string;
   name: string;
+  /**
+   * The name the run was recorded under, when a person renamed it in wowUI.
+   * Kept so anything keyed on the original — the flow file lookup, history
+   * lines written before the rename — can still be matched; set once, on the
+   * first rename, and never overwritten by later renames.
+   */
+  renamedFrom?: string | undefined;
   status: RunStatus;
   startedAt: string;
   finishedAt: string;
@@ -522,7 +695,45 @@ export interface ProofBundle {
    * only auditable if the report can say what `orderId` was.
    */
   variables?: Record<string, string> | undefined;
+  /**
+   * Decisions the harness took about THIS run that a reader should know and
+   * that are not findings — "started from an empty session because the flow
+   * signs in itself". One line each, plain words.
+   */
+  notes?: string[] | undefined;
   generatedBy?: GenerationProvenance | undefined;
+  /**
+   * Whether this test MEANS to prove acceptance or refusal. A negative test's
+   * green run says "the application refused it, as required" — read without
+   * this label, the same green says the opposite. `polaritySource` says
+   * whether the catalog stated it or the harness inferred it, because a
+   * stated column is the author's word and an inference is only a reading.
+   */
+  polarity?: TestPolarity | undefined;
+  polaritySource?: PolaritySource | undefined;
+  /**
+   * A human's ruling on a `needs-review` run, written back into the bundle
+   * file by the panel (or by hand). `proved` means the near-miss wording is
+   * acceptable and the claims count as held; `failed` means it is a real
+   * mismatch. The original status is never rewritten — the ruling sits
+   * beside it, so what the machine said and what the person decided are both
+   * on the record.
+   */
+  review?:
+    | {
+        verdict: 'proved' | 'failed';
+        at: string;
+        /**
+         * Who ruled. Absent = a human (wowUI's Confirm buttons). A model
+         * ruling (`src/engine/review-judge.ts`) carries its model label here
+         * plus its confidence and reasoning — and a human may REPLACE a model
+         * ruling in the panel; never the reverse.
+         */
+        by?: string | undefined;
+        confidence?: number | undefined;
+        reasoning?: string | undefined;
+      }
+    | undefined;
   error?: string | undefined;
 }
 
@@ -535,6 +746,9 @@ export interface ProofBundleBuilderOptions {
   generatedBy?: GenerationProvenance | undefined;
   /** Called synchronously right after each step is recorded — for live progress output. */
   onStep?: ((step: ProofStep) => void) | undefined;
+  /** See `ProofBundle.polarity`. Stamped by `runFlow` from the flow or by inference. */
+  polarity?: TestPolarity | undefined;
+  polaritySource?: PolaritySource | undefined;
 }
 
 /** Accumulates steps during a run and seals them into a `ProofBundle`. */
@@ -548,12 +762,16 @@ export class ProofBundleBuilder {
   readonly #cachePath: string | null;
   readonly #healerModel: string | null;
   readonly #generatedBy: GenerationProvenance | undefined;
+  readonly #polarity: TestPolarity | undefined;
+  readonly #polaritySource: PolaritySource | undefined;
   readonly #steps: ProofStep[] = [];
   readonly #defects: Defect[] = [];
   readonly #onStep: ((step: ProofStep) => void) | undefined;
   #coverage: CoverageReport | undefined;
   #trend: RunTrend | undefined;
   #variables: Record<string, string> | undefined;
+  #notes: string[] = [];
+  #errorIsTally = false;
   #video: VideoRecording | undefined;
   #videoStartedMs: number | undefined;
   #error: string | undefined;
@@ -561,6 +779,8 @@ export class ProofBundleBuilder {
   #network = { calls: 0, failures: 0, dropped: 0 };
   #backendBlocked = 0;
   #healUnavailable = 0;
+  #extraInputTokens = 0;
+  #extraOutputTokens = 0;
   #hasNonPass = false;
 
   constructor(options: ProofBundleBuilderOptions) {
@@ -572,6 +792,8 @@ export class ProofBundleBuilder {
     this.#cachePath = options.cachePath ?? null;
     this.#healerModel = options.healerModel ?? null;
     this.#generatedBy = options.generatedBy;
+    this.#polarity = options.polarity;
+    this.#polaritySource = options.polarity === undefined ? undefined : options.polaritySource;
     this.#onStep = options.onStep;
   }
 
@@ -704,6 +926,21 @@ export class ProofBundleBuilder {
   }
 
   /**
+   * Tokens spent by a model call that leaves no per-step record — an in-run
+   * reconstruction ask, including one whose answer was `canFix: false` or was
+   * refused. `summary.inputTokens`/`outputTokens` are the run's WHOLE runtime
+   * model bill, and before this the reconstruction calls (the generator role,
+   * measured as the second-largest sink on be100) simply vanished from it.
+   * Heal, agent and data spend still arrives via their own records; this
+   * counter is only for calls with nowhere else to land, so nothing is ever
+   * counted twice.
+   */
+  noteModelSpend(inputTokens: number, outputTokens: number): void {
+    this.#extraInputTokens += inputTokens;
+    this.#extraOutputTokens += outputTokens;
+  }
+
+  /**
    * A later reconstruction of these failed attempts passed: mark them
    * superseded and withdraw the defects they filed. The attempts stay in the
    * step list — what was tried is evidence — but a rescued step must not
@@ -780,6 +1017,11 @@ export class ProofBundleBuilder {
    * seal time; an empty snapshot is left off the bundle entirely so a run
    * that saved nothing does not grow an empty object that reads like data.
    */
+  /** One plain sentence about a decision this run took. Never a verdict. */
+  note(text: string): void {
+    this.#notes.push(text);
+  }
+
   setVariables(snapshot: Record<string, string>): void {
     if (Object.keys(snapshot).length > 0) this.#variables = snapshot;
   }
@@ -805,6 +1047,17 @@ export class ProofBundleBuilder {
   /** Record a run-level failure that isn't attributable to a single step. */
   recordRunError(error: unknown): void {
     this.#error = error instanceof Error ? error.message : String(error);
+  }
+
+  /**
+   * Record the run's "completed with N issue(s)" tally. It lands on the
+   * bundle's `error` field like a run error — every reader of that field
+   * already expects the tally there — but it is NOT a fatal, and the verdict
+   * may still be a qualified pass over it. See `StepIssuesError`.
+   */
+  recordIssueTally(message: string): void {
+    this.#error = message;
+    this.#errorIsTally = true;
   }
 
   /**
@@ -870,8 +1123,10 @@ export class ProofBundleBuilder {
       networkDropped: this.#network.dropped,
       healLatencyMs: 0,
       agentLatencyMs: 0,
-      inputTokens: 0,
-      outputTokens: 0,
+      // Seeded with the recordless spend (reconstruction asks); the step loop
+      // below adds every heal/agent/data record's own usage on top.
+      inputTokens: this.#extraInputTokens,
+      outputTokens: this.#extraOutputTokens,
       defects: this.#defects.length,
     };
 
@@ -974,10 +1229,88 @@ export class ProofBundleBuilder {
     if (counted.some((s) => s.status === 'error')) status = 'error';
     else if (counted.some((s) => s.status === 'dead-end')) status = 'dead-end';
     else if (summary.failed > 0 || this.#error !== undefined) status = 'failed';
+    // **The claims held, the path did not.** When every assertion the run made
+    // passed — and it made at least one — and only ACTION steps broke, the
+    // row's claim was proved and the verdict says so, qualified. The broken
+    // actions stay on the record as issues (their defects are untouched), and
+    // the film is kept whole so a reader can see the claim being reached
+    // past them. Never applied over a run-level error (a session guard, a
+    // dead browser): those say the claims were asserted against the wrong
+    // page, which no passing assertion can outrank.
+    // An `error` step is excluded outright: it says the HARNESS could not
+    // proceed (a variable that never saved, a database it could not reach, a
+    // model that would not answer) — a passing assertion after one proves the
+    // claim, not that the run did what it said. Only `failed`/`dead-end`
+    // actions — a click that missed, a selector that never resolved — are the
+    // kind of issue a held claim may be read over.
+    if (
+      status !== 'passed' &&
+      status !== 'error' &&
+      (this.#error === undefined || this.#errorIsTally)
+    ) {
+      const assertions = counted.filter((s) => isAssertionAction(s.action));
+      const claimsHeld =
+        assertions.length > 0 && assertions.every((s) => s.status === 'passed');
+      if (claimsHeld) status = 'passed-with-issues';
+    }
+    // **proved-? — every broken step is a failed assertion whose actual is a
+    // near-miss of its expected.** The page produced the right SHAPE of thing
+    // under wording the machine cannot rule on: whether "Create Benefit
+    // Plan" satisfies a claim written "Create Plan" is a spec question, and
+    // both answers are defensible. The run defers to a human instead of
+    // picking one: status `needs-review`, the proof of each unsure part
+    // written onto the step (`unsure`), and `ProofBundle.review` is where
+    // the ruling lands. Never over an error, a dead end (the control was
+    // ABSENT — nothing near about that), or a run-level fatal; a far miss
+    // ("Home landing" for "Create Plan") stays failed.
+    //
+    // ONE dead-end shape qualifies: a step the runner stamped
+    // `foundInPageText` — the exact-match instrument (`text="X"`, a role
+    // name) resolved nothing, but the runner then read the live page and the
+    // asserted text IS in it, inside larger text. "Absent" is disproved by
+    // the page's own words, so whether an embedded rendering satisfies an
+    // exact claim is the same human wording call as any other near-miss
+    // (be100 PL_06_10: `text="Plan ID already exists"` dead-ended while the
+    // toast held that exact sentence in a longer message).
+    // `expectUrl` never defers: a URL is a mechanical destination, grounded
+    // from the link's own href — "expected /orders, got /login" is a routing
+    // fact, and inviting a judge to bless a wrong route is exactly the
+    // softening the numeric guard refuses for numbers.
+    const nearEligible = (s: ProofStep): boolean =>
+      s.action !== 'expectUrl' &&
+      (s.status === 'failed' ||
+        (s.status === 'dead-end' && s.detail?.['foundInPageText'] === true));
+    if (
+      (status === 'failed' || status === 'dead-end') &&
+      (this.#error === undefined || this.#errorIsTally)
+    ) {
+      const broken = counted.filter((s) => s.status !== 'passed');
+      const allNearMisses =
+        broken.length > 0 &&
+        broken.every(
+          (s) =>
+            nearEligible(s) &&
+            isAssertionAction(s.action) &&
+            s.detail?.['expected'] !== undefined &&
+            s.detail?.['actual'] !== undefined &&
+            nearMiss(s.detail['expected'], s.detail['actual']),
+        );
+      if (allNearMisses) {
+        for (const s of broken) {
+          const render = (v: unknown): string => (typeof v === 'string' ? v : JSON.stringify(v));
+          s.unsure =
+            `expected ${JSON.stringify(render(s.detail!['expected']))} but the page holds ` +
+            `${JSON.stringify(render(s.detail!['actual']))} — the exact comparison cannot rule ` +
+            'whether this satisfies the claim; the judge (or a human in the panel) decides, ' +
+            'confirm proved or failed';
+        }
+        status = 'needs-review';
+      }
+    }
     // A run whose session guard fired proved nothing, whatever its steps say.
     // `error` and not `failed`: the application was never reached, so this is
     // the harness's own environment fact, not a verdict about the feature.
-    if (status === 'passed' && this.#sessionLost) status = 'error';
+    if (isPassing(status) && this.#sessionLost) status = 'error';
 
     return {
       runId: this.runId,
@@ -996,7 +1329,10 @@ export class ProofBundleBuilder {
       coverage: this.#coverage,
       trend: this.#trend,
       variables: this.#variables,
+      ...(this.#notes.length > 0 ? { notes: [...this.#notes] } : {}),
       generatedBy: this.#generatedBy,
+      polarity: this.#polarity,
+      polaritySource: this.#polaritySource,
       error: this.#error,
     };
   }
@@ -1058,8 +1394,25 @@ export function formatStepLine(step: ProofStep): string {
     `${mark} [${step.index}] ${step.action}${target ? ` ${target}` : ''}${kind} (${tag}${step.durationMs}ms)`,
   ];
   if (step.intent) lines.push(`      ${step.intent}`);
+  const comparison = expectedActual(step);
+  if (comparison) lines.push(`      ${comparison}`);
   if (step.status !== 'passed' && step.error) lines.push(`      ${step.error.split('\n')[0]}`);
   return lines.join('\n');
+}
+
+/**
+ * The "expected X, actual Y" line, when the step recorded both. Assertions
+ * write these into `detail` on every outcome — a pass shows what the page
+ * really held, not just that a check went green.
+ */
+export function expectedActual(step: ProofStep): string | null {
+  const detail = step.detail;
+  if (!detail || detail['expected'] === undefined) return null;
+  const render = (v: unknown): string =>
+    typeof v === 'string' ? JSON.stringify(v) : JSON.stringify(v) ?? String(v);
+  const expected = render(detail['expected']);
+  const actual = 'actual' in detail ? render(detail['actual']) : null;
+  return actual === null ? `expected ${expected}` : `expected ${expected} · actual ${actual}`;
 }
 
 /** One line per completed agent turn, for live progress during a `workflow` step. */
@@ -1094,10 +1447,34 @@ function tierLines(summary: ProofSummary): string[] {
 }
 
 /** Short human-readable digest, used by the CLI. */
+/**
+ * How a status is printed. `passed-with-issues` prints as `PASS**`: it IS a
+ * pass — every claim held and nothing about validation changes — and the
+ * asterisks point at the step(s) that only acted and broke on the way, which
+ * `issueSteps` names. One spelling for the CLI, the report and the panel.
+ */
+function statusLabel(status: ProofBundle['status']): string {
+  return status === 'passed-with-issues' ? 'PASS**' : status.toUpperCase();
+}
+
+/** The broken action steps behind a `PASS**`, one line each. */
+export function issueSteps(bundle: ProofBundle): string[] {
+  return bundle.steps
+    .filter((s) => !s.superseded && s.status !== 'passed')
+    .map(
+      (s) =>
+        `step ${s.index} ${s.action}${s.selector ? ` ${s.selector}` : ''}` +
+        (s.error ? ` — ${s.error.split('\n')[0]}` : ''),
+    );
+}
+
 export function formatProofSummary(bundle: ProofBundle): string {
   const { summary } = bundle;
   const lines = [
-    `${bundle.status.toUpperCase()} ${bundle.name} (${bundle.durationMs}ms)`,
+    `${statusLabel(bundle.status)} ${bundle.name} (${bundle.durationMs}ms)`,
+    ...(bundle.status === 'passed-with-issues'
+      ? issueSteps(bundle).map((line) => `  ** issue   ${line} (does not affect the verdict)`)
+      : []),
     `  steps      ${summary.passed}/${summary.totalSteps} passed`,
     ...tierLines(summary),
     `  resolution fast=${summary.fastPath} case=${summary.caseRetries} cache=${summary.cacheHits} jit=${summary.jitHeals} dialog=${summary.dialogsDismissed} agent=${summary.agentTakeovers}`,

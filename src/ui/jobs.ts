@@ -18,6 +18,8 @@
  *   readable until it is replaced.
  */
 
+import { writeFile } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -87,6 +89,26 @@ export interface JobProgress {
   phase: string | null;
 }
 
+/**
+ * One case of a suite, as the panel follows it.
+ *
+ * A catalog runs its cases concurrently, so a single job's output carries
+ * several runs at once and a single progress bar could only describe their
+ * average — which is nothing anybody is waiting for. Each case therefore keeps
+ * its own denominator, its own lines and its own verdict, demultiplexed from
+ * the `[cN]` tag the CLI prints in front of every line it owns.
+ */
+export interface JobCase {
+  /** 1-based, as the tag writes it. */
+  number: number;
+  name: string;
+  /** True when the plan said this case changes data and must run alone. */
+  exclusive: boolean;
+  status: 'waiting' | 'running' | 'passed' | 'passed-with-issues' | 'needs-review' | 'failed' | 'error' | 'dead-end' | 'blocked';
+  lines: JobLine[];
+  progress: JobProgress;
+}
+
 export interface Job {
   id: string;
   commandId: string;
@@ -102,6 +124,27 @@ export interface Job {
   lines: JobLine[];
   artifacts: JobArtifact[];
   progress: JobProgress;
+  /** Empty unless the command announced a per-case plan. */
+  cases: JobCase[];
+  /**
+   * How the job ended, once it has. `cause` is the best one-line account the
+   * output gives — the stop request, the signal, the error most cases were
+   * blocked on, or the exit code; `resumable` says a `--resume` of the same
+   * command would have work to do (a catalog with cases still waiting,
+   * running or blocked when it ended); `runtimeError` marks an end that was
+   * the machinery's, not a verdict about the application.
+   */
+  ended: {
+    cause: string | null;
+    resumable: boolean;
+    runtimeError: boolean;
+    /** Cases that ended in `error` — re-runnable as a batch. */
+    errors: number;
+    /** Cases that `failed` / dead-ended — healable as a batch. */
+    failed: number;
+    /** Cases that were never reached, still running, or blocked when the job ended. */
+    unfinished: number;
+  } | null;
 }
 
 /**
@@ -113,6 +156,23 @@ const ARTIFACT_LINE = /^\s{2,}(report|proof|flow|patch|suite|index|junit|ctrf|fo
 
 /** `  plan       17 step(s)` — the denominator, announced before the first step. */
 const PLAN_LINE = /^\s{2,}plan\s{2,}(\d+) step/;
+
+/**
+ * `[c3] …` — which case a line belongs to.
+ *
+ * Printed only when a suite actually runs more than one case at a time, so a
+ * sequential run's output carries no tags and every path below is inert. The
+ * tag is stripped before the line is parsed for anything else, which is what
+ * lets `PLAN_LINE`, `STEP_LINE` and `ARTIFACT_LINE` stay exactly as they were.
+ */
+const CASE_TAG = /^\[c(\d+)\] ?/;
+
+/** `  [c3]      alone   PB_03_01 …` — the roster, printed before anything runs. */
+const CASE_ROSTER = /^\s{2,}\[c(\d+)\]\s{2,}(alone|shared)\s+(\S.*)$/;
+
+/** `case "…" started` / `case "…" passed` — the boundaries of one case's life. */
+const CASE_STARTED = /^case "(.+)" started$/;
+const CASE_ENDED = /^case "(.+)" (passed-with-issues|needs-review|passed|failed|error|dead-end|blocked)$/;
 
 /**
  * Milestones for the commands that have no steps to count, in the order they
@@ -163,7 +223,7 @@ function projectRoot(): string {
  * otherwise the same `tsx src/cli.ts` the `cli` npm script uses. Neither path
  * goes through a shell.
  */
-export function cliCommand(): { file: string; prefix: string[] } {
+function cliCommand(): { file: string; prefix: string[] } {
   const root = projectRoot();
   const built = join(root, 'dist', 'cli.js');
   if (existsSync(built)) return { file: process.execPath, prefix: [built] };
@@ -186,6 +246,13 @@ export class JobRunner {
 
   /** The one browser job allowed to be in flight. */
   #browserJobId: string | null = null;
+
+  /** Called once per job, after its status and exit code are final. */
+  readonly #onFinish: (job: Job) => void;
+
+  constructor(options: { onFinish?: (job: Job) => void } = {}) {
+    this.#onFinish = options.onFinish ?? (() => undefined);
+  }
 
   list(): Job[] {
     return this.#order.map((id) => this.#jobs.get(id)!).filter(Boolean).reverse();
@@ -233,7 +300,9 @@ export class JobRunner {
       finishedAt: null,
       lines: [],
       artifacts: [],
+      ended: null,
       progress: { done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0 },
+      cases: [],
     };
     this.#jobs.set(id, job);
     this.#order.push(id);
@@ -270,12 +339,57 @@ export class JobRunner {
       // The CLI's exit-code contract: 0 passed, 1 a real failure, 2 usage,
       // 3 environment. The last two are not test results, so they are not
       // reported as one.
-      const status: JobStatus =
-        code === 0 ? 'passed' : code === 1 ? 'failed' : job.status === 'stopped' ? 'stopped' : 'error';
+      // A paused suite ends "stopped" whatever its exit code says: the cases
+      // that ran may all have passed, but the suite as approved did not run
+      // to the end, and a green chip over a half-run list would be a lie the
+      // resume banner then contradicts.
+      const status: JobStatus = this.#paused.has(job.id)
+        ? 'stopped'
+        : code === 0
+          ? 'passed'
+          : code === 1
+            ? 'failed'
+            : job.status === 'stopped'
+              ? 'stopped'
+              : 'error';
+      this.#paused.delete(job.id);
       this.#finish(job, status, code);
     });
 
     return job;
+  }
+
+  /** Jobs asked to pause: their eventual exit reports "stopped", never "passed". */
+  #paused = new Set<string>();
+
+  /**
+   * Instant pause: SIGUSR2 makes the suite loop (`runCases`) write the
+   * ledger's pause record and exit on the spot — interrupted cases keep no
+   * verdict, and the resume banner picks the suite up from the ledger.
+   * A resume is a fresh spawn of the same command plus `--resume`: it re-runs
+   * each interrupted case from its own first step, keeps every finished
+   * verdict, and runs on whatever the code says at resume time, not on the
+   * paused process's image.
+   */
+  pause(id: string): boolean {
+    const child = this.#processes.get(id);
+    const job = this.#jobs.get(id);
+    if (!child || !job || job.status !== 'running') return false;
+    if (process.platform === 'win32') return false;
+    this.#paused.add(id);
+    this.#append(job, 'err', '— pausing instantly: in-flight cases are interrupted and keep no verdict; Continue testing re-runs them from their first step —');
+    // Belt AND braces: the signal is instant when it lands, and the pause
+    // file beside the progress ledger is what still works when it cannot —
+    // the suite polls for `<claims>.progress.json.pause` before every case it
+    // would start. (A run orphaned by a panel restart can be paused from a
+    // terminal the same way: touch that file.)
+    const at = job.argv.indexOf('--claims');
+    const claims = at >= 0 ? job.argv[at + 1] : undefined;
+    if (claims !== undefined) {
+      void writeFile(`${resolvePath(claims)}.progress.json.pause`, `pause requested ${new Date().toISOString()}\n`, 'utf8').catch(() => undefined);
+    }
+    child.kill('SIGUSR2');
+    return true;
   }
 
   /** Ctrl-C, then a hard kill if it does not go. */
@@ -323,6 +437,55 @@ export class JobRunner {
     if (job.lines.length > MAX_LINES) job.lines.splice(0, job.lines.length - MAX_LINES);
 
     const elapsed = Date.now() - new Date(job.startedAt).getTime();
+
+    // The roster comes before anything runs, so a reader sees the whole list
+    // — including the cases still waiting — rather than watching rows appear.
+    const roster = CASE_ROSTER.exec(text);
+    if (roster) {
+      const number = Number(roster[1]);
+      if (!job.cases.some((c) => c.number === number)) {
+        job.cases.push(emptyCase(number, roster[3]!.trim(), roster[2] === 'alone'));
+        job.cases.sort((a, b) => a.number - b.number);
+        this.#emit(job.id, 'cases', summariseCases(job.cases));
+      }
+      this.#emit(job.id, 'line', line);
+      return;
+    }
+
+    // A tagged line belongs to one case and to no other. Everything about it
+    // — its progress, its output pane, its verdict — is that case's.
+    const tagged = CASE_TAG.exec(text);
+    if (tagged) {
+      const number = Number(tagged[1]);
+      const body = text.slice(tagged[0].length);
+      let entry = job.cases.find((c) => c.number === number);
+      if (entry === undefined) {
+        // A tag with no roster line in front of it: keep the output rather
+        // than drop it, and let the case name arrive with its `started` line.
+        entry = emptyCase(number, `case ${number}`, false);
+        job.cases.push(entry);
+        job.cases.sort((a, b) => a.number - b.number);
+      }
+      const caseLine: JobLine = { stream, text: body };
+      entry.lines.push(caseLine);
+      if (entry.lines.length > MAX_LINES) entry.lines.splice(0, entry.lines.length - MAX_LINES);
+
+      const started = CASE_STARTED.exec(body);
+      if (started) {
+        entry.name = started[1]!;
+        entry.status = 'running';
+      }
+      const ended = CASE_ENDED.exec(body);
+      if (ended) {
+        entry.name = ended[1]!;
+        entry.status = ended[2] as JobCase['status'];
+      }
+      applyProgressLine(entry.progress, body, elapsed);
+      this.#emit(job.id, 'cases', summariseCases(job.cases));
+      this.#emit(job.id, 'line', line);
+      return;
+    }
+
     if (applyProgressLine(job.progress, text, elapsed)) {
       this.#emit(job.id, 'progress', job.progress);
     }
@@ -344,9 +507,11 @@ export class JobRunner {
     job.status = status;
     job.exitCode = code;
     job.finishedAt = new Date().toISOString();
+    job.ended = endedOf(job, status, code);
     this.#processes.delete(job.id);
     if (this.#browserJobId === job.id) this.#browserJobId = null;
     this.#emit(job.id, 'done', { status, exitCode: code, finishedAt: job.finishedAt });
+    this.#onFinish(job);
   }
 
   #emit(id: string, event: string, data: unknown): void {
@@ -380,6 +545,72 @@ const SMOOTHING = 0.3;
  * run goes, which is what people expect of an estimate and what no constant can
  * do.
  */
+/** Lines that say why a run stopped, most specific first. */
+const CAUSE_LINE =
+  /never ran: (.+)$|BLOCKED .+? — (.+)$|^(?:wowlidator[^:]*: )?(.*(?:Error|error:|refused|unavailable|circuit is open|could not attach|quota|budget).*)$/;
+
+function endedOf(job: Job, status: JobStatus, code: number | null): NonNullable<Job['ended']> {
+  const unfinished = job.cases.filter(
+    (c) => c.status === 'waiting' || c.status === 'running' || c.status === 'blocked',
+  );
+  const resumable = job.commandId === 'catalog-run' && status !== 'passed' && unfinished.length > 0;
+  let cause: string | null = null;
+  if (status === 'stopped') cause = 'stopped from the panel';
+  else if (code === null) cause = 'the process was killed before it could finish';
+  else if (status !== 'passed') {
+    // The reason most blocked cases share beats the last line: seventy
+    // "never ran: <same cause>" lines are one cause, and the last line of a
+    // run is usually the summary.
+    const tally = new Map<string, number>();
+    for (const line of job.lines) {
+      const m = CAUSE_LINE.exec(line.text.replace(/^\[c\d+\]\s*/, ''));
+      const reason = (m?.[1] ?? m?.[2] ?? m?.[3])?.trim();
+      if (reason) tally.set(reason, (tally.get(reason) ?? 0) + 1);
+    }
+    const top = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
+    cause = top ? `${top[0]}${top[1] > 1 ? ` (${top[1]} cases)` : ''}` : `exit code ${code}`;
+  }
+  if (cause !== null) cause = cause.slice(0, 300);
+  return {
+    cause,
+    resumable,
+    runtimeError: status === 'error' || (status === 'failed' && unfinished.length > 0),
+    errors: job.cases.filter((c) => c.status === 'error').length,
+    failed: job.cases.filter((c) => c.status === 'failed' || c.status === 'dead-end').length,
+    unfinished: unfinished.length,
+  };
+}
+
+/**
+ * The cases without their output — what the stream and the polled list carry.
+ * The lines are already going past on the same stream; sending them a second
+ * time, in full, on every line, is how a progress feed becomes a bandwidth
+ * problem.
+ */
+function summariseCases(cases: readonly JobCase[]): Record<string, unknown>[] {
+  return cases.map(({ lines, ...entry }) => ({ ...entry, lineCount: lines.length }));
+}
+
+/** A case as it stands before its first line of output. */
+function emptyCase(number: number, name: string, exclusive: boolean): JobCase {
+  return {
+    number,
+    name,
+    exclusive,
+    status: 'waiting',
+    lines: [],
+    progress: {
+      done: 0,
+      total: null,
+      etaMs: null,
+      percent: null,
+      phase: null,
+      rateMsPerStep: null,
+      lastStepMs: 0,
+    },
+  };
+}
+
 export function applyProgressLine(
   progress: JobProgress,
   text: string,

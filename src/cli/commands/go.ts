@@ -29,7 +29,7 @@ export async function cmdGo(target: string | undefined, options: CliOptions): Pr
     return EXIT.usage;
   }
 
-  if (target.endsWith('.json')) return cmdRun(target, options);
+  if (target.endsWith('.json')) return cmdRun([target], options);
   // A sequence-diagram image is a catalog, and the evidence is kept concrete:
   // the name alone is not enough — the file must exist on disk, or a stray
   // "diagram.png" in a sentence would hijack the description path below.

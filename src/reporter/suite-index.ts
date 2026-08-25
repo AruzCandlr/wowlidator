@@ -17,6 +17,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { basename, dirname, relative, resolve } from 'node:path';
 
 import type { ProofBundle } from '../engine/proof-bundle.js';
+import { isPassing } from '../engine/proof-bundle.js';
 import { buildVerdict } from './verdict.js';
 
 export const DEFAULT_INDEX_FILENAME = 'index.html';
@@ -54,7 +55,7 @@ export interface BlockedEntry {
 /** Failures first, then flaky, then the rest — ordered by what needs attention. */
 export function rankEntries(entries: readonly IndexEntry[]): IndexEntry[] {
   const rank = (entry: IndexEntry): number => {
-    if (entry.bundle.status !== 'passed' && !entry.bundle.quarantined) return 0;
+    if (!isPassing(entry.bundle.status) && !entry.bundle.quarantined) return 0;
     if (entry.bundle.trend?.verdict === 'flaky' || entry.bundle.quarantined) return 1;
     return 2;
   };
@@ -132,7 +133,7 @@ export function renderSuiteIndex(
   // reader has no way to catch.
   const total = ranked.length + blocked.length;
 
-  const failed = ranked.filter((e) => e.bundle.status !== 'passed' && !e.bundle.quarantined).length;
+  const failed = ranked.filter((e) => !isPassing(e.bundle.status) && !e.bundle.quarantined).length;
   const quarantined = ranked.filter((e) => e.bundle.quarantined).length;
   const defects = ranked.reduce((n, e) => n + e.bundle.summary.defects, 0);
   const high = ranked.reduce(

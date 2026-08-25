@@ -24,7 +24,7 @@ import { jsonModel, nonJsonModel } from './helpers.js';
 
 import { CacheManager, type HealedSelectorCacheFile } from '../src/cache/cache-manager.js';
 import { PROVIDER_META, loadConfig } from '../src/config.js';
-import { ProofBundleBuilder, formatStepLine, type ProofStep } from '../src/engine/proof-bundle.js';
+import { ProofBundleBuilder, formatStepLine, isPassing, type ProofStep } from '../src/engine/proof-bundle.js';
 import {
   NATIVE_SUBMIT_UNNAMED,
   StepResolutionError,
@@ -141,6 +141,48 @@ describe('cache-manager', () => {
     const afterDelete = new CacheManager({ filePath: path });
     await afterDelete.load();
     assert.equal(afterDelete.size, 0);
+  });
+
+  // Two cases of one suite, running side by side, each holding its own
+  // manager loaded at its own start. Before the merge-on-flush, the second
+  // flush wrote its snapshot over the first's and a repair that had just been
+  // paid for vanished; and the temp file was named by pid, identical for both.
+  it('two concurrent managers on one file keep each other\'s repairs', async () => {
+    const path = join(dir, 'shared.json');
+    const entry = (key: string, healed: string) => ({
+      key,
+      original: key.split(' :: ')[1]!,
+      healed,
+      strategy: 'role',
+      url: 'https://example.test/p',
+      confidence: 0.9,
+      reasoning: 'r',
+      model: 'stub',
+    });
+    const a = new CacheManager({ filePath: path });
+    const b = new CacheManager({ filePath: path });
+    await a.load();
+    await b.load();
+    a.set(entry('https://example.test/p :: #a', 'role=button[name="A"]'));
+    b.set(entry('https://example.test/p :: #b', 'role=button[name="B"]'));
+    // Flushed together, as siblings finishing at once do.
+    await Promise.all([a.flush(), b.flush()]);
+
+    const reader = new CacheManager({ filePath: path });
+    await reader.load();
+    assert.equal(reader.size, 2, 'neither repair may clobber the other');
+    assert.equal(reader.get('https://example.test/p :: #a')?.healed, 'role=button[name="A"]');
+    assert.equal(reader.get('https://example.test/p :: #b')?.healed, 'role=button[name="B"]');
+
+    // A later delete by one side must not resurrect from the other's stale view.
+    assert.equal(a.delete('https://example.test/p :: #a'), true);
+    await a.flush();
+    b.recordUse('https://example.test/p :: #b');
+    await b.flush();
+    const after = new CacheManager({ filePath: path });
+    await after.load();
+    assert.equal(after.has('https://example.test/p :: #a'), false, 'the delete must hold');
+    assert.equal(after.get('https://example.test/p :: #b')?.hits, 1);
   });
 
   it('starts empty rather than throwing on a corrupt cache file', async () => {
@@ -1589,5 +1631,65 @@ describe('lost-fill detection — the hydration race, second signature', () => {
   it('an unreadable field is skipped, never guessed lost', async () => {
     const lost = await fillsLostToHydration(async () => null, [passwordFill]);
     assert.equal(lost, null);
+  });
+});
+
+describe('passed-with-issues: the claims held, the path did not', () => {
+  const base = { startedAt: new Date().toISOString(), durationMs: 5, url: 'https://x.test/app' };
+  const step = (action: string, status: ProofStep['status'], selector = '#s') => ({
+    action, selector, resolvedSelector: selector, resolution: 'fast' as const, status, ...base,
+  });
+
+  // The live shape (BE_Test2 PL_02_03): a click dead-ends, a later click on
+  // the same control passes, every assertion passes.
+  it('is the verdict when every assertion passed and only actions broke', () => {
+    const b = new ProofBundleBuilder({ name: 'pl_02_03' });
+    b.addStep(step('goto', 'passed'));
+    b.addStep(step('click', 'dead-end', 'role=button[name="Create Plan" i]'));
+    b.addStep(step('click', 'passed', 'role=button[name="Create Plan" i]'));
+    b.addStep(step('expectVisible', 'passed', 'heading="Benefit Plan Catalog"'));
+    const bundle = b.finish();
+    assert.equal(bundle.status, 'passed-with-issues');
+    assert.equal(isPassing(bundle.status), true);
+    assert.equal(bundle.summary.failed, 1, 'the broken action is still counted as an issue');
+  });
+
+  it('is NOT the verdict when an assertion itself failed', () => {
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('click', 'dead-end'));
+    b.addStep(step('expectVisible', 'failed'));
+    assert.equal(b.finish().status, 'dead-end');
+  });
+
+  it('is NOT the verdict when the run made no assertion at all', () => {
+    // A flow that only acts proves nothing; a broken action in it is a failure.
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('click', 'error'));
+    b.addStep(step('click', 'passed'));
+    assert.equal(b.finish().status, 'error');
+  });
+
+  it('never outranks a run-level error', () => {
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('click', 'dead-end'));
+    b.addStep(step('expectVisible', 'passed'));
+    b.recordRunError('the run is on the sign-in page after asking for /app');
+    assert.notEqual(b.finish().status, 'passed-with-issues');
+  });
+
+  it('is NOT the verdict over an error step — the harness itself could not proceed', () => {
+    // A request whose save path missed, then an assertion that happens to
+    // hold: the claim is proved, the run is not what it said it was.
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('request', 'error'));
+    b.addStep(step('expectStatus', 'passed'));
+    assert.equal(b.finish().status, 'error');
+  });
+
+  it('a clean run is plain passed, never qualified', () => {
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('click', 'passed'));
+    b.addStep(step('expectVisible', 'passed'));
+    assert.equal(b.finish().status, 'passed');
   });
 });

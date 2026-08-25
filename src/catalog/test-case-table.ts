@@ -246,6 +246,25 @@ export function beyondHarnessReason(row: TestCaseRow): string | null {
   return null;
 }
 
+/**
+ * The sheet's own recorded outcome for a case, normalised — the ground truth
+ * accuracy is measured against, because Positive/Negative says what a case
+ * MEANS to prove and only the Actual Result column says how the application
+ * actually behaved when a person last ran it.
+ *
+ * `Passed` / `Re-Test Passed` → 'passed'; `Failed` / `Re-Test Failed` →
+ * 'failed'. Everything else — blank, `Cancelled`, `Pending confirm`,
+ * `Re-Testing` — is `undefined`: the sheet has no verdict there, and inventing
+ * one would put fabricated ground truth under a percentage. Same
+ * understate-never-overstate rule as `statedPolarity`.
+ */
+export function recordedResult(raw: string): 'passed' | 'failed' | undefined {
+  const trimmed = raw.trim().toLowerCase();
+  if (/^(re-?test(ed)?[\s-]*)?pass(ed)?$/.test(trimmed)) return 'passed';
+  if (/^(re-?test(ed)?[\s-]*)?fail(ed)?$/.test(trimmed)) return 'failed';
+  return undefined;
+}
+
 export function tableToClaims(rows: readonly TestCaseRow[]): CatalogClaim[] {
   return rows.map((row) => {
     const beyond = beyondHarnessReason(row);

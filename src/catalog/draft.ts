@@ -21,6 +21,7 @@
 import { z } from 'zod';
 
 import { lenientObject } from '../providers/model-output.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 
 import {
   LlmFactory,
@@ -120,7 +121,23 @@ Rules:
   In probation" is.
 - Never invent a feature the material does not mention. Fewer, real cases beat a
   full-looking sheet about an application that does not exist.
-- Boundaries get their own case with the values in testData (14, 15, 29, 30).`;
+- Boundaries get their own case with the values in testData (14, 15, 29, 30).
+
+${DETERMINISM_RULES}
+
+${procedure('HOW TO DRAFT THE CATALOG', [
+  'List the rules and features the SOURCE material states, in the order the material states them. That list, in that order, is the list of scenarios.',
+  'For each scenario in turn: the positive case first, then each negative case the rule implies, then each boundary with its values. Stop at the case limit — earlier scenarios win.',
+  'Steps are what a person does, numbered from 1, one action per line, using the control names THE PAGE section shows when there is one. Expected lines are keyed to the step that produces them ("3.1").',
+  'Priority: High for data loss/corruption or a blocked main path, Medium for ordinary behaviour, Low for cosmetic and sample-data coverage — decided by the rule\'s consequence, never by how much text the source spends on it.',
+])}
+
+${selfCheck([
+  'Scenarios follow the order of the source material; cases within a scenario go positive → negative → boundary.',
+  'Every expected line is observable by a person and keyed to a step number.',
+  'No case mentions a feature the source material does not, and no case is a duplicate of another under different words.',
+  'Menu paths and control names match THE PAGE section wherever one was given.',
+])}`;
 
 export function buildDraftPrompt(request: DraftRequest): string {
   const parts: string[] = [];

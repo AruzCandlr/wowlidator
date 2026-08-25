@@ -15,7 +15,10 @@ import { z } from 'zod';
 import { CacheManager, type HealedSelectorEntry } from '../cache/cache-manager.js';
 import type { RejectedHeal } from '../engine/proof-bundle.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
+import type { HealHints, HealHintsProvider } from '../context/heal-hints.js';
+import { focusTreeText } from '../context/retriever.js';
 import {
   LlmFactory,
   generateStructuredForModel,
@@ -23,10 +26,16 @@ import {
 } from '../providers/llm-factory.js';
 
 export const DEFAULT_MAX_AX_NODES = 120;
+/**
+ * Tree lines the heal prompt keeps after relevance ranking (see
+ * `buildUserPrompt`). Half the capture cap: generous enough that the intent's
+ * neighbourhood survives, small enough to matter on the token bill.
+ */
+export const HEAL_TREE_MAX_LINES = 60;
 export const DEFAULT_MIN_CONFIDENCE = 0.5;
 
 /** Roles worth sending even when they carry no accessible name. */
-const INTERACTIVE_ROLES = new Set([
+export const INTERACTIVE_ROLES = new Set([
   'button',
   'checkbox',
   'combobox',
@@ -85,6 +94,12 @@ export interface HealRequest {
   url: string;
   /** Pre-formatted, pruned accessibility tree. */
   axTree: string;
+  /**
+   * The test case the failed step serves — claim, expected output, persona —
+   * stamped on the flow at authoring (`Flow.caseContext`). Context for
+   * matching intent against the tree, never a licence to change the claim.
+   */
+  caseContext?: string | undefined;
   /** Controls revealed by opening disclosures (menus, dialogs). */
   interactions?: string | undefined;
   /**
@@ -147,6 +162,21 @@ reject them outright:
   WRONG:     role=button[name="Edit"].first()   <- not a real selector, never
                                                     resolves
 
+CANONICAL FORM — one way to write each thing, so the same tree yields the same
+selector every time:
+- A control with a role and a name in the tree is ALWAYS written as
+  role=ROLE[name="NAME"], the name copied verbatim from the tree.
+- The same role and name repeated: append \` >> nth=N\`, counting the matches in
+  tree order from 0.
+- A textbox the tree shows with NO name: input[type="password"] when it is
+  the password field of a sign-in form (the one nameless textbox beside an
+  identity field or under a "Password" label), otherwise role=textbox >> nth=N,
+  N counted among the tree's textboxes in order.
+- Never a bare tag or attribute selector for something the tree names — never
+  button, input, [type="submit"], or a class or id the tree does not show.
+- text=… only for static text that has no role of its own; quoted
+  (text="exact") for a literal token, unquoted for a phrase.
+
 Rules:
 - Return exactly one selector string. No code fences, no explanation inside it.
 - Use only roles, names, and attributes that appear in the accessibility tree
@@ -199,7 +229,26 @@ what this page offers to do the job.
 
 Returning the selector that just failed is never an answer. If nothing in the
 tree can serve the intent, say so with a low confidence rather than repeating
-it.`;
+it.
+
+${DETERMINISM_RULES}
+
+${procedure('HOW TO CHOOSE THE REPLACEMENT', [
+  'Read the author intent (and the failed selector\'s role and name as a hint to it). Decide what the control DOES: submits, opens, filters, navigates, asserts text.',
+  'If the failure was a strict-mode violation (several matches), keep the failed selector and append " >> nth=N"; pick N from the intent, else nth=0 and say so.',
+  'Otherwise, look in the tree for a control with the SAME role and a name that means the same thing (case, spacing, punctuation and a translation may differ). If exactly one exists, that is the answer, in canonical form.',
+  'If none, look for a control with a DIFFERENT role that does the same job (a link where the author guessed a button). If exactly one, that is the answer; say the role changed.',
+  'If several candidates remain equally plausible and the intent does not distinguish them, take the FIRST in tree order and say so — never a different one on a different run.',
+  'If nothing serves the intent, or the tree is a different page (sign-in, error, consent, empty state), answer with confidence below 0.3 and say which.',
+])}
+
+${selfCheck([
+  'The selector is in canonical form and every token of it appears in the tree.',
+  'It is not the failed selector, and not one listed as already rejected.',
+  'It identifies ONE element (or a group, only for a counting step).',
+  'The control it names does what the author intent says — not the page\'s primary action, not a neighbour.',
+  'The confidence is between 0 and 1, and is below 0.3 whenever step 6 applied.',
+])}`;
 
 /**
  * How many times to ask for a repair before giving up.
@@ -256,7 +305,7 @@ function sameSelector(a: string, b: string): boolean {
   return normal(a) === normal(b);
 }
 
-function buildUserPrompt(request: HealRequest): string {
+export function buildUserPrompt(request: HealRequest, hints?: HealHints): string {
   const lines = [
     `Page URL: ${request.url}`,
     `Attempted action: ${request.action}`,
@@ -264,6 +313,26 @@ function buildUserPrompt(request: HealRequest): string {
   ];
   if (request.failureReason) lines.push(`Why it failed: ${request.failureReason}`);
   if (request.intent) lines.push(`Author intent: ${request.intent}`);
+  if (request.caseContext) {
+    lines.push(`The test case this step serves (context, not the thing to repair): ${request.caseContext}`);
+  }
+  // Advisory context, before the tree so every re-ask of this heal keeps a
+  // byte-identical prefix (`rejected` alone grows between attempts). Framing
+  // only: the tree below is the page, and a candidate must come from it.
+  if (hints?.repoHints) {
+    lines.push(
+      '',
+      'What the repository declares about this page (advisory — the accessibility tree below is the page as it stands, and your candidate must come from it):',
+      hints.repoHints,
+    );
+  }
+  if (hints?.background) {
+    lines.push(
+      '',
+      'Background documents matching this step (context for intent, never candidate material):',
+      hints.background,
+    );
+  }
   if (request.action === 'expectCount') {
     lines.push(
       'This is a COUNTING step: the replacement must match ALL the items being ' +
@@ -272,16 +341,32 @@ function buildUserPrompt(request: HealRequest): string {
         '(e.g. the buttons inside the group container the tree shows).',
     );
   }
+  // The tree ranked against what the step was trying to do, not just capped
+  // in capture order. The blind cap kept the first `DEFAULT_MAX_AX_NODES`
+  // interactive nodes; on a dense page that spends most of the healer's
+  // ~3.2k-token bill (measured, be100) on controls the intent never named,
+  // while the answer can sit past the cut. Deterministic (BM25, ties in
+  // document order), so every re-ask still shares a byte-identical prefix.
+  const focusQuery = [request.failedSelector, request.intent ?? '', request.caseContext ?? '']
+    .join(' ')
+    .trim();
+  const tree =
+    focusQuery === ''
+      ? request.axTree
+      : focusTreeText(request.axTree, focusQuery, HEAL_TREE_MAX_LINES).text;
+  lines.push('', 'Accessibility tree:', tree);
+  if (request.interactions) {
+    lines.push('', 'Controls revealed by opening disclosures on page:', request.interactions);
+  }
+  // The rejected list is the only part that grows between attempts; keeping it
+  // after the tree leaves attempts 1-3 sharing a byte-identical prefix, which a
+  // provider's implicit prompt cache bills at cache rates.
   if (request.rejected?.length) {
     lines.push(
       '',
       'Already tried and rejected — do NOT propose any of these again:',
       ...request.rejected.map((entry) => `  - ${entry}`),
     );
-  }
-  lines.push('', 'Accessibility tree:', request.axTree);
-  if (request.interactions) {
-    lines.push('', 'Controls revealed by opening disclosures on page:', request.interactions);
   }
   return lines.join('\n');
 }
@@ -294,6 +379,12 @@ export interface LlmHealerModelOptions {
   maxOutputTokens?: number | undefined;
   maxRetries?: number | undefined;
   factory?: LlmFactory | undefined;
+  /**
+   * BM25-retrieved advisory context per repair — repository declarations for
+   * the failing page and background-document slices (`healHintsFrom`).
+   * Consulted synchronously per heal; absent, the prompt is what it was.
+   */
+  hints?: HealHintsProvider | undefined;
 }
 
 /**
@@ -310,8 +401,10 @@ export class LlmHealerModel implements HealerModel {
   readonly #source: ModelSource;
   readonly #maxOutputTokens: number;
   readonly #maxRetries: number;
+  readonly #hints: HealHintsProvider | undefined;
 
   constructor(options: LlmHealerModelOptions = {}) {
+    this.#hints = options.hints;
     if (options.model) {
       this.#source = { model: options.model };
       this.id = options.id ?? 'custom:healer';
@@ -326,11 +419,17 @@ export class LlmHealerModel implements HealerModel {
   }
 
   async suggest(request: HealRequest): Promise<HealSuggestion> {
+    const hints = this.#hints?.({
+      url: request.url,
+      selector: request.failedSelector,
+      intent: request.intent,
+      caseContext: request.caseContext,
+    });
     const { object, inputTokens, outputTokens } = await generateStructuredForModel(this.#source, {
       modelLabel: this.id,
       schema: HealSuggestionSchema,
       system: SYSTEM_PROMPT,
-      prompt: buildUserPrompt(request),
+      prompt: buildUserPrompt(request, hints),
       maxOutputTokens: this.#maxOutputTokens,
       maxRetries: this.#maxRetries,
     });
@@ -426,7 +525,7 @@ export interface AxCapture {
  * while dropping the buttons is exactly backwards for both healing and
  * coverage.
  */
-export async function captureAxTreeDetailed(
+async function captureAxTreeDetailed(
   page: Page,
   maxNodes = DEFAULT_MAX_AX_NODES,
 ): Promise<AxCapture> {
@@ -507,7 +606,7 @@ export async function captureAxNodes(
   }
 }
 
-function formatAxNode(node: AxNode): string {
+export function formatAxNode(node: AxNode): string {
   const parts = [node.role];
   if (node.name) parts.push(JSON.stringify(node.name));
   if (node.value) parts.push(`value=${JSON.stringify(node.value)}`);
@@ -550,6 +649,8 @@ export interface HealInput {
   intent?: string | undefined;
   /** Why the fast/cache attempts failed, passed straight through to `HealRequest`. */
   failureReason?: string | undefined;
+  /** The test case the step serves, passed straight through to `HealRequest`. */
+  caseContext?: string | undefined;
 }
 
 export class JitHealer {
@@ -622,6 +723,7 @@ export class JitHealer {
           action: input.action,
           url,
           axTree,
+          caseContext: input.caseContext,
           interactions,
           failureReason: input.failureReason,
           rejected,

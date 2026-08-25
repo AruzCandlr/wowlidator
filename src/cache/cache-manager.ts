@@ -61,6 +61,10 @@ export function scopeUrl(url: string): string {
   }
 }
 
+/** In-process serialisation of flushes, one chain per cache file. */
+const flushChain = new Map<string, Promise<void>>();
+let flushCounter = 0;
+
 export class CacheManager {
   readonly filePath: string;
 
@@ -68,6 +72,10 @@ export class CacheManager {
   #entries = new Map<string, HealedSelectorEntry>();
   #dirty = false;
   #loaded = false;
+  /** Keys this instance set, used or deleted since its last flush. */
+  readonly #touched = new Set<string>();
+  /** `clear()` was called: the next flush must not resurrect the file's entries. */
+  #cleared = false;
 
   constructor(options: CacheManagerOptions = {}) {
     this.filePath = resolve(options.filePath ?? DEFAULT_CACHE_FILENAME);
@@ -125,6 +133,7 @@ export class CacheManager {
     const now = new Date().toISOString();
     const stored: HealedSelectorEntry = { ...entry, healedAt: now, lastUsedAt: now, hits: 0 };
     this.#entries.set(entry.key, stored);
+    this.#touched.add(entry.key);
     this.#dirty = true;
     return stored;
   }
@@ -135,18 +144,24 @@ export class CacheManager {
     if (!entry) return;
     entry.hits += 1;
     entry.lastUsedAt = new Date().toISOString();
+    this.#touched.add(key);
     this.#dirty = true;
   }
 
   delete(key: string): boolean {
     const deleted = this.#entries.delete(key);
-    if (deleted) this.#dirty = true;
+    if (deleted) {
+      this.#touched.add(key);
+      this.#dirty = true;
+    }
     return deleted;
   }
 
   clear(): void {
     if (this.#entries.size === 0) return;
+    for (const key of this.#entries.keys()) this.#touched.add(key);
     this.#entries.clear();
+    this.#cleared = true;
     this.#dirty = true;
   }
 
@@ -158,22 +173,73 @@ export class CacheManager {
     return this.#entries.size;
   }
 
-  /** Persist to disk if anything changed. Writes via temp file + rename. */
+  /**
+   * Persist to disk if anything changed. Writes via temp file + rename, and
+   * **merges with what is on disk first**.
+   *
+   * A suite runs its cases concurrently now, and each case holds its own
+   * `CacheManager` loaded at its own start. Two of them healing two different
+   * selectors used to race: whichever flushed second wrote its snapshot of the
+   * file over the first one's, and a repair that had just been paid for was
+   * gone before the next run could use it. Worse, the temp file was named by
+   * process id — identical for every case in one process — so concurrent
+   * flushes wrote through the same path and one of the renames could move a
+   * half-written file into place.
+   *
+   * So a flush re-reads the file, takes every entry it holds, and lays this
+   * instance's **own changes** over the top — only the keys it set, used or
+   * deleted. Another case's repair survives; a stale copy of an entry this
+   * instance never touched cannot clobber a newer one. Flushes to one path are
+   * also serialised within the process, and the temp name carries a counter,
+   * so the rename is always of a file this flush alone wrote.
+   */
   async flush(): Promise<void> {
     if (!this.#dirty) return;
+    const previous = flushChain.get(this.filePath) ?? Promise.resolve();
+    const mine = previous.then(() => this.#flushNow());
+    flushChain.set(this.filePath, mine.catch(() => undefined));
+    await mine;
+  }
+
+  async #flushNow(): Promise<void> {
+    // What is on disk now — possibly written by a sibling case since we
+    // loaded. A missing or unreadable file contributes nothing, exactly as it
+    // does at load time.
+    const onDisk = new Map<string, HealedSelectorEntry>();
+    if (!this.#cleared) {
+      try {
+        const parsed = JSON.parse(await readFile(this.filePath, 'utf8')) as Partial<HealedSelectorCacheFile>;
+        for (const [key, entry] of Object.entries(parsed.entries ?? {})) {
+          if (entry && typeof entry.healed === 'string') onDisk.set(key, entry);
+        }
+      } catch {
+        // Nothing to merge with.
+      }
+    }
+    // Our changes win for the keys we changed; everything else is whatever the
+    // file says, which is at least as new as what we loaded.
+    for (const key of this.#touched) {
+      const mine = this.#entries.get(key);
+      if (mine === undefined) onDisk.delete(key);
+      else onDisk.set(key, mine);
+    }
+    // Keep memory in step with what was written, so a second flush merges
+    // against the same picture.
+    for (const [key, entry] of onDisk) if (!this.#touched.has(key)) this.#entries.set(key, entry);
 
     const payload: HealedSelectorCacheFile = {
       version: CACHE_FILE_VERSION,
       updatedAt: new Date().toISOString(),
-      entries: Object.fromEntries(
-        [...this.#entries.entries()].sort(([a], [b]) => a.localeCompare(b)),
-      ),
+      entries: Object.fromEntries([...onDisk.entries()].sort(([a], [b]) => a.localeCompare(b))),
     };
 
     await mkdir(dirname(this.filePath), { recursive: true });
-    const tmp = `${this.filePath}.${process.pid}.tmp`;
+    flushCounter += 1;
+    const tmp = `${this.filePath}.${process.pid}.${flushCounter}.tmp`;
     await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
     await rename(tmp, this.filePath);
     this.#dirty = false;
+    this.#cleared = false;
+    this.#touched.clear();
   }
 }

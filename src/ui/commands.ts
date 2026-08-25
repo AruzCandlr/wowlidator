@@ -17,7 +17,7 @@
 
 import { DEFAULT_MAX_REPAIR_ATTEMPTS } from '../repair/flow-repair-loop.js';
 
-export type FieldType = 'text' | 'textarea' | 'number' | 'boolean' | 'enum';
+export type FieldType = 'text' | 'textarea' | 'number' | 'boolean' | 'enum' | 'secret';
 
 export interface Field {
   /** Wire name. For a flag this is the flag itself, minus the leading `--`. */
@@ -41,6 +41,15 @@ export interface Field {
    * in as one string containing a separator.
    */
   repeatable?: boolean;
+  /**
+   * For a `secret` field: the environment variable that carries the value to
+   * the spawned CLI. A secret NEVER becomes argv — argv is what `ps` prints,
+   * what the panel displays as the run's command line, and what the job
+   * record keeps, and a password must appear in none of them. The CLI already
+   * reads this variable as the fallback for the flag (`WOWLIDATOR_AS`), so
+   * the env route is the same feature, not a second code path.
+   */
+  envVar?: string;
 }
 
 export interface CommandSpec {
@@ -72,6 +81,69 @@ export interface CommandSpec {
   fixedFlags?: readonly string[];
   fields: readonly Field[];
 }
+
+/**
+ * How many cases of a suite may run at once. Offered by the two commands that
+ * run a list of cases (a catalog, a generated suite); a single flow has
+ * nothing to run beside. `1` is the strictly sequential run and the A/B test
+ * for a parallel result that looks wrong. A case that changes data runs alone
+ * whatever this says.
+ */
+const AUTHOR_CONCURRENCY_FIELD: Field = {
+  name: 'author-concurrency',
+  label: 'Rows authored at a time',
+  type: 'number',
+  default: 3,
+  min: 1,
+  help: 'How many rows of a test-case table are written side by side, each with its own tab and its own model call. With a run, a finished case starts at once. Set 1 to author one after another — the way to tell whether a surprising flow was caused by batching.',
+  advanced: true,
+};
+
+const CONCURRENCY_FIELD: Field = {
+  name: 'concurrency',
+  label: 'Cases at a time',
+  type: 'number',
+  default: 4,
+  min: 1,
+  help: 'How many cases run side by side, each in its own browser context. A case that changes data (fills a form, calls a writing endpoint, asserts on the database) always runs alone. Set 1 to run one after another — the way to tell whether a surprising result was caused by running in parallel.',
+  advanced: true,
+};
+
+/**
+ * The account a run may sign in with, offered on every command that consumes
+ * it (run, go, generate --run, author, catalog --run, watch). One field in
+ * the CLI's own `--as` shape rather than two, so what the panel teaches is
+ * exactly what a terminal invocation looks like. Carried to the CLI as
+ * WOWLIDATOR_AS (see `Field.envVar`); the runner masks the password wherever
+ * it lands in a record, and the session bootstrap is what makes this the
+ * difference between a fresh headless Chrome dying on the login screen and
+ * the run establishing the session itself.
+ */
+/**
+ * Autoheal — `--repair` worn as the launcher's own words. On a failed / error /
+ * dead-end result the repair model rewrites the flow around the break and the
+ * case reruns itself, up to the attempt budget. Suites heal per case through
+ * the same loop `run --repair` uses; a clean pass costs nothing extra.
+ */
+const AUTOHEAL_FIELD: Field = {
+  name: 'repair',
+  label: 'Autoheal enabled',
+  type: 'boolean',
+  help:
+    'When the result is failed, error or dead-end, the repair model rewrites the flow around the ' +
+    'break and the test reruns itself, up to 3 total runs. Every rewrite lands as its own ' +
+    'reviewable .attempt-N.flow.json plus a .patch; assertions always keep their claim, so a ' +
+    'test is never rewritten until it merely passes.',
+};
+
+const CREDENTIALS_FIELD: Field = {
+  name: 'as',
+  label: 'Sign in as',
+  type: 'secret',
+  envVar: 'WOWLIDATOR_AS',
+  placeholder: 'email:password',
+  help: 'The account the run may use — email and password joined by the first colon (a password may contain colons). With it, a flow that lands on the sign-in page establishes the session itself; the authored steps also fill these exact characters instead of guessing. The value travels to the CLI as an environment variable, never in the command line, and the password is masked in every record.',
+};
 
 /** Options every browser-touching command shares. Kept in the advanced drawer. */
 const COMMON_BROWSER_FIELDS: readonly Field[] = [
@@ -281,6 +353,8 @@ export const COMMANDS: readonly CommandSpec[] = [
       },
       SCOPE_FIELD,
       POLICY_FIELD,
+      AUTOHEAL_FIELD,
+      CREDENTIALS_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -297,13 +371,18 @@ export const COMMANDS: readonly CommandSpec[] = [
         label: 'Flow file',
         type: 'text',
         positional: 1,
+        // A list runs every file as one suite job — one browser slot, a
+        // roll-up, and `[cN]`-tagged output — which is how the group-level
+        // "Rerun all" / "Heal all" buttons re-run a whole catalog without a
+        // click per case. A lone string is still the single-flow form.
+        repeatable: true,
         required: true,
         placeholder: 'examples/login.flow.json',
-        help: 'Pick one from the Flows tab, or type a path.',
+        help: 'Pick one from the Flows tab, or type a path. Several run as one suite.',
       },
       {
         name: 'repair',
-        label: 'Repair on failure',
+        label: 'Autoheal enabled',
         type: 'boolean',
         help: 'On failure, ask the generator role to rewrite the flow around the break and retry. Never overwrites your file — each attempt lands as its own .attempt-N.flow.json plus a .patch explaining the change.',
       },
@@ -327,6 +406,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         type: 'boolean',
         help: 'Lets a fix rewrite the failed step and everything after it in the same section, for when the failure shows the rest of the flow was written against a page that does not exist. Steps before the failure are never touched. Implies repair.',
       },
+      CREDENTIALS_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -377,6 +457,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Opens the page’s disclosures so controls that only exist after a click are visible. Clicks ARIA-marked disclosures only — never a plain button — and closes each one again.',
       },
       {
+        name: 'no-author-review',
+        label: 'Skip the authoring review',
+        type: 'boolean',
+        help: 'By default every authored flow gets a second look before it is written: steps with nothing behind them (a control named in no captured tree, a path no route declares) are checked by the agent role against the codebase index and the documents, repointed only when the evidence supports it, and reported either way. Tick to write the flow exactly as authored.',
+        advanced: true,
+      },
+      {
         name: 'no-agent-capture',
         label: 'Capture without the agent pilot',
         type: 'boolean',
@@ -403,6 +490,9 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Where the generated suite JSON is written.',
         advanced: true,
       },
+      CONCURRENCY_FIELD,
+      AUTOHEAL_FIELD,
+      CREDENTIALS_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -447,6 +537,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Same disclosure-opening pass as generation, for controls that live behind a menu.',
       },
       {
+        name: 'no-author-review',
+        label: 'Skip the authoring review',
+        type: 'boolean',
+        help: 'By default every authored flow gets a second look before it is written: steps with nothing behind them (a control named in no captured tree, a path no route declares) are checked by the agent role against the codebase index and the documents, repointed only when the evidence supports it, and reported either way. Tick to write the flow exactly as authored.',
+        advanced: true,
+      },
+      {
         name: 'no-agent-capture',
         label: 'Capture without the agent pilot',
         type: 'boolean',
@@ -461,6 +558,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Where the authored flow is written.',
         advanced: true,
       },
+      CREDENTIALS_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -610,6 +708,40 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'The flow is written out either way, so it can be re-run later without asking a model again.',
       },
       {
+        name: 'resume-from',
+        label: 'Rerun from case id',
+        type: 'text',
+        help: 'Run again from this case ONWARD in plan order — earlier verdicts are kept, everything from it (passes included) reruns on the current config. Implies Continue.',
+      },
+      {
+        name: 'resume',
+        label: 'Continue where the last run stopped',
+        type: 'boolean',
+        default: false,
+        help: 'Continue the same catalog run under its run key: cases the progress file beside the claims file already has a verdict for are pulled in as finished tests; the ones that never ran or were never reached run now.',
+      },
+      {
+        name: 'rerun-vacuous',
+        label: 'Re-author cases that proved nothing',
+        type: 'boolean',
+        default: false,
+        help: 'Cases whose flow only asserted the sign-in and a URL are re-authored and run. Implies Continue.',
+      },
+      {
+        name: 'rerun-errors',
+        label: 'Rerun cases that ended in a runtime error',
+        type: 'boolean',
+        default: false,
+        help: 'A runtime error is the harness, not a verdict: those cases run again. Implies Continue.',
+      },
+      {
+        name: 'rerun-failed',
+        label: 'Heal and rerun failed cases',
+        type: 'boolean',
+        default: false,
+        help: 'Failed and dead-end cases run again with autoheal on. Implies Continue and Autoheal.',
+      },
+      {
         name: 'context-doc',
         label: 'Supporting document',
         type: 'text',
@@ -624,12 +756,22 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Opens the page’s disclosures so controls that only exist after a click can be asserted on.',
       },
       {
+        name: 'no-author-review',
+        label: 'Skip the authoring review',
+        type: 'boolean',
+        help: 'By default every authored flow gets a second look before it is written: steps with nothing behind them (a control named in no captured tree, a path no route declares) are checked by the agent role against the codebase index and the documents, repointed only when the evidence supports it, and reported either way. Tick to write the flow exactly as authored.',
+        advanced: true,
+      },
+      {
         name: 'no-agent-capture',
         label: 'Capture without the agent pilot',
         type: 'boolean',
         help: 'By default an agent steadies the page before its capture — waits out spinners, dismisses overlays, primes lazy content — because an inaccurate capture poisons every test written from it. Tick to capture immediately instead; also skipped automatically when the agent role has no key.',
         advanced: true,
       },
+      AUTHOR_CONCURRENCY_FIELD,
+      CONCURRENCY_FIELD,
+      AUTOHEAL_FIELD,
       {
         name: 'flow',
         label: 'Flow destination',
@@ -637,6 +779,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Where the authored flow is written.',
         advanced: true,
       },
+      CREDENTIALS_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -729,6 +872,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         type: 'boolean',
         help: 'Otherwise it runs until you stop it.',
       },
+      CREDENTIALS_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -886,6 +1030,17 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Indexes tables alongside the code. With WOWLIDATOR_DB_URL set and no file, the live schema is introspected.',
       },
       {
+        name: 'context-doc',
+        label: 'Remember a context document',
+        type: 'text',
+        repeatable: true,
+        placeholder: '.wowlidator/context-docs/spec.md',
+        help:
+          'A document remembered WITH the repository — markdown, text, PDF, PowerPoint, Excel or CSV. ' +
+          'Every run grounded in this repo reads it automatically, fresh from disk, so an edited file ' +
+          'updates itself; re-adding a file of the same name replaces the remembered one.',
+      },
+      {
         name: 'force',
         label: 'Rebuild even if unchanged',
         type: 'boolean',
@@ -941,6 +1096,42 @@ export function commandById(id: string): CommandSpec | undefined {
 export class UiCommandError extends Error {}
 
 /**
+ * The environment a submission's secret fields become.
+ *
+ * The mirror of `buildArgv`, for the values that must not be argv: each
+ * `secret` field with a non-empty value lands in its `envVar`, validated here
+ * so a malformed pair fails the submission with a sentence rather than
+ * failing the run thirty seconds in. Empty means "not supplied" and
+ * contributes nothing — the spawned CLI then falls back to whatever the
+ * panel's own environment says, exactly as a terminal run would.
+ */
+export function buildEnvOverlay(
+  spec: CommandSpec,
+  values: Record<string, unknown>,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const field of spec.fields) {
+    if (field.type !== 'secret' || field.envVar === undefined) continue;
+    const raw = values[field.name];
+    if (raw === undefined || raw === null || raw === '') continue;
+    if (typeof raw !== 'string') throw new UiCommandError(`"${field.label}" must be text`);
+    if (raw.includes('\0')) throw new UiCommandError(`"${field.name}" contains a NUL byte`);
+    if (field.name === 'as') {
+      // The CLI's own rule (`parseCredentials`): first colon separates, both
+      // halves non-empty. Checked here so the panel says so immediately.
+      const at = raw.indexOf(':');
+      if (at <= 0 || raw.slice(at + 1) === '') {
+        throw new UiCommandError(
+          `"${field.label}" must be email:password — the first colon separates them`,
+        );
+      }
+    }
+    env[field.envVar] = raw;
+  }
+  return env;
+}
+
+/**
  * Turn a validated form submission into an argv array.
  *
  * Everything is checked against the spec: an unknown field, an enum value that
@@ -961,6 +1152,33 @@ export function buildArgv(spec: CommandSpec, values: Record<string, unknown>): s
   for (const field of spec.fields) {
     const raw = values[field.name];
 
+    if (field.repeatable && field.positional !== undefined) {
+      // A repeatable *positional* (run's flow files): entries become
+      // consecutive argv positions. A lone string is accepted as a
+      // one-entry list — it is still exactly one argv entry, so nothing can
+      // be smuggled through it — because every single-flow caller (the
+      // classic panel's form, wowUI's per-run buttons) sends a string.
+      const list =
+        raw === undefined || raw === null || raw === ''
+          ? []
+          : Array.isArray(raw)
+            ? raw
+            : [raw];
+      if (list.length === 0) {
+        if (field.required) throw new UiCommandError(`"${field.label}" is required`);
+        continue;
+      }
+      let slot = field.positional - 1;
+      for (const entry of list) {
+        if (typeof entry !== 'string' || entry.trim() === '') {
+          throw new UiCommandError(`every "${field.name}" must be a non-empty string`);
+        }
+        if (entry.includes('\0')) throw new UiCommandError(`"${field.name}" contains a NUL byte`);
+        positionals[slot++] = entry.trim();
+      }
+      continue;
+    }
+
     if (field.repeatable) {
       if (raw === undefined || raw === null) continue;
       if (!Array.isArray(raw)) throw new UiCommandError(`"${field.name}" must be a list`);
@@ -980,6 +1198,10 @@ export function buildArgv(spec: CommandSpec, values: Record<string, unknown>): s
       flags.push(`--${field.name}`);
       continue;
     }
+
+    // A secret is validated here and carried by `buildEnvOverlay`; it must
+    // never reach the argv whatever the submission says.
+    if (field.type === 'secret') continue;
 
     let text: string;
     if (raw === undefined || raw === null || raw === '') {

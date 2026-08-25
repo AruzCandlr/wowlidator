@@ -15,6 +15,7 @@ import { lenientObject } from '../providers/model-output.js';
 
 import { GENERATOR_ACTIONS, GeneratedStepSchema, toFlowStep } from '../generator/test-generator.js';
 import { SELECTOR_SYNTAX_RULES } from '../healer/jit-healer.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 import { LlmFactory, generateStructuredForModel, type ModelSource } from '../providers/llm-factory.js';
 import type { Flow, FlowStep } from '../engine/runner.js';
 
@@ -103,6 +104,24 @@ export interface RepairProposal {
 export interface FlowRepairModel {
   readonly id: string;
   repair(request: RepairRequest): Promise<RepairProposal>;
+  /**
+   * Whether this backend's output schema can express a step with this action
+   * at all. `RepairSchema` is built on `GeneratedStepSchema`, whose `action`
+   * enum is `GENERATOR_ACTIONS` — no DB, HTTP or workflow actions. Asked to
+   * repair an `expectDbRow` step, the model echoes the action, zod rejects
+   * it, and at temperature 0 the identical mismatch repeats until the
+   * structured-output breaker opens and takes the whole suite down (be100,
+   * 2026-08-23: six echoed `expectDbRow` repairs opened the breaker and 90+
+   * cases were blocked against a model that was answering fine). Callers
+   * must not ask a question the schema refuses every answer to. Optional so
+   * scripted test stubs are unaffected; absent means "ask away".
+   */
+  canExpress?(action: string): boolean;
+}
+
+/** The one answer `canExpress` gives for the LLM-backed model. */
+export function repairSchemaCanExpress(action: string): boolean {
+  return (GENERATOR_ACTIONS as readonly string[]).includes(action);
 }
 
 const SYSTEM_PROMPT = `A UI test flow just failed at one step. You propose a targeted fix — not a
@@ -133,7 +152,24 @@ ${SELECTOR_SYNTAX_RULES}
 Set "canFix" to false, and explain why in "reasoning", when the evidence doesn't support a fix:
 the app looks genuinely broken, the page is on an unexpected origin, or nothing in the tree
 resembles what the failed step needed. A wrong guess that makes the flow appear to pass while
-testing the wrong thing is worse than reporting the failure honestly.`;
+testing the wrong thing is worse than reporting the failure honestly.
+
+${DETERMINISM_RULES}
+
+${procedure('HOW TO DIAGNOSE, THEN FIX', [
+  'Classify the failure from the error text and the tree, in this order: (a) WRONG PAGE STATE — the tree is a sign-in page, a consent page, an error page, an empty state, or a dialog is open; (b) CONTROL EXISTS UNDER ANOTHER NAME/ROLE — the intent is served by a node in the tree; (c) CONTROL NOT RENDERED YET — the tree looks half-built or the failure is a timeout on a page that just navigated; (d) DATA — the value typed was refused (already exists, invalid); (e) APP BROKEN — the intended control is absent and the page is otherwise complete.',
+  '(a) → insertBefore the steps that reach the right state (a goto, a click that closes the dialog, a clickIfVisible on the consent accept); keep the failing step as it was. (b) → replace only the selector, canonical form. (c) → insertBefore ONE waitFor on the control, or on the container the tree names; nothing else. (d) → replace only the value. (e) → canFix false.',
+  'An assertion is never rewritten into a different claim: you may prepare the page before it, never change what it asserts.',
+  'Rewrite the following steps ONLY when they are listed AND the diagnosis is (a) with a page that will never come — and then regenerate them against the tree in front of you, in canonical selectors, keeping their assertions\' meaning.',
+])}
+
+${selfCheck([
+  'The fix touches only the failing step and what goes immediately before it.',
+  'Every selector in insertBefore and replacement is in canonical form and appears in the tree.',
+  'If the failing step was an assertion, its claim is unchanged.',
+  'rewriteFollowing is empty unless following steps were listed and the diagnosis called for it.',
+  'canFix is false whenever the diagnosis was APP BROKEN or the tree is on an unexpected origin.',
+])}`;
 
 function buildUserPrompt(request: RepairRequest): string {
   const lines = [
@@ -208,6 +244,10 @@ export class LlmFlowRepairModel implements FlowRepairModel {
       this.#maxRetries = options.maxRetries ?? factory.maxRetries;
     }
     this.#maxOutputTokens = options.maxOutputTokens ?? 2048;
+  }
+
+  canExpress(action: string): boolean {
+    return repairSchemaCanExpress(action);
   }
 
   get id(): string {

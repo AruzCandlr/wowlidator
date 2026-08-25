@@ -21,6 +21,7 @@
  */
 
 import type { LanguageModel } from 'ai';
+import { CONSENT_ACCEPT_NAME } from '../engine/sign-in.js';
 import type { Page } from 'playwright';
 import { z } from 'zod';
 
@@ -29,20 +30,32 @@ import { parseExpectedCallEntry, type ExpectedCall } from '../api/expect-calls.j
 import { parseDbConditions } from '../db/db-actions.js';
 
 import { SELECTOR_SYNTAX_RULES, captureAxTree } from '../healer/jit-healer.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
 import { matchesRoutePattern } from '../context/context-engine.js';
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
+import { focusTreeText } from '../context/retriever.js';
 import {
   LlmFactory,
   generateStructuredForModel,
   type ModelSource,
 } from '../providers/llm-factory.js';
 import { hasAssertion } from '../engine/runner.js';
+import { vacuousClaim } from './vacuous.js';
 import type { Flow, FlowStep } from '../engine/runner.js';
 import { DEFAULT_MUTATION_POLICY, type MutationPolicy } from './test-generator.js';
+import type { FlowReviewer, ReviewRecord } from './flow-review.js';
 
 /** Same budget as the generator: the AX tree dominates the prompt either way. */
 export const DEFAULT_AUTHOR_MAX_NODES = 200;
+
+/**
+ * Journey-tree lines kept after ranking against the row's own request —
+ * see the narrowing in `author()`. The start tree is never narrowed this way:
+ * it is the page the flow's first steps are written against, and on a catalog
+ * it is the one section shared across rows.
+ */
+export const JOURNEY_TREE_MAX_LINES = 80;
 
 /**
  * Total authoring attempts, including the first. Same shape and same reason
@@ -75,6 +88,13 @@ export const AUTHOR_ATTEMPTS = 3;
 export const AUTHOR_ACTIONS = [
   'goto',
   'click',
+  // Click a control only if it is on the page; otherwise carry on. Narrows to
+  // the engine's `when { visible } then [click]`, whose condition is a probe
+  // that never heals — so a consent gate, a "remember this device" prompt or
+  // a cookie banner that appears on some runs and not others is one authored
+  // step rather than a `workflow` leg (a model call per run) or a `click`
+  // that fails setup on the runs where the gate does not show.
+  'clickIfVisible',
   'fill',
   'selectOption',
   'check',
@@ -85,6 +105,9 @@ export const AUTHOR_ACTIONS = [
   'workflow',
   'setLocalStorage',
   'clearStorage',
+  // End the session through the application's own sign-out control — the
+  // persona-switch step. Deterministic engine procedure, no selector needed.
+  'signOut',
   'back',
   'forward',
   'scrollTo',
@@ -361,8 +384,16 @@ export interface AuthorResult {
    * Reported rather than silently swallowed: a rising count is a prompt problem.
    */
   droppedSteps: number;
+  /** Each dropped step with the reason, so the re-ask can say what to fix. */
+  dropped?: DroppedStep[] | undefined;
   inputTokens?: number | undefined;
   outputTokens?: number | undefined;
+}
+
+export interface DroppedStep {
+  action: string;
+  reason: string;
+  intent: string;
 }
 
 /** Pluggable backend, so authoring can be tested without a network call. */
@@ -443,6 +474,17 @@ The author has already decided what to test. Your job is to express their intent
 faithfully as steps — not to redesign the test, broaden it, or add cases they did
 not ask for. If the request is narrow, the flow is narrow.
 
+${DETERMINISM_RULES}
+
+${procedure('HOW TO BUILD THE FLOW', [
+  'Read the request and write down, for yourself: the persona and its exact credentials; the page or route under test; each CLAIM the request makes (one per line of its Expected output, or one per sentence that asserts something); any date the claim depends on; anything the request says is already true.',
+  'setup = sign in (SIGNING IN, below), reach the page under test, and assert WHO is signed in. Nothing else goes in setup. If a date matters, setClock is the FIRST step of setup, before the first goto.',
+  'One case per claim. The case name is the request\'s own case id VERBATIM (PB_01_01, DB_07_01 …); when the request lists several independent claims under one id, suffix them " / 1", " / 2" in the order the request states them. Never invent a case name when the request has an id, and never merge two claims into one case.',
+  'For each case: the fewest steps that reach the claim, then the assertion(s) that would FAIL if the claim were false — nothing that passes either way. The sign-in proof and an expectUrl are PREPARATION, never the claim: every case must assert at least one line of the Expected output in the page\'s own terms (the option list a dropdown shows, the error message text, the count), and a case whose only assertions are the sign-in proof and a URL is refused.',
+  'Every selector comes from a tree you were given, in the canonical form. Only when the control appears in NO tree given to you may the leg be a workflow step (WORKFLOW GOALS, below).',
+  'Run the checklist at the end of these instructions and fix what fails.',
+])}
+
 DO NOT TRUNCATE OR OMIT REQUESTED ACTIONS:
 If the request describes multiple actions (e.g. fill inputs, select dates, click buttons, submit form), you MUST emit explicit steps for EVERY requested interaction. Never collapse form interactions or submissions into a single generic workflow step.
 
@@ -456,6 +498,12 @@ A flow has three parts:
 Actions available:
 - goto            navigate. URL or path in "url".
 - click           press a control.
+- clickIfVisible  press a control ONLY if it is on the page right now, and
+                  carry on either way. For an interstitial that appears on
+                  some runs and not others — a consent page after sign-in, a
+                  cookie banner, a "remember this device" prompt. Never for a
+                  control the journey depends on: an optional click cannot
+                  fail, so nothing after it may rely on it having happened.
 - fill            type into a field. Text in "value".
 - selectOption    choose a dropdown option. The option's VISIBLE LABEL in
                   "value", the dropdown control itself in "selector". Works on
@@ -490,6 +538,18 @@ Actions available:
                   request assertion, or page content read afterwards. An
                   assertion an agent made true proves nothing; an agent-driven
                   edit PROVEN BY the database row is evidence like any other.
+WORKFLOW GOALS — a workflow goal is judged by evidence, so write one the
+                  evidence can settle. Every goal MUST: (a) cover ONE leg of
+                  the journey, not the whole test; (b) name the concrete
+                  values (ids, amounts, labels) taken verbatim from the
+                  request; (c) when the leg ends on a different page, END with
+                  the URL path the page will be on when the goal is met, in
+                  the form "… and end on /en/workflows/probation" — a goal
+                  that names its destination is proved the moment the page
+                  arrives there. NEVER a workflow step for: signing in when a
+                  tree shows the sign-in form; accepting a consent page
+                  (clickIfVisible); making an assertion true; anything a
+                  captured tree already contains the controls for.
 - setLocalStorage seed a key. "key" and "value". Must follow a goto — storage is
                   origin-scoped. If the key is what signs the user in, follow it
                   with ANOTHER goto to the page under test: an application reads
@@ -500,6 +560,13 @@ Actions available:
                   the same reason: before one, there is no origin to clear. Do
                   not open a flow with it as hygiene — a fresh page has nothing
                   in it.
+- signOut         end the session the way a user does: the engine finds and
+                  clicks the application's own Sign out / Log out control
+                  (opening the identity menu if it must). No selector. Use it
+                  as the FIRST step of every persona switch, before the goto
+                  to the sign-in page — never fill a login form while still
+                  signed in, and never fake a sign-out with clearStorage: a
+                  cookie-backed session survives the wipe.
 - snapshot        visual regression baseline. Name in "name", optional selector.
 - expectText      element's text CONTAINS "value".
 - expectVisible / expectHidden      element is / is not visible.
@@ -646,36 +713,90 @@ user, log in explicitly and completely before anything else:
   1. goto the sign-in page.
   2. Fill EVERY field the form has. A password field usually has no accessible
      name of its own — if the tree shows a nameless textbox next to the email
-     one, that is the password, and "role=textbox >> nth=1" addresses it.
-     A form missing one field never submits, and every later step then runs
-     against the sign-in page.
+     one, that is the password, and input[type="password"] addresses it
+     (role=textbox >> nth=1 if you must count). A form missing one field never
+     submits, and every later step then runs against the sign-in page.
+     TWO-STEP SIGN-IN: when the tree shows an identity field (email / work
+     email / username) and a Next / Continue button but NO password field,
+     the password screen only exists after that button. Write exactly:
+       fill the identity field → click Next → fill input[type="password"]
+       → click Sign in.
+     The password field is not in the tree you were given because it does not
+     exist yet — that is expected, and it is NOT a reason for a workflow step.
+     If the identity field already shows a value in the tree, fill it anyway:
+     fill replaces, and the pre-filled address may be someone else's.
   3. Click the submit control. Then, BEFORE any goto, assert the login took
-     effect: expectUrl of a non-login path, or expectVisible of something only
-     a signed-in page shows. A click can land before the application has
-     hydrated — the form then submits natively, no session is created, and
-     every later step runs against the sign-in page; the assertion after the
-     click is what catches that, and it is not optional.
+     effect. THE CANONICAL PROOF, the same for every persona and every
+     application: expectHidden of the very submit control you just clicked
+     (role=button[name="Sign in" i]) — a sign-in that did not take leaves the
+     form standing, one that did removes it, on the landing page and on a
+     consent gate alike. Use expectUrl here ONLY with a path the evidence
+     states outright (a SIGN-IN LANDING line, or a url= in a tree); never a
+     path you infer from a route name or a persona — a guessed landing fails
+     every run against a working sign-in, and it fails slowly. A click can
+     land before the application has hydrated — the form then submits
+     natively, no session is created, and every later step runs against the
+     sign-in page; the assertion after the click is what catches that, and
+     it is not optional.
+     CONSENT GATE: if the request says a consent / terms / PDPA page can
+     appear after sign-in (or the tree of a later page shows one), the step
+     immediately after the submit click is
+       clickIfVisible role=button[name="Accept and continue"]
+     (the accept control's name exactly as the request or tree gives it). It
+     is clickIfVisible, never click, because the gate shows once per person
+     and a plain click fails every run after the first; and never a workflow
+     step, because a model call to press one button every run is waste.
+     Then the login assertion, which now also proves the gate was passed.
   4. Then goto the page under test, and assert WHO is signed in — the account
      name or role the page's chrome shows — before testing anything that
      depends on it. A flow that proceeds as the wrong persona fails later,
      somewhere confusing, or worse: passes against a page the persona should
      never have seen.
+     QUOTE THAT IDENTITY FROM A TREE — the display name, role label or user
+     id the chrome actually renders. NEVER assert that a credential the flow
+     itself typed is displayed: a credential is what the test PUT IN, not
+     what the page shows back — an application signs in with an email but
+     renders a name, role or id, so expectVisible text="admin@…" fails on
+     every run against a working application. When no tree shows the
+     signed-in chrome, the expectHidden login proof above already carries
+     the sign-in; do not invent a chrome check. A check the claim does not
+     ask for and no tree grounds is out of the test's scope: leave it out.
 Never assume a session already exists, and never switch user by filling the
 login form from another page — go back to the sign-in page first. A login
 form only exists on the sign-in page; filling "the password field" anywhere
 else fills nothing, three steps in a row.
 Claims about DIFFERENT personas belong in SEPARATE cases, each starting with
-its own complete sign-in (goto the sign-in page, fill, submit). Setup runs
-again before every case, so each persona gets a clean start — one case that
-switches identity three times mid-stream is how a whole verification dies on
-its second login.
-If a "SIGN IN AS" section is present, those are the real credentials: fill them
-EXACTLY as given, character for character, and never substitute a different
-address or a password of your own. If there is NO such section, you have no way
-to know a working password — use an obvious placeholder, and say plainly in
-"notes" that the credentials are a guess and the flow will not sign in until
-they are replaced. A guessed password does not merely fail: it fails at the
-login, and every claim the flow makes after that is about the sign-in page.
+its own complete sign-in (goto the sign-in page, fill, submit) IN THAT CASE'S
+OWN BODY — and then setup must NOT sign anyone in: setup runs again before
+every case, so a sign-in there is the SAME persona for every case, and a case
+that then visits the sign-in page as that persona finds no form there. When
+cases share one persona, sign in once in setup; when they do not, setup holds
+only setClock and the first goto, and each case signs in as its own persona.
+SWITCHING PERSONA inside one flow, when unavoidable: signOut first — the
+application's own sign-out path, which is itself part of what an end-to-end
+test exercises — then goto the sign-in page and fill the NEXT account's
+credentials completely. Never fill a login form while still signed in: the
+application sends a signed-in user away from that form, and the fill fails
+as "control not found" about a form that exists for a signed-out user. Never
+substitute clearStorage for signing out: a cookie-backed session survives
+the wipe and the login form never appears. A flow that switches personas is
+an END-TO-END test and is marked so, whatever scope was asked for. One case
+that switches identity three times mid-stream is how a whole verification
+dies on its second login.
+WHICH CREDENTIALS, in this order of precedence:
+  1. The credentials the request ITSELF states for the persona it names (a
+     "Login / persona" line, "sign in as X, password Y") — verbatim, character
+     for character. A catalog names its own personas, and a case about the
+     HRBP must sign in as the HRBP.
+  2. Otherwise, the "SIGN IN AS" section when one is present — the account the
+     person running this supplied. Fill it EXACTLY as given.
+  3. Otherwise you have no way to know a working password: use an obvious
+     placeholder and say plainly in "notes" that the credentials are a guess
+     and the flow will not sign in until they are replaced.
+Never invent a password when either source above gives one, and never
+substitute one source's address for the other's. A guessed password does not
+merely fail: it fails at the login, and every claim the flow makes after that
+is about the sign-in page.
 NOTHING may be placed between the credential fields and the submit click — not
 an assertion, not a wait. The engine recovers a sign-in that landed before the
 page hydrated by replaying the fill block and the click together, and it only
@@ -686,6 +807,18 @@ WHAT A CLAIM HAS TO BE MADE OF
    visible. If the journey enters 18:00 and 20:00 and the page derives "2 h",
    the claim is that it says 2 — a visibility check passes whether the
    arithmetic is right or wrong, which is the whole thing worth testing.
+   ANCHORING: a value that renders as its own text is asserted as
+   expectVisible text="<the value>" — the value's presence IS the claim. Never
+   anchor an expectText at a LABEL and assert the value beside it
+   (expectText text=HIRE DATE = "20 Jul 2026" resolves the label's own node,
+   which contains the label and not the date — it fails against a correct
+   page, every run). Anchor at the node that holds the value, or at a
+   container the tree shows holding both.
+   WHICH VALUE: the value the CLAIM requires — computed from its own rule —
+   never the value a note reports the app currently shows. A row marked
+   KNOWN FAIL documents the wrong value on screen precisely so the test can
+   assert the right one and report the failure; asserting the observed wrong
+   value turns a documented defect into a green run.
 2. A record this flow creates is identified by a value THIS flow typed. Put a
    distinctive string in a free-text field (a reason, a note, a title) and
    assert THAT in the list afterwards. "A row appeared" and "MY row appeared"
@@ -727,8 +860,30 @@ request quotes — a requirement written in English against a UI that shows Thai
 - If the request insists on specific wording and the tree shows a different
   rendering, assert the neutral anchor and note the discrepancy in the
   rationale rather than writing an assertion that can only fail.
+- A bare number read off the tree — a count tile, a badge, an "x of y" — is
+  never asserted as text unless the request itself states that number. The
+  tree's number counts the data as it stands this minute; every run that
+  creates or deletes a row moves it, and the assertion rots into a false
+  defect against a working page. Anchor the claim to the labeled thing (the
+  tile's label, a row identified by a value THIS flow typed); when the count
+  itself is the claim and database tables are declared, prove it with
+  expectDbCount instead.
 
-${SELECTOR_SYNTAX_RULES}`;
+${SELECTOR_SYNTAX_RULES}
+
+${selfCheck([
+  'Every case has at least one expect* step, and each would FAIL if its claim were false.',
+  'When the request states an expected concrete value — a date, a number, an amount, an exact label ("the extension date should be 18 Nov 2026", "the tile shows at least 1") — that exact value is what an expect* step asserts; asserting that the field or card is merely visible is the claim going untested. If the request itself says the value currently comes out wrong (a KNOWN FAIL note), assert the value the claim REQUIRES, so the run reports the failure the note describes.',
+  'Case names are the request\'s own case ids, verbatim; body steps of one case are contiguous.',
+  'Nothing sits between the credential fills and the submit click — no assertion, no wait, no goto.',
+  'A two-step sign-in has fill identity → click Next → fill input[type="password"] → click submit; a consent gate is a clickIfVisible right after the submit; then the login proof — expectHidden of the submit control, or an expectUrl of a path the evidence states outright, never one inferred; then goto the page under test.',
+  'Every selector token (role, name, text) appears in a tree you were given, in canonical form; no CSS class or id the tree does not show; no live count inside a name.',
+  'Every expectUrl fragment appears in a url= in a tree, or in one of this flow\'s own gotos, or in the request verbatim.',
+  'setClock is the first setup step whenever a claim depends on today\'s date or a date is typed.',
+  'No workflow step exists for a leg whose controls a given tree contains; every workflow goal names its concrete values and, when it changes page, ends with the destination path.',
+  'No expect* step asserts a bare number the request does not state.',
+  'Every unused field is an empty string, and every step has an intent.',
+])}`;
 
 function buildUserPrompt(request: AuthorRequest): string {
   const lines = [`Test request: ${request.prompt}`];
@@ -740,13 +895,6 @@ function buildUserPrompt(request: AuthorRequest): string {
       request.scope === 'e2e'
         ? 'Test scope: END-TO-END — the whole journey, and it must leave the page it starts on.'
         : 'Test scope: UNIT — one thing, on this page only.',
-    );
-  }
-  if (request.feedback?.length) {
-    lines.push(
-      '',
-      'Your previous attempt at this flow was REFUSED. Fix exactly this — do not repeat it:',
-      ...request.feedback.map((entry) => `  - ${entry}`),
     );
   }
   // Its own labelled section, apart from the tree — "declared in the schema"
@@ -787,6 +935,18 @@ function buildUserPrompt(request: AuthorRequest): string {
   // are written against, and burying it under a second tree invites the model
   // to write step 1 for a page it has not navigated to yet.
   if (request.journeyTree) lines.push('', request.journeyTree);
+  // Refusal feedback goes LAST, after every byte the retry shares with the
+  // first attempt: the trees and context above are then an identical prefix
+  // across all three authoring attempts, which is what lets a provider's
+  // implicit prompt cache bill the resent capture at cache rates instead of
+  // full price. Recency also puts the correction where the model weighs it most.
+  if (request.feedback?.length) {
+    lines.push(
+      '',
+      'Your previous attempt at this flow was REFUSED. Fix exactly this — do not repeat it:',
+      ...request.feedback.map((entry) => `  - ${entry}`),
+    );
+  }
   return lines.join('\n');
 }
 
@@ -822,7 +982,11 @@ export class LlmFlowAuthorModel implements FlowAuthorModel {
       this.id = options.id ?? factory.forRole('generator').id;
       this.#maxRetries = options.maxRetries ?? factory.maxRetries;
     }
-    this.#maxOutputTokens = options.maxOutputTokens ?? 8192;
+    // 16k, not 8k: measured on the live catalog every authoring call of any
+    // size was cut at 8k+cap and re-asked at double — the re-ask always
+    // succeeded, and always cost a second call. A budget is billed only as
+    // far as it is used, so the larger one is the cheaper one.
+    this.#maxOutputTokens = options.maxOutputTokens ?? 16_384;
   }
 
   async author(request: AuthorRequest): Promise<AuthorResult> {
@@ -840,15 +1004,26 @@ export class LlmFlowAuthorModel implements FlowAuthorModel {
     });
 
     let dropped = 0;
+    const droppedDetail: DroppedStep[] = [];
     const allowDb = (request.tables?.length ?? 0) > 0;
     const policy = request.policy ?? DEFAULT_MUTATION_POLICY;
     // Narrow and keep each surviving step next to the case it was labelled with:
     // `toFlowStep` returns the runner's own union, which has no room for a label
-    // that means nothing at execution time.
+    // that means nothing at execution time. A step that does not narrow is
+    // kept as a REASON — measured on be100, the dropped steps were the whole
+    // middle of the test, and a count alone told nobody what to fix.
     const narrow = (steps: z.infer<typeof AuthoredStepSchema>[]): LabelledStep[] => {
-      const narrowed = steps.map((raw) => ({ step: toFlowStep(raw, allowDb, policy), label: (raw.case ?? '').trim() }));
-      dropped += narrowed.filter(({ step }) => step === null).length;
-      return narrowed.filter((entry): entry is LabelledStep => entry.step !== null);
+      const kept: LabelledStep[] = [];
+      for (const raw of steps) {
+        const step = toFlowStep(raw, allowDb, policy);
+        if (step === null) {
+          dropped += 1;
+          droppedDetail.push({ action: raw.action, reason: dropReasonFor(raw, allowDb, policy), intent: raw.intent });
+          continue;
+        }
+        kept.push({ step, label: (raw.case ?? '').trim() });
+      }
+      return kept;
     };
 
     const body = narrow(object.steps);
@@ -862,6 +1037,7 @@ export class LlmFlowAuthorModel implements FlowAuthorModel {
       teardown: narrow(object.teardown).map(({ step }) => step),
       notes: object.notes,
       droppedSteps: dropped,
+      dropped: droppedDetail,
       inputTokens,
       outputTokens,
     };
@@ -959,6 +1135,97 @@ const REQUEST_VERBS_BY_POLICY: Record<MutationPolicy, readonly string[]> = {
  * null — a prompt instruction is a request, a filter is a guarantee. The
  * `policy` gates authored `request` verbs the same way.
  */
+/**
+ * Rewrite a selector written in the AX TREE'S OWN notation into real selector
+ * syntax.
+ *
+ * A model that reads the tree sometimes answers in the tree's vocabulary
+ * (glm-4.5-flash, live, all three shapes in one catalog run):
+ *
+ * - `StaticText[text="20 Jul 2026"]` — CSS for a tag named StaticText;
+ *   matches nothing, ever. The meaning is the text engine: `text="…"`.
+ * - `role=cell[text="…"]` — the role engine has no `text` attribute and
+ *   throws. A node's accessible name IS its text for these roles: `[name=]`.
+ * - `role=link[url*="/en/…"]` — the tree prints `url=` on links; the role
+ *   engine has no such attribute. A link's URL is its href: `a[href*="…"]`.
+ *
+ * Each rewrite is meaning-preserving and deterministic — the same $0 repair
+ * `qualifyBareRole` makes for a dropped `role=` prefix, applied to the other
+ * direction of the same confusion. Anything not matching these exact shapes
+ * is returned untouched.
+ */
+export function fromTreeNotation(selector: string): string {
+  const trimmed = selector.trim();
+  // A chained tail (` >> nth=0`) rides along unchanged — seen live on the
+  // very next run after the unchained form was handled: the $-anchored match
+  // let `role=link[text="Review"] >> nth=0` through to Playwright verbatim.
+  const chain = /\s*>>.*$/.exec(trimmed);
+  const head = chain === null ? trimmed : trimmed.slice(0, chain.index);
+  const tail = chain === null ? '' : trimmed.slice(chain.index);
+  // Either quote style: a smaller model writes `[text='HR']` as readily as
+  // `[text="HR"]`, and the single-quoted spelling sailed past every rewrite
+  // here — seen live 2026-08-21, a whole catalog of `StaticText[text='…']`,
+  // `heading[title='…']` and `textbox[placeholder='…']`, each one a guaranteed
+  // miss that cost the full ladder and a healer call on a single-lane server.
+  const Q = `(?:"([^"]+)"|'([^']+)')`;
+  const pick = (m: RegExpExecArray, i: number): string => m[i] ?? m[i + 1] ?? '';
+  const rewritten = ((): string | null => {
+    const staticText = new RegExp(`^StaticText\\s*\\[text=${Q}\\]$`).exec(head);
+    if (staticText !== null) return `text="${pick(staticText, 1)}"`;
+    const linkUrl = new RegExp(`^role=link\\s*\\[url(\\*?)=${Q}\\]$`).exec(head);
+    if (linkUrl !== null) return `a[href${linkUrl[1]}="${pick(linkUrl, 2)}"]`;
+    const textAttr = new RegExp(`^(role=[a-z]+)\\s*\\[text=${Q}\\]$`).exec(head);
+    if (textAttr !== null) return `${textAttr[1]}[name="${pick(textAttr, 2)}"]`;
+    // `placeholder` is not an accessible name and not a role-engine attribute
+    // (`qualifyBareRole` rightly declines it); the CSS form is what resolves.
+    const placeholder = new RegExp(`^(?:role=)?(textbox|searchbox|combobox)\\s*\\[placeholder=${Q}\\]$`).exec(head);
+    if (placeholder !== null) return `input[placeholder="${pick(placeholder, 2)}"]`;
+    // `aria-label` IS the accessible name; `title` is the name of anything
+    // with no other — both are the tree's `name`, written under the DOM's
+    // attribute instead of the engine's.
+    const labelAttr = new RegExp(`^(?:role=)?([a-z]+)\\s*\\[(?:aria-label|title)=${Q}\\]$`).exec(head);
+    if (labelAttr !== null) return `role=${labelAttr[1]}[name="${pick(labelAttr, 2)}"]`;
+    return null;
+  })();
+  return rewritten === null ? selector : rewritten + tail;
+}
+
+/**
+ * Why `toFlowStep` returned null for this step, in words the model can act
+ * on. Kept beside `toFlowStep` and derived from the same fields, so the two
+ * cannot disagree about what was missing.
+ */
+export function dropReasonFor(
+  raw: z.infer<typeof AuthoredStepSchema>,
+  allowDb: boolean,
+  policy: MutationPolicy = DEFAULT_MUTATION_POLICY,
+): string {
+  const noSelector = raw.selector === '' || raw.selector.trimStart().startsWith('/*');
+  if (!(AUTHOR_ACTIONS as readonly string[]).includes(raw.action)) {
+    return `"${raw.action}" is not an action this harness has — use one of: ${AUTHOR_ACTIONS.join(', ')}`;
+  }
+  if (/^(dbSnapshot|expectDb)/.test(raw.action) && !allowDb) {
+    return 'a database check needs an indexed schema, and none was given — assert on the page instead';
+  }
+  if (
+    raw.action === 'request' &&
+    !(REQUEST_VERBS_BY_POLICY[policy] as readonly string[]).includes(raw.name.trim().split(/\s+/)[0]?.toUpperCase() ?? '')
+  ) {
+    return `the request's verb is not allowed under the ${policy} policy`;
+  }
+  if (raw.action === 'goto' && raw.url === '') return 'goto needs a url';
+  if (raw.action === 'workflow' && raw.value === '' && raw.intent === '') return 'workflow needs a goal in "value"';
+  if (noSelector && !/^(goto|workflow|setLocalStorage|clearStorage|signOut|back|forward|expectUrl|snapshot|expectScrollable|dbSnapshot|expectDb|request|expectStatus|expectJson|expectCalls|setClock|press)/.test(raw.action)) {
+    return raw.selector.trimStart().startsWith('/*')
+      ? 'the selector is a comment, not a selector — name a control from the tree'
+      : 'the step names no selector — copy the control from the tree';
+  }
+  if (/^(fill|type|selectOption|expectText|expectValue|expectCount|expectAttribute)$/.test(raw.action) && raw.value === '') {
+    return `${raw.action} needs a value`;
+  }
+  return 'the step could not be narrowed to a runnable form (a field it needs is missing or malformed)';
+}
+
 function toFlowStep(
   raw: z.infer<typeof AuthoredStepSchema>,
   allowDb: boolean,
@@ -979,13 +1246,22 @@ function toFlowStep(
   // fancy glyph can never match the ASCII row it means.
   const selector = needsSelector
     ? ''
-    : withRelaxedRoleName(withQualifiedRole(raw.selector.replace(/‑/g, '-')));
+    : withRelaxedRoleName(withQualifiedRole(fromTreeNotation(raw.selector.replace(/‑/g, '-'))));
 
   switch (raw.action) {
     case 'goto':
       return raw.url === '' ? null : { action: 'goto', url: raw.url };
     case 'click':
       return needsSelector ? null : { action: 'click', selector, intent };
+    case 'clickIfVisible':
+      return needsSelector
+        ? null
+        : {
+            action: 'when',
+            visible: selector,
+            then: [{ action: 'click', selector, intent }],
+            intent: intent ?? `click ${selector} if it is shown`,
+          };
     case 'waitFor':
       return needsSelector ? null : { action: 'waitFor', selector, intent };
     case 'fill':
@@ -1019,6 +1295,8 @@ function toFlowStep(
       return raw.key === '' ? null : { action: 'setLocalStorage', key: raw.key, value: raw.value };
     case 'clearStorage':
       return { action: 'clearStorage' };
+    case 'signOut':
+      return { action: 'signOut', intent };
     case 'back':
       return { action: 'back', intent };
     case 'forward':
@@ -1043,8 +1321,24 @@ function toFlowStep(
         : { action: 'expectText', selector, value: raw.value, intent };
     case 'expectVisible':
       return needsSelector ? null : { action: 'expectVisible', selector, intent };
-    case 'expectHidden':
-      return needsSelector ? null : { action: 'expectHidden', selector, intent };
+    case 'expectHidden': {
+      if (needsSelector) return null;
+      // The prompt's own quoting rule, applied mechanically where ignoring it
+      // is guaranteed-false: an UNQUOTED single word in the text engine is a
+      // case-insensitive substring match, so `expectHidden text=extended`
+      // fires on the page's legitimate "Extended" label and files a leak
+      // defect about correct copy (glm-4.5-flash, live, three of seven codes
+      // in one flow — the snake_case four passed, the plain-word three could
+      // only fail). Quoting narrows to an exact text node, which is what a
+      // raw-code leak looks like. Words with spaces or a snake_case shape are
+      // left exactly as written.
+      const bareWord = /^text=([\p{L}\p{N}]+)$/u.exec(selector);
+      return {
+        action: 'expectHidden',
+        selector: bareWord !== null ? `text="${bareWord[1]}"` : selector,
+        intent,
+      };
+    }
     case 'expectEnabled':
       return needsSelector ? null : { action: 'expectEnabled', selector, intent };
     case 'expectDisabled':
@@ -1249,6 +1543,8 @@ export interface AuthoredFlow {
   inputTokens?: number | undefined;
   outputTokens?: number | undefined;
   latencyMs: number;
+  /** What the authoring review did, when one ran — see `flow-review.ts`. */
+  review?: ReviewRecord | undefined;
 }
 
 /**
@@ -1402,6 +1698,12 @@ export interface FlowAuthorOptions {
    * own gotos — see `ungroundedUrlExpectation`.
    */
   declaredRoutes?: readonly string[] | undefined;
+  /**
+   * A second look at the accepted flow against the codebase and documents
+   * before it is handed back — the level above the lints. Absent means the
+   * flow is exactly what the author wrote. See `flow-review.ts`.
+   */
+  reviewer?: FlowReviewer | undefined;
   /** Called at each authoring lifecycle event — for live progress output. */
   onLog?: ((line: string) => void) | undefined;
 }
@@ -1421,6 +1723,7 @@ export class FlowAuthor {
   readonly #scope: TestScope | undefined;
   /** Route patterns the selected repository declares — grounding for expectUrl. */
   readonly #declaredRoutes: readonly string[];
+  readonly #reviewer: FlowReviewer | undefined;
 
   constructor(options: FlowAuthorOptions) {
     this.model = options.model;
@@ -1434,6 +1737,7 @@ export class FlowAuthor {
     this.#journeyTree = options.journeyTree;
     this.#scope = options.scope;
     this.#declaredRoutes = options.declaredRoutes ?? [];
+    this.#reviewer = options.reviewer;
     this.#onLog = options.onLog;
   }
 
@@ -1444,14 +1748,55 @@ export class FlowAuthor {
    * on screen. Without it the flow is shape-correct but its selectors are
    * guesses, and `grounded` says so.
    */
-  async author(prompt: string, page?: Page): Promise<AuthoredFlow> {
+  async author(
+    prompt: string,
+    page?: Page,
+    /**
+     * Per-call evidence a caller captured for THIS prompt. A catalog authors
+     * one row per call against one open page, and each row's journey ends on
+     * its own page — so the destination tree cannot be a property of the
+     * author; it is a property of the call.
+     */
+    extra: {
+      journeyTree?: string | undefined;
+      /**
+       * A repository-context slice ranked against THIS row's own words,
+       * overriding the author-wide `projectContext` for this call. Same
+       * reasoning as `journeyTree`: a catalog authors one row per call, and
+       * the routes that matter are the row's, not the whole project's.
+       */
+      projectContext?: string | undefined;
+    } = {},
+  ): Promise<AuthoredFlow> {
     const trimmed = prompt.trim();
     if (trimmed === '') throw new AuthoringError('prompt is empty — describe the test you want');
+    // The journey capture ranked against THIS row's request. It is per-row
+    // evidence already (each case captures its own destination), so unlike the
+    // start tree there is no shared prompt prefix to preserve — and a dense
+    // destination page otherwise bills every row for controls its claim never
+    // mentions. The label line is always kept (which page this is IS the
+    // evidence), the cut is disclosed inside the tree text, and under the cap
+    // nothing changes. The narrowed text is also what the grounding lints
+    // read, so the model and the lints see one tree, never two.
+    const rawJourneyTree = extra.journeyTree ?? this.#journeyTree;
+    const journeyTree =
+      rawJourneyTree === undefined
+        ? undefined
+        : focusTreeText(rawJourneyTree, trimmed, JOURNEY_TREE_MAX_LINES, 1).text;
 
     const startedMs = Date.now();
     const url = page?.url();
     if (page) this.#onLog?.(`reading ${url}…`);
     const axTree = page ? await captureAxTree(page, this.#maxAxNodes) : undefined;
+    // What the grounding lints may treat as evidence: EVERY tree the model was
+    // given, not only the start page's. A journey tree carries the destination
+    // page's `url=` attributes and roles, and a lint that ignored it refused —
+    // three times running, live — an expectUrl the queue's own Review link
+    // grounded, on the row the capture had been added to help.
+    const evidenceTree =
+      axTree === undefined && journeyTree === undefined
+        ? undefined
+        : [axTree ?? '', journeyTree ?? ''].filter((t) => t !== '').join('\n');
 
     // Opt-in: it clicks the page's disclosures, which costs a second or two and
     // is a mutation of on-screen state even though it never submits anything.
@@ -1495,9 +1840,11 @@ export class FlowAuthor {
         interactions,
         policy: this.#policy,
         ...(this.#tables?.length ? { tables: this.#tables } : {}),
-        ...(this.#projectContext ? { projectContext: this.#projectContext } : {}),
+        ...((extra.projectContext ?? this.#projectContext)
+          ? { projectContext: extra.projectContext ?? this.#projectContext }
+          : {}),
         ...(this.#credentials ? { credentials: this.#credentials } : {}),
-        ...(this.#journeyTree ? { journeyTree: this.#journeyTree } : {}),
+        ...(journeyTree ? { journeyTree } : {}),
         ...(this.#scope ? { scope: this.#scope } : {}),
         ...(feedback.length > 0 ? { feedback } : {}),
       });
@@ -1507,6 +1854,9 @@ export class FlowAuthor {
           (caseCount > 1 ? ` in ${caseCount} discrete case(s)` : '') +
           (result.droppedSteps > 0 ? `, ${result.droppedSteps} dropped` : ''),
       );
+      for (const drop of result.dropped ?? []) {
+        this.#onLog?.(`  dropped  ${drop.action}${drop.intent ? ` "${drop.intent.slice(0, 60)}"` : ''} — ${drop.reason}`);
+      }
 
       // $0 repair before any judgement: when the flow itself names its
       // sign-in page, a persona switch that forgot to navigate back to it is
@@ -1532,6 +1882,89 @@ export class FlowAuthor {
           result.notes =
             `${result.notes}${result.notes ? ' ' : ''}wowlidator inserted ${repaired.grounded} ` +
             `goto(s) to ${signInUrl} before credential fills that had no sign-in page to run against.`;
+        }
+      }
+
+      // $0 repair, the same move for the VALUE: a sign-in block for the
+      // supplied account that types a different password can only be an
+      // invention (be100: 19 of 107 flows, each a whole red run). Mutates the
+      // step objects in place, so the case lists see it too.
+      if (this.#credentials) {
+        const corrected = groundCredentialValues(
+          [...(result.setup ?? []), ...result.steps],
+          this.#credentials,
+        );
+        if (corrected > 0) {
+          this.#onLog?.(
+            `replaced ${corrected} invented credential value(s) with the supplied account's — ` +
+              'the model typed a password of its own for the sign-in it was given',
+          );
+          result.notes =
+            `${result.notes}${result.notes ? ' ' : ''}wowlidator replaced ${corrected} ` +
+            'credential value(s) the model invented with the supplied sign-in password.';
+        }
+      }
+
+      // A flow that switches personas is an end-to-end test whatever scope
+      // was asked for (`Flow.scope` is stamped where the flow is assembled),
+      // and every switch must travel the application's own sign-out path —
+      // the prompt asks for a signOut step there; this is the guarantee.
+      // After `groundCredentialFills`, so a stranded block has its goto by
+      // the time this looks for where the signOut belongs.
+      {
+        const personas = switchesPersona(result.setup ?? [], result.steps);
+        if (personas.length > 1) {
+          const fixed = groundPersonaSwitches(result.setup ?? [], result.steps);
+          let insertedTotal = fixed.inserted;
+          if (fixed.inserted > 0) result.steps = fixed.steps;
+          if (result.cases?.length) {
+            result.cases = result.cases.map((one) => {
+              const perCase = groundPersonaSwitches(result.setup ?? [], one.steps);
+              if (perCase.inserted === 0) return one;
+              insertedTotal += perCase.inserted;
+              return { ...one, steps: perCase.steps };
+            });
+          }
+          this.#onLog?.(
+            `the flow switches persona (${personas.join(' → ')}) — an end-to-end journey; marked so`,
+          );
+          if (insertedTotal > 0) {
+            this.#onLog?.(
+              `inserted ${insertedTotal} signOut step(s) before persona switches — a switch must ` +
+                "travel the application's own sign-out path, not fill a form the app hides from " +
+                'signed-in users',
+            );
+            result.notes =
+              `${result.notes}${result.notes ? ' ' : ''}wowlidator inserted ${insertedTotal} ` +
+              'signOut step(s) before persona switches, so each re-login starts from the ' +
+              "application's own signed-out state.";
+          }
+        }
+      }
+
+      // Same move for a consent accept the model placed after the first
+      // post-login navigation or assertion — the assertion would run against
+      // the gate and the accept would strand the run on the app's home page
+      // (PL_02_09, docs/consent-gate-recovery-spec.md F3).
+      {
+        const early = settleConsentEarly(result.steps);
+        let movedTotal = early.moved ? 1 : 0;
+        if (early.moved) result.steps = early.steps;
+        if (result.cases?.length) {
+          result.cases = result.cases.map((one) => {
+            const fixed = settleConsentEarly(one.steps);
+            if (fixed.moved) movedTotal += 1;
+            return fixed.moved ? { ...one, steps: fixed.steps } : one;
+          });
+        }
+        if (movedTotal > 0) {
+          this.#onLog?.(
+            'moved a consent accept to immediately after the sign-in — it was placed after steps ' +
+              'that would have run against the consent gate',
+          );
+          result.notes =
+            `${result.notes}${result.notes ? ' ' : ''}wowlidator moved a consent-accept step to ` +
+            'immediately after the sign-in block, so the flow\'s own goto re-navigates after the gate is cleared.';
         }
       }
 
@@ -1568,6 +2001,38 @@ export class FlowAuthor {
             `the authored flow "${result.name}" contains no assertion, so it would pass ` +
               'without proving anything. Restate the request in terms of what should be ' +
               'TRUE afterwards (e.g. "...and the row count shows 8").',
+          );
+        } else {
+          // **A flow whose only assertions are the sign-in proof and a URL is
+          // refused as if it asserted nothing** — measured on be100, that
+          // exact shape was 20 of 22 `pass**` cases, each green about a row
+          // whose Expected Output it never touched. Fatal: on the last
+          // attempt the case is blocked (and re-authored on a resume), never
+          // handed over as a test that passes whatever the application does.
+          const vacuous = vacuousClaim([...(result.setup ?? []), ...result.steps]);
+          if (vacuous !== null) {
+            refuse(
+              `the authored flow "${result.name}" proves nothing about its claim: ${vacuous}. ` +
+                'Assert at least one line of the Expected output in the page\'s own terms — ' +
+                'the options a dropdown lists, the exact error message, the count the page ' +
+                'shows — after the step that reaches it. If that page is in no tree you were ' +
+                'given, reach it with a precisely-goaled workflow step and assert what it then ' +
+                'shows; if the assertion is impossible, say so in notes rather than omitting it.',
+            );
+          }
+        }
+        // Steps the model wrote that could not run ride along as a weak
+        // complaint: alone they are a note; beside a refusal they are the
+        // reason the refusal exists, and the re-ask must know what to fix.
+        if ((result.dropped?.length ?? 0) > 0) {
+          const list = (result.dropped ?? [])
+            .slice(0, 6)
+            .map((d) => `${d.action}${d.intent ? ` ("${d.intent.slice(0, 50)}")` : ''}: ${d.reason}`)
+            .join('; ');
+          refuse(
+            `${result.dropped!.length} step(s) you wrote were dropped before they could run — ${list}. ` +
+              'Rewrite each in a form the harness accepts.',
+            { severity: 'weak', note: `${result.dropped!.length} step(s) dropped on narrowing: ${list}` },
           );
         }
 
@@ -1627,6 +2092,79 @@ export class FlowAuthor {
           );
         }
 
+        // **$0 mechanical repair before the lint**, the `groundCredentialFills`
+        // move: the vacuous login proof (`expectUrl "/en/"` after a sign-in
+        // from /en/login) was refused on nearly every row of every measured
+        // run, and every refusal cost a full authoring call to learn what a
+        // string replacement knows. The submit control the flow itself just
+        // clicked is the honest witness: still on the page, the sign-in did
+        // not take (a native GET resubmit leaves the form standing); gone, it
+        // did — on the landing page and on a consent gate alike, and the goto
+        // plus who-is-signed-in assertion that follow settle the rest.
+        const grounded = groundLoginProof(
+          result.setup ?? [],
+          result.steps,
+          `${evidenceTree ?? ''}\n${trimmed}`,
+        );
+        if (grounded !== null) {
+          this.#onLog?.(`login proof grounded: ${grounded}`);
+          result.notes = result.notes === '' ? grounded : `${result.notes}; ${grounded}`;
+        }
+
+        // A check generated out of the scope of the test is re-judged for
+        // necessity before it can cost anything: an assertion that a
+        // credential the flow itself typed is DISPLAYED came from the input
+        // side of the test, not from the claim and not from the page, and it
+        // fails on every run against a working application (PL_02_02: 42s of
+        // ladder, patience, healer and reconstruction to disprove a string
+        // the tree never contained, then a high defect). When the claim's own
+        // assertions carry the proof, the echo is unnecessary and dropped —
+        // the `groundCredentialFills` move, $0, disclosed, never silent. Only
+        // when the echo is ALL the proof there is does it earn the informed
+        // re-ask.
+        {
+          const typed = typedCredentialValues(result.setup ?? [], result.steps);
+          const setupEchoes = credentialEchoAssertions(result.setup ?? [], typed, evidenceTree ?? '');
+          const bodyEchoes = credentialEchoAssertions(result.steps, typed, evidenceTree ?? '');
+          if (setupEchoes.length + bodyEchoes.length > 0) {
+            const bodyKept = result.steps.filter((_, i) => !bodyEchoes.includes(i));
+            if (bodyEchoes.length > 0 && !hasAssertion(bodyKept)) {
+              refuse(
+                `the authored flow "${result.name}" proves itself only by expecting a ` +
+                  'credential the flow itself typed to be displayed on the page. A credential ' +
+                  'is input, not expected output — an application signs in with an email but ' +
+                  'renders a display name, role label or user id in its chrome, so this ' +
+                  'assertion fails on every run against a working application. Assert what the ' +
+                  'claim asks for, quoting text a tree actually shows.',
+              );
+            } else {
+              const droppedDescs = [
+                ...setupEchoes.map((i) => (result.setup ?? [])[i]),
+                ...bodyEchoes.map((i) => result.steps[i]),
+              ].map((s) => `${s!.action} ${(s as { selector: string }).selector}`);
+              result.setup = (result.setup ?? []).filter((_, i) => !setupEchoes.includes(i));
+              result.steps = bodyKept;
+              if (result.cases?.length) {
+                result.cases = result.cases.map((one) => {
+                  const echoes = credentialEchoAssertions(one.steps, typed, evidenceTree ?? '');
+                  if (echoes.length === 0) return one;
+                  const kept = one.steps.filter((_, i) => !echoes.includes(i));
+                  // A case whose only proof is the echo keeps it — the
+                  // body-level refusal above is where that shape is judged.
+                  return hasAssertion(kept) ? { ...one, steps: kept } : one;
+                });
+              }
+              const droppedNote =
+                `wowlidator dropped ${droppedDescs.length} out-of-scope check(s) asserting a ` +
+                `credential the flow itself typed (${droppedDescs.join('; ')}) — a credential ` +
+                'is input, not expected output; the page renders a name, role or id, never the ' +
+                "sign-in email, and the claim's own assertions carry the proof.";
+              this.#onLog?.(droppedNote);
+              result.notes = result.notes === '' ? droppedNote : `${result.notes}; ${droppedNote}`;
+            }
+          }
+        }
+
         const weakProof = loginProofCannotFail([...(result.setup ?? []), ...result.steps]);
         if (weakProof !== null) {
           refuse(
@@ -1651,7 +2189,7 @@ export class FlowAuthor {
           );
         }
 
-        const inventedUrl = ungroundedUrlExpectation(result.steps, axTree, this.#declaredRoutes);
+        const inventedUrl = ungroundedUrlExpectation(result.steps, evidenceTree, this.#declaredRoutes);
         if (inventedUrl !== null) {
           refuse(
             `the authored flow "${result.name}" expects the URL to contain ` +
@@ -1702,6 +2240,23 @@ export class FlowAuthor {
           );
         }
 
+        const volatileCount = volatileCountAssertion(
+          [...(result.setup ?? []), ...result.steps],
+          trimmed,
+        );
+        if (volatileCount !== null) {
+          refuse(
+            `the authored flow "${result.name}" asserts the bare number ` +
+              `"${volatileCount.value}" (step ${volatileCount.index}), which the request never ` +
+              'states — so it was read off the page, and it counts the data as it stands this ' +
+              'minute. Every run that creates or deletes a row moves it, and the assertion rots ' +
+              'into a false defect. Anchor the claim to the labeled thing instead (the tile\'s ' +
+              'label, a row identified by a value THIS flow typed); when the count itself is ' +
+              'the claim and tables are declared, prove it with expectDbCount. A number the ' +
+              'request itself states may be asserted exactly.',
+          );
+        }
+
         const interrupted = interruptedCredentialSubmit([...(result.setup ?? []), ...result.steps]);
         if (interrupted !== null) {
           refuse(
@@ -1743,9 +2298,16 @@ export class FlowAuthor {
           );
         }
 
-        // Only when the person asked for a journey. `fatal`: a single-page
-        // flow is not a thinner end-to-end test, it is a different test, and
-        // handing one back would answer a question nobody asked.
+        // Only when the person asked for a journey. A single-page flow is not
+        // a thinner end-to-end test, it is a different test, and handing one
+        // back would answer a question nobody asked — that stays `fatal`. A
+        // journey handed to the agent is `weak`: the flow travels, and it
+        // proves less than it could. It was fatal once, and measured on a real
+        // catalog the refusal fired three times running on a row whose
+        // captured journey page was the WRONG page (the ranker's guess), so
+        // the model was right to reach for the agent and the row was lost.
+        // The workflow step now records the page before and after the agent
+        // acted; the note says what to tighten.
         if (this.#scope === 'e2e') {
           const confined = notEndToEnd(result.setup ?? [], result.steps, url);
           if (confined !== null) {
@@ -1760,11 +2322,21 @@ export class FlowAuthor {
                   'leaves the page it starts on. An end-to-end test reaches the page the way a ' +
                   'user reaches it, acts, and verifies on the page that results — navigate, ' +
                   'then assert there.',
+              confined === 'agent-journey'
+                ? {
+                    severity: 'weak',
+                    note:
+                      'the journey is driven by the navigation agent rather than written as ' +
+                      'steps — the workflow step records what the page showed before and ' +
+                      'after, and the agent\'s turns are on the report; write the leg as ' +
+                      'steps once its page has been captured',
+                  }
+                : {},
             );
           }
         }
 
-        const phantom = ungroundedCountRole(result.steps, axTree);
+        const phantom = ungroundedCountRole(result.steps, evidenceTree);
         if (phantom !== null) {
           refuse(
             `the authored flow "${result.name}" counts role "${phantom.role}" (step ` +
@@ -1778,7 +2350,23 @@ export class FlowAuthor {
         // Order is source order, so two runs of one broken flow produce the
         // same feedback — the reason `temperature: 0` exists, applied to the
         // refusal rather than the generation.
-        if (violations.length > 0) throw composeRefusal(violations);
+        //
+        // **A flow refused ONLY for thinness is accepted at once, with the
+        // note.** The re-ask used to run for `weak` violations too, and it
+        // bought nothing measurable: the model was told its workflow leg was
+        // unchecked, came back with the same leg (it could not see the page
+        // the leg ends on), and the weak result was accepted anyway once the
+        // budget was spent — two model calls and a minute later. The workflow
+        // step now records the page before and after the agent acted (URL,
+        // headings, the requests the page made), so the leg is auditable
+        // from the report without a re-ask. Fatal violations still refuse:
+        // a flow that says something UNTRUE is worse than none.
+        if (violations.length > 0) {
+          if (violations.some((v) => v.severity === 'fatal')) throw composeRefusal(violations);
+          const note = violations.map((v) => v.note).join('; ');
+          result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
+          this.#onLog?.(`weak claim, accepted with a note: ${note}`);
+        }
         accepted = true;
         break;
       } catch (error) {
@@ -1793,7 +2381,13 @@ export class FlowAuthor {
         // `buildUserPrompt` renders each entry on its own line, and a model
         // fixes a list far more reliably than a paragraph.
         feedback.push(...error.messages);
+        // Every problem, not the headline: "3 problems with the authored flow"
+        // tells a reader nothing about which rules the model keeps breaking,
+        // and that list is the whole diagnostic value of a refusal.
         this.#onLog?.(`refused: ${error.message.split('\n')[0]}`);
+        if (error.messages.length > 1) {
+          for (const line of error.messages) this.#onLog?.(`  · ${line.split('\n')[0]}`);
+        }
       }
     }
 
@@ -1807,9 +2401,44 @@ export class FlowAuthor {
       this.#onLog?.(`weak claim: ${weak.note}`);
     }
 
+    // The review, after every lint has had its say: the lints refuse shapes a
+    // string check can name, the review asks what the codebase and the
+    // documents say about the steps that have no evidence behind them. It
+    // repoints, never re-claims — see `applyReview`.
+    let review: ReviewRecord | undefined;
+    if (this.#reviewer !== undefined) {
+      const outcome = await this.#reviewer.review(
+        result.setup,
+        result.steps,
+        {
+          url,
+          axTree,
+          journeyTree,
+          interactions,
+          projectContext: this.#projectContext,
+          declaredRoutes: this.#declaredRoutes,
+          prompt: trimmed,
+        },
+        result.cases,
+      );
+      result.setup = outcome.setup;
+      result.steps = outcome.steps;
+      if (outcome.record !== null) {
+        review = outcome.record;
+        const summary =
+          `authoring review: ${review.replaced} step(s) repointed, ${review.inserted} inserted, ` +
+          `${review.unsure} still ungrounded`;
+        result.notes = result.notes === '' ? summary : `${result.notes}; ${summary}`;
+      }
+    }
+
     const flow: Flow = {
       name: result.name,
       ...(originOf(url) === undefined ? {} : { baseUrl: originOf(url) }),
+      // A persona-switching flow is an end-to-end journey by construction —
+      // the mark travels IN the flow file, like `polarity`, so a re-run or a
+      // repair keeps it.
+      ...(switchesPersona(result.setup, result.steps).length > 1 ? { scope: 'e2e' as const } : {}),
       ...(result.setup.length > 0 ? { setup: result.setup } : {}),
       steps: result.steps,
       ...(result.teardown.length > 0 ? { teardown: result.teardown } : {}),
@@ -1832,6 +2461,7 @@ export class FlowAuthor {
       inputTokens: result.inputTokens,
       outputTokens: result.outputTokens,
       latencyMs: Date.now() - startedMs,
+      ...(review === undefined ? {} : { review }),
     };
   }
 }
@@ -1981,6 +2611,187 @@ export function loginProofCannotFail(
     }
   }
   return null;
+}
+
+/**
+ * Replace a login proof that cannot fail with one that can, in place.
+ *
+ * The shape `loginProofCannotFail` refuses: credentials filled, a submit
+ * clicked, then `expectUrl` of a fragment the sign-in URL already contains.
+ * The replacement is `expectHidden` of the very control that was clicked —
+ * the flow's own selector, so nothing is invented — because a submit that did
+ * not take leaves the form standing and one that did removes it. Both arrays
+ * are edited in place (setup and body are one sequence for this purpose, and
+ * the vacuous step usually sits in setup). Returns the disclosure line, or
+ * null when nothing was changed.
+ */
+export function groundLoginProof(
+  setup: FlowStep[],
+  steps: FlowStep[],
+  /**
+   * Everything the model was shown — the trees and the request. A login proof
+   * that quotes text found in none of it (`expectVisible text="HRIS ADMIN"`,
+   * live, from a sheet that said "HR Admin" and a shell that renders
+   * "ผู้ดูแลระบบ HR") is a guess dressed as a check, and it cost that run ~100
+   * seconds of ladder, patience and reconstruction before the real claims.
+   */
+  evidence = '',
+): string | null {
+  let lastGoto: string | null = null;
+  let sawCredentialFill = false;
+  let submittedFrom: string | null = null;
+  let submitSelector: string | null = null;
+  const haystack = evidence.toLowerCase();
+  const replaceWith = (list: FlowStep[], i: number, why: string): string => {
+    list[i] = {
+      action: 'expectHidden',
+      selector: submitSelector as string,
+      intent: `the sign-in took: the submit control "${submitSelector}" is no longer on the page`,
+    };
+    return `${why} and was replaced with expectHidden of the submit control the flow clicked`;
+  };
+  const sections: FlowStep[][] = [setup, steps];
+  for (const list of sections) {
+    for (let i = 0; i < list.length; i += 1) {
+      const step = list[i]!;
+      if (step.action === 'goto') {
+        lastGoto = step.url;
+        sawCredentialFill = false;
+        submittedFrom = null;
+        continue;
+      }
+      if (step.action === 'fill' || step.action === 'type') {
+        if (isCredentialFill(step)) sawCredentialFill = true;
+        continue;
+      }
+      if (step.action === 'click' && sawCredentialFill) {
+        submittedFrom = lastGoto;
+        submitSelector = step.selector;
+        sawCredentialFill = false;
+        continue;
+      }
+      // The consent gate sits between the submit and its proof; it is not the
+      // proof and does not end the search for one.
+      if (step.action === 'when') continue;
+      if (submittedFrom === null || submitSelector === null) continue;
+      if (step.action === 'expectUrl') {
+        const expected = step.value.trim();
+        if (expected !== '' && submittedFrom.includes(expected)) {
+          return replaceWith(list, i, `the login proof "expectUrl ${expected}" could not fail (the sign-in URL contains it)`);
+        }
+        submittedFrom = null;
+        continue;
+      }
+      if (step.action === 'expectVisible' || step.action === 'expectText') {
+        const quoted = [
+          ...(step.selector.match(/text="([^"]+)"/)?.[1] ? [step.selector.match(/text="([^"]+)"/)![1] as string] : []),
+          ...(step.selector.startsWith('text=') && !step.selector.startsWith('text="') ? [step.selector.slice(5)] : []),
+          ...(step.action === 'expectText' && step.value !== '' ? [step.value] : []),
+        ];
+        const ungrounded = quoted.find((q) => haystack !== '' && !haystack.includes(q.toLowerCase()));
+        if (ungrounded !== undefined) {
+          return replaceWith(
+            list,
+            i,
+            `the login proof quotes "${ungrounded}", which appears in no tree given and not in the request`,
+          );
+        }
+        submittedFrom = null;
+        continue;
+      }
+      // Any other assertion after the submit is the proof; leave it.
+      if (step.action.startsWith('expect')) submittedFrom = null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The values this flow typed as credentials — every `fill`/`type` value that
+ * is password-shaped (`isCredentialFill`) or sits on a sign-in page (the most
+ * recent `goto` matches `LOGIN_URL_PATTERN`). Walked in execution order,
+ * setup first, because that is the order the page saw them.
+ *
+ * These are the flow's INPUT. An assertion that one of them is displayed
+ * claims the application echoes a credential back — see
+ * `credentialEchoAssertions`.
+ */
+export function typedCredentialValues(
+  setup: readonly FlowStep[],
+  steps: readonly FlowStep[],
+): string[] {
+  const typed: string[] = [];
+  let lastGoto: string | null = null;
+  for (const step of [...setup, ...steps]) {
+    if (step.action === 'goto') {
+      lastGoto = step.url;
+      continue;
+    }
+    if (step.action !== 'fill' && step.action !== 'type') continue;
+    const value = step.value.trim().toLowerCase();
+    if (value === '') continue;
+    const onSignIn = lastGoto !== null && LOGIN_URL_PATTERN.test(lastGoto);
+    if (onSignIn || isCredentialFill(step)) typed.push(value);
+  }
+  return typed;
+}
+
+/**
+ * Presence assertions that echo a credential the flow itself typed — the
+ * PL_02_02 shape: `expectVisible text="admin@cnext.test"` under the intent
+ * "assert authenticated user email is displayed in chrome", against an
+ * application whose identity plate renders a display name, a role label and
+ * a user id, and never the sign-in email. The value came from the INPUT side
+ * of the test (the credential the flow filled), not from anything the page
+ * was seen to render, so the check is out of the claim's scope by
+ * construction: unresolvable on every run, it dead-ends the ladder, spends a
+ * healer call to be told the string is nowhere in the tree, and files a high
+ * defect against a working application.
+ *
+ * The request text can never rescue such an assertion — the credentials are
+ * ALWAYS in the request (the persona lines put them there), which is exactly
+ * where the model found the value. The EVIDENCE can: a value that appears in
+ * a tree the model was given is something the page really renders, and
+ * asserting it is grounded (a truncated tree may fail to rescue a value a
+ * deeper page shows — the cost of that miss is one auxiliary check dropped
+ * with a note, and the informed re-ask covers the refusal path).
+ *
+ * `expectHidden` is deliberately not matched: asserting a credential is NOT
+ * displayed is a legitimate check (a password must never render), and it is
+ * also the canonical login proof's own action.
+ *
+ * Returns the indexes into `list`, for the caller to drop (when the proof
+ * stands without them) or refuse over (when they are all the proof there is)
+ * — that decision needs `hasAssertion` over the surviving body, which only
+ * the caller can see.
+ */
+export function credentialEchoAssertions(
+  list: readonly FlowStep[],
+  typedCredentials: readonly string[],
+  evidence = '',
+): number[] {
+  if (typedCredentials.length === 0) return [];
+  const haystack = evidence.toLowerCase();
+  const indexes: number[] = [];
+  for (const [index, step] of list.entries()) {
+    if (
+      step.action !== 'expectVisible' &&
+      step.action !== 'expectText' &&
+      step.action !== 'waitFor'
+    ) {
+      continue;
+    }
+    const selector = step.selector.toLowerCase();
+    const value = step.action === 'expectText' ? step.value.toLowerCase() : '';
+    const echoed = typedCredentials.find(
+      (typed) => selector.includes(typed) || (value !== '' && value.includes(typed)),
+    );
+    if (echoed === undefined) continue;
+    // The page was seen to render it — grounded, in scope, keep it.
+    if (haystack !== '' && haystack.includes(echoed)) continue;
+    indexes.push(index);
+  }
+  return indexes;
 }
 
 export function loginProofAssertsLoginPage(steps: readonly FlowStep[]): number | null {
@@ -2156,6 +2967,14 @@ export function notEndToEnd(
         pages.add(claimed);
       }
     }
+    // A click on a LINK is a navigation by construction — a link is a GET to
+    // somewhere else, which is precisely what this lint asks the flow to do.
+    // Needed since the canonical login proof became expectHidden of the
+    // submit control: a flow that then travels by clicking sidebar links can
+    // honestly carry no expectUrl at all, and was refused three times running
+    // as "never leaves the page it starts on" while clicking its way across
+    // four pages (run 10, live).
+    if (step.action === 'click' && /^role=link\b/i.test(step.selector)) return null;
   }
   if (pages.size > 1) return null;
 
@@ -2190,6 +3009,50 @@ export function countPinnedName(
     const named = /\[name\s*=\s*"([^"]*)"/.exec(selector);
     const name = named?.[1];
     if (name !== undefined && COUNT_SUFFIX.test(name)) return { index, name };
+  }
+  return null;
+}
+
+/** A whole value that is nothing but a number — the shape a count tile renders. */
+const BARE_NUMBER = /^\d{1,4}(?:,\d{3})*(?:\.\d+)?$/;
+
+/**
+ * An assertion whose entire claim is a bare number the request never stated.
+ *
+ * `countPinnedName`'s disease, in text-assertion form. The model reads the
+ * page's count tiles at authoring time and pins what they showed —
+ * `expectVisible text="75"` — but that number counts the data as it stands
+ * that minute, and on an application whose writes persist, every later run
+ * that creates or deletes a row makes the assertion false forever. Measured
+ * (be100, 2026-08-25): an entire scenario of count checks dead-ended on
+ * exactly this after the app's storage became a shared database, and repair
+ * could not rescue them — an assertion always keeps its claim, and the claim
+ * itself had rotted.
+ *
+ * A number the REQUEST states is exempt: the sheet's word is the claim
+ * (the EXPECTED VALUES rule), and refusing it would untest the case.
+ * `expectCount` is exempt too — it counts elements the flow selects, not
+ * text the data renders.
+ */
+export function volatileCountAssertion(
+  steps: readonly FlowStep[],
+  requestText: string,
+): { index: number; value: string } | null {
+  for (const [index, step] of steps.entries()) {
+    if (!step.action.startsWith('expect') || step.action === 'expectCount') continue;
+    const candidates: string[] = [];
+    const selector = (step as { selector?: string }).selector ?? '';
+    const quoted = /text\s*=\s*"([^"]*)"/.exec(selector);
+    if (quoted?.[1] !== undefined) candidates.push(quoted[1]);
+    const bare = /text\s*=\s*([^\s">]+)\s*$/.exec(selector);
+    if (bare?.[1] !== undefined) candidates.push(bare[1]);
+    const value = (step as { value?: string }).value;
+    if (typeof value === 'string' && value !== '') candidates.push(value);
+    for (const candidate of candidates) {
+      if (BARE_NUMBER.test(candidate) && !requestText.includes(candidate)) {
+        return { index, value: candidate };
+      }
+    }
   }
   return null;
 }
@@ -2433,7 +3296,7 @@ export function ungroundedUrlExpectation(
 }
 
 /** The sign-in URL this flow itself names, when it names one. */
-export function findSignInUrl(steps: readonly FlowStep[]): string | null {
+function findSignInUrl(steps: readonly FlowStep[]): string | null {
   for (const step of steps) {
     if (step.action === 'goto' && LOGIN_URL_PATTERN.test(step.url)) return step.url;
   }
@@ -2458,6 +3321,92 @@ export function findSignInUrl(steps: readonly FlowStep[]): string | null {
  * sign-in URL to learn from, nothing is touched and the refusal stands: an
  * invented URL would be a guess, and this repo does not guess.
  */
+/** The accessible name a click-shaped selector asks for, when readable. */
+function clickTargetName(selector: string): string | null {
+  const m = /\[name=(?:"([^"]+)"|'([^']+)')/.exec(selector) ?? /^text="([^"]+)"$/.exec(selector.trim());
+  return (m?.[1] ?? m?.[2] ?? null) as string | null;
+}
+
+/** Is this step an accept of the consent gate — bare click, or the authored `when { visible }` form? */
+function isConsentAccept(step: FlowStep): boolean {
+  if (step.action === 'click') {
+    const name = clickTargetName(step.selector);
+    return name !== null && CONSENT_ACCEPT_NAME.test(name);
+  }
+  if (step.action === 'when' && step.visible !== undefined) {
+    const first = step.then[0];
+    if (first === undefined || first.action !== 'click') return false;
+    const name = clickTargetName(first.selector);
+    return name !== null && CONSENT_ACCEPT_NAME.test(name);
+  }
+  return false;
+}
+
+/**
+ * F3 of docs/consent-gate-recovery-spec.md: a consent-accept step the model
+ * placed AFTER the first post-login navigation or assertion is spliced to
+ * immediately after the login block. PL_02_09's shape, live: the breadcrumb
+ * assertion ran against the gate and failed, the accept then landed the run
+ * on the app's home page with no re-navigation, and everything after
+ * dead-ended. Moved early, the accept fires where the gate actually shows
+ * (right after sign-in) and the flow's own `goto` — which now runs AFTER it —
+ * is the re-navigation. A bare `click` is converted to the `when { visible }`
+ * form on the way, because the gate shows once per context and a bare click
+ * fails every run after the first. Mechanical, disclosed, never a re-ask —
+ * the `groundCredentialFills` move.
+ */
+export function settleConsentEarly(steps: readonly FlowStep[]): { steps: FlowStep[]; moved: boolean } {
+  // The login block: the last credential fill, then the first click after it.
+  let lastCredential = -1;
+  for (const [index, step] of steps.entries()) {
+    if (isCredentialFill(step)) lastCredential = index;
+  }
+  if (lastCredential === -1) return { steps: [...steps], moved: false };
+  let submit = -1;
+  for (let i = lastCredential + 1; i < steps.length; i += 1) {
+    if (steps[i]!.action === 'click') {
+      submit = i;
+      break;
+    }
+  }
+  if (submit === -1) return { steps: [...steps], moved: false };
+
+  // The anchor: right after the submit and its login proof (the contiguous
+  // expectHidden/expectUrl steps the prompt asks for).
+  let anchor = submit + 1;
+  while (
+    anchor < steps.length &&
+    (steps[anchor]!.action === 'expectHidden' || steps[anchor]!.action === 'expectUrl')
+  ) {
+    anchor += 1;
+  }
+
+  const acceptAt = steps.findIndex((step, index) => index >= anchor && isConsentAccept(step));
+  if (acceptAt === -1 || acceptAt === anchor) return { steps: [...steps], moved: false };
+  // Only a misplacement is repaired: something between the anchor and the
+  // accept must be a navigation or an assertion that would otherwise run
+  // against the gate.
+  const between = steps.slice(anchor, acceptAt);
+  if (!between.some((step) => step.action === 'goto' || step.action.startsWith('expect'))) {
+    return { steps: [...steps], moved: false };
+  }
+
+  const accept = steps[acceptAt]!;
+  const conditional: FlowStep =
+    accept.action === 'click'
+      ? {
+          action: 'when',
+          visible: accept.selector,
+          then: [accept],
+          ...(accept.intent === undefined ? {} : { intent: accept.intent }),
+        }
+      : accept;
+  const out = [...steps];
+  out.splice(acceptAt, 1);
+  out.splice(anchor, 0, conditional);
+  return { steps: out, moved: true };
+}
+
 export function groundCredentialFills(
   prefix: readonly FlowStep[],
   steps: readonly FlowStep[],
@@ -2495,6 +3444,192 @@ export function groundCredentialFills(
     out.push(step);
   }
   return { steps: out, grounded };
+}
+
+/**
+ * Force the supplied account's password onto the fills that sign in AS that
+ * account.
+ *
+ * Measured on be100 (2026-08-23, 107 flows): 88 typed the `--as` password
+ * exactly; 19 invented one (`Password123!`, `AdminPass123!`, `password`, …) —
+ * and every one of those spent its whole run against the sign-in page, failed
+ * the login proof, and filed defects about an application that was fine. The
+ * prompt states the precedence ("use these characters exactly"); this is the
+ * guarantee — the `groundCredentialFills` move: a string replacement should
+ * never cost an authoring call, let alone a whole red run.
+ *
+ * Narrow on purpose, two gates both required:
+ * - the segment (fills since the last `goto`) types the supplied email, so a
+ *   three-persona catalog keeps its other personas untouched; and
+ * - the segment's tail carries an `expectHidden` login proof — the flow MEANS
+ *   this sign-in to succeed. A negative test that deliberately types a wrong
+ *   password asserts an error message instead, and is left exactly as written.
+ *
+ * Steps are mutated in place (the `applyReview` precedent) so a case list
+ * holding the same objects sees the correction without a second pass.
+ */
+export function groundCredentialValues(
+  steps: readonly FlowStep[],
+  credentials: { email: string; password: string },
+): number {
+  let corrected = 0;
+  let segmentStart = 0;
+  const segments: [number, number][] = [];
+  for (const [index, step] of steps.entries()) {
+    if (step.action === 'goto') {
+      segments.push([segmentStart, index]);
+      segmentStart = index + 1;
+    }
+  }
+  segments.push([segmentStart, steps.length]);
+
+  for (const [from, to] of segments) {
+    const segment = steps.slice(from, to);
+    const typesEmail = segment.some(
+      (s) =>
+        (s.action === 'fill' || s.action === 'type') &&
+        s.value.trim().toLowerCase() === credentials.email.toLowerCase(),
+    );
+    if (!typesEmail) continue;
+    const meansToSucceed = segment.some((s) => s.action === 'expectHidden');
+    if (!meansToSucceed) continue;
+    for (const step of segment) {
+      if (step.action !== 'fill' && step.action !== 'type') continue;
+      if (!isCredentialFill(step)) continue;
+      if (step.value === credentials.password) continue;
+      // The email field can itself read as a credential fill (an intent
+      // mentioning "password credentials"); never overwrite the identity.
+      if (step.value.trim().toLowerCase() === credentials.email.toLowerCase()) continue;
+      (step as { value: string }).value = credentials.password;
+      corrected += 1;
+    }
+  }
+  return corrected;
+}
+
+/**
+ * The distinct identities this flow signs in as, in order of first use.
+ *
+ * Segmented by `goto`: the fills between two navigations belong to one form,
+ * so a two-step sign-in (identity → Next → password) stays one segment even
+ * though a click sits between its fills. A segment is a credential segment
+ * when its navigation looked like a sign-in page (`LOGIN_URL_PATTERN`) or any
+ * of its fills is credential-shaped (`isCredentialFill`); its identity is the
+ * first email-shaped value it types, else its first typed value. More than
+ * one distinct identity means the flow SWITCHES PERSONA — an end-to-end fact
+ * about the flow whatever scope the request asked for, and the trigger for
+ * `groundPersonaSwitches`.
+ */
+export function switchesPersona(
+  setup: readonly FlowStep[],
+  steps: readonly FlowStep[],
+): string[] {
+  const identities: string[] = [];
+  let lastGoto: string | null = null;
+  let fills: { value: string; credential: boolean }[] = [];
+  const flush = (): void => {
+    if (fills.length === 0) return;
+    const onSignIn = lastGoto !== null && LOGIN_URL_PATTERN.test(lastGoto);
+    if (onSignIn || fills.some((f) => f.credential)) {
+      const identity = (fills.find((f) => f.value.includes('@')) ?? fills[0])!.value.toLowerCase();
+      if (identities[identities.length - 1] !== identity) identities.push(identity);
+    }
+    fills = [];
+  };
+  for (const step of [...setup, ...steps]) {
+    if (step.action === 'goto') {
+      flush();
+      lastGoto = step.url;
+      continue;
+    }
+    if ((step.action === 'fill' || step.action === 'type') && step.value.trim() !== '') {
+      fills.push({ value: step.value.trim(), credential: isCredentialFill(step) });
+    }
+  }
+  flush();
+  return [...new Set(identities)];
+}
+
+/**
+ * Put the application's own sign-out in front of every persona switch.
+ *
+ * The prompt asks for it; this is the guarantee, the `groundCredentialFills`
+ * move: a credential segment whose identity differs from the one before it,
+ * with no `signOut` between them, gets `{ action: 'signOut' }` spliced in
+ * before the `goto` that opens its sign-in — so the switch travels the
+ * application's own sign-out path (the thing an end-to-end test is for)
+ * instead of filling a login form the app hides from signed-in users, or
+ * faking the switch with a storage wipe a cookie-backed session survives.
+ * Runs after `groundCredentialFills`, so a stranded block has its `goto` by
+ * the time this looks for one. Disclosed on notes, never silent.
+ */
+export function groundPersonaSwitches(
+  prefix: readonly FlowStep[],
+  steps: readonly FlowStep[],
+): { steps: FlowStep[]; inserted: number } {
+  const prefixIdentities = switchesPersona(prefix, []);
+  let previousIdentity: string | null = prefixIdentities[prefixIdentities.length - 1] ?? null;
+  let lastGoto: string | null = null;
+  // `pendingSignOut`: a signOut stands between the previous credential
+  // segment's fills and the upcoming one — the switch is already grounded.
+  let pendingSignOut = false;
+  for (const step of prefix) {
+    if (step.action === 'goto') lastGoto = step.url;
+    if (step.action === 'signOut') pendingSignOut = true;
+    if ((step.action === 'fill' || step.action === 'type') && isCredentialFill(step)) {
+      pendingSignOut = false;
+    }
+  }
+
+  const out: FlowStep[] = [];
+  let inserted = 0;
+  let segmentStart = 0;
+  let segmentGotoAt: number | null = null;
+  let fills: { value: string; credential: boolean }[] = [];
+  // A signOut arriving AFTER the current segment's fills belongs to the NEXT
+  // switch, not this one — the flush below must not consume it.
+  let signOutAfterFills = false;
+  const flush = (): void => {
+    if (fills.length > 0) {
+      const onSignIn = lastGoto !== null && LOGIN_URL_PATTERN.test(lastGoto);
+      if (onSignIn || fills.some((f) => f.credential)) {
+        const identity = (fills.find((f) => f.value.includes('@')) ?? fills[0])!.value.toLowerCase();
+        if (previousIdentity !== null && identity !== previousIdentity && !pendingSignOut) {
+          out.splice(segmentGotoAt ?? segmentStart, 0, {
+            action: 'signOut',
+            intent: "end the previous persona's session through the application before signing in as the next",
+          });
+          inserted += 1;
+        }
+        previousIdentity = identity;
+        pendingSignOut = signOutAfterFills;
+      } else {
+        pendingSignOut = pendingSignOut || signOutAfterFills;
+      }
+      fills = [];
+    }
+    signOutAfterFills = false;
+  };
+  for (const step of steps) {
+    if (step.action === 'goto') {
+      flush();
+      lastGoto = step.url;
+      out.push(step);
+      segmentGotoAt = out.length - 1;
+      segmentStart = out.length;
+      continue;
+    }
+    if (step.action === 'signOut') {
+      if (fills.length > 0) signOutAfterFills = true;
+      else pendingSignOut = true;
+    }
+    if ((step.action === 'fill' || step.action === 'type') && step.value.trim() !== '') {
+      fills.push({ value: step.value.trim(), credential: isCredentialFill(step) });
+    }
+    out.push(step);
+  }
+  flush();
+  return { steps: out, inserted };
 }
 
 /**

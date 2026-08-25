@@ -37,6 +37,7 @@
 import { z } from 'zod';
 
 import { lenientObject } from '../providers/model-output.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 
 import {
   LlmFactory,
@@ -47,6 +48,7 @@ import type { ExtractedDocument } from './extract.js';
 
 /** Claims asked for in one call. Beyond this a catalog wants splitting up. */
 export const DEFAULT_MAX_CLAIMS = 40;
+export const END_SUPPORTING_CONTEXT = '--- END SUPPORTING CONTEXT ---';
 
 export interface CatalogClaim {
   /** One thing the document says must be true, in the document's own terms. */
@@ -118,7 +120,24 @@ Rules:
 - NEVER invent a claim the document does not make. A short document yields few claims; that is a correct answer.
 - Mark a line that only sets up context (who is logged in, what data exists) as testable=false.
 - "source" is where you found it: a heading, a row identifier, a section number. If there is no marker, quote three or four words of the line.
-- "priority" is high, medium or low — as the document states it, or your reading of how central it is.`;
+- "priority" is high, medium or low — as the document states it, or your reading of how central it is.
+
+${DETERMINISM_RULES}
+
+${procedure('HOW TO LIST THE CLAIMS', [
+  'Walk the catalog top to bottom, in its own order. Claims come out in DOCUMENT ORDER — never regrouped, never sorted by importance.',
+  'For each row, section or paragraph: one claim per assertion it makes. A sentence with "and" between two checkable things is two claims; a numbered "Expected output" list is one claim per number.',
+  'Keep the document\'s identifiers: "source" is the case id / row id / heading exactly as written (PB_01_01, "3.2 Session timeout"), or the first four words of the line when there is none.',
+  'Priority: the document\'s own word when it has one (High/Medium/Low → high/medium/low); otherwise medium. Never infer high from tone.',
+  'testable=false for a line that only states who is signed in, what data exists, or what environment is running; everything that says what the application must show or do is testable=true.',
+])}
+
+${selfCheck([
+  'Every claim quotes or closely paraphrases a line of the CATALOG section, none of the SUPPORTING CONTEXT.',
+  'Claims are in document order and no two claims restate one line.',
+  'Every claim with a document identifier carries it verbatim in "source".',
+  'No claim mentions a selector, a click, a step, or code.',
+])}`;
 
 /** Exported for the test that asserts the two kinds of document stay apart. */
 export function buildClaimsPrompt(request: ClaimsRequest): string {
@@ -376,6 +395,12 @@ export function buildAuthoringPrompt(
         document.text,
     );
   }
+  // A parseable boundary after the documents. Docs sit FIRST deliberately —
+  // identical across every row of a catalog, they form a shared prompt prefix
+  // a provider's implicit cache can bill at cache rates — and this sentinel is
+  // what lets the reviewer elide them instead of paying for the whole document
+  // set a second time per reviewed flow.
+  if ((options.context ?? []).length > 0) parts.push(END_SUPPORTING_CONTEXT);
 
   if (options.summary !== undefined && options.summary !== '') {
     parts.push(`The catalog this comes from: ${options.summary}`);
@@ -395,6 +420,17 @@ export function buildAuthoringPrompt(
         'them, what should be true afterwards. Follow the steps; turn each expected ' +
         'output into an assertion. An expectation numbered 3.2 belongs after the ' +
         'step numbered 3.\n\n' +
+        // Expected values are the sheet's word, and a citation is a pointer,
+        // never a licence to invent: the value lives in the cited source, and
+        // retrieval has already placed that source's relevant passage in the
+        // SUPPORTING CONTEXT above.
+        'EXPECTED VALUES: the test case itself is the authority — quote its expected ' +
+        'output wording and values exactly. When a case refers to another source for a ' +
+        'value ("as per …", "according to …", "ตาม…", a named document, master list or ' +
+        'section), that source\'s relevant passage is in the SUPPORTING CONTEXT above: ' +
+        'take the exact value from there. Never invent a value neither the case nor ' +
+        'the context states — if the cited value is genuinely absent from both, assert ' +
+        'what the case itself states and nothing more.\n\n' +
         options.cases.join('\n\n'),
     );
   } else {

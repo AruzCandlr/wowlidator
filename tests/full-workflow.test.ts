@@ -21,7 +21,7 @@ import type { AddressInfo } from 'node:net';
 
 import { z } from 'zod';
 
-import { jsonModel } from './helpers.js';
+import { jsonModel, scriptedModel } from './helpers.js';
 import { MockLanguageModelV4 } from 'ai/test';
 
 import { ProofBundleBuilder, type Defect } from '../src/engine/proof-bundle.js';
@@ -51,7 +51,7 @@ import {
   slugify,
   writeHtmlReport,
 } from '../src/reporter/html-reporter.js';
-import { ConfigError, DEFAULT_ROLE_MODELS, loadConfig } from '../src/config.js';
+import { ConfigError, DEFAULT_ROLE_MODELS, loadConfig, DEFAULT_PROVIDER_MODELS, LOCAL_LLM_PLACEHOLDER_KEY } from '../src/config.js';
 import { hasAssertion, hasStorableOrigin, type FlowStep } from '../src/engine/runner.js';
 import {
   canonicalSelector,
@@ -726,6 +726,70 @@ describe('form-case generation honesty', () => {
 
 });
 
+describe('a response cut at the output budget', () => {
+  // The live failure, 2026-08-19: a thinking model spent the budget on hidden
+  // reasoning, the JSON arrived cut off, and — at temperature 0 — the re-ask
+  // repeated the identical request and was cut identically, three times, and
+  // then the circuit breaker put a whole catalog run down. A length cut is
+  // deterministic; only a bigger budget can change it.
+  it('is re-asked with a bigger budget, not the same one', async () => {
+    resetStructuredBreaker();
+    const budgets: number[] = [];
+    const model = new MockLanguageModelV4({
+      provider: 'mock',
+      modelId: 'thinker',
+      doGenerate: async (options) => {
+        budgets.push(options.maxOutputTokens ?? -1);
+        const cut = budgets.length === 1;
+        return {
+          content: [{ type: 'text', text: cut ? '{"ok": "yes' : '{"ok": "yes"}' }],
+          finishReason: { unified: cut ? 'length' : 'stop', raw: cut ? 'length' : 'stop' },
+          usage: {
+            inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 5, text: 5, reasoning: 0 },
+          },
+          warnings: [],
+        };
+      },
+    });
+    const result = await generateStructured({
+      model,
+      modelLabel: 'mock:thinker',
+      schema: z.object({ ok: z.string() }),
+      system: 's',
+      prompt: 'p',
+      maxOutputTokens: 1024,
+      maxRetries: 0,
+    });
+    assert.equal(result.object.ok, 'yes');
+    assert.deepEqual(budgets, [1024, 2048], 'the second ask doubles the budget');
+    resetStructuredBreaker();
+  });
+
+  it('never grows the budget for a failure that was not a cut', async () => {
+    resetStructuredBreaker();
+    const budgets: number[] = [];
+    const model = scriptedModel('mock:prose', ['not json at all', { ok: 'yes' }]);
+    const original = model.doGenerate;
+    (model as unknown as { doGenerate: typeof original }).doGenerate = async (options) => {
+      budgets.push(options.maxOutputTokens ?? -1);
+      return original(options);
+    };
+    const result = await generateStructured({
+      model,
+      modelLabel: 'mock:prose',
+      schema: z.object({ ok: z.string() }),
+      system: 's',
+      prompt: 'p',
+      maxOutputTokens: 1024,
+      maxRetries: 0,
+    });
+    assert.equal(result.object.ok, 'yes');
+    assert.deepEqual(budgets, [1024, 1024], 'a prose reply is re-asked at the same budget');
+    resetStructuredBreaker();
+  });
+});
+
 describe('structured-output circuit breaker', () => {
   it('declares a model broken after two exhausted cycles, and stops paying it', async () => {
     resetStructuredBreaker();
@@ -786,6 +850,12 @@ describe('structured-output circuit breaker', () => {
       classifyError(new Error('openrouter:google/gemini-3.6-flash failed to produce a valid structured response: …')),
       EXIT.environment,
     );
+    // A provider that refused the call (quota, rate limit) is environment too —
+    // worded apart from "could not do JSON", because the fix is different.
+    assert.equal(
+      classifyError(new Error('groq:openai/gpt-oss-120b could not be asked — the provider refused the call (rate limit, quota, or credential): Rate limit reached')),
+      EXIT.environment,
+    );
     assert.equal(
       classifyError(new Error('mock structured-output circuit is open: …')),
       EXIT.environment,
@@ -800,8 +870,10 @@ describe('config & llm-factory', () => {
     assert.equal(config.roles.generator.provider, 'google', 'generator wants the biggest context');
     assert.equal(config.roles.agent.provider, DEFAULT_ROLE_MODELS.agent.provider);
     assert.equal(config.roles.generator.modelId, DEFAULT_ROLE_MODELS.generator.modelId);
-    // No keys present, so nothing should claim to be resolvable.
-    assert.deepEqual(config.apiKeys, {});
+    // No keys present, so nothing should claim to be resolvable — except the
+    // local server, which needs none: its placeholder is always there so a
+    // role pointed at it passes every "has a key" gate.
+    assert.deepEqual(config.apiKeys, { local: [LOCAL_LLM_PLACEHOLDER_KEY] });
   });
 
   it('lets any role be re-pointed at any provider', () => {
@@ -825,6 +897,18 @@ describe('config & llm-factory', () => {
     assert.equal(resolved.id, 'groq:some-other-model');
     // Resolution is memoised — the same object comes back.
     assert.equal(factory.forRole('generator'), resolved);
+  });
+
+  it('gives a re-pointed provider its own default model, never another provider\'s', () => {
+    // Live: `WOWLIDATOR_GENERATOR_PROVIDER=zai` alone resolved to
+    // `zai:gemini-3.6-flash` — the generator role's Google default — and the
+    // provider read as broken when only the id was.
+    const config = loadConfig({ WOWLIDATOR_GENERATOR_PROVIDER: 'zai', WOWLIDATOR_AGENT_PROVIDER: 'zai' });
+    assert.equal(config.roles.generator.provider, 'zai');
+    assert.equal(config.roles.generator.modelId, DEFAULT_PROVIDER_MODELS.zai);
+    assert.equal(config.roles.agent.modelId, DEFAULT_PROVIDER_MODELS.zai);
+    // A role left on its own provider keeps its own, role-specific default.
+    assert.equal(config.roles.healer.modelId, DEFAULT_ROLE_MODELS.healer.modelId);
   });
 
   it('rejects an unknown provider rather than failing later', () => {
@@ -1122,19 +1206,26 @@ describe('workflow agent (CDP)', { skip: skipBrowser }, () => {
     });
 
     assert.equal(result.success, true, result.summary);
-    // landing -> consent -> details, then finish.
-    assert.equal(result.turns, 3);
+    // landing -> consent -> details, then finish. The consent interstitial
+    // is the loop's to clear (2026-08-25): a gate on a consent URL with a
+    // name-gated accept control costs no model turn, on any turn — and
+    // since the journey was under way, the agent stays where the accept
+    // lands rather than being returned to the landing page.
+    assert.equal(result.turns, 2);
     assert.equal(result.actions.length, 3);
     assert.equal(result.actions[0]?.action, 'click');
     assert.equal(result.actions[1]?.action, 'click');
+    assert.match(result.actions[1]?.reasoning ?? '', /consent gate/, 'cleared by the loop, not the model');
     assert.equal(result.actions[2]?.action, 'finish');
     assert.ok(result.actions.every((a) => a.ok));
-    assert.equal(result.inputTokens, 580);
+    assert.equal(model.seen.length, 2, 'the model never saw the consent page');
+    assert.equal(result.inputTokens, 280, 'only the landing click was a model turn');
 
-    // History must accumulate, or the model cannot avoid repeating itself.
-    assert.equal(model.seen.length, 3);
+    // History must accumulate, or the model cannot avoid repeating itself:
+    // the second turn reads the landing click and the gate the loop cleared.
     assert.equal(model.seen[0]?.history.length, 0);
-    assert.equal(model.seen[2]?.history.length, 2);
+    assert.equal(model.seen[1]?.history.length, 2);
+    assert.match(model.seen[1]?.history[1] ?? '', /cleared a consent gate on turn 2/);
   });
 
   it('refuses to navigate off the starting origin', async () => {
@@ -1360,8 +1451,10 @@ describe('generation → multi-page run → report (CDP)', { skip: skipBrowser }
     assert.ok(agentStep);
     assert.equal(agentStep.agent?.success, true);
     assert.equal(agentStep.agent?.actions.length, 3);
-    // The agent's token spend must roll into the run summary.
-    assert.equal(bundle.summary.inputTokens, 580);
+    // The agent's token spend must roll into the run summary. One model
+    // turn (the landing click, 280 in); the consent interstitial is cleared
+    // by the loop and the finish carries no tokens.
+    assert.equal(bundle.summary.inputTokens, 280);
 
     // The final assertion ran on /details, which only the agent could reach.
     const finalStep = bundle.steps.at(-1);

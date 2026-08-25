@@ -692,7 +692,7 @@ function agentBlock(agent: AgentRecord): string {
         <tbody>${rows || '<tr><td colspan="5" class="muted">no actions taken</td></tr>'}</tbody>
       </table>
       <dl class="kv">
-        <div><dt>turns</dt><dd>${agent.turns} / ${agent.maxSteps}</dd></div>
+        <div><dt>turns</dt><dd>${agent.maxSteps == null ? `${agent.turns} (no ceiling)` : `${agent.turns} / ${agent.maxSteps}`}</dd></div>
         <div><dt>model</dt><dd>${esc(agent.model)}</dd></div>
         <div><dt>latency</dt><dd>${ms(agent.latencyMs)}</dd></div>
         <div><dt>tokens</dt><dd>${agent.inputTokens ?? 0} in / ${agent.outputTokens ?? 0} out</dd></div>
@@ -921,13 +921,53 @@ function seekControl(step: ProofStep, hasVideo: boolean): string {
   return `<button class="seek" type="button" data-seek="${(step.videoOffsetMs / 1000).toFixed(2)}">▶ play from here (${ms(step.videoOffsetMs)} in)</button>`;
 }
 
+/**
+ * Whether this test meant to prove acceptance or refusal — without the label,
+ * a negative test's green run reads as "the feature works" when it actually
+ * says "the application refused it, as required". The title carries the
+ * reading in full, and says whether the catalog stated it or the harness
+ * inferred it, because those are different strengths of evidence.
+ */
+/**
+ * "expected X · actual Y", rendered on every assertion step that recorded
+ * both — passes included, because "it passed" and "it passed and the page
+ * really held 119 days" are different amounts of evidence. Application text
+ * goes through `captured` like everywhere else it is quoted.
+ */
+function expectedActualLine(step: ProofStep): string {
+  const detail = step.detail;
+  if (!detail || detail['expected'] === undefined) return '';
+  const render = (v: unknown): string => (typeof v === 'string' ? v : JSON.stringify(v));
+  const expected = render(detail['expected']);
+  const actual = detail['actual'] === undefined ? null : render(detail['actual']);
+  const bad = step.status !== 'passed';
+  return `<p class="step-compare">expected <code>${captured(expected)}</code>${
+    actual === null ? '' : ` &middot; actual <code${bad ? ' class="cmp-bad"' : ''}>${captured(actual)}</code>`
+  }</p>`;
+}
+
+function polarityPill(bundle: ProofBundle): string {
+  if (bundle.polarity === undefined) return '';
+  const negative = bundle.polarity === 'negative';
+  const how = bundle.polaritySource === 'stated' ? 'stated by the catalog' : 'inferred from the test\'s own words and assertions';
+  const title = negative
+    ? `a NEGATIVE test — it passes by proving the application refuses or blocks the attempt (${how})`
+    : `a POSITIVE test — it passes by proving the intended path works (${how})`;
+  return `<span class="polarity ${negative ? 'neg' : 'pos'}" title="${esc(title)}">${negative ? 'negative test' : 'positive test'}</span>`;
+}
+
 function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): string {
   const target = step.resolvedSelector ?? step.selector;
   // `intent` gets its own dedicated line — don't also dump it into the generic
   // detail list, that would just repeat the same sentence twice.
+  // `intent`, `expected` and `actual` each get a dedicated line — don't also
+  // dump them into the generic detail list, that would repeat them verbatim.
   const detail = step.detail
-    ? Object.entries(step.detail).filter(([k, v]) => k !== 'intent' || typeof v !== 'string')
+    ? Object.entries(step.detail).filter(
+        ([k, v]) => (k !== 'intent' || typeof v !== 'string') && k !== 'expected' && k !== 'actual',
+      )
     : [];
+  const compare = expectedActualLine(step);
 
   // Intent leads. A reader triaging a red run needs "what was this step for"
   // before "which selector expressed it"; the selector is one line down, and
@@ -945,7 +985,9 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
       <span class="chev" aria-hidden="true">&#9662;</span>
     </button>
     <p class="step-sub"><span class="action">${esc(step.action)}</span> <code class="target">${captured(target ?? '—')}</code></p>
+    ${compare}
     <div class="step-body" hidden>
+      ${step.unsure ? `<div class="callout unsure"><div class="callout-title">Proved-? — a human must rule on this step</div><pre>${captured(step.unsure)}</pre></div>` : ''}
       ${step.error ? `<div class="callout error"><div class="callout-title">Failure</div><pre>${esc(step.error.split('\n')[0] ?? step.error)}</pre></div>` : ''}
       ${pageContextBlock(step)}
       ${seekControl(step, hasVideo)}
@@ -1039,7 +1081,18 @@ h1{font-size:21px;margin:0;font-weight:650;letter-spacing:-.01em}
 .status{font-weight:700;font-size:13px;letter-spacing:.08em;text-transform:uppercase;
   padding:6px 14px;border-radius:999px}
 .status.passed{color:var(--ok);background:var(--ok-bg)}
+.status.passed-with-issues{color:var(--warn);background:var(--warn-bg)}
+.status.needs-review{color:var(--warn);background:var(--warn-bg);border:1px dashed var(--warn)}
+.verdict-card.needs-review{border-left-color:var(--warn)}
+.callout.unsure{border-left:3px solid var(--warn)}
 .status.failed,.status.error,.status.dead-end{color:var(--bad);background:var(--bad-bg)}
+.status-group{display:flex;align-items:center;gap:8px}
+.polarity{font-weight:600;font-size:11px;letter-spacing:.06em;text-transform:uppercase;
+  padding:4px 10px;border-radius:999px;border:1px dashed var(--line);color:var(--muted);cursor:help}
+.polarity.neg{color:var(--warn);border-color:var(--warn)}
+.step-compare{margin:2px 0 0;font-size:12px;color:var(--muted)}
+.step-compare code{font-size:12px}
+.step-compare .cmp-bad{color:var(--bad)}
 .cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));margin-bottom:28px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
 .card .v{font-size:24px;font-weight:650;letter-spacing:-.02em}
@@ -1053,8 +1106,6 @@ ol.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
 .step-head{width:100%;display:flex;align-items:center;gap:11px;padding:11px 14px;background:none;
   border:0;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .step-head:hover{background:color-mix(in srgb,var(--ink) 4%,transparent)}
-.step-intent{margin:0;padding:0 14px 11px 50px;color:var(--muted);font-size:12.5px;/* legacy */
-  font-style:italic;line-height:1.4}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}
 .step.failed .dot,.step.error .dot,.step.dead-end .dot{background:var(--bad)}
 .idx{color:var(--muted);font-size:12px;min-width:20px;font-family:ui-monospace,monospace}
@@ -1188,9 +1239,11 @@ table{width:100%;border-collapse:collapse;font-size:13px}
   border-radius:var(--radius);padding:18px 20px;margin-bottom:18px}
 .verdict.failed,.verdict.error,.verdict.dead-end{border-left-color:var(--bad)}
 .verdict.passed{border-left-color:var(--ok)}
+.verdict.needs-review, .verdict.passed-with-issues{border-left-color:var(--warn)}
 .verdict-headline{margin:0 0 10px;font-size:19px;letter-spacing:-.01em}
 .verdict.failed .verdict-headline,.verdict.error .verdict-headline,.verdict.dead-end .verdict-headline{color:var(--bad)}
 .verdict.passed .verdict-headline{color:var(--ok)}
+.verdict.passed-with-issues .verdict-headline{color:var(--warn)}
 .verdict-line{margin:0 0 7px;font-size:14.5px;line-height:1.55;max-width:78ch}
 .verdict-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}
 .owner{font-size:12px;padding:3px 9px;border-radius:999px;font-weight:600;
@@ -1592,7 +1645,7 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
         ${bundle.cdpUrl ? ` &middot; ${esc(bundle.cdpUrl)}` : ''}
       </div>
     </div>
-    <span class="status ${esc(bundle.status)}">${esc(bundle.status)}</span>
+    <div class="status-group">${polarityPill(bundle)}<span class="status ${esc(bundle.status)}">${esc(bundle.status)}</span></div>
   </header>
 
   ${verdictBlock(verdict)}

@@ -14,7 +14,7 @@ export const USAGE = `wowlidator — decoupled UI testing engine with JIT self-h
 Usage:
   wowlidator ui [--port 4600] [--no-open] [--wow]              everything below, in a browser
   wowlidator go <flow.json | url | "what to test"> [options]   one command, start to report
-  wowlidator run <flow.json> [--repair] [options]
+  wowlidator run <flow.json>... [--repair] [options]        several files run as one suite
   wowlidator generate <url> [--run] [--context] [options]
   wowlidator author "<prompt>" [--url <url>] [--run] [options]
   wowlidator catalog <file> [--claims-only] [--claims <f>] [--url <url>] [--run]
@@ -26,7 +26,7 @@ Usage:
   wowlidator history clear [--all] [--out <proof dir>]
   wowlidator context build [--root <dir>] [--openapi <path|url>] [--db-schema <path>] [--force]
   wowlidator context show  [--root <dir>] [--context-out <path>] [--json]
-  wowlidator context add <path> [--openapi <path|url>] [--db-schema <path>]
+  wowlidator context add <path> [--openapi <path|url>] [--db-schema <path>] [--context-doc <file>]
                                            scan a repository and remember it —
                                            select it on a run with --repo
   wowlidator context list                  the saved repositories and their slugs
@@ -108,8 +108,20 @@ Options:
   -h, --help           Show this message
 
 run options:
-  --repair             On failure, ask AI to rewrite the flow around it and
-                       retry — up to --repair-attempts total runs. Never
+  A suite whose catalog recorded its own results (an Actual Result column)
+  also writes truth-table.html beside the suite index on finish — every case
+  graded TP/TN/FP/FN against the sheet, accuracy/precision/recall on top.
+  Pure arithmetic over the verdicts already earned: zero model tokens.
+  --sheet-order        Keep the suite's own case order. By default readers run
+                       before writers: a read-assertion is authored against the
+                       data as it stood, and a suite that creates or deletes
+                       records mid-run invalidates its own remaining reads.
+                       Use this when the sequence itself is what the suite
+                       tests.
+  --repair             Autoheal: on a failed / error / dead-end result, ask AI
+                       to rewrite the flow around the break and rerun — up to
+                       --repair-attempts total runs. On a catalog or generated
+                       suite it heals each case the same way. Never
                        overwrites the original file: each attempt writes a
                        new <name>.attempt-N.flow.json beside it, plus a
                        <name>.attempt-N.patch explaining the change. Reports
@@ -163,21 +175,33 @@ catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mm
                        model call, no browser. Writes a claims file.
   --claims <path>      Author from an already-reviewed claims file. Strike a
                        claim out by setting its "approved" to false.
+  --resume             Continue a catalog that stopped short, under its original run key:
+                       cases whose verdict is in <claims>.progress.json are pulled into the
+                       roll-up as finished tests; the rest are authored and run
+  --rerun-vacuous      Re-author and re-run every recorded case whose flow asserts nothing about
+                       its claim (only the sign-in proof and a URL); implies --resume
+  --rerun-errors       Re-run every recorded case the harness ended in error; implies --resume
+  --rerun-failed       Re-run every failed / dead-end case with autoheal; implies --resume --repair
   --claims-out <path>  Where --claims-only writes
                        (default: <report-dir>/catalogs/<name>.claims.json)
   --context-doc <path> A supporting document — background for the model, never
                        a source of claims. Repeatable. Not --context, which is
                        the static repository index.
-  --context-budget <n> Characters of that background sent per prompt. Off by
-                       default (0 = send every context document whole). Set it
-                       — 24000 is the measured setting — when a long spec is
-                       authored across many rows: over the budget, the sections
+  --context-budget <n> Characters of that background sent per prompt. Default
+                       24000; 0 sends every context document whole. Over the
+                       budget, the sections
                        that bear on each case are selected and the document's
                        full heading outline is sent with them, so nothing
                        elided reads as absent. A document under the budget, or
                        one the case does not distinguish, is still sent whole.
   --max-claims <n>     Cap on claims read from one catalog (default 40)
   --policy <p>         read-only | forms | mutations      (default forms)
+  --no-author-review   Skip the authoring review. By default every authored
+                       flow gets a second look before it is written: steps
+                       with nothing behind them (a name in no captured tree, a
+                       path no route declares) are checked by the agent role
+                       against the codebase index and the documents, repointed
+                       when the evidence supports it, and reported either way.
   --no-agent-capture   Capture the page immediately instead of letting the
                        agent steady it first (wait out spinners, dismiss
                        overlays, prime lazy content). The pilot is on by
@@ -208,6 +232,30 @@ Browser lifecycle (wowlidator starts and checks Chrome itself — no wrapper scr
                        link is a GET, a button is anything. Even on, a control
                        whose short label reads like an action (Approve, Delete,
                        Submit…) is never clicked.
+  --concurrency <n>    (catalog --run, generate --run) How many cases run at
+                       once, each in its own browser context. A pipelined
+                       catalog with no value stated runs 3 while rows are
+                       still being authored and widens to 5 once authoring
+                       finishes; anywhere else the default is 8. A case that
+                       changes data — fills a form, calls a writing endpoint,
+                       asserts on the database — always runs alone. 1 runs
+                       them one after another, and is the A/B test for a
+                       parallel result that looks wrong.
+  --author-concurrency <n>
+                       (catalog --claims) How many rows of a test-case table
+                       are authored at once (default 3). Each worker reads the
+                       start page in its own tab and makes its own model call;
+                       with --run, a finished case is queued to run at once.
+                       1 authors rows one after another, and is the A/B test
+                       for a batched result that looks wrong.
+  --author-lookahead <n|all>
+                       (catalog --claims --run) How far authoring may run
+                       ahead of the runs. Default 0: rows of a scenario are
+                       authored only once every scenario before it has
+                       finished running, so flows are always written against
+                       the application state their runs will actually see.
+                       A number allows that many scenarios ahead; 'all'
+                       authors eagerly, as before.
   --max-heal <n>       (crawl) Repair attempts per link before falling back to
                        navigating by URL (default 5). Every attempt is recorded
                        in the report, successful or not.

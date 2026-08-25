@@ -26,6 +26,7 @@
 import { spawn } from 'node:child_process';
 
 import type { ProofBundle, RunStatus } from './engine/proof-bundle.js';
+import { isPassing } from './engine/proof-bundle.js';
 import { buildVerdict } from './reporter/verdict.js';
 
 export const DEFAULT_INTERVAL_MS = 15 * 60 * 1000;
@@ -55,7 +56,7 @@ export function classifyChange(bundle: ProofBundle, state: WatchState): ChangeKi
 
   if (state.previousStatus === undefined) return 'first-result';
   if (trend === 'flaky' && state.previousTrend !== 'flaky') return 'now-flaky';
-  if (status !== state.previousStatus) return status !== 'passed' ? 'broke' : 'fixed';
+  if (status !== state.previousStatus) return !isPassing(status) ? 'broke' : 'fixed';
   return 'unchanged';
 }
 
@@ -139,7 +140,7 @@ export function parseInterval(raw: string | undefined): number {
 
 /** One line per iteration, for the terminal. */
 export function formatWatchLine(payload: NotifyPayload, iteration: number): string {
-  const mark = payload.status === 'passed' ? '✓' : '✗';
+  const mark = isPassing(payload.status) ? '✓' : '✗';
   const change =
     payload.change === 'unchanged' ? '' : `  ← ${payload.change.replace(/-/g, ' ').toUpperCase()}`;
   return `[${new Date(payload.startedAt).toISOString().slice(11, 19)}] #${iteration} ${mark} ${payload.name}${change}`;

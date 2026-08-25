@@ -76,7 +76,7 @@ fi
 # where that person was working.
 PATH_FLAGS=(
   --report --report-dir --out --cache --flow --suite
-  --claims --claims-out --context-out --context-doc --root --openapi
+  --claims --claims-out --context-out --context-doc --root --openapi --db-schema
 )
 
 # Absolute against the caller's own directory. A path that is already absolute,

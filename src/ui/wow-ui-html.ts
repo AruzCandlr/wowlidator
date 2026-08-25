@@ -122,7 +122,7 @@ html, body { height: 100%; }
 .dot.off { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 14%, transparent); }
 
 /* ---- main ---- */
-.main { padding: var(--s6) var(--s7) 56px; max-width: 1120px; }
+.main { padding: var(--s6) var(--s7) 56px; }
 .page-head { display: flex; align-items: flex-start; gap: var(--s4); margin-bottom: var(--s7); }
 h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-height: 1.3; margin: 0; }
 .page-head .sub { font-size: var(--fs-sm); color: var(--muted); margin-top: 2px; max-width: 640px; }
@@ -202,6 +202,7 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .chip.verified { background: var(--ok-bg); color: var(--ok); }
 .chip.running { background: var(--info-bg); color: var(--info); }
 .chip.feedback { background: var(--warn-bg); color: var(--warn); }
+.chip.doubt { background: var(--warn-bg); color: var(--warn); border: 1px dashed var(--warn); }
 .chip.escalated { background: var(--bad-bg); color: var(--bad); }
 .chip.blocked { background: var(--warn-bg); color: var(--warn); }
 .chip.plain { background: var(--panel-2); color: var(--muted); }
@@ -261,6 +262,21 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
   border-radius: 10px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; margin-left: 8px;
 }
 .tag.warn { border-color: var(--warn); color: var(--warn); }
+.autoheal-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; cursor: pointer; font-size: 13px; }
+.autoheal-row input { accent-color: var(--accent); }
+.claims-summary { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: var(--panel-2); }
+.cs-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.cs-row { display: flex; align-items: baseline; gap: 8px; padding: 4px 0; flex-wrap: wrap; }
+.cs-row .cd { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; align-self: center; }
+.cs-row .cd.pass { background: var(--ok); }
+.cs-row .cd.fail { background: var(--bad); }
+.cs-claim { font-size: 13px; }
+.cs-cmp { font-size: 11px; color: var(--muted); margin-left: auto; text-align: right; }
+.cs-cmp b { font-weight: 600; color: var(--fg); }
+.why-block { border: 1px solid var(--line); border-left: 3px solid var(--bad); border-radius: 10px; padding: 12px 14px; margin-top: 12px; background: var(--panel-2); }
+.why-headline { font-weight: 700; font-size: 13px; margin: 6px 0 4px; }
+.why-line { font-size: 12.5px; line-height: 1.55; margin-top: 4px; }
+.why-line.muted2 { color: var(--muted); }
 
 /* ---- stats ---- */
 .stats {
@@ -277,7 +293,7 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 
 /* ---- groups & rows ---- */
 .group { margin-bottom: var(--s6); }
-.group-head { display: flex; align-items: center; gap: var(--s2); padding: 0 var(--s1) var(--s2); }
+.group-head { display: flex; align-items: center; gap: var(--s2); padding: 0 var(--s1) var(--s2); flex-wrap: wrap; row-gap: 4px; }
 .avatar {
   width: 24px; height: 24px; border-radius: 6px; background: var(--ink); color: var(--panel);
   font-family: var(--mono); font-size: 11px; font-weight: 700; display: grid; place-items: center; flex: 0 0 auto;
@@ -287,8 +303,104 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .group-head .state { margin-left: auto; font-size: var(--fs-xs); color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 .group-head .state::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); }
 .group-head .state.busy::before { background: var(--info); }
+/* A group header you can shut. Only the ones that collapse get the cursor and
+   the affordance — the three static section labels using .group-head keep
+   looking exactly as they did. */
+.suite-acts { display: inline-flex; gap: 6px; flex: none; }
+.meta.cost { flex: none; white-space: nowrap; }
+.x.mini {
+  width: 16px; height: 16px; font-size: 10px; line-height: 1; margin-left: 4px; opacity: .55;
+  border: 0; background: none; color: var(--faint); border-radius: var(--r-sm);
+  display: inline-grid; place-items: center; cursor: pointer; padding: 0; flex: 0 0 auto;
+}
+.x.mini:hover { opacity: 1; color: var(--bad); background: var(--panel-2); }
+.btn.danger { color: var(--bad); border-color: var(--bad); }
+.btn.danger:hover:not(:disabled) { background: var(--bad); color: var(--panel); }
+.btn.danger:disabled { opacity: .45; cursor: not-allowed; }
+.group-head.clickable { cursor: pointer; border-radius: var(--r-md); }
+.group-head.clickable:hover { background: var(--panel-2); }
+.group-head.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.group-head .twist { color: var(--muted); font-size: var(--fs-sm); width: 12px; }
 
 .rows { overflow: hidden; border-radius: var(--r-lg); }
+
+/* ---- a suite's cases, each with its own bar and its own output ---- */
+.cases { margin-top: var(--s3); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; }
+.cases-head {
+  display: flex; align-items: baseline; gap: var(--s2);
+  padding: var(--s2) var(--s4); background: var(--panel-2); border-bottom: 1px solid var(--line);
+}
+.cases-head b { font-size: var(--fs-sm); font-weight: 600; }
+.cases-head .meta { font-size: var(--fs-xs); color: var(--faint); }
+.case { border-bottom: 1px solid var(--line); }
+.case:last-child { border-bottom: 0; }
+.case.live { background: color-mix(in srgb, var(--info) 6%, transparent); }
+.case-head {
+  display: grid; grid-template-columns: 16px 30px minmax(0, 1fr) auto;
+  align-items: center; gap: 10px; padding: var(--s2) var(--s4);
+  cursor: pointer; color: inherit;
+}
+.case-head:hover { background: var(--panel-2); }
+.case-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.case-head .twist { color: var(--muted); font-size: var(--fs-xs); }
+.case-n { font-size: var(--fs-xs); color: var(--faint); font-variant-numeric: tabular-nums; }
+.case-cell { min-width: 0; }
+.case-name { font-size: var(--fs-sm); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.case-sub { font-size: var(--fs-xs); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.case .prog { padding: 0 var(--s4) var(--s2); }
+.case-out {
+  max-height: 260px; overflow: auto; padding: 8px 12px;
+  white-space: pre-wrap; font-size: var(--fs-xs);
+  border-top: 1px solid var(--line); background: var(--panel-2);
+}
+@media (max-width: 720px) {
+  .case-head { grid-template-columns: 16px 30px minmax(0, 1fr); row-gap: 4px; }
+}
+
+/* A run group: one authoring pass, with its runs beneath it. Its own class
+   rather than the existing .group-head, which is a plain section label and is
+   already used by three other sections. */
+.run-group {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  align-items: center; gap: 12px;
+  margin: var(--s4) 0 var(--s2); padding: var(--s3) var(--s5);
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-lg);
+  cursor: pointer; color: inherit; transition: background .12s ease;
+}
+.run-group:hover { background: var(--panel); }
+.run-group:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.run-group .twist { color: var(--muted); font-size: var(--fs-sm); }
+.group-cell { min-width: 0; }
+.group-name { font-size: var(--fs-md); font-weight: 600; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-sub { font-size: var(--fs-xs); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-tally { font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; }
+.group-tally b { font-weight: 600; color: var(--ink); }
+.group-tally b.ok { color: var(--ok); }
+.group-tally b.bad { color: var(--bad); }
+/* A grouped list is indented under its header, so the nesting is visible
+   without a second border fighting the group's own. */
+.rows.in-group { margin-left: var(--s5); }
+/* A scenario inside a catalog group: one sheet scenario, its cases beneath. */
+.scenario-head { display: flex; align-items: center; gap: var(--s2); padding: var(--s2) var(--s3); cursor: pointer; border-bottom: 1px solid var(--line); background: var(--panel-2); flex-wrap: wrap; row-gap: 4px; }
+.scenario-head:hover { background: var(--panel); }
+.scenario-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.scenario-head .twist { color: var(--muted); font-size: var(--fs-sm); width: 12px; }
+.scenario-head b { font-size: var(--fs-sm); font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scenario-head .pct { margin-left: auto; }
+/* The verdict split as percentages — each kind a count and its share. */
+.pct { font-size: var(--fs-xs); color: var(--muted); display: inline-flex; flex-wrap: wrap; gap: 4px 8px; }
+.pct span { white-space: nowrap; }
+.pct span b { font-weight: 600; }
+.pct .ok b { color: var(--ok); }
+.pct .bad b { color: var(--bad); }
+.pct .warn b { color: var(--warn); }
+.pct .info b { color: var(--info); }
+.rows.in-scenario .row { padding-left: var(--s5); }
+.task-sub .case-title { color: var(--muted); }
+@media (max-width: 720px) {
+  .run-group { grid-template-columns: 18px minmax(0, 1fr); row-gap: 6px; }
+  .rows.in-group { margin-left: 0; }
+}
 .row {
   display: grid; grid-template-columns: 54px minmax(0, 1fr) auto auto auto auto;
   align-items: center; gap: 12px; padding: var(--s3) var(--s5);
@@ -306,7 +418,8 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 }
 .task-sub.fail { font-family: var(--sans); font-size: var(--fs-xs); color: var(--bad); }
 .task-sub.live { font-family: var(--sans); font-size: var(--fs-xs); color: var(--info); }
-.counts { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; }
+.counts { font-size: var(--fs-xs); color: var(--muted); white-space: normal; text-align: right; font-variant-numeric: tabular-nums; }
+.counts b { white-space: nowrap; }
 .counts b { color: var(--ink); font-weight: 600; }
 .counts.none { color: var(--faint); }
 .when { font-size: var(--fs-xs); color: var(--faint); white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; min-width: 92px; }
@@ -540,6 +653,17 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
   .main { padding: var(--s5) var(--s4) 48px; }
   .stats { grid-template-columns: repeat(2, 1fr); }
   .row { grid-template-columns: 54px minmax(0, 1fr); row-gap: 6px; }
+  /* Statistics must never be the thing a narrow window cuts: counts and
+     cost lines become ordinary wrapped text, full width, left-aligned. */
+  .counts { max-width: none; text-align: left; }
+  .when { text-align: left; min-width: 0; }
+  .meta.cost { white-space: normal; }
+  .scenario-head b { white-space: normal; }
+}
+@media (max-width: 480px) {
+  .stats { grid-template-columns: 1fr; }
+  .stat { border-left: 0; border-top: 1px solid var(--line); }
+  .stat:first-child { border-top: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
@@ -551,15 +675,200 @@ const WOW_SCRIPT = String.raw`
 
 /* ------------------------------------------------------------------ state */
 
+/* Did a run's claims hold? Mirrors isPassing() in engine/proof-bundle.ts —
+   the client is a template string and cannot import it. 'passed-with-issues'
+   is a pass whose path broke: green where green means "the claims held",
+   and marked everywhere it is shown so nobody mistakes it for a clean run. */
+function isPassing(status) { return status === 'passed' || status === 'passed-with-issues'; }
+
+/* The status a reader should act on: a human ruling on a proved-? run
+   outranks the machine's deferral. Mirrors effectiveStatus in
+   engine/proof-bundle.ts — the page script cannot import it. */
+function effStatus(x) {
+  if (x && x.status === 'needs-review' && x.review) {
+    return x.review.verdict === 'proved' ? 'passed' : 'failed';
+  }
+  return x ? x.status : '';
+}
+
+/* Which tally bucket a run lands in. Mirrors verdictKind in ui/proofs.ts — the
+   flows view tallies client-side over the latest run of each flow, where the
+   server's per-run grouping does not apply. A quarantined run is in none. */
+function verdictKindOf(x) {
+  if (!x || x.quarantined) return null;
+  var st = effStatus(x);
+  if (isPassing(st)) return 'passed';
+  if (st === 'dead-end') return 'deadEnd';
+  if (st === 'error') return 'error';
+  if (st === 'needs-review') return 'needsReview';
+  return 'failed';
+}
+
+function tallyOf(items) {
+  var counts = { passed: 0, failed: 0, deadEnd: 0, error: 0, needsReview: 0 };
+  items.forEach(function (x) { var k = verdictKindOf(x); if (k) counts[k] += 1; });
+  var total = items.length;
+  var out = {};
+  Object.keys(counts).forEach(function (k) {
+    out[k] = { count: counts[k], percent: total === 0 ? 0 : Math.round(counts[k] / total * 100) };
+  });
+  return out;
+}
+
+/* "proved 67% (4) · failed 17% (1) · dead-end 17% (1)". Zero buckets are left
+   out except proved, so a clean group reads "proved 100%" and nothing else. */
+var TALLY_LABELS = [
+  ['passed', 'proved', 'ok'], ['failed', 'failed', 'bad'], ['deadEnd', 'dead-end', 'bad'],
+  ['error', 'error', 'warn'], ['needsReview', 'proved-?', 'info']
+];
+function tallyLine(tally, total) {
+  var node = el('span', { class: 'pct', title: 'share of the ' + total + ' run(s) in this group' });
+  TALLY_LABELS.forEach(function (t) {
+    var v = tally[t[0]] || { count: 0, percent: 0 };
+    if (v.count === 0 && t[0] !== 'passed') return;
+    var span = el('span', { class: t[2] });
+    span.appendChild(document.createTextNode(t[1] + ' '));
+    span.appendChild(el('b', { text: v.percent + '%' }));
+    span.appendChild(document.createTextNode(' (' + v.count + ')'));
+    node.appendChild(span);
+  });
+  return node;
+}
+
+/* Accuracy = agreement with the sheet's own recorded results. The
+   Positive/Negative column says what a case MEANS to prove and cannot score
+   a run; the ground truth is the Actual Result column — a person ran every
+   case by hand — carried per case as generatedBy.knownResult. A case agrees
+   when its latest verdict matches theirs: passed where they saw Passed,
+   failed where they saw Failed. A dead-end or error run agrees with nothing:
+   it delivered no verdict. Rows the sheet left unverdicted (Cancelled,
+   Pending, blank) are disclosed as unscored, never invented into either
+   side. One verdict per case — the lists arrive newest-first, so the first
+   run seen under a name stands. Mirrors groupAccuracy in ui/proofs.ts;
+   computed here client-side because the flows view tallies over the latest
+   run of each flow, where the server's per-run grouping does not apply. */
+function accuracyOf(items) {
+  var seen = {}, cases = [];
+  items.forEach(function (x) {
+    var key = (x && x.name) || (x && x.runId) || '';
+    if (!seen[key]) { seen[key] = true; cases.push(x); }
+  });
+  var agreed = 0, scored = 0, unscored = 0;
+  cases.forEach(function (x) {
+    var known = x.generatedBy && x.generatedBy.knownResult;
+    if (known !== 'passed' && known !== 'failed') { unscored += 1; return; }
+    scored += 1;
+    var v = verdictKindOf(x);
+    if ((v === 'passed' && known === 'passed') || (v === 'failed' && known === 'failed')) agreed += 1;
+  });
+  return { agreed: agreed, scored: scored, unscored: unscored, percent: scored === 0 ? 0 : Math.round(agreed / scored * 100) };
+}
+
+/* "accuracy 40% (39/98 vs sheet · 10 unscored)". Shown only when the sheet
+   recorded results to compare against — a catalog with no Actual Result
+   column has no ground truth, and a percentage over nothing would be a lie
+   wearing a number. */
+function accuracyLine(items) {
+  var a = accuracyOf(items);
+  if (a.scored === 0) return null;
+  var node = el('span', {
+    class: 'pct',
+    title: 'agreement with the sheet’s recorded Actual Result: verdicts matching what a person found running the same case by hand (' + a.agreed + ' of ' + a.scored + ' recorded case(s); dead-end/error runs deliver no verdict and agree with nothing' + (a.unscored > 0 ? '; ' + a.unscored + ' case(s) have no recorded result and are not scored' : '') + ')'
+  });
+  var span = el('span', { class: a.percent === 100 ? 'ok' : '' });
+  span.appendChild(document.createTextNode('accuracy '));
+  span.appendChild(el('b', { text: a.percent + '%' }));
+  span.appendChild(document.createTextNode(' (' + a.agreed + '/' + a.scored + ' vs sheet' + (a.unscored > 0 ? ' · ' + a.unscored + ' unscored' : '') + ')'));
+  node.appendChild(span);
+  return node;
+}
+
+/* Humanize a token count: 950, 12.3k, 2.1M. */
+function fmtTok(n) {
+  if (!n) return '0';
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+/* Total runtime and runtime-model tokens over a set of runs — the cost line a
+   scenario or catalog header wears next to its verdict tally. Sums EVERY run
+   given (retries included): the cost of a pass is what was actually spent,
+   not what its latest verdicts spent. */
+function costLine(runs) {
+  var ms = 0, tin = 0, tout = 0;
+  runs.forEach(function (r) { ms += r.durationMs || 0; tin += r.inputTokens || 0; tout += r.outputTokens || 0; });
+  var node = el('span', {
+    class: 'meta cost',
+    title: 'total wall clock · runtime model tokens (heals, agent turns, data retries, reconstructions) across ' + runs.length + ' run(s)'
+  });
+  node.appendChild(document.createTextNode(fmtMs(ms)));
+  if (tin > 0 || tout > 0) {
+    node.appendChild(document.createTextNode(' · ' + fmtTok(tin) + ' in / ' + fmtTok(tout) + ' out tok'));
+  }
+  return node;
+}
+
+/* The sheet scenario a run came from. The stamp when the run carries one;
+   otherwise the case id at the head of its name less its last segment
+   (PL_02_03 -> PL_02), which is how a sheet numbers cases inside a scenario.
+   Mirrors inferredScenario / inferredCaseTitle in ui/proofs.ts. */
+var CASE_ID_RE = /^([A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+)(?=\s|$)/;
+function caseIdOf(name) { var m = CASE_ID_RE.exec(name || ''); return m ? m[1] : null; }
+function scenarioOf(x) {
+  if (x && x.generatedBy && x.generatedBy.scenario) return x.generatedBy.scenario;
+  var id = caseIdOf(x && x.name);
+  if (!id) return 'ungrouped';
+  var cut = Math.max(id.lastIndexOf('_'), id.lastIndexOf('-'));
+  return cut <= 0 ? 'ungrouped' : id.slice(0, cut);
+}
+function caseTitleOf(x) {
+  if (x && x.generatedBy && x.generatedBy.caseTitle) return x.generatedBy.caseTitle;
+  var id = caseIdOf(x && x.name);
+  if (!id) return null;
+  var rest = (x.name || '').slice(id.length).trim();
+  return rest === '' ? null : rest;
+}
+
+/* A collapsible scenario header. Keyed on the group and scenario, so a poll
+   never springs a shut one open. */
+function scenarioHead(id, title, items, body, allRuns) {
+  var shut = !!S.shutGroups[id];
+  function toggle() { S.shutGroups[id] = !shut; render(); }
+  var head = el('div', {
+    class: 'scenario-head', role: 'button', tabindex: '0', 'aria-expanded': shut ? 'false' : 'true',
+    onclick: function (e) { e.stopPropagation(); toggle(); },
+    onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } }
+  }, [
+    el('span', { class: 'twist', text: shut ? '\u25B8' : '\u25BE' }),
+    el('b', { text: title + ' · ' + items.length + ' case(s)' }),
+    tallyLine(tallyOf(items), items.length),
+    /* Every run of the scenario, retries included — the tally reads the
+       latest verdicts, the cost reads what was spent getting them. */
+    costLine(allRuns || items),
+    // One click reruns or heals the scenario's cases as one job — never a
+    // job per case against a browser that refuses a second one.
+    suiteRunButtons(items)
+  ]);
+  body.appendChild(head);
+  return !shut;
+}
+
 var S = {
   meta: null, online: true,
   view: 'runs',
-  proofs: [], flows: [], jobs: [], reports: [], cache: [],
+  proofs: [], flows: [], jobs: [], reports: [], cache: [], failedRuns: [],
+  catalogRuns: [],   /* catalog run ledgers on disk — the resumable record, survives a panel restart */
+  groups: [],        /* runs grouped by the authoring pass that made them */
+  shutGroups: {},    /* group id -> collapsed. Open is the default: a group
+                        nobody has touched must show its runs. */
+  openCase: {},      /* 'case:<job>:<n>' -> its output pane is expanded */
   keys: { providers: [], roles: [] },
-  models: { providers: [], roles: [] },  /* the model catalogue, and each role's pick */
+  models: { providers: [], roles: [], checks: [], checking: [] },  /* the model catalogue, each role's pick, and its last readiness check */
   contextDocs: [],   /* stored background documents — see the launcher */
   repos: [],         /* saved repositories (context add) — see Machinery › Repositories */
   bundles: {},       /* runId -> the full bundle, fetched when a run is opened */
+  verdicts: {},      /* runId -> the server-computed verdict (same pure function the report leads with) */
   openTask: null,    /* which flow's detail is expanded */
   cycleOf: {},       /* flow name -> the run being shown in its detail */
   filter: 'all',
@@ -664,6 +973,36 @@ function tail(path) {
 }
 
 /** What a step checked, in the author's words when there are any. */
+/* Whether the test means to prove acceptance or refusal. Without the label a
+   negative test's green run reads as "the feature works" when it says the
+   opposite: "the application refused it, as required". Rendered for both
+   readings — a reader scanning a mixed catalog needs the positives labelled
+   too, or absence is ambiguous. */
+function polarityTag(polarity, source) {
+  if (!polarity) return null;
+  var negative = polarity === 'negative';
+  var how = source === 'stated' ? 'stated by the catalog' : 'inferred from the test\u2019s own words and assertions';
+  return el('span', {
+    class: 'tag' + (negative ? ' warn' : ''),
+    title: negative
+      ? 'a NEGATIVE test \u2014 it passes by proving the application refuses or blocks the attempt (' + how + ')'
+      : 'a POSITIVE test \u2014 it passes by proving the intended path works (' + how + ')',
+    text: negative ? 'negative' : 'positive'
+  });
+}
+
+/* The expected-vs-actual line an assertion recorded, pass or fail \u2014 "it
+   passed" and "it passed and the page really held 119 days" are different
+   amounts of evidence. */
+function expectedActualOf(step) {
+  var d = step.detail;
+  if (!d || d.expected === undefined) return null;
+  var render = function (v) { return typeof v === 'string' ? v : JSON.stringify(v); };
+  var out = 'expected ' + render(d.expected);
+  if (d.actual !== undefined) out += ' \u00b7 actual ' + render(d.actual);
+  return out;
+}
+
 function stepClaim(step) {
   if (step.intent) return step.intent;
   return step.action + (step.selector ? ' ' + step.selector : '');
@@ -712,13 +1051,18 @@ function blockers(step) {
 }
 
 /** The flow file this run came from, when the panel can see one. */
-function flowPathFor(name) {
-  var exact = S.flows.filter(function (f) { return f.name === name; })[0];
-  if (exact) return exact.path;
-  var byFile = S.flows.filter(function (f) {
-    return f.path.split('/').pop().replace(/\.flow\.json$/i, '') === name;
-  })[0];
-  return byFile ? byFile.path : null;
+function flowPathFor(name, renamedFrom) {
+  var candidates = renamedFrom ? [name, renamedFrom] : [name];
+  for (var i = 0; i < candidates.length; i++) {
+    var want = candidates[i];
+    var exact = S.flows.filter(function (f) { return f.name === want; })[0];
+    if (exact) return exact.path;
+    var byFile = S.flows.filter(function (f) {
+      return f.path.split('/').pop().replace(/\.flow\.json$/i, '') === want;
+    })[0];
+    if (byFile) return byFile.path;
+  }
+  return null;
 }
 
 /* -------------------------------------------------------------- grouping */
@@ -727,22 +1071,48 @@ function flowPathFor(name) {
  * Runs, grouped the way GRIM groups cycles: one row per flow, and one chip per
  * run of it, oldest to newest. S.proofs arrives newest first.
  */
+/**
+ * Which authoring pass produced this run — the identity of a batch.
+ *
+ * A catalog becomes a case per approved claim, and every case of one pass
+ * carries the same generatedAt. Running that catalog again produces a new one,
+ * which is what makes "the same catalog, run twice" two things rather than one
+ * thing with twelve runs. Anything nobody authored as a batch is its own.
+ */
+function batchOf(proof) {
+  return proof.generatedBy && proof.generatedBy.generatedAt
+    ? 'batch:' + proof.generatedBy.generatedAt
+    : 'run';
+}
+
+/** What to call a batch: the document it came from, or the best thing left. */
+function batchTitle(proof) {
+  if (!proof.generatedBy) return 'Authored flows';
+  return proof.generatedBy.source || proof.generatedBy.sourceUrl;
+}
+
 function tasks() {
   var byName = {};
   var order = [];
   S.proofs.forEach(function (proof) {
-    if (!byName[proof.name]) { byName[proof.name] = []; order.push(proof.name); }
-    byName[proof.name].push(proof);
+    // Keyed by batch AND name: two runs of PB_01_01 from two different
+    // catalog passes are two results about two different authorings, and
+    // stacking them as cycles of one flow hid which pass a verdict belonged
+    // to — the rail showed three chips spanning three catalogs.
+    var key = batchOf(proof) + '\u0000' + proof.name;
+    if (!byName[key]) { byName[key] = []; order.push(key); }
+    byName[key].push(proof);
   });
-  return order.map(function (name) {
-    var cycles = byName[name].slice().reverse();
+  return order.map(function (key) {
+    var cycles = byName[key].slice().reverse();
     var latest = cycles[cycles.length - 1];
     return {
-      key: name,
-      name: name,
+      key: key,
+      name: latest.name,
       cycles: cycles,
       latest: latest,
-      origin: latest.generatedBy ? latest.generatedBy.sourceUrl : 'authored',
+      batch: batchOf(latest),
+      origin: batchTitle(latest),
       generated: latest.generatedBy
     };
   });
@@ -752,7 +1122,7 @@ function tasks() {
 function failStreak(task) {
   var streak = 0;
   for (var i = task.cycles.length - 1; i >= 0; i -= 1) {
-    if (task.cycles[i].status !== 'passed') streak += 1; else break;
+    if (!isPassing(task.cycles[i].status)) streak += 1; else break;
   }
   return streak;
 }
@@ -761,11 +1131,23 @@ function groups() {
   var map = {};
   var order = [];
   tasks().forEach(function (task) {
-    if (!map[task.origin]) { map[task.origin] = []; order.push(task.origin); }
-    map[task.origin].push(task);
+    // Grouped on the batch, never on generatedBy.sourceUrl: for a catalog that
+    // is the page every case was grounded against, which is the same login
+    // screen for every catalog anyone has ever run — so every document
+    // collapsed into one group titled with a URL, and a second run of the same
+    // catalog vanished into the first.
+    if (!map[task.batch]) { map[task.batch] = []; order.push(task.batch); }
+    map[task.batch].push(task);
   });
-  return order.map(function (origin) {
-    return { origin: origin, generated: map[origin][0].generated, tasks: map[origin] };
+  return order.map(function (batch) {
+    var first = map[batch][0];
+    return {
+      batch: batch,
+      origin: first.origin,
+      generated: first.generated,
+      tasks: map[batch],
+      runs: map[batch].reduce(function (n, t) { return n + t.cycles.length; }, 0)
+    };
   });
 }
 
@@ -785,7 +1167,7 @@ function runningJobs() {
  * would reintroduce exactly the problem the fingerprint exists to solve. The
  * nodes register here instead, and tickProgress() writes to them.
  */
-function progressBar(job) {
+function progressBar(job, caseNumber) {
   var fill = el('i');
   var bar = el('div', { class: 'pbar' }, [fill]);
   var steps = el('span', { class: 'steps' });
@@ -799,7 +1181,10 @@ function progressBar(job) {
     steps, bar, eta
   ]);
 
-  var live = { jobId: job.id, node: node, bar: bar, fill: fill, steps: steps, eta: eta, etaText: etaText };
+  var live = {
+    jobId: job.id, node: node, bar: bar, fill: fill, steps: steps, eta: eta, etaText: etaText,
+    caseNumber: caseNumber || null
+  };
   S.bars.push(live);
   paintProgress(live, job, 0);
   return node;
@@ -829,8 +1214,17 @@ function clockMs(ms) {
 }
 
 /** Write one bar's current state. "age" is ms since the server last spoke. */
+/** One case of a job, by the number its tag carries. */
+function caseOf(job, number) {
+  var found = (job.cases || []).filter(function (c) { return c.number === number; });
+  return found[0] || null;
+}
+
 function paintProgress(live, job, age) {
-  var progress = job.progress;
+  // A bar bound to a case reads that case's own denominator. The job's own
+  // progress describes the command as a whole and would be the average of
+  // several runs, which is not a thing anybody is waiting for.
+  var progress = live.caseNumber ? (caseOf(job, live.caseNumber) || {}).progress : job.progress;
   var done = (progress && progress.done) || 0;
   var total = progress && progress.total;
 
@@ -924,7 +1318,7 @@ function loopRail(slots, size) {
 }
 
 function railFor(task, isRunning) {
-  var slots = task.cycles.slice(-3).map(function (c) { return c.status === 'passed' ? 'ok' : 'bad'; });
+  var slots = task.cycles.slice(-3).map(function (c) { return c.status === 'passed' ? 'ok' : c.status === 'passed-with-issues' ? 'warn' : 'bad'; });
   if (isRunning && slots.length < 3) slots.push('run');
   while (slots.length < 3) slots.push('empty');
   return loopRail(slots);
@@ -1060,6 +1454,52 @@ function renderRuns(main) {
 
   main.appendChild(statsStrip());
 
+  // A catalog run that ended before every case had a verdict — stopped,
+  // killed, paused, or blocked on the machinery — says why and offers to
+  // continue rather than start the hundred rows over. Read from the ledgers
+  // on disk (each catalog run keeps one, under its unique key of catalog
+  // name + timestamp), so the offer survives a panel restart: continuing
+  // resumes the remaining cases and pulls the ones already tested under the
+  // same key back in as finished tests.
+  (S.catalogRuns || []).filter(function (run) {
+    return !run.running && (run.resumable || run.errors > 0 || run.failed > 0);
+  })
+    .slice(0, 3)
+    .forEach(function (run) {
+      var e = run.ended;
+      var cause = e && e.cause;
+      var head = run.resumable
+        ? (/^paused\b/.test(cause || '') ? 'Paused — ' : 'Stopped — ') + run.title + ' has ' + run.left + ' of ' + run.summary.planned + ' case(s) still to run'
+        : run.title + ' finished — ' + run.errors + ' runtime error(s), ' + run.failed + ' failed';
+      var acts = [];
+      if (run.resumable) acts.push(el('button', { type: 'button', class: 'btn md accent', text: 'Continue testing (' + run.left + ' left)', onclick: function () { resumeCatalog(run.ledgerPath, 'continue'); } }));
+      if (run.errors > 0) acts.push(el('button', { type: 'button', class: 'btn md', title: 'A runtime error is the harness, not a verdict — those cases run again (plus anything still unfinished).', text: 'Rerun all errors (' + run.errors + ')', onclick: function () { resumeCatalog(run.ledgerPath, 'errors'); } }));
+      if (run.failed > 0) acts.push(el('button', { type: 'button', class: 'btn md', title: 'Failed and dead-end cases run again with autoheal on (plus anything still unfinished).', text: 'Heal all failed (' + run.failed + ')', onclick: function () { resumeCatalog(run.ledgerPath, 'failed'); } }));
+      acts.push(el('button', { type: 'button', class: 'btn', title: 'Cases whose flow only asserted the sign-in and a URL are re-authored and run.', text: 'Re-author vacuous', onclick: function () { resumeCatalog(run.ledgerPath, 'vacuous'); } }));
+      acts.push(el('button', {
+        type: 'button', class: 'btn',
+        title: 'Rerun the plan from one case ONWARD in sheet order — earlier verdicts are kept, everything from that case (passes included) runs again in a fresh process on the CURRENT config (.env, models, code).',
+        text: 'Resume from case…',
+        onclick: function () {
+          var caseId = window.prompt('Rerun from which case id? (plan order — that case and everything after it run again on current config)', '');
+          if (caseId === null) return;
+          caseId = caseId.trim();
+          if (caseId === '') return;
+          resumeCatalog(run.ledgerPath, 'from', caseId);
+        }
+      }));
+      main.appendChild(el('div', { class: 'warn-banner', role: 'status' }, [
+        svg(['M12 9v4', 'M12 17h.01', 'M10.36 3.6 2.32 17a2 2 0 0 0 1.71 3h15.94a2 2 0 0 0 1.71-3L13.64 3.6a2 2 0 0 0-3.28 0z']),
+        el('div', {}, [
+          el('b', { text: head }),
+          run.runKey ? el('span', { class: 'fix mono', text: 'run key: ' + run.runKey }) : null,
+          el('span', { class: 'fix mono', text: 'cause: ' + (cause || (run.resumable ? 'the run never recorded how it ended' : 'the run completed')) }),
+          el('span', { class: 'fix', text: 'Every button continues this catalog run under the same key: cases already tested are pulled in as finished tests unless the button says otherwise, and the resumed cases join the original group.' }),
+          el('div', { class: 'acts' }, acts)
+        ])
+      ]));
+    });
+
   var live = runningJobs();
   if (live.length > 0) {
     var section = el('section', { class: 'group' });
@@ -1085,11 +1525,26 @@ function renderRuns(main) {
         el('span', { class: 'when', text: 'started ' + shortTime(job.startedAt) }),
         el('div', { class: 'actions' }, [
           el('button', { type: 'button', class: 'btn', text: 'Output', onclick: function (e) { e.stopPropagation(); toggleOut(job.id, job); } }),
+          /* Pause is only offered where a resume can pick up: a suite with a
+             progress ledger. It is instant — in-flight cases are interrupted
+             and keep no verdict; Continue testing re-runs them from their
+             first step and keeps every finished verdict. */
+          job.commandId === 'catalog-run' ? el('button', {
+            type: 'button', class: 'btn',
+            title: 'Pause immediately: in-flight cases are interrupted and keep no verdict. Continue testing later re-runs them from their first step and keeps everything already finished — on whatever the code says then, not a pre-pause copy.',
+            text: 'Pause', onclick: function (e) { e.stopPropagation(); pauseJob(job.id); }
+          }) : null,
           el('button', { type: 'button', class: 'btn', text: 'Stop', onclick: function (e) { e.stopPropagation(); stopJob(job.id); } })
         ])
       ]));
-      // The console lives under the card it explains, not in a side pane.
-      rows.appendChild(el('div', { class: 'detail' }, [outputSection(job.id, job)]));
+      // The console lives under the card it explains, not in a side pane —
+      // and above it, one row per case, because a suite running six at once
+      // has six things happening and one bar cannot describe them.
+      var detail = el('div', { class: 'detail' });
+      var cases = caseSections(job);
+      if (cases) detail.appendChild(cases);
+      detail.appendChild(outputSection(job.id, job));
+      rows.appendChild(detail);
     });
     section.appendChild(rows);
     main.appendChild(section);
@@ -1114,7 +1569,7 @@ function statsStrip() {
   startOfDay.setHours(0, 0, 0, 0);
   var today = S.proofs.filter(function (p) { return new Date(p.finishedAt || p.startedAt).getTime() >= startOfDay.getTime(); });
   var recent = S.proofs.slice(0, 7);
-  var passed = recent.filter(function (p) { return p.status === 'passed'; }).length;
+  var passed = recent.filter(function (p) { return isPassing(p.status); }).length;
   var pct = recent.length > 0 ? Math.round((passed / recent.length) * 100) : 100;
   var live = runningJobs();
   var stuck = tasks().filter(function (t) { return failStreak(t) >= 3; }).length;
@@ -1146,13 +1601,61 @@ function statsStrip() {
 
 function renderGroup(group) {
   var section = el('section', { class: 'group' });
-  var head = el('div', { class: 'group-head' });
+  var shut = !!S.shutGroups[group.batch];
+  function toggle() { S.shutGroups[group.batch] = !shut; render(); }
+  var head = el('div', {
+    class: 'group-head clickable' + (shut ? ' shut' : ''),
+    role: 'button', tabindex: '0', 'aria-expanded': shut ? 'false' : 'true',
+    onclick: toggle,
+    onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } }
+  });
+  // The affordance first, so what to click is not a guess. Collapsed state is
+  // keyed on the batch, which is stable across polls — a group someone shut
+  // must not spring open because the list was fetched again.
+  head.appendChild(el('span', { class: 'twist', text: shut ? '\u25B8' : '\u25BE' }));
 
   if (group.generated) {
-    head.appendChild(el('span', { class: 'badge gen', text: 'generated' }));
+    head.appendChild(el('span', { class: 'badge gen', text: group.generated.kind || 'generated' }));
     head.appendChild(el('b', { text: group.origin }));
     head.appendChild(el('span', { class: 'chip plain', text: group.generated.model }));
-    head.appendChild(el('span', { class: 'meta', style: 'margin-left:auto', text: group.tasks.length + ' flow(s)' }));
+    // The catalog run's unique key (catalog name + init timestamp) — the same
+    // identity the resumable-runs record lists, so the two can be matched by
+    // eye. Only catalog passes mint one.
+    if (group.generated.runKey) {
+      head.appendChild(el('span', { class: 'chip plain mono', title: 'catalog run key — a resume continues under the same key', text: group.generated.runKey }));
+    }
+    // Which pass this is. Two groups can carry the same document name — that is
+    // the same catalog run twice — so the time is what tells them apart.
+    head.appendChild(el('span', {
+      class: 'meta', style: 'margin-left:auto',
+      text: group.tasks.length + ' flow(s) · authored ' + shortTime(group.generated.generatedAt)
+    }));
+    // The split of the latest verdicts across the catalog, as percentages.
+    var latests = group.tasks.map(function (t) { return t.latest; });
+    head.appendChild(tallyLine(tallyOf(latests), group.tasks.length));
+    // A catalog authored from a sheet may carry the sheet's own recorded
+    // results (Actual Result); when it does, agreement with them is shown.
+    if ((group.generated.kind || '') === 'catalog') {
+      var acc = accuracyLine(latests);
+      if (acc) head.appendChild(acc);
+    }
+    /* The pass's whole bill: every run of every case, retries included. */
+    head.appendChild(costLine(group.tasks.reduce(function (acc, t) { return acc.concat(t.cycles); }, [])));
+    // Rerun or heal the whole pass in one click — one job, one roll-up,
+    // every re-run landing back in this group via the flows' own provenance.
+    head.appendChild(suiteRunButtons(latests));
+    head.appendChild(el('button', {
+      type: 'button', class: 'btn',
+      title: 'Rename this catalog group. Rewrites the recorded document title on every run of the pass; grouping is keyed on the pass stamp, so nothing regroups.',
+      text: 'Rename',
+      onclick: function (e) { e.stopPropagation(); renameGroup(group); }
+    }));
+    head.appendChild(el('button', {
+      type: 'button', class: 'btn danger',
+      title: 'Permanently delete every proof file of this catalog result. Asks for confirmation first.',
+      text: 'Delete',
+      onclick: function (e) { e.stopPropagation(); confirmDeleteGroup(group); }
+    }));
   } else {
     head.appendChild(el('span', { class: 'avatar', text: 'F' }));
     head.appendChild(el('b', { text: 'Authored flows' }));
@@ -1164,11 +1667,32 @@ function renderGroup(group) {
     }));
   }
   section.appendChild(head);
+  if (shut) return section;
 
   var rows = el('div', { class: 'card rows' });
+  // A catalog authored from a sheet carries each row's scenario; group on it,
+  // in first-seen (sheet) order. A pass with no scenarios at all renders flat.
+  var byScenario = {}, scenarioOrder = [];
   group.tasks.forEach(function (task) {
-    rows.appendChild(taskRow(task));
-    if (S.openTask === task.key) rows.appendChild(taskDetail(task));
+    var sc = scenarioOf(task.latest);
+    if (!byScenario[sc]) { byScenario[sc] = []; scenarioOrder.push(sc); }
+    byScenario[sc].push(task);
+  });
+  var flat = scenarioOrder.length === 1 && scenarioOrder[0] === 'ungrouped';
+  scenarioOrder.forEach(function (sc) {
+    var list = byScenario[sc];
+    if (!flat) {
+      var open = scenarioHead(
+        group.batch + '|' + sc, sc,
+        list.map(function (t) { return t.latest; }), rows,
+        list.reduce(function (acc, t) { return acc.concat(t.cycles); }, [])
+      );
+      if (!open) return;
+    }
+    list.forEach(function (task) {
+      rows.appendChild(taskRow(task));
+      if (S.openTask === task.key) rows.appendChild(taskDetail(task));
+    });
   });
   section.appendChild(rows);
   return section;
@@ -1182,12 +1706,16 @@ function taskRow(task) {
   var streak = failStreak(task);
   var escalated = streak >= 3;
   var open = S.openTask === task.key;
-  var flowPath = flowPathFor(task.name);
+  var flowPath = flowPathFor(task.name, task.latest && task.latest.renamedFrom);
 
   var chip;
+  var latestEff = effStatus(latest);
   if (isRunning) chip = verdictChip('running', 'running');
+  else if (latest.status === 'needs-review' && !latest.review) chip = verdictChip('doubt', 'proved-? · confirm below');
+  else if (latest.status === 'needs-review' && latest.review) chip = verdictChip(latestEff === 'passed' ? 'verified' : 'feedback', latestEff === 'passed' ? 'proved (human-confirmed)' : 'failed (human-confirmed)');
   else if (escalated) chip = verdictChip('escalated', 'needs a human');
-  else if (latest.status !== 'passed') chip = verdictChip('feedback', latest.status);
+  else if (latest.status === 'passed-with-issues') chip = verdictChip('doubt', 'pass**');
+  else if (!isPassing(latest.status)) chip = verdictChip('feedback', latest.status);
   else if (latest.quarantined) chip = verdictChip('blocked', 'quarantined');
   else {
     chip = verdictChip('verified', latest.coverage === null
@@ -1198,7 +1726,17 @@ function taskRow(task) {
   var sub;
   if (isRunning) sub = el('div', { class: 'task-sub live', text: 'running ' + job.commandLine });
   else if (escalated) sub = el('div', { class: 'task-sub fail', text: 'failed ' + streak + ' runs in a row: ' + (latest.error || firstFailure(latest) || 'still broken') });
-  else sub = el('div', { class: 'task-sub', text: flowPath ? tail(flowPath) : latest.runId });
+  else {
+    sub = el('div', { class: 'task-sub' });
+    // The sheet's own test-case title first, when the run carries one: the
+    // flow name is the case id plus title and can be cut short by the column.
+    var title = caseTitleOf(latest);
+    if (title) {
+      sub.appendChild(el('span', { class: 'case-title', text: title }));
+      sub.appendChild(document.createTextNode(' · '));
+    }
+    sub.appendChild(document.createTextNode(flowPath ? tail(flowPath) : latest.runId));
+  }
 
   var counts = el('span', { class: 'counts' + (isRunning ? ' none' : '') });
   if (isRunning) counts.textContent = '—';
@@ -1210,6 +1748,18 @@ function taskRow(task) {
     if (latest.jitHeals > 0) {
       counts.appendChild(document.createTextNode(' · '));
       counts.appendChild(el('b', { style: 'color:var(--warn)', text: latest.jitHeals + ' healed' }));
+    }
+    /* The latest run's own cost: wall clock always, tokens when any runtime
+       model was paid. "It passed" and "it passed in 4m for 12k tokens" are
+       different facts, and only the second predicts next week's bill. */
+    counts.appendChild(document.createTextNode(' · ' + fmtMs(latest.durationMs)));
+    if (latest.inputTokens > 0 || latest.outputTokens > 0) {
+      counts.appendChild(document.createTextNode(' · '));
+      counts.appendChild(el('b', {
+        style: 'color:var(--info)',
+        title: 'runtime model tokens this run: heals, agent turns, data retries, reconstructions',
+        text: fmtTok(latest.inputTokens) + ' in / ' + fmtTok(latest.outputTokens) + ' out'
+      }));
     }
   }
 
@@ -1226,7 +1776,13 @@ function taskRow(task) {
     }
   }, [
     railFor(task, isRunning),
-    el('div', { class: 'task-cell' }, [el('div', { class: 'task-name', text: task.name }), sub]),
+    el('div', { class: 'task-cell' }, [
+      el('div', { class: 'task-name' }, [
+        document.createTextNode(task.name),
+        polarityTag(latest.polarity, latest.polaritySource)
+      ]),
+      sub
+    ]),
     chip,
     counts,
     el('span', { class: 'when', text: isRunning ? 'started ' + shortTime(job.startedAt) : timeAgo(latest.finishedAt) }),
@@ -1236,7 +1792,7 @@ function taskRow(task) {
         text: 'Run again', onclick: function () { startRun(task.key, { flow: flowPath }); }
       }),
       el('button', {
-        type: 'button', class: 'btn' + (latest.status !== 'passed' && flowPath && !isRunning ? ' accent' : ''),
+        type: 'button', class: 'btn' + (!isPassing(latest.status) && flowPath && !isRunning ? ' accent' : ''),
         disabled: isRunning || !flowPath || latest.status !== 'failed',
         title: latest.status !== 'failed' ? 'nothing failed — there is nothing to repair' : runAgainTitle,
         text: 'Repair', onclick: function () { startRun(task.key, { flow: flowPath, repair: true }); }
@@ -1269,12 +1825,17 @@ function taskDetail(task) {
   var runId = S.cycleOf[task.key] || task.latest.runId;
   var card = task.cycles.filter(function (c) { return c.runId === runId; })[0] || task.latest;
   var bundle = S.bundles[card.runId];
-  var flowPath = flowPathFor(task.name);
+  var flowPath = flowPathFor(task.name, task.latest && task.latest.renamedFrom);
 
   var detail = el('div', { class: 'detail' });
   detail.appendChild(el('div', { class: 'dh' }, [
     el('span', { class: 'cap', text: 'Run timeline' }),
-    el('span', { class: 'mono', text: flowPath || task.name })
+    el('span', { class: 'mono', text: flowPath || task.name }),
+    el('button', {
+      type: 'button', class: 'btn', style: 'margin-left:auto', text: 'Rename',
+      title: 'Rename every recorded run of this flow. The original name is kept on the record (renamedFrom), so Run again still finds the flow file.',
+      onclick: function () { renameTask(task); }
+    })
   ]));
 
   var cycles = el('div', { class: 'cycles' });
@@ -1287,9 +1848,16 @@ function taskDetail(task) {
       el('div', { class: 'ct' }, [
         el('span', { class: 'cd ' + (c.status === 'passed' ? (c.jitHeals > 0 ? 'warn' : 'pass') : 'fail') }),
         document.createTextNode('Run ' + (index + 1) + ' · ' + fmtMs(c.durationMs)),
-        index === task.cycles.length - 1 ? el('span', { class: 'now', text: 'latest' }) : null
+        index === task.cycles.length - 1 ? el('span', { class: 'now', text: 'latest' }) : null,
+        el('button', {
+          type: 'button', class: 'x mini', 'aria-label': 'Hide this run',
+          title: 'Hide this run from the panel. The proof file moves to archived/ inside the proof directory - move it back to undo.',
+          text: '\u2715',
+          onclick: function (e) { e.stopPropagation(); hideRun(c.runId); }
+        })
       ]),
-      el('div', { class: 'cm', text: c.passed + ' passed / ' + c.failed + ' failed · ' + timeAgo(c.finishedAt) })
+      el('div', { class: 'cm', text: c.passed + ' passed / ' + c.failed + ' failed · ' + timeAgo(c.finishedAt) +
+        (c.inputTokens > 0 || c.outputTokens > 0 ? ' · ' + fmtTok(c.inputTokens) + ' in / ' + fmtTok(c.outputTokens) + ' out tok' : '') })
     ]);
     // The trend line is GRIM's "the code moved between these two cycles", with
     // the signal wowlidator actually has: how this run compares to the last.
@@ -1303,7 +1871,13 @@ function taskDetail(task) {
   if (!bundle) {
     detail.appendChild(el('div', { class: 'mono', style: 'padding:12px', text: 'reading the proof bundle…' }));
   } else {
+    var summary = claimsSummary(bundle);
+    if (summary) detail.appendChild(summary);
     detail.appendChild(checksTable(bundle));
+    var review = reviewBlock(bundle);
+    if (review) detail.appendChild(review);
+    var why = whyBlock(bundle);
+    if (why) detail.appendChild(why);
   }
 
   // The console output of the job that produced this run, collapsed under the
@@ -1393,6 +1967,102 @@ function artifactButton(artifact) {
     text: artifact.kind + ' · ' + artifact.path.split('/').pop(),
     onclick: function (e) { e.stopPropagation(); window.open('/view?path=' + encodeURIComponent(artifact.path), '_blank'); }
   });
+}
+
+/**
+ * The cases of a suite, each with its own bar and its own output.
+ *
+ * A catalog runs its cases concurrently, so one bar and one output pane can
+ * only describe the command; these describe the runs. Each row collapses
+ * independently, and a case that has not started yet is listed rather than
+ * hidden — the roster arrives before anything runs, so what is waiting is
+ * evidence too.
+ */
+function caseSections(job) {
+  if (!job.cases || job.cases.length === 0) return null;
+  var wrap = el('div', { class: 'cases', onclick: function (e) { e.stopPropagation(); } });
+
+  var done = job.cases.filter(function (c) { return c.status !== 'waiting' && c.status !== 'running'; }).length;
+  var running = job.cases.filter(function (c) { return c.status === 'running'; }).length;
+  wrap.appendChild(el('div', { class: 'cases-head' }, [
+    el('b', { text: job.cases.length + ' case' + (job.cases.length === 1 ? '' : 's') }),
+    el('span', { class: 'meta', text: done + ' finished · ' + running + ' running' })
+  ]));
+
+  job.cases.forEach(function (entry) { wrap.appendChild(caseRow(job, entry)); });
+  return wrap;
+}
+
+/* What a status is called on screen. 'passed-with-issues' IS a pass; the
+   asterisks point at the broken action step, and nothing about validation
+   changes. 'error' is the machinery, never a verdict about the application. */
+function caseLabel(status) {
+  if (status === 'passed-with-issues') return 'pass**';
+  if (status === 'error') return 'runtime error';
+  return status;
+}
+
+var CASE_CHIP = {
+  waiting: 'plain', running: 'run', passed: 'verified', 'passed-with-issues': 'doubt',
+  'needs-review': 'doubt',
+  failed: 'feedback', error: 'feedback', 'dead-end': 'feedback', blocked: 'plain'
+};
+
+function caseRow(job, entry) {
+  var key = 'case:' + job.id + ':' + entry.number;
+  var open = !!S.openCase[key];
+  var row = el('div', { class: 'case' + (entry.status === 'running' ? ' live' : '') });
+
+  var head = el('div', {
+    class: 'case-head', role: 'button', tabindex: '0',
+    'aria-expanded': open ? 'true' : 'false',
+    onclick: function () { S.openCase[key] = !open; render(); },
+    onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); S.openCase[key] = !open; render(); } }
+  }, [
+    el('span', { class: 'twist', text: open ? '\u25BE' : '\u25B8' }),
+    el('span', { class: 'case-n', text: 'c' + entry.number }),
+    el('div', { class: 'case-cell' }, [
+      el('div', { class: 'case-name', text: entry.name }),
+      el('div', { class: 'case-sub', text: (entry.exclusive ? 'runs alone (changes data)' : 'runs beside others') + ' · ' + (entry.lineCount || (entry.lines || []).length) + ' line(s)' })
+    ]),
+    el('span', { class: 'chip ' + (CASE_CHIP[entry.status] || 'plain'), text: caseLabel(entry.status),
+      title: entry.status === 'passed-with-issues' ? 'pass: every claim held. ** = a step that only acted (a click, a navigation, an agent leg) broke on the way; it does not affect the verdict' : null })
+  ]);
+  row.appendChild(head);
+
+  // The bar belongs to the case whether or not its output is open: watching
+  // six of them move is the whole point of running them together.
+  if (entry.status === 'running' || (entry.progress && entry.progress.done > 0)) {
+    row.appendChild(progressBar(job, entry.number));
+  }
+
+  if (open) {
+    var pane = el('div', { class: 'case-out mono' });
+    var lines = caseLines(job, entry);
+    if (lines.length === 0) {
+      pane.appendChild(el('div', { style: 'color:var(--faint)', text: 'nothing yet' }));
+    } else {
+      lines.forEach(function (line) { pane.appendChild(outLine(line)); });
+    }
+    row.appendChild(pane);
+  }
+  return row;
+}
+
+/**
+ * One case's output.
+ *
+ * The polled list and the live stream both shed per-case lines — they would be
+ * the same scrollback twice — so a running case's output is demultiplexed here
+ * from the job lines the page already holds. A finished job fetched in full
+ * carries them on the case itself, and that wins when it is there.
+ */
+function caseLines(job, entry) {
+  if (entry.lines && entry.lines.length > 0) return entry.lines;
+  var prefix = '[c' + entry.number + '] ';
+  return (S.jobLines[job.id] || [])
+    .filter(function (line) { return line.text.indexOf(prefix) === 0; })
+    .map(function (line) { return { stream: line.stream, text: line.text.slice(prefix.length) }; });
 }
 
 function outputSection(key, job) {
@@ -1542,12 +2212,39 @@ function renderRepos(main) {
 
   var body = el('tbody');
   (S.repos || []).forEach(function (repo) {
+    // Documents remembered WITH the repository: uploaded once here, read
+    // fresh on every run grounded in this repo. A file re-uploaded under the
+    // same name replaces the remembered one — that is how an updated spec
+    // supersedes the old copy.
+    var pathCell = el('td', { class: 'mono' }, [document.createTextNode(repo.path)]);
+    if (repo.contextDocs && repo.contextDocs.length > 0) {
+      pathCell.appendChild(el('div', { style: 'margin-top:4px;font-size:11px;color:var(--muted)',
+        title: 'context documents remembered with this repository — every run grounded in it reads them automatically',
+        text: 'remembers: ' + repo.contextDocs.map(function (d) { return d.split('/').pop(); }).join(', ') }));
+    }
+    var docPicker = el('input', { type: 'file', accept: DOCUMENT_ACCEPT, style: 'display:none',
+      onchange: function (e) {
+        var chosen = e.target.files && e.target.files[0];
+        if (!chosen) return;
+        readFileAsBase64(chosen)
+          .then(function (base64) { return saveDocument('context', { name: chosen.name, contentBase64: base64 }); })
+          .then(function (doc) {
+            toast('remembering ' + chosen.name + ' with ' + repo.slug + '…');
+            return post('context-add', { path: repo.path, 'context-doc': [doc.path] }, null);
+          })
+          ['catch'](function (error) { toast(error.message); });
+      } });
     body.appendChild(el('tr', {}, [
       el('td', {}, [el('code', { text: repo.slug })]),
-      el('td', { class: 'mono', text: repo.path }),
+      pathCell,
       el('td', { class: 'col-r mono', text: String(repo.nodes) }),
       el('td', { class: 'mono', text: (repo.indexedAt || '').slice(0, 16).replace('T', ' ') }),
       el('td', { class: 'col-r' }, [
+        docPicker,
+        el('button', { type: 'button', class: 'link', text: 'Remember document…',
+          title: 'markdown, text, PDF, PowerPoint, Excel or CSV — background every run grounded in this repository will read',
+          onclick: function () { docPicker.click(); } }),
+        document.createTextNode(' '),
         el('button', { type: 'button', class: 'link', text: 'Re-scan',
           onclick: function () { post('context-add', { path: repo.path }, null); } })
       ])
@@ -1573,6 +2270,123 @@ function renderRepos(main) {
 var BACKEND_ACTIONS = { request: 1, expectStatus: 1, expectJson: 1, expectHeader: 1,
   expectCalls: 1, dbSnapshot: 1, expectDbRow: 1, expectDbDelta: 1, expectDbUnchanged: 1, expectDbCalled: 1 };
 
+/* The claims at a glance, above the table: the test's polarity and every
+   assertion's expected-vs-actual, so a reader sees what was demanded and what
+   the page really held before scrolling a step list. Only assertions that
+   recorded a comparison appear — an action step has nothing to compare. */
+function claimsSummary(bundle) {
+  var rows = (bundle.steps || []).filter(function (step) {
+    return !step.superseded && step.detail && step.detail.expected !== undefined;
+  });
+  var tag = polarityTag(bundle.polarity, bundle.polaritySource);
+  if (rows.length === 0 && !tag) return null;
+
+  var box = el('div', { class: 'claims-summary' });
+  var head = el('div', { class: 'cs-head' }, [
+    el('span', { class: 'cap', text: 'Expected vs actual' }),
+    tag
+  ]);
+  box.appendChild(head);
+  rows.forEach(function (step) {
+    var passed = step.status === 'passed';
+    var render = function (v) { return typeof v === 'string' ? v : JSON.stringify(v); };
+    var line = el('div', { class: 'cs-row' }, [
+      el('span', { class: 'cd ' + (passed ? 'pass' : 'fail') }),
+      el('span', { class: 'cs-claim', text: stepClaim(step) })
+    ]);
+    var cmp = el('div', { class: 'cs-cmp mono' });
+    cmp.appendChild(document.createTextNode('expected '));
+    cmp.appendChild(el('b', { text: render(step.detail.expected) }));
+    if (step.detail.actual !== undefined) {
+      cmp.appendChild(document.createTextNode(' \u00b7 actual '));
+      cmp.appendChild(el('b', { style: passed ? null : 'color:var(--bad)', text: render(step.detail.actual) }));
+    }
+    line.appendChild(cmp);
+    box.appendChild(line);
+  });
+  return box;
+}
+
+/* Why the run is red, under the table — the same pure verdict the HTML report
+   leads with, served alongside the bundle so the two surfaces cannot disagree
+   about the same run. Rendered only for failed / error / dead-end: a green
+   run's why is the table itself. */
+function whyBlock(bundle) {
+  if (bundle.status !== 'failed' && bundle.status !== 'error' && bundle.status !== 'dead-end') return null;
+  var verdict = S.verdicts[bundle.runId];
+  var box = el('div', { class: 'why-block' });
+  box.appendChild(el('div', { class: 'cap', text: 'Why it ' + (bundle.status === 'failed' ? 'failed' : bundle.status === 'dead-end' ? 'dead-ended' : 'errored') }));
+  if (verdict) {
+    box.appendChild(el('div', { class: 'why-headline', text: verdict.headline }));
+    if (verdict.what) box.appendChild(el('div', { class: 'why-line', text: verdict.what }));
+    if (verdict.side) box.appendChild(el('div', { class: 'why-line', text: verdict.side }));
+    if (verdict.history) box.appendChild(el('div', { class: 'why-line muted2', text: verdict.history }));
+    if (verdict.firstFailingStep !== null && verdict.firstFailingStep !== undefined) {
+      box.appendChild(el('div', { class: 'why-line muted2', text: 'First broken step: ' + verdict.firstFailingStep + ' \u2014 its row above carries the evidence.' }));
+    }
+  } else {
+    // The verdict travels with the bundle fetch; a bundle read before this
+    // build (or a fetch that failed) still gets the honest floor.
+    var step = (bundle.steps || []).filter(function (s) { return s.status !== 'passed' && !s.superseded; })[0];
+    box.appendChild(el('div', { class: 'why-line', text: bundle.error || (step ? stepClaim(step) + ' \u2014 ' + ((step.error || '').split('\n')[0] || 'did not hold') : 'the run did not complete') }));
+  }
+  return box;
+}
+
+/* proved-? — the run defers to a human. The block carries the proof of each
+   unsure part (the exact expected-vs-actual pair) and the two rulings; the
+   POST writes the review ruling into the bundle file beside the machine's status. */
+function reviewBlock(bundle) {
+  if (bundle.status !== 'needs-review') return null;
+  var box = el('div', { class: 'why-block', style: 'border-left-color:var(--warn)' });
+  box.appendChild(el('div', { class: 'cap', text: 'Proved-? — needs a human ruling' }));
+  box.appendChild(el('div', { class: 'why-line', text:
+    'Every broken step failed only on wording, and closely: the page produced the right kind of thing under a name the claim does not quite match. Whether that is a spec violation or an acceptable rendering is your call, not the machine\u2019s.' }));
+  (bundle.steps || []).forEach(function (step) {
+    if (!step.unsure || step.superseded) return;
+    var row = el('div', { class: 'why-line' });
+    row.appendChild(el('b', { text: stepClaim(step) + ': ' }));
+    row.appendChild(el('span', { class: 'mono', style: 'font-size:11px', text: step.unsure }));
+    box.appendChild(row);
+  });
+  if (bundle.review) {
+    var byModel = !!bundle.review.by;
+    box.appendChild(el('div', { class: 'why-line', style: 'margin-top:8px' }, [
+      el('b', { text: 'Ruled ' + (bundle.review.verdict === 'proved' ? 'PROVED' : 'FAILED') }),
+      document.createTextNode(
+        byModel
+          ? ' automatically by ' + bundle.review.by +
+            (bundle.review.confidence !== undefined ? ' at confidence ' + Number(bundle.review.confidence).toFixed(2) : '') +
+            ' \u00b7 ' + timeAgo(bundle.review.at)
+          : ' by a human \u00b7 ' + timeAgo(bundle.review.at)
+      )
+    ]));
+    if (byModel && bundle.review.reasoning) {
+      box.appendChild(el('div', { class: 'why-line mono', style: 'font-size:11px', text: bundle.review.reasoning }));
+    }
+    /* A model ruling is replaceable by a human \u2014 never the reverse. */
+    if (!byModel) return box;
+    box.appendChild(el('div', { class: 'why-line', style: 'margin-top:6px', text: 'Disagree? Your ruling replaces the model\u2019s.' }));
+  }
+  var rule = function (verdict, label, cls) {
+    return el('button', { type: 'button', class: 'btn ' + cls, text: label, onclick: function () {
+      api('/api/proofs/' + encodeURIComponent(bundle.runId) + '/review', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ verdict: verdict })
+      }).then(function () {
+        toast('ruled ' + verdict);
+        delete S.bundles[bundle.runId];
+        return loadBundle(bundle.runId);
+      }).then(render)['catch'](function (e) { toast(e.message); });
+    } });
+  };
+  box.appendChild(el('div', { class: 'acts', style: 'margin-top:10px' }, [
+    rule('proved', 'Confirm proved', 'accent'),
+    rule('failed', 'Confirm failed', '')
+  ]));
+  return box;
+}
+
 function checksTable(bundle) {
   if (!bundle.steps || bundle.steps.length === 0) {
     return el('div', { class: 'mono', style: 'padding:12px', text: 'this run recorded no steps' });
@@ -1585,6 +2399,14 @@ function checksTable(bundle) {
     var failedCalls = blockers(step);
 
     var what = el('td', {}, [document.createTextNode(stepClaim(step))]);
+    var compare = expectedActualOf(step);
+    if (compare) {
+      what.appendChild(el('div', {
+        class: 'mono',
+        style: 'margin-top:4px;font-size:11px;color:' + (passed ? 'var(--muted)' : 'var(--bad)'),
+        text: compare
+      }));
+    }
     // "It failed" routes to different people depending on the side it
     // exercised — same split summary.frontend/backend makes for the run.
     if (BACKEND_ACTIONS[step.action] === 1) {
@@ -1593,6 +2415,11 @@ function checksTable(bundle) {
         text: 'backend' }));
     }
     if (family) what.appendChild(el('span', { class: 'tag', title: 'the kind of problem this is — a label from the run, not the raw evidence', text: family }));
+    if (step.unsure) {
+      what.appendChild(el('span', { class: 'tag warn',
+        title: step.unsure,
+        text: 'proved-?' }));
+    }
 
     var how = el('td', { style: 'color:var(--muted)' });
     var repro = step.resolvedSelector || step.selector ||
@@ -1699,7 +2526,7 @@ function evidencePanel(view) {
   var bundle = view.bundle;
   var step = view.step;
   var passed = step.status === 'passed';
-  var flowPath = flowPathFor(bundle.name);
+  var flowPath = flowPathFor(bundle.name, bundle.renamedFrom);
   var reproCommand = flowPath
     ? 'wowlidator run ' + flowPath
     : JSON.stringify({ action: step.action, selector: step.selector || undefined }, null, 2);
@@ -1809,7 +2636,7 @@ function evidenceTrace(panel, bundle, step) {
   if (step.url) panel.appendChild(el('div', { class: 'path', text: step.url }));
 
   panel.appendChild(el('div', { class: 'cap', text: 'How to prove it again yourself' }));
-  var flowPath = flowPathFor(bundle.name);
+  var flowPath = flowPathFor(bundle.name, bundle.renamedFrom);
   panel.appendChild(el('div', {
     class: 'repro',
     text: flowPath
@@ -1928,8 +2755,26 @@ function evidenceFix(panel, bundle, step) {
     panel.appendChild(el('div', { class: 'repro', text: step.agent.goal + '\n\n' + step.agent.summary }));
     panel.appendChild(el('div', { class: 'kv' }, [
       el('b', { text: 'turns: ' }),
-      document.createTextNode(step.agent.turns + ' of ' + step.agent.maxSteps + ' · ' + step.agent.model)
+      document.createTextNode(step.agent.turns + (step.agent.maxSteps == null ? ' (no ceiling)' : ' of ' + step.agent.maxSteps) + ' · ' + step.agent.model)
     ]));
+    /* The action log: what the agent actually DID with the browser, turn by
+       turn — the evidence behind the summary above. A password-shaped fill
+       shows its length, never its characters. */
+    var acts = step.agent.actions || [];
+    if (acts.length > 0) {
+      panel.appendChild(el('div', { class: 'cap', text: 'What the agent did (' + acts.length + ' action(s))' }));
+      var log = acts.map(function (a, i) {
+        var target = a.selector || a.url || '';
+        var value = a.value
+          ? ' = ' + (/password|passwd|pwd/i.test(a.selector || '') ? '•••• (' + a.value.length + ' chars)' : JSON.stringify(a.value))
+          : '';
+        return (a.ok ? '✓' : '✗') + ' ' + (i + 1) + '. ' + a.action + ' ' + target + value +
+          (a.durationMs !== undefined && a.durationMs !== null ? ' (' + fmtMs(a.durationMs) + ')' : '') +
+          (a.reasoning ? '\n     ' + a.reasoning : '') +
+          (a.error ? '\n     FAILED: ' + String(a.error).split('\n')[0] : '');
+      }).join('\n');
+      panel.appendChild(el('div', { class: 'repro', text: log }));
+    }
   }
 
   if (defects.length > 0) {
@@ -1945,6 +2790,50 @@ function evidenceFix(panel, bundle, step) {
 }
 
 /* -------------------------------------------------------------- history */
+
+/**
+ * Failed runs: jobs that finished without producing a proof. Each row is the
+ * job's own account — command line, exit code, the last lines it printed —
+ * because the reason ("cannot reach http://localhost:3000") is the evidence.
+ */
+function renderFailedRuns(main) {
+  var list = S.failedRuns || [];
+  if (list.length === 0) return;
+  main.appendChild(el('div', { class: 'group-head' }, [
+    el('div', { class: 'group-title', text: 'Failed runs — no proof was produced (' + list.length + ')' }),
+    el('div', { class: 'muted2', text: 'The run ended before it could assert anything. Nothing here is a verdict about the application.' })
+  ]));
+  var rows = el('div', { class: 'card rows in-group' });
+  list.forEach(function (run) {
+    var key = 'failed-run:' + run.id;
+    var open = S.openTask === key;
+    var kind = run.status === 'failed' ? 'escalated' : 'blocked';
+    var label = run.status === 'stopped' ? 'stopped' : run.status === 'failed' ? 'failed' : 'did not run';
+    var last = run.reason.length ? run.reason[run.reason.length - 1] : 'no output';
+    rows.appendChild(el('div', {
+      class: 'row' + (open ? ' open' : ''), role: 'button', tabindex: '0', 'aria-expanded': open ? 'true' : 'false',
+      onclick: function () { S.openTask = open ? null : key; render(); },
+      onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); S.openTask = open ? null : key; render(); } }
+    }, [
+      loopRail(['bad', 'empty', 'empty']),
+      el('div', { class: 'task-cell' }, [
+        el('div', { class: 'task-name', text: run.title }),
+        el('div', { class: 'task-sub', text: last })
+      ]),
+      verdictChip(kind, label),
+      el('span', { class: 'when', text: shortTime(run.finishedAt) + (run.exitCode === null ? '' : ' · exit ' + run.exitCode) })
+    ]));
+    if (open) {
+      var detail = el('div', { class: 'detail' });
+      detail.appendChild(el('div', { class: 'why-line muted2', text: run.commandLine }));
+      var pane = el('div', { class: 'mono', style: 'margin-top:var(--s2);max-height:300px;overflow:auto;padding:8px 12px;white-space:pre-wrap;font-size:var(--fs-xs)' });
+      run.reason.forEach(function (text) { pane.appendChild(el('div', { text: text })); });
+      detail.appendChild(pane);
+      rows.appendChild(detail);
+    }
+  });
+  main.appendChild(rows);
+}
 
 function renderHistory(main) {
   main.appendChild(pageHead(
@@ -1978,14 +2867,23 @@ function renderHistory(main) {
           el('button', { type: 'button', class: 'btn', text: 'Output', onclick: function () { toggleOut(job.id, job); } })
         ])
       ]));
-      pending.appendChild(el('div', { class: 'detail' }, [outputSection(job.id, job)]));
+      var pendingDetail = el('div', { class: 'detail' });
+      var pendingCases = caseSections(job);
+      if (pendingCases) pendingDetail.appendChild(pendingCases);
+      pendingDetail.appendChild(outputSection(job.id, job));
+      pending.appendChild(pendingDetail);
     });
     main.appendChild(pending);
   }
 
+  // Runs that ended without a proof — the app was down, Chrome would not
+  // attach, someone stopped it. No bundle, so no row below; remembered by the
+  // server instead, and shown here under the verdicts they never reached.
+  if (S.filter === 'all' || S.filter === 'failed') renderFailedRuns(main);
+
   var counts = {
     all: S.proofs.length,
-    passed: S.proofs.filter(function (p) { return p.status === 'passed'; }).length,
+    passed: S.proofs.filter(function (p) { return isPassing(p.status); }).length,
     failed: S.proofs.filter(function (p) { return p.status === 'failed'; }).length,
     healed: S.proofs.filter(function (p) { return p.jitHeals > 0; }).length
   };
@@ -2000,7 +2898,7 @@ function renderHistory(main) {
   main.appendChild(filters);
 
   var shown = S.proofs.filter(function (p) {
-    if (S.filter === 'passed') return p.status === 'passed';
+    if (S.filter === 'passed') return isPassing(p.status);
     if (S.filter === 'failed') return p.status === 'failed';
     if (S.filter === 'healed') return p.jitHeals > 0;
     return true;
@@ -2014,22 +2912,119 @@ function renderHistory(main) {
     return;
   }
 
-  var rows = el('div', { class: 'card rows' });
-  shown.forEach(function (card) {
+  // Runs are grouped by the authoring pass that produced them. The key is the
+  // pass, never the document's name — running the same catalog again makes a
+  // NEW group, so this morning's six cases never pile on top of last night's
+  // six under one averaged pass rate. See groupRuns() in proofs.ts.
+  var kept = {};
+  shown.forEach(function (p) { kept[p.runId] = true; });
+  var groups = (S.groups || []).map(function (group) {
+    return { group: group, runs: group.runs.filter(function (r) { return kept[r.runId]; }) };
+  }).filter(function (entry) { return entry.runs.length > 0; });
+
+  // A proof directory written before grouping existed has no provenance to
+  // group on. One flat list is the honest fallback: better than a page that
+  // renders nothing because every group came back empty.
+  if (groups.length === 0) groups = [{ group: null, runs: shown }];
+
+  groups.forEach(function (entry) {
+    if (entry.group) main.appendChild(groupHeader(entry.group, entry.runs));
+    if (entry.group && S.shutGroups[entry.group.id]) return;
+    var rows = el('div', { class: 'card rows' + (entry.group ? ' in-group' : '') });
+    var scenarios = entry.group ? entry.group.scenarios || [] : [];
+    var flat = scenarios.length <= 1 && (scenarios.length === 0 || scenarios[0].title === 'ungrouped');
+    if (flat) {
+      entry.runs.forEach(function (card) { appendHistoryRow(rows, card); });
+    } else {
+      // The server's scenario split, narrowed to the runs the filter kept.
+      scenarios.forEach(function (sc) {
+        var list = sc.runs.filter(function (r) { return kept[r.runId]; });
+        if (list.length === 0) return;
+        if (!scenarioHead(sc.id, sc.title, list, rows)) return;
+        list.forEach(function (card) { appendHistoryRow(rows, card); });
+      });
+    }
+    main.appendChild(rows);
+  });
+}
+
+/**
+ * One group's header: what produced these runs, and how they went.
+ *
+ * Clicking collapses it. Open is the default and the state is remembered only
+ * for the groups someone has actually shut, so a run that lands in a new group
+ * while the page is polling shows up rather than arriving pre-hidden.
+ */
+function groupHeader(group, runs) {
+  var shut = !!S.shutGroups[group.id];
+  var passed = 0, failed = 0, quarantined = 0;
+  runs.forEach(function (r) {
+    if (r.quarantined) { quarantined += 1; return; }
+    if (isPassing(r.status)) passed += 1; else failed += 1;
+  });
+  var sub = group.kind + ' · ' + runs.length + ' run' + (runs.length === 1 ? '' : 's');
+  if (group.authoredAt) sub += ' · authored ' + shortTime(group.authoredAt);
+  if (quarantined) sub += ' · ' + quarantined + ' quarantined';
+  function toggle() { S.shutGroups[group.id] = !shut; render(); }
+  return el('div', {
+    class: 'run-group' + (shut ? ' shut' : ''), role: 'button', tabindex: '0',
+    'aria-expanded': shut ? 'false' : 'true',
+    onclick: toggle,
+    onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } }
+  }, [
+    el('span', { class: 'twist', text: shut ? '\u25B8' : '\u25BE' }),
+    el('div', { class: 'group-cell' }, [
+      el('div', { class: 'group-name', text: group.title }),
+      el('div', { class: 'group-sub', text: sub })
+    ]),
+    el('span', { class: 'group-tally' }, [
+      el('b', { class: passed === runs.length ? 'ok' : '', text: String(passed) }),
+      document.createTextNode(' passed'),
+      failed ? el('b', { class: 'bad', text: ' · ' + failed + ' failed' }) : document.createTextNode(''),
+      group.defects ? el('span', { class: 'muted', text: ' · ' + group.defects + ' defect(s)' }) : document.createTextNode(''),
+      document.createTextNode(' · '),
+      tallyLine(tallyOf(runs), runs.length),
+      (function () {
+        if (group.kind !== 'catalog') return document.createTextNode('');
+        var acc = accuracyLine(runs);
+        if (!acc) return document.createTextNode('');
+        var wrap = el('span', {});
+        wrap.appendChild(document.createTextNode(' · '));
+        wrap.appendChild(acc);
+        return wrap;
+      })()
+    ]),
+    el('span', { class: 'when', text: timeAgo(group.finishedAt) })
+  ]);
+}
+
+/** One run inside a group — the row, plus its detail when it is open. */
+function appendHistoryRow(rows, card) {
+  {
     var open = S.openTask === 'history:' + card.runId;
     rows.appendChild(el('div', {
       class: 'row' + (open ? ' open' : ''), role: 'button', tabindex: '0',
       onclick: function () { toggleHistory(card); },
       onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleHistory(card); } }
     }, [
-      loopRail([card.status === 'passed' ? 'ok' : 'bad', 'empty', 'empty']),
+      loopRail([isPassing(card.status) ? 'ok' : 'bad', 'empty', 'empty']),
       el('div', { class: 'task-cell' }, [
-        el('div', { class: 'task-name', text: card.name }),
-        el('div', { class: 'task-sub', text: card.runId + ' · ' + fmtMs(card.durationMs) + (card.trend ? ' · ' + card.trend : '') })
+        el('div', { class: 'task-name' }, [
+          document.createTextNode(card.name),
+          polarityTag(card.polarity, card.polaritySource)
+        ]),
+        el('div', { class: 'task-sub', text: (caseTitleOf(card) ? caseTitleOf(card) + ' · ' : '') + card.runId + ' · ' + fmtMs(card.durationMs) + (card.trend ? ' · ' + card.trend : '') })
       ]),
-      card.status === 'passed'
-        ? verdictChip('verified', card.quarantined ? 'quarantined' : 'proved')
-        : verdictChip('feedback', 'failed'),
+      card.status === 'needs-review'
+        ? (card.review
+            ? verdictChip(effStatus(card) === 'passed' ? 'verified' : 'feedback',
+                effStatus(card) === 'passed' ? 'proved (human-confirmed)' : 'failed (human-confirmed)')
+            : verdictChip('doubt', 'proved-?'))
+        : card.status === 'passed'
+          ? verdictChip('verified', card.quarantined ? 'quarantined' : 'proved')
+          : card.status === 'passed-with-issues'
+            ? verdictChip('doubt', 'pass**')
+            : verdictChip('feedback', 'failed'),
       el('span', { class: 'counts' }, [
         el('b', { text: String(card.passed) }),
         document.createTextNode(' / ' + card.totalSteps + ' steps')
@@ -2044,12 +3039,11 @@ function renderHistory(main) {
     ]));
     if (open) {
       var bundle = S.bundles[card.runId];
-      rows.appendChild(el('div', { class: 'detail' }, [
-        bundle ? checksTable(bundle) : el('div', { class: 'mono', style: 'padding:12px', text: 'reading the proof bundle…' })
-      ]));
+      rows.appendChild(el('div', { class: 'detail' }, bundle
+        ? [claimsSummary(bundle), checksTable(bundle), reviewBlock(bundle), whyBlock(bundle)].filter(Boolean)
+        : [el('div', { class: 'mono', style: 'padding:12px', text: 'reading the proof bundle…' })]));
     }
-  });
-  main.appendChild(rows);
+  }
 }
 
 /**
@@ -2207,7 +3201,7 @@ function renderAttention(main) {
   items.forEach(function (item) {
     var acts = el('div', { class: 'note' });
     if (item.task) {
-      var flowPath = flowPathFor(item.task.name);
+      var flowPath = flowPathFor(item.task.name, item.task.latest && item.task.latest.renamedFrom);
       acts.appendChild(el('button', {
         type: 'button', class: 'btn accent', disabled: !flowPath, text: 'Repair it',
         title: flowPath ? 'run it again, letting the generator rewrite the flow around the break' : 'the .flow.json is not visible from here',
@@ -2309,13 +3303,16 @@ function modelPicker(role) {
         return p.provider === provider.value;
       })[0];
       var first = next && next.models.length > 0 ? next.models[0] : '';
-      if (first === '') {
+      // A fixed-model provider has no id to pick: the server answers with
+      // whatever it loaded, so the first (only) listed alias is the choice.
+      if (first === '' && !(next && next.fixedModel)) {
         toast('pick a model for ' + provider.value + ' — its catalogue could not be read');
         model.value = '';
         model.focus();
         return;
       }
-      selectModel(role, provider.value, first);
+      // Moving onto local keeps whichever port the field shows.
+      selectModel(role, provider.value, first, provider.value === 'local' ? port.value : null);
     }
   });
   (S.models.providers || []).forEach(function (p) {
@@ -2335,7 +3332,31 @@ function modelPicker(role) {
     }
   });
 
-  var row = el('div', { class: 'picker' }, [provider, model, datalist]);
+  // A local server is chosen by port, not by model id: two rerise
+  // instances differ only by the port they listen on. Shown only for local;
+  // for every other provider there is no server on this machine to point at.
+  var port = el('input', {
+    class: 'inp mono', type: 'number', min: '1', max: '65535', step: '1',
+    value: entry.port === null ? '' : String(entry.port),
+    'aria-label': role + ' local server port', placeholder: 'port',
+    style: 'flex: 0 0 auto; width: 7em',
+    onchange: function () {
+      var value = port.value.trim();
+      if (value !== '' && (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535)) {
+        toast('a port is a number from 1 to 65535');
+        port.value = entry.port === null ? '' : String(entry.port);
+        return;
+      }
+      selectModel(role, provider.value, entry.modelId, value === '' ? null : Number(value));
+    }
+  });
+
+  // No model field for a provider that ignores the model in a request — the
+  // model was chosen where the server was started, and a box here would
+  // invite an id the run would record and the server would never honour.
+  var row = el('div', { class: 'picker' },
+    entry.provider === 'local' ? [provider, el('span', { class: 'mono', text: 'localhost :' }), port]
+      : catalogue.fixedModel ? [provider] : [provider, model, datalist]);
   var below = el('div', { class: 'picker-note' });
 
   if (entry.overridden) {
@@ -2353,6 +3374,10 @@ function modelPicker(role) {
           ['catch'](function (error) { toast(error.message); });
       }
     }));
+  } else if (entry.provider === 'local') {
+    below.appendChild(el('span', { class: 'mono', text: 'the server on ' + (entry.baseUrl || '') + ' decides the model' }));
+  } else if (catalogue.fixedModel) {
+    below.appendChild(el('span', { class: 'mono', text: 'the server decides the model' }));
   } else if (catalogue.note) {
     // Why the completions are missing. The field still works.
     below.appendChild(el('span', { class: 'mono', text: catalogue.note }));
@@ -2365,16 +3390,130 @@ function modelPicker(role) {
   return el('div', {}, [row, below]);
 }
 
-/** Send one role's choice, and redraw from what came back. */
-function selectModel(role, provider, modelId) {
-  api('/api/models', {
+/**
+ * Is this role's model ready — the last real call the panel made to find out.
+ *
+ * The catalogue cannot answer it (a listed id can be rate-limited into
+ * uselessness) and neither can the key mask (a present key can be out of
+ * quota). Only a call can, so there is a button, and it spends one small
+ * call — never on a poll. The verdict is chosen by cause: out of quota, key
+ * refused, model missing and provider unreachable are fixed in different
+ * places, and one red "failed" would send someone to the wrong one.
+ */
+function CHECK_CHIP(status) {
+  if (status === 'ready') return ['verified', 'ready'];
+  if (status === 'empty') return ['feedback', 'empty reply'];
+  if (status === 'exhausted') return ['escalated', 'out of quota'];
+  if (status === 'rejected') return ['escalated', 'key refused'];
+  if (status === 'model-missing') return ['escalated', 'model missing'];
+  if (status === 'unreachable') return ['blocked', 'unreachable'];
+  if (status === 'no-key') return ['feedback', 'no key'];
+  return ['escalated', 'failed'];
+}
+
+function fmtInt(n) {
+  return typeof n === 'number' ? n.toLocaleString() : String(n);
+}
+
+function checkCell(role) {
+  var checking = (S.models.checking || []).indexOf(role) !== -1;
+  var check = (S.models.checks || []).filter(function (c) { return c.role === role; })[0];
+  var top = el('div', { style: 'display:flex; gap:8px; align-items:center; justify-content:flex-end' });
+
+  if (checking) {
+    top.appendChild(verdictChip('running', 'checking…'));
+  } else if (check) {
+    var chip = CHECK_CHIP(check.status);
+    top.appendChild(el('span', {
+      class: 'chip ' + chip[0], text: chip[1],
+      title: 'checked ' + timeAgo(check.checkedAt) + ' — ' + check.detail
+    }));
+  } else {
+    top.appendChild(el('span', { class: 'counts none', text: 'not checked' }));
+  }
+  top.appendChild(el('button', {
+    type: 'button', class: 'btn' + (check || checking ? '' : ' accent'), disabled: checking,
+    title: 'Make one small real call (~10 tokens) through the key this role would start on and the model it points at, and report whether it is ready, out of quota, refused, missing or unreachable',
+    text: checking ? 'checking…' : check ? 'Re-check' : 'Check',
+    onclick: function () { checkRole(role); }
+  }));
+
+  var note = el('div', { class: 'picker-note', style: 'text-align:right' });
+  if (check && !checking) {
+    var lines = [];
+    if (check.status === 'ready' || check.status === 'empty') {
+      var line = 'answered in ' + check.latencyMs + 'ms';
+      if (check.usage) line += ', ' + fmtInt(check.usage.inputTokens) + ' in / ' + fmtInt(check.usage.outputTokens) + ' out';
+      if (check.keyMask && check.keyCount > 1) line += ', on ' + check.keyMask;
+      if (check.status === 'empty') line += ' — empty reply; the model may not suit this role';
+      lines.push(line);
+      if (check.quota && check.quota.remainingTokens !== null) {
+        var q = fmtInt(check.quota.remainingTokens) + ' tokens left';
+        if (check.quota.limitTokens !== null) q += ' of ' + fmtInt(check.quota.limitTokens);
+        if (check.quota.resetTokens) q += ' · refills in ' + check.quota.resetTokens;
+        if (check.quota.remainingRequests !== null) q += ' · ' + fmtInt(check.quota.remainingRequests) + ' requests left';
+        lines.push(q);
+      }
+    } else {
+      lines.push(check.detail);
+      if (check.status === 'exhausted' && check.quota && check.quota.resetTokens) {
+        lines.push('token bucket refills in ' + check.quota.resetTokens);
+      }
+    }
+    // The failover trail: which keys were tried and abandoned before the
+    // answer. That is the evidence for clicking "Start here" on another key.
+    // On a failure the last attempt IS the headline, so it is not repeated.
+    var trail = check.attempts || [];
+    if (check.keyIndex === null) trail = trail.slice(0, -1);
+    trail.forEach(function (a) {
+      lines.push('key ' + (a.keyIndex + 1) + ': ' + a.detail);
+    });
+    lines.push('checked ' + timeAgo(check.checkedAt));
+    lines.forEach(function (text) { note.appendChild(el('div', { class: 'mono', text: text })); });
+  } else if (!checking) {
+    note.appendChild(el('span', { class: 'mono', text: 'one small call tells you if it is ready or out of quota' }));
+  }
+  return el('div', {}, [top, note]);
+}
+
+/** Probe one role (or every role when role is empty) and redraw from what came back. */
+function checkRole(role) {
+  // Mark it running at once, so the button cannot be clicked twice before the
+  // server answers — the server joins duplicate checks anyway, this just
+  // keeps the page honest during the round trip.
+  S.models.checking = (S.models.checking || []).concat(role ? [role] : (S.models.roles || []).map(function (r) { return r.role; }));
+  render();
+  api('/api/models/check', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ role: role, provider: provider, modelId: modelId })
+    body: JSON.stringify(role ? { role: role } : {})
   }).then(function (body) {
     S.models = body;
-    // Only the next run is affected — nothing in flight is re-pointed, and
-    // nothing is written to .env.
-    toast(role + ' → ' + provider + ':' + modelId + ' (next run)');
+    var checks = (body.checks || []).filter(function (c) { return !role || c.role === role; });
+    var bad = checks.filter(function (c) { return c.status !== 'ready' && c.status !== 'empty'; });
+    toast(bad.length === 0
+      ? (role ? role + ' is ready' : 'all roles ready')
+      : bad.map(function (c) { return c.role + ': ' + CHECK_CHIP(c.status)[1]; }).join(' · '));
+    render();
+  })['catch'](function (error) {
+    S.models.checking = [];
+    toast(error.message);
+    render();
+  });
+}
+
+/** Send one role's choice, and redraw from what came back. */
+function selectModel(role, provider, modelId, port) {
+  var payload = { role: role, provider: provider, modelId: modelId };
+  // The port is a property of a local server: sent only for local, and
+  // only when a number was typed — an empty field means the default port.
+  if (provider === 'local' && port !== undefined && port !== null && port !== '') payload.port = port;
+  api('/api/models', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(function (body) {
+    S.models = body;
+    // Only the next run is affected — nothing in flight is re-pointed.
+    toast(role + ' → ' + provider + ':' + modelId + (payload.port ? ' on :' + payload.port : '') + ' (next run)');
     render();
   })['catch'](function (error) { toast(error.message); render(); });
 }
@@ -2382,8 +3521,14 @@ function selectModel(role, provider, modelId) {
 function renderKeys(main) {
   main.appendChild(pageHead(
     'Models and keys',
-    'Which model each role calls, and which key it starts on. Both are choices about the runs this panel starts — nothing here is written to .env, and nothing already running is re-pointed.',
+    'Which model each role calls, which key it starts on, and whether that is ready right now. The first two are choices about the runs this panel starts; the third is one small real call, made when you ask, that says ready, out of quota, key refused, model missing or unreachable — nothing already running is re-pointed.',
     el('div', { style: 'display:flex; gap:8px' }, [
+      el('button', {
+        type: 'button', class: 'btn md accent', text: 'Check all roles',
+        disabled: (S.models.checking || []).length > 0,
+        title: 'One small real call per role (~10 tokens each), through the key it would start on. The same probe as wowlidator doctor.',
+        onclick: function () { checkRole(''); }
+      }),
       el('button', {
         type: 'button', class: 'btn md', text: 'Refresh models',
         title: 'Ask each provider what it serves right now. Model ids move faster than any list this repo could ship.',
@@ -2439,7 +3584,7 @@ function renderKeys(main) {
       ]),
       el('td', { class: 'mono', text: role.keyCount > 1 ? role.keyCount + ' keys · failover on' : role.keyCount === 1 ? '1 key · no fallback' : '—' }),
       el('td', { class: 'col-r' }, [
-        role.keyed ? verdictChip('verified', 'keyed') : verdictChip('feedback', 'no key')
+        role.keyed ? checkCell(role.role) : verdictChip('feedback', 'no key')
       ])
     ]));
   });
@@ -2449,7 +3594,7 @@ function renderKeys(main) {
       el('th', { text: 'Provider and model' }),
       el('th', { style: 'width:150px', text: 'Key in use' }),
       el('th', { text: 'Fallback' }),
-      el('th', { class: 'col-r', style: 'width:110px' })
+      el('th', { class: 'col-r', style: 'width:280px', text: 'Ready?' })
     ])]),
     roleBody
   ]));
@@ -2501,12 +3646,92 @@ function renderKeys(main) {
     main.appendChild(section);
   });
 
+  renderDbSection(main);
+
   main.appendChild(el('div', { class: 'box', style: 'text-align:left;margin-top:8px' }, [
+    el('div', { class: 'big', text: 'What “Check” actually does' }),
+    el('div', { class: 'why', style: 'max-width:none;margin:0 0 14px' }, [
+      document.createTextNode('It makes one real call — “reply with the single word: ok” — through the exact key-failover path a run takes, against the model the row shows and starting on the key the row shows. That is the same probe wowlidator doctor runs, and it is the only thing that can tell a listed model from a usable one: a catalogue says an id exists, not that your key has quota left for it. The verdict is chosen by cause. Out of quota (429) or out of credit (402) means wait for the reset or start on another key; key refused (401/403) means the key itself; model missing means the id in the row; unreachable means the provider. Where the provider states its rate-limit headroom, the tokens left are shown too. If the first key was dead and a later one answered, the trail says so — the check never moves where runs start; that stays your click.')
+    ]),
     el('div', { class: 'big', text: 'How a key gets swapped without you' }),
     el('div', { class: 'why', style: 'max-width:none;margin:0' }, [
       document.createTextNode('When a call comes back unauthorised, out of quota or rate-limited, wowlidator moves to the next key for that provider and carries on — for every role sharing it, so a dead key is only discovered once. It stays there; it never goes back to re-probe a key it already knows is dead. Each move is printed into the run’s output, so the run drawer is where you see one happen. A failure that is not about the key — a model that cannot emit JSON, a malformed prompt — never rotates, because spending a second key on a call that was never going to work would only hide which model failed.')
     ])
   ]));
+}
+
+/**
+ * The database card: wowlidator's own WOWLIDATOR_DB_URL (masked), whether it
+ * answers (on a click, never on a poll — a probe is a real connection to
+ * someone's database), and what the scanned repositories' own files say
+ * their database is when nothing is configured. The password never reaches
+ * this page in any form — the DSN arrives masked, a repo hint carries only
+ * WHERE a password is defined, and the suggestion is built without one.
+ */
+function renderDbSection(main) {
+  var db = S.db;
+  var section = el('section', { class: 'group' });
+  section.appendChild(el('div', { class: 'group-head' }, [
+    el('span', { class: 'avatar', text: 'D' }),
+    el('b', { text: 'Database' }),
+    el('span', { class: 'mono', text: 'WOWLIDATOR_DB_URL' }),
+    el('span', { class: 'meta', style: 'margin-left:auto', text: 'what expectDbRow and the DB evidence verify against' })
+  ]));
+  var card = el('div', { class: 'card', style: 'padding:16px 20px' });
+  if (!db) {
+    card.appendChild(el('div', { class: 'mono', text: 'reading…' }));
+  } else if (db.configured) {
+    var head = el('div', { style: 'display:flex; align-items:center; gap:10px' }, [
+      el('span', { class: 'mono', text: db.maskedUrl || '' }),
+      el('span', { class: 'meta', text: db.passwordSet ? 'password set (never shown)' : 'no password in the DSN' }),
+      el('button', {
+        type: 'button', class: 'btn sm accent', style: 'margin-left:auto',
+        text: db.checking ? 'Checking…' : 'Check',
+        disabled: !!db.checking,
+        title: 'Open one read-only session, count the visible tables, close. The same check as wowlidator doctor\u2019s db line.',
+        onclick: checkDb
+      })
+    ]);
+    card.appendChild(head);
+    var facts = [];
+    if (db.host) facts.push(db.host + (db.port ? ':' + db.port : ''));
+    if (db.database) facts.push('database ' + db.database);
+    if (db.user) facts.push('as ' + db.user);
+    if (facts.length > 0) card.appendChild(el('div', { class: 'mono', style: 'margin-top:6px', text: facts.join(' · ') }));
+    if (db.probe) {
+      card.appendChild(el('div', { class: 'mono', style: 'margin-top:6px', text: (db.probe.ok ? '✓ ' : '✗ ') + db.probe.detail + ' · checked ' + timeAgo(db.probe.at) }));
+    } else if (!db.checking) {
+      card.appendChild(el('div', { class: 'meta', style: 'margin-top:6px', text: 'one read-only connection tells you if it answers and how many tables it can see' }));
+    }
+  } else {
+    card.appendChild(el('div', { class: 'mono', text: 'nothing set. Database checks in flows will be blocked (not failed) until WOWLIDATOR_DB_URL is in .env.' }));
+  }
+  // What the scanned repositories say — shown whether or not a DSN is set, so
+  // a configured DSN pointing somewhere the repo does not name is visible too.
+  (db && db.hints || []).forEach(function (hint) {
+    var where = (hint.host || '?') + (hint.port ? ':' + hint.port : '') + (hint.database ? '/' + hint.database : '');
+    card.appendChild(el('div', { style: 'margin-top:10px' }, [
+      el('div', { class: 'mono', text: 'repo ' + hint.repo + ' declares ' + hint.engine + ' at ' + where + ' (from ' + hint.source + ')' + (hint.passwordAt ? ' · password lives in ' + hint.passwordAt : '') }),
+      hint.suggestedUrl ? el('div', { class: 'meta', text: 'suggestion: WOWLIDATOR_DB_URL=' + hint.suggestedUrl + ' — add the password yourself; wowlidator never reads one out of a repo' }) : el('span', {})
+    ]));
+  });
+  section.appendChild(card);
+  main.appendChild(section);
+}
+
+/** One real read-only connection, on a click. */
+function checkDb() {
+  if (S.db) S.db.checking = true;
+  render();
+  api('/api/db/check', { method: 'POST' }).then(function (body) {
+    S.db = body;
+    toast(body.probe && body.probe.ok ? 'database answers — ' + body.probe.tables + ' table(s) visible' : (body.probe ? body.probe.detail : 'no answer'));
+    render();
+  })['catch'](function (error) {
+    if (S.db) S.db.checking = false;
+    toast(error.message);
+    render();
+  });
 }
 
 function selectKey(provider, index) {
@@ -2623,6 +3848,8 @@ function openLauncher() {
     focus: '',
     url: '',
     repo: '',          /* slug of a saved repository to ground the run in */
+    as: '',            /* email:password the run may sign in with — env-carried, never argv */
+    autoheal: false,   /* --repair: a failed / error / dead-end case reruns itself after a fix */
     advanced: false,
     video: 'on',
     screenshots: 'auto',
@@ -2662,7 +3889,7 @@ function formField(label, optional, control, hint) {
   ]);
 }
 
-var DOCUMENT_ACCEPT = '.md,.markdown,.csv,.tsv,.html,.htm,.txt,.text,.log,.json,.yaml,.yml,.xlsx,.xlsm,.pdf,.mmd,.mermaid,.puml,.plantuml';
+var DOCUMENT_ACCEPT = '.md,.markdown,.csv,.tsv,.html,.htm,.txt,.text,.log,.json,.yaml,.yml,.xlsx,.xlsm,.pptx,.ppsx,.pdf,.mmd,.mermaid,.puml,.plantuml';
 /* Catalogs additionally take an IMAGE (or SVG render) of a sequence diagram —
    a model transcribes it to Mermaid text first (pixels for rasters, markup
    for .svg), and the transcript (not the picture) is what the gate reviews
@@ -2710,7 +3937,7 @@ function renderContextTab(box, M) {
     }
   });
   box.appendChild(formField('Upload a document', false, file,
-    'md · csv · html · txt · json · yaml · xlsx · pdf · mmd · puml'));
+    'md · csv · html · txt · json · yaml · xlsx · pptx · pdf · mmd · puml'));
 
   var name = el('input', { type: 'text', placeholder: 'leave-balance-api', value: M.ctxName,
     oninput: function (e) { M.ctxName = e.target.value; syncSubmit(); } });
@@ -3133,6 +4360,15 @@ function launcherBox(M) {
     box.appendChild(formField('Page to prove it against', true, url,
       'Strongly recommended: with it the selectors come from the page, not from the document.'));
 
+    /* A password box, deliberately: the value must not sit readable on screen
+       or in a screenshot of this panel. It reaches the CLI as WOWLIDATOR_AS —
+       an environment variable, never the command line — so it appears in no
+       ps output and no job record, and the engine masks it in every proof. */
+    var who = el('input', { type: 'password', class: 'mono', placeholder: 'email:password',
+      value: M.as, oninput: function (e) { M.as = e.target.value; } });
+    box.appendChild(formField('Sign in as', true, who,
+      'The account the run may use. A flow that lands on the sign-in page then establishes the session itself, and authored steps fill these exact characters instead of guessing a password.'));
+
     // Any run type can ground itself in scanned code — the memory lives under
     // Machinery › Repositories, selection lives here, per run.
     if ((S.repos || []).length > 0) {
@@ -3146,6 +4382,18 @@ function launcherBox(M) {
       box.appendChild(formField('Ground in a saved repository', true, repoSel,
         'The repo’s indexed routes, endpoints and tables ride along in the authoring prompt, clearly labelled as what the code declares. Save one under Machinery › Repositories.'));
     }
+
+    // Autoheal, in front of the fold: the one run option someone reaches for
+    // every time, so it is a click before starting rather than a fold away.
+    var autohealBox = el('input', { type: 'checkbox', onchange: function (e) { M.autoheal = e.target.checked; } });
+    autohealBox.checked = M.autoheal;
+    box.appendChild(el('label', { class: 'autoheal-row', title:
+      'On a failed, error or dead-end result the repair model rewrites the flow around the break and the case reruns itself, up to 3 total runs. Every rewrite lands as its own reviewable .attempt-N.flow.json plus a .patch; assertions always keep their claim — a test is never rewritten until it merely passes.' }, [
+      autohealBox,
+      el('span', { text: 'Autoheal enabled' }),
+      el('span', { class: 'mono', style: 'color:var(--muted);font-size:11px',
+        text: 'fix broken steps with the repair model, then rerun — costs tokens on failure only' })
+    ]));
 
     box.appendChild(el('button', {
       type: 'button', class: 'btn', style: 'margin-top:8px',
@@ -3262,6 +4510,8 @@ function submitLauncher() {
   if (M.screenshots !== 'auto') extras.screenshots = M.screenshots;
   if (M.waitFor.trim()) extras['wait-for'] = M.waitFor.trim();
   if (M.repo) extras.repo = M.repo;
+  if (M.as.trim()) extras.as = M.as.trim();
+  if (M.autoheal) extras.repair = true;
 
   if (M.mode === 'describe') {
     var go = { target: M.describe.trim() };
@@ -3425,9 +4675,176 @@ function startRun(taskKey, options) {
   post('run', values, options.flow).then(function (job) { S.runningFor[taskKey] = job.id; });
 }
 
+/* Every listed flow as ONE run job — the flow field is a repeatable
+   positional, so the suite holds the browser once instead of a refused job
+   per case. With repair, runCases' ordinary autoheal rewrites each broken
+   flow around its break and retries it. */
+function startSuiteRun(flowPaths, repair) {
+  var values = { flow: flowPaths };
+  if (repair) values.repair = true;
+  post('run', values, null).then(function () {
+    toast((repair ? 'healing ' : 'rerunning ') + flowPaths.length + ' flow(s) as one suite');
+  });
+}
+
+/* "Rerun all" / "Heal all" for a catalog group or one scenario of it — so
+   re-running a whole pass is one click, not a click per case. items are the
+   latest proof cards; only flows whose .flow.json is visible from here can be
+   re-run, and the button says when any were left out. Heal covers the runs
+   without a passing verdict, except proved-? — that one is waiting on a human
+   ruling, not on a repair. */
+function suiteRunButtons(items) {
+  var all = [], broken = [], missing = 0;
+  items.forEach(function (p) {
+    var path = flowPathFor(p.name, p.renamedFrom);
+    if (!path) { missing += 1; return; }
+    all.push(path);
+    var k = verdictKindOf(p);
+    if (k === 'failed' || k === 'deadEnd' || k === 'error') broken.push(path);
+  });
+  var left = missing > 0 ? ' — ' + missing + ' flow file(s) are not visible from here and are left out' : '';
+  var node = el('span', { class: 'suite-acts' });
+  if (all.length > 0) {
+    node.appendChild(el('button', {
+      type: 'button', class: 'btn', text: 'Rerun all (' + all.length + ')',
+      title: 'Run every flow here again, as one job with one roll-up' + left,
+      onclick: function (e) { e.stopPropagation(); startSuiteRun(all, false); }
+    }));
+  }
+  if (broken.length > 0) {
+    node.appendChild(el('button', {
+      type: 'button', class: 'btn accent', text: 'Heal all (' + broken.length + ')',
+      title: 'Re-run the failed, dead-end and error flows with autoheal: the repair model rewrites each around its break and retries, every rewrite landing as a reviewable .attempt-N file' + left,
+      onclick: function (e) { e.stopPropagation(); startSuiteRun(broken, true); }
+    }));
+  }
+  return node;
+}
+
+/* Continue a catalog run from its ledger on disk — works after a panel
+   restart too, because the ledger (not the in-memory job) is the record.
+   The resumed run keeps the catalog's unique run key, so cases already
+   tested under it are pulled into the resumed roll-up as finished tests. */
+function resumeCatalog(ledgerPath, mode, caseId) {
+  api('/api/catalog-runs/resume', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(caseId ? { ledgerPath: ledgerPath, mode: mode, caseId: caseId } : { ledgerPath: ledgerPath, mode: mode || 'continue' })
+  })
+    .then(function () { toast(mode === 'failed' ? 'healing failed cases' : mode === 'errors' ? 'rerunning errored cases' : mode === 'vacuous' ? 're-authoring vacuous cases' : mode === 'from' ? 'rerunning from ' + caseId + ' on current config' : 'continuing where it stopped'); refresh(); })
+    ['catch'](function (error) { toast(error.message); });
+}
+
 function stopJob(id) {
   api('/api/jobs/' + encodeURIComponent(id) + '/stop', { method: 'POST' })
     .then(refresh)['catch'](function (error) { toast(error.message); });
+}
+
+/* Hide one run from every list. The bundle file MOVES to archived/ inside the
+   proof directory - nothing is deleted, and moving it back is the undo. */
+function hideRun(runId) {
+  api('/api/proofs/' + encodeURIComponent(runId) + '/hide', { method: 'POST' })
+    .then(function (b) {
+      delete S.bundles[runId];
+      toast('run hidden - proof file moved to ' + (b.movedTo ? tail(b.movedTo) : 'archived/') + ' (move it back to undo)');
+      refresh();
+    })['catch'](function (e) { toast(e.message); });
+}
+
+/* Rename EVERY recorded run of the flow, so the group stays one group - a
+   single renamed cycle would split off as its own row. The server keeps the
+   original on renamedFrom, once, so the flow-file lookup still matches. */
+function renameTask(task) {
+  var next = window.prompt('Rename this flow (applies to all ' + task.cycles.length + ' recorded run(s)):', task.name);
+  if (next === null) return;
+  next = next.trim();
+  if (next === '' || next === task.name) return;
+  Promise.all(task.cycles.map(function (c) {
+    return api('/api/proofs/' + encodeURIComponent(c.runId) + '/rename', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: next })
+    });
+  })).then(function () {
+    S.bundles = {};
+    S.openTask = null;
+    toast('renamed to "' + next + '"');
+    refresh();
+  })['catch'](function (e) { toast(e.message); });
+}
+
+/* Rename a catalog group: the displayed title is generatedBy.source on each
+   bundle, so the new title is written onto every run of the pass. Grouping is
+   keyed on generatedAt, never the title, so nothing regroups. */
+function renameGroup(group) {
+  var runs = group.tasks.reduce(function (acc, t) { return acc.concat(t.cycles); }, []);
+  var next = window.prompt('Rename this catalog group (all ' + runs.length + ' recorded run(s)):', group.origin);
+  if (next === null) return;
+  next = next.trim();
+  if (next === '' || next === group.origin) return;
+  Promise.all(runs.map(function (c) {
+    return api('/api/proofs/' + encodeURIComponent(c.runId) + '/rename', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ group: next })
+    });
+  })).then(function () {
+    S.bundles = {};
+    toast('group renamed to "' + next + '"');
+    refresh();
+  })['catch'](function (e) { toast(e.message); });
+}
+
+/* Permanently delete every proof of a catalog result — the destructive
+   sibling of Hide, so it is gated twice: a modal, and a checkbox inside it
+   that must be ticked before the delete button arms. */
+function confirmDeleteGroup(group) {
+  var runs = group.tasks.reduce(function (acc, t) { return acc.concat(t.cycles); }, []);
+  var overlay = el('div', { class: 'overlay-backdrop', onclick: function () { overlay.remove(); } });
+  var box = el('div', {
+    class: 'modal', role: 'dialog', 'aria-label': 'Delete proofs',
+    style: 'max-width:480px', onclick: function (e) { e.stopPropagation(); }
+  });
+  box.appendChild(el('div', { class: 'top' }, [
+    el('b', { text: 'Delete this catalog result?' }),
+    el('button', { type: 'button', class: 'x', 'aria-label': 'Cancel', text: '\u2715', onclick: function () { overlay.remove(); } })
+  ]));
+  box.appendChild(el('div', { class: 'why-line', text:
+    '\u201C' + group.origin + '\u201D \u2014 ' + runs.length + ' recorded run(s). This permanently deletes the proof files from disk: ' +
+    'every step, screenshot and recording in them. Reports already written stay where they are. This cannot be undone \u2014 to merely clear runs from the screen, use the \u2715 on a run instead.' }));
+  var ticked = false;
+  var doDelete;
+  var check = el('input', { type: 'checkbox', id: 'del-confirm' });
+  check.addEventListener('change', function () { ticked = check.checked; doDelete.disabled = !ticked; });
+  box.appendChild(el('label', { class: 'autoheal-row', for: 'del-confirm' }, [
+    check,
+    el('span', { text: 'I understand: permanently delete ' + runs.length + ' proof file(s)' })
+  ]));
+  doDelete = el('button', {
+    type: 'button', class: 'btn danger', text: 'Delete permanently', disabled: true,
+    onclick: function () {
+      doDelete.disabled = true;
+      Promise.all(runs.map(function (c) {
+        return api('/api/proofs/' + encodeURIComponent(c.runId) + '/delete', { method: 'POST' });
+      })).then(function () {
+        runs.forEach(function (c) { delete S.bundles[c.runId]; });
+        overlay.remove();
+        toast('deleted ' + runs.length + ' proof file(s)');
+        refresh();
+      })['catch'](function (e) { overlay.remove(); toast(e.message); refresh(); });
+    }
+  });
+  box.appendChild(el('div', { class: 'acts', style: 'margin-top:12px; justify-content:flex-end' }, [
+    el('button', { type: 'button', class: 'btn', text: 'Cancel', onclick: function () { overlay.remove(); } }),
+    doDelete
+  ]));
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
+function pauseJob(id) {
+  api('/api/jobs/' + encodeURIComponent(id) + '/pause', { method: 'POST' })
+    .then(function (b) {
+      toast(b.paused ? 'pausing — cases in flight will finish, then Continue testing resumes at the exact case' : 'could not pause this job');
+      refresh();
+    })['catch'](function (error) { toast(error.message); });
 }
 
 /* ------------------------------------------------------------------ data */
@@ -3436,6 +4853,7 @@ function loadBundle(runId) {
   if (S.bundles[runId]) return Promise.resolve(S.bundles[runId]);
   return api('/api/proofs/' + encodeURIComponent(runId)).then(function (body) {
     S.bundles[runId] = body.proof;
+    S.verdicts[runId] = body.verdict || null;
     return body.proof;
   })['catch'](function () { return null; });
 }
@@ -3455,25 +4873,37 @@ function loadBundle(runId) {
 function dataSignature() {
   return JSON.stringify([
     S.proofs.map(function (p) { return p.runId + p.status + p.finishedAt; }),
-    S.jobs.map(function (j) { return j.id + j.status; }),
+    // A case changing state redraws; a case merely advancing does not. The
+    // bars are repainted every second from the polled job without a render,
+    // so step-by-step progress costs no DOM churn and an open output pane
+    // keeps its scroll position.
+    S.jobs.map(function (j) {
+      return j.id + j.status + (j.cases || []).map(function (c) { return c.number + c.status; }).join();
+    }),
     S.flows.length, S.reports.length, S.cache.length,
+    S.catalogRuns.map(function (r) { return r.ledgerPath + r.updatedAt + r.left + r.running; }),
     S.repos.map(function (r) { return r.slug + r.indexedAt; }),
     S.keys.providers && S.keys.providers.map(function (p) { return p.provider + p.activeIndex + p.keys.length; }),
     S.models.roles && S.models.roles.map(function (r) { return r.role + r.provider + r.modelId; }),
-    S.models.providers && S.models.providers.map(function (p) { return p.provider + p.models.length + p.note; })
+    S.models.providers && S.models.providers.map(function (p) { return p.provider + p.models.length + p.note; }),
+    S.models.checks && S.models.checks.map(function (c) { return c.role + c.status + c.checkedAt + c.running; }),
+    S.models.checking
   ]);
 }
 
 function refresh() {
   return Promise.all([
-    api('/api/proofs').then(function (b) { S.proofs = b.proofs; }),
+    api('/api/proofs').then(function (b) { S.proofs = b.proofs; S.groups = b.groups || []; }),
     api('/api/jobs').then(function (b) { S.jobs = b.jobs; S.jobsAt = Date.now(); }),
+    api('/api/failed-runs').then(function (b) { S.failedRuns = b.failedRuns || []; }).catch(function () {}),
+    api('/api/catalog-runs').then(function (b) { S.catalogRuns = b.runs || []; })['catch'](function () {}),
     api('/api/flows').then(function (b) { S.flows = b.flows; }),
     api('/api/reports').then(function (b) { S.reports = b.reports; })['catch'](function () {}),
     api('/api/cache').then(function (b) { S.cache = b.entries || []; })['catch'](function () {}),
     api('/api/keys').then(function (b) { S.keys = b; })['catch'](function () {}),
     api('/api/models').then(function (b) { S.models = b; })['catch'](function () {}),
-    api('/api/repos').then(function (b) { S.repos = b.repos || []; })['catch'](function () {})
+    api('/api/repos').then(function (b) { S.repos = b.repos || []; })['catch'](function () {}),
+    api('/api/db').then(function (b) { S.db = b; })['catch'](function () {})
   ]).then(function () {
     var wasOffline = !S.online;
     S.online = true;

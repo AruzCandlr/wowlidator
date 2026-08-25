@@ -173,8 +173,13 @@ describe('expectModal / closeModal (CDP)', { skip: skipBrowser }, () => {
       cachePath: join(dir, 'expect-wrong-name.json'),
       healedTimeoutMs: 500,
     });
-    assert.equal(bundle.status, 'failed');
+    // The step fails; the RUN defers — a modal-name mismatch is exactly the
+    // wording call the judge gate covers since it broadened (2026-08-24):
+    // this is PL_02_03's shape ("Create Plan" vs "Create Benefit Plan"), and
+    // the judge (or a human in the panel) rules it, not a string comparison.
+    assert.equal(bundle.status, 'needs-review');
     const step = bundle.steps.find((s) => s.action === 'expectModal');
+    assert.equal(step?.status, 'failed');
     assert.match(step?.error ?? '', /does not mention "Checkout"/);
   });
 

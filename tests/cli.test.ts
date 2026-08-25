@@ -148,6 +148,22 @@ describe('cli — argument handling and gating', () => {
     assert.equal(result.code, EXIT.usage);
   });
 
+  it('run with several flows fails at the boundary when any file is bad', async () => {
+    // The multi-flow form (wowUI's "Rerun all" / "Heal all") reads every file
+    // before any browser time is spent — a typo in the second path is a usage
+    // error naming that file, never a half-run suite.
+    const dir = await mkdtemp(join(tmpdir(), 'wow-run-many-'));
+    try {
+      const good = join(dir, 'good.flow.json');
+      await writeFile(good, JSON.stringify({ name: 'ok', steps: [] }));
+      const result = await runCli(['run', good, '/nope/missing.flow.json']);
+      assert.equal(result.code, EXIT.usage, result.stdout + result.stderr);
+      assert.match(result.stderr, /no such flow file: \/nope\/missing\.flow\.json/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('exits 3, naming the role, when a command needs a key it does not have', async () => {
     // Environment, not usage: the invocation was correct, the machine is not
     // set up. CI must be able to tell those apart.

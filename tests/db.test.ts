@@ -157,6 +157,22 @@ describe('db building blocks', () => {
     assert.equal(parseDbConditions('no equals sign'), null);
   });
 
+  it('refuses SQL mangled into the flat form — unusable, never a predicate that cannot match', () => {
+    // The live shape (BE catalog, 2026-08-24): a stray quote opened mid-value
+    // swallowed the rest of the string, and the "condition" matched nothing on
+    // every run — filed as a backend failure about an unaddressable row.
+    assert.equal(
+      parseDbConditions("benefit_type = REIMBURSEMENT' OR benefit_type = 'INFORMATION"),
+      null,
+    );
+    // A top-level OR is SQL alternation the AND-only flat form cannot say.
+    assert.equal(parseDbConditions('status = A OR status = B'), null);
+    // An unterminated quote alone is unparseable too.
+    assert.equal(parseDbConditions("name = 'unclosed"), null);
+    // Balanced quotes and quoted ORs stay valid values.
+    assert.deepEqual(parseDbConditions("note = 'a OR b'"), { note: 'a OR b' });
+  });
+
   it('compares cell values stringily, dates as ISO', () => {
     assert.equal(looseEquals('42', 42), true);
     assert.equal(looseEquals(42, '42'), true);
@@ -616,6 +632,31 @@ describe('expectDbRow failure wording with a values filter', () => {
       (error: Error) => {
         assert.match(error.message, /expected at least 1 row in "orders" where id = 9; found 0 row\(s\) \(/);
         assert.doesNotMatch(error.message, /holding|matching the where/);
+        return true;
+      },
+    );
+  });
+
+  it('an exact count over the whole table names its own brittleness', async () => {
+    // Live (BE catalog, 2026-08-24): "expected exactly 75 row(s) … found 45" —
+    // a sheet's recorded total against a table other tests write into, read as
+    // a backend defect. The claim still fails; the message now says to check
+    // the claim first.
+    const client = new StubDbClient();
+    client.rows['orders'] = [{ id: '1' }, { id: '2' }];
+    const { db } = harness(client);
+    await assert.rejects(
+      () => db.expectDbRow({ table: 'orders', where: {}, count: 75, timeoutMs: 100 }),
+      (error: Error) => {
+        assert.match(error.message, /counted the whole table with no where/);
+        return true;
+      },
+    );
+    // A count anchored by a where carries no such caveat.
+    await assert.rejects(
+      () => db.expectDbRow({ table: 'orders', where: { id: '1' }, count: 3, timeoutMs: 100 }),
+      (error: Error) => {
+        assert.doesNotMatch(error.message, /counted the whole table/);
         return true;
       },
     );

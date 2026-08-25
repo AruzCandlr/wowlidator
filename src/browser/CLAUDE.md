@@ -1,0 +1,29 @@
+# CLAUDE.md — the browser lifecycle
+
+Split out of the root CLAUDE.md (2026-08-24) so this loads only when working under
+`src/browser/`. Same authority as the root file; the root keeps the map of the whole system.
+
+## Browser lifecycle (`src/browser/chrome.ts`)
+
+`wowlidator.sh` used to find Chrome, start it, wait for the port, open a tab and only then run wowlidator. That worked and split the project in two: the interesting half in TypeScript with a test suite, and the half that decides *whether anything can run at all* in bash, exercisable only by executing it. It is TypeScript now, `wowlidator.sh` is a shim, and `tests/chrome.test.ts` covers it.
+
+**Readiness is proved by taking the browser over, never by a status check.** A Chrome left running for a day keeps serving `/json/version` perfectly while refusing to hand out browser-level context management, and the failure surfaces much later as `Browser.setDownloadBehavior: Browser context management is not supported` on every step — an error that reads like a missing `--remote-debugging-port` and is not one. So `cdpDrivable()` connects and disconnects for real.
+
+**A stale browser on wowlidator's own profile is recycled; anything else is reported and left alone.** The distinction is made on the process command line, and it uses `pgrep -f` rather than `ps | grep` because the pattern appears in the grep's own arguments — a piped grep matches itself and calls every profile ours. `--stop-chrome` obeys the same rule via `startedByUs`: a run may only stop a browser it started.
+
+**The browser is launched detached and `unref`'d**, because it has to outlive the command that started it. A `nohup … &` inside an ordinary shell call dies with that call's process group, which then makes the browser tier *skip* rather than fail — a quieter failure mode, and worse.
+
+**A recording context inherits the attached browser's session.** Recording is a property of a context and can only be set when one is created, so a filmed run cannot reuse the browser's own context — and a bare `newContext()` starts with an empty cookie jar. Against an application that requires a login every protected URL then redirects to the sign-in page, and the whole run tests that page while the report blames the selectors. `SmartRunner.connect` therefore copies `storageState()` across, so filming is invisible to the application; if the copy fails, or the browser had cookies and the new context received none, that is recorded as a high-severity finding rather than left to be inferred. See `inheritSession`.
+
+**Chrome is launched with `about:blank`, explicitly.** Given no URL it opens its startup page — `chrome://newtab`, which renders Google's search box and a `one-google-bar` iframe — so every run that had to start a browser popped what looks like a random Google tab, on a profile nobody browses with, and they accumulated on the persistent profile. `ensureTab` already knew a blank tab is the right thing here; this is the same decision made at launch, before the wrong tab exists.
+
+**Window mode is part of what "a browser wowlidator can drive" means, so a mismatch recycles.** `--headless` used to apply only to a browser this *started*, so the second run of the day silently kept the first run's window: you pass the flag, windows keep appearing, nothing says why. `CliOptions.headless` is therefore `boolean | undefined` and **`undefined` is not `false`** — with no preference stated a running browser is left exactly as it is, rather than being restarted to acquire a window nobody asked for. `--headless` / `--no-headless` / `WOWLIDATOR_HEADLESS` set it (flag, then env); a mismatch on our own profile goes through the same `restart()` a stale browser does, and a browser on someone else's profile is reported and left alone.
+
+Two traps in detecting the mode, both found by running it:
+
+- **`/json/version` cannot tell.** `--headless=new` reports `Chrome/151.0.7922.76`, identical to headful — the `HeadlessChrome/…` product string belonged to the old headless implementation. `chromeIsHeadless()` reads the process command line instead, the same way and of the same process as `chromeIsOurs`.
+- **`pgrep -a` is not BSD.** macOS pgrep has no `-a`, and instead of refusing it prints bare pids and exits 0 — so the command lines came back empty, every browser read as windowed, and each run restarted a perfectly good one. It is `-fl`. And the pattern matches Chrome's helper processes, which never carry `--headless` whatever the browser is doing, so the browser process is picked out as the one with no `--type=`.
+
+**`--no-sandbox` is no longer implied by headless** (`WOWLIDATOR_CHROME_NO_SANDBOX=1` opts in, for containers). It rode along on the assumption that headless means CI, but headless is also how someone keeps the browser out of their way on a desktop all day, and turning off the renderer sandbox for a browser that is about to load the application under test is not a windowing decision.
+
+`wowlidator go` is the dispatch the shell script used to do, on the same evidence: a `.json` is a test, a URL is a page to explore, anything else is a description of a test to write. Preparation (`prepare()`) runs before every browser command, not just `go`, so `run`, `generate`, `author`, `crawl` and `watch` all get a working browser without anyone thinking about it.

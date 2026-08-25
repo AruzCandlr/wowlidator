@@ -119,6 +119,20 @@ describe('re-asking a model that answered badly', () => {
     assert.equal(callsTo(model), 3, 'bounded — a model that cannot comply must not loop');
   });
 
+  it('re-asks with the complaint attached, never the identical request', async () => {
+    // At temperature 0 the same request gets the same malformed reply, so a
+    // bare retry can only fail identically — measured three times running on
+    // a local model. The second ask must differ, and what differs is the
+    // complaint: what was wrong with the first reply.
+    const model = scriptedModel('stubborn', ['{"name":"ok","steps":[{"action":"click","selector":"a"', good]);
+    await generateStructured({ ...request, model });
+    const calls = (model as unknown as { doGenerateCalls: { prompt: unknown }[] }).doGenerateCalls;
+    const second = JSON.stringify(calls[1]?.prompt);
+    assert.match(second, /PREVIOUS REPLY/);
+    assert.match(second, /not valid JSON/);
+    assert.doesNotMatch(JSON.stringify(calls[0]?.prompt), /PREVIOUS REPLY/);
+  });
+
   it('does not re-ask when the first answer was already good', async () => {
     const model = jsonModel('fine', good, { inputTokens: 1, outputTokens: 1 });
     await generateStructured({ ...request, model });
@@ -156,6 +170,26 @@ describe('what the failure message says', () => {
       (error: Error) => {
         assert.match(error.message, /Try a different model id/);
         assert.doesNotMatch(error.message, /rate limit, quota/);
+        return true;
+      },
+    );
+  });
+});
+
+describe('a connection that dropped is not a schema failure', () => {
+  it('is worded as transport, without the "3 times running" advice', async () => {
+    const { MockLanguageModelV4 } = await import('ai/test');
+    const model = new MockLanguageModelV4({
+      modelId: 'gone',
+      doGenerate: async () => {
+        throw new Error('Cannot connect to API: other side closed');
+      },
+    });
+    await assert.rejects(
+      generateStructured({ modelLabel: 'local:default_model', schema: z.object({ a: z.string() }), system: 's', prompt: 'p', model: model as never }),
+      (error: Error) => {
+        assert.match(error.message, /could not be reached/);
+        assert.doesNotMatch(error.message, /3 times running|valid structured response/);
         return true;
       },
     );

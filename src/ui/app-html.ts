@@ -362,7 +362,9 @@ function renderField(field, prefill) {
     if (value !== undefined) input.value = value;
   } else {
     input = el('input', {
-      type: field.type === 'number' ? 'number' : 'text',
+      /* A secret renders as a password box: the value must not sit readable on
+         screen, in a screenshot of the panel, or in the DOM as plain text. */
+      type: field.type === 'number' ? 'number' : field.type === 'secret' ? 'password' : 'text',
       id: 'f-' + field.name, name: field.name, placeholder: field.placeholder || '',
       min: field.min !== undefined ? String(field.min) : null,
       list: (field.name === 'flow' || field.name === 'target') ? 'flowlist' : null

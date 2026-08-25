@@ -219,6 +219,39 @@ describe('reading a spreadsheet', () => {
   });
 });
 
+describe('reading a PowerPoint deck', () => {
+  // Written by Python's zipfile — an independent ZIP writer, same rule as the
+  // openpyxl workbook: a reader tested only against its own writer proves the
+  // two agree, not that either is right.
+  it('reads every slide in order, joining runs a title was split into', async () => {
+    const document = await extractDocumentFile(join(FIXTURES, 'sample.pptx'));
+    assert.equal(document.format, 'pptx');
+    assert.match(document.text, /## Slide 1/);
+    // "Leave " + "Request Policy" are two <a:t> runs of one paragraph.
+    assert.match(document.text, /Leave Request Policy/);
+    assert.match(document.text, /Employees submit requests before the 20th/);
+    assert.match(document.text, /## Slide 2/);
+    assert.match(document.text, /การลาพักร้อน/);
+    assert.match(document.text, /Approval & escalation/, 'entities decode');
+  });
+
+  it('carries speaker notes, labelled apart, with bare slide numbers dropped', async () => {
+    const document = await extractDocumentFile(join(FIXTURES, 'sample.pptx'));
+    assert.match(document.text, /\(speaker notes\)\nRemind the team about the payroll cutoff/);
+    assert.doesNotMatch(document.text, /\(speaker notes\)\n1\b/);
+  });
+
+  it('says how many slides had no readable text rather than silently dropping them', async () => {
+    const document = await extractDocumentFile(join(FIXTURES, 'sample.pptx'));
+    assert.match(document.note, /1 slide\(s\) with no readable text skipped/);
+  });
+
+  it('the fixture is really a ZIP', async () => {
+    const bytes = await readFile(join(FIXTURES, 'sample.pptx'));
+    assert.equal(bytes.subarray(0, 2).toString('latin1'), 'PK');
+  });
+});
+
 describe('reading a PDF', () => {
   it('reads the text layer of a real PDF', async () => {
     const document = await extractDocumentFile(join(FIXTURES, 'catalog.pdf'));
@@ -424,6 +457,7 @@ import {
   beyondHarnessReason,
   describeCase,
   parseTestCaseTable,
+  recordedResult,
   tableToClaims,
 } from '../src/catalog/test-case-table.js';
 
@@ -494,6 +528,24 @@ describe('the test-case table, read whole', () => {
     // title that pivots on the write do.
     assert.equal(beyondHarnessReason(rows[0]!), null);
     assert.equal(tableToClaims(rows)[0]?.testable, true);
+  });
+
+  it('normalises the Actual Result column into accuracy\'s ground truth — and invents nothing', () => {
+    // Every value the real be100 sheet holds. Passed/Failed (Re-Test included)
+    // are verdicts; everything else — Cancelled, Pending confirm, Re-Testing,
+    // blank — is the sheet saying it has none, and a percentage built on an
+    // invented verdict would be a lie wearing a number.
+    assert.equal(recordedResult('Passed'), 'passed');
+    assert.equal(recordedResult('Re-Test Passed'), 'passed');
+    assert.equal(recordedResult('pass'), 'passed');
+    assert.equal(recordedResult('Failed'), 'failed');
+    assert.equal(recordedResult('Re-Test Failed'), 'failed');
+    assert.equal(recordedResult('fail'), 'failed');
+    assert.equal(recordedResult('Cancelled'), undefined);
+    assert.equal(recordedResult('Pending confirm'), undefined);
+    assert.equal(recordedResult('Re-Testing'), undefined);
+    assert.equal(recordedResult(''), undefined);
+    assert.equal(recordedResult('  '), undefined);
   });
 
   it('describeCase hands the author the sheet whole: persona, preconditions, note', () => {

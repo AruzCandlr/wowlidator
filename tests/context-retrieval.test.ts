@@ -19,12 +19,15 @@ import {
   MAX_SPINE_LINES,
   chunkDocument,
   rankChunks,
+  referencedSources,
   selectRelevantContext,
   tokenize,
 } from '../src/catalog/retrieve.js';
 import { buildAuthoringPrompt, buildClaimsPrompt } from '../src/catalog/catalog.js';
 import { buildDraftPrompt } from '../src/catalog/draft.js';
 import type { ExtractedDocument } from '../src/catalog/extract.js';
+import { HEAL_BACKGROUND_BUDGET_CHARS, healHintsFrom } from '../src/context/heal-hints.js';
+import { buildUserPrompt as healerPrompt } from '../src/healer/jit-healer.js';
 
 function doc(name: string, text: string): ExtractedDocument {
   return { name, format: 'markdown', text, note: '', originalChars: text.length };
@@ -286,14 +289,19 @@ describe('selection', () => {
     assert.equal(result.documents[0]?.note, '');
   });
 
-  it('is off unless a budget asks for it', () => {
-    // The default. This decides what every authoring prompt sees, and an
-    // inaccurate context poisons every test written from it — so it is opted
-    // into, the same call `--probe` and `--agent-assist` make.
-    for (const options of [{}, { budgetChars: CONTEXT_BUDGET_CHARS }, { budgetChars: 0 }]) {
-      const result = selectRelevantContext([spec], 'session expiry', options);
+  it('is on by default, and 0 sends every document whole', () => {
+    // The default budget is what a run gets with no flag: a document larger
+    // than it is cut to the sections that bear on the query. `0` is the off
+    // switch, and it must still mean "everything, untouched".
+    assert.equal(CONTEXT_BUDGET_CHARS, 24_000);
+    const big = doc('big.md', Array.from({ length: 60 }, (_, i) => `# Section ${i}\n\n${'filler words about topic '.repeat(40)}${i === 7 ? 'session expiry logs the user out' : ''}`).join('\n\n'));
+    const byDefault = selectRelevantContext([big], 'session expiry', {});
+    assert.equal(byDefault.retrieved, true);
+    assert.ok((byDefault.documents[0]?.text.length ?? 0) < big.text.length);
+    for (const options of [{ budgetChars: 0 }]) {
+      const result = selectRelevantContext([big], 'session expiry', options);
       assert.equal(result.retrieved, false);
-      assert.equal(result.documents[0]?.text, spec.text);
+      assert.equal(result.documents[0]?.text, big.text);
     }
   });
 
@@ -349,5 +357,105 @@ describe('the boundaries retrieval must not cross', () => {
     );
     assert.match(prompt, /--- SUPPORTING CONTEXT: spec\.md ---/);
     assert.match(prompt, /Background only/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Heal hints (`src/context/heal-hints.ts`) — the healer's slice of retrieval.
+// Unit-tier for the same reason as the rest of this file; the graph half is
+// exercised where a real graph exists (`context-engine.test.ts`).
+// ---------------------------------------------------------------------------
+
+describe('healHintsFrom', () => {
+  it('yields nothing from nothing — no graph, no documents, no sections', () => {
+    const hints = healHintsFrom(null, [])({
+      url: 'http://x.test/en/admin',
+      selector: 'role=button[name="Save" i]',
+    });
+    assert.equal(hints.repoHints, undefined);
+    assert.equal(hints.background, undefined);
+  });
+
+  it('yields no background when the query has no terms to rank by', () => {
+    const hints = healHintsFrom(null, [doc('spec.md', '# Benefits\ncontent')])({
+      url: 'http://x.test/en/admin',
+      selector: '',
+    });
+    assert.equal(hints.background, undefined);
+  });
+
+  it('selects background by the failed step\'s own words and never exceeds its budget', () => {
+    const filler = Array.from({ length: 200 }, (_, i) => `## Section ${i}\nfiller line about nothing relevant ${i}`).join('\n');
+    const documents = [
+      doc('spec.md', `# Manual\n${filler}\n## Benefit plan editing\nThe Edit Plan dialog opens from the row's pencil button and saves via the Update button.\n`),
+    ];
+    const hints = healHintsFrom(null, documents)({
+      url: 'http://x.test/en/admin/benefits/plans',
+      selector: 'role=button[name="Update" i]',
+      intent: 'Save the edited benefit plan',
+      caseContext: 'Case: PL_06_01 edit a benefit plan',
+    });
+    assert.ok(hints.background !== undefined, 'the matching section was selected');
+    assert.match(hints.background!, /Edit Plan dialog/);
+    assert.ok(
+      hints.background!.length <= HEAL_BACKGROUND_BUDGET_CHARS + 100,
+      `background exceeded the healer's budget: ${hints.background!.length}`,
+    );
+  });
+});
+
+// The healer's prompt renders both hint sections BEFORE the tree, so every
+// re-ask of one heal still shares a byte-identical prefix — only `rejected`
+// may grow between attempts (the healer's own caching rule).
+describe('heal prompt with hints', () => {
+  const request = {
+    failedSelector: 'role=button[name="Update" i]',
+    action: 'click',
+    url: 'http://x.test/en/admin/benefits/plans',
+    axTree: 'role=dialog\n  role=button[name="Update"]',
+    rejected: ['role=button[name="Save" i] — not in the tree'],
+  };
+
+  it('renders repo and background sections between the header and the tree', () => {
+    const prompt = healerPrompt(request, {
+      repoHints: 'Project context for /en/admin/benefits/plans: renders PlanEditDialog',
+      background: '--- spec.md ---\nThe Edit Plan dialog saves via Update.',
+    });
+    const repoAt = prompt.indexOf('What the repository declares');
+    const backgroundAt = prompt.indexOf('Background documents');
+    const treeAt = prompt.indexOf('Accessibility tree:');
+    const rejectedAt = prompt.indexOf('Already tried and rejected');
+    assert.ok(repoAt > -1 && backgroundAt > repoAt && treeAt > backgroundAt && rejectedAt > treeAt);
+  });
+
+  it('without hints the prompt is byte-identical to what it always was', () => {
+    assert.equal(healerPrompt(request), healerPrompt(request, undefined));
+    assert.doesNotMatch(healerPrompt(request), /repository declares|Background documents/);
+  });
+});
+
+describe('referencedSources — the citations a test case defers to', () => {
+  it('extracts the cited source from English and Thai markers', () => {
+    assert.deepEqual(
+      referencedSources('The displayed rates must match the values as per the Master Benefit List'),
+      ['the Master Benefit List'],
+    );
+    assert.deepEqual(
+      referencedSources('Verify totals according to section 4.2 of the spec'),
+      ['section 4.2 of the spec'],
+    );
+    assert.deepEqual(referencedSources('ตรวจสอบค่า อ้างอิงจาก Requirement Spec v2'), ['Requirement Spec v2']);
+    // Bare "ตาม" needs a document-ish noun — "per the condition" is not a citation.
+    assert.deepEqual(referencedSources('ตรวจสอบตามเงื่อนไขที่กำหนด'), []);
+    assert.equal(referencedSources('ตามเอกสาร Master Benefit List ข้อ 3').length, 1);
+  });
+
+  it('deduplicates, trims quotes, and never returns runaway phrases', () => {
+    const twice = referencedSources('as per "the Master List". Also refer to the Master List.');
+    assert.deepEqual(twice, ['the Master List']);
+    assert.deepEqual(referencedSources('nothing cited here'), []);
+    for (const phrase of referencedSources('see ' + 'x'.repeat(300))) {
+      assert.ok(phrase.length <= 80);
+    }
   });
 });

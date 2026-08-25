@@ -21,6 +21,8 @@ import {
   summarize,
   toPromptContext,
 } from '../src/context/query.js';
+import { HEAL_REPO_HINTS_MAX_LINES, healHintsFrom } from '../src/context/heal-hints.js';
+import { detectDbHint } from '../src/context/db-hint.js';
 import { ManifestIngester } from '../src/context/ingesters/manifest-ingester.js';
 import { ComponentIngester } from '../src/context/ingesters/component-ingester.js';
 import { RouteIngester } from '../src/context/ingesters/route-ingester.js';
@@ -446,6 +448,25 @@ describe('context engine', () => {
       assert.match(text, /^Project context: no indexed route matches/);
     });
 
+    // The healer's slice of this graph: bounded, and the no-match sentinel is
+    // suppressed — a healer told "nothing matches" learns nothing about the
+    // tree in front of it (`heal-hints.ts`).
+    it('heal hints trim the graph slice to the hint budget and drop the sentinel', () => {
+      const hints = healHintsFrom(graph, [])({
+        url: 'http://localhost:3000/employees/42',
+        selector: 'role=link[name="Employee" i]',
+        intent: 'open the employee page',
+      });
+      assert.ok(hints.repoHints !== undefined);
+      assert.match(hints.repoHints!, /Project context for \/employees\/:id/);
+      assert.ok(hints.repoHints!.split('\n').length <= HEAL_REPO_HINTS_MAX_LINES);
+      const nowhere = healHintsFrom(graph, [])({
+        url: 'http://localhost:3000/nowhere',
+        selector: 'role=button[name="Save" i]',
+      });
+      assert.equal(nowhere.repoHints, undefined);
+    });
+
     it('truncates at the node budget and says so', () => {
       const text = toPromptContext(graph, { url: 'http://localhost:3000/employees/42', maxNodes: 2 });
       assert.match(text, /context truncated at 2 nodes/);
@@ -530,5 +551,76 @@ describe('context engine', () => {
 
   it('default max node budget stays in sync with the exported constant', () => {
     assert.equal(DEFAULT_CONTEXT_MAX_NODES, 40);
+  });
+});
+
+describe('db-hint', () => {
+  // What a scan learns about the CONNECTION (engine, host, port — never a
+  // password value) from the repo's own files, as a hint for the panel.
+  it('reads a dotenv DSN, reporting the password location but never its value', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wowlidator-dbhint-'));
+    await writeFixture(root, {
+      '.env': 'DATABASE_URL="postgres://app:s3cret@localhost:5432/hrcenter"\n',
+    });
+    const hint = await detectDbHint(root);
+    assert.equal(hint?.engine, 'postgres');
+    assert.equal(hint?.host, 'localhost');
+    assert.equal(hint?.port, 5432);
+    assert.equal(hint?.database, 'hrcenter');
+    assert.equal(hint?.user, 'app');
+    assert.match(hint?.passwordAt ?? '', /\.env: DATABASE_URL/);
+    // The one rule that matters: the secret never survives into the hint.
+    assert.ok(!JSON.stringify(hint).includes('s3cret'));
+    assert.equal(hint?.suggestedUrl, 'postgres://app@localhost:5432/hrcenter');
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('reads a compose postgres service, publishing port and password location', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wowlidator-dbhint-'));
+    await writeFixture(root, {
+      'docker-compose.yml': [
+        'services:',
+        '  db:',
+        '    image: postgres:16',
+        '    ports:',
+        '      - "15432:5432"',
+        '    environment:',
+        '      POSTGRES_DB: hrcenter',
+        '      POSTGRES_USER: app',
+        '      POSTGRES_PASSWORD: s3cret',
+        '',
+      ].join('\n'),
+    });
+    const hint = await detectDbHint(root);
+    assert.equal(hint?.engine, 'postgres');
+    // localhost, not the service name: the hint is for connecting from the
+    // machine running wowlidator, which is what a published port means.
+    assert.equal(hint?.host, 'localhost');
+    assert.equal(hint?.port, 15432);
+    assert.equal(hint?.database, 'hrcenter');
+    assert.match(hint?.passwordAt ?? '', /docker-compose\.yml: POSTGRES_PASSWORD/);
+    assert.ok(!JSON.stringify(hint).includes('s3cret'));
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('resolves a Prisma datasource through the repo dotenv files, whatever the var is named', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wowlidator-dbhint-'));
+    await writeFixture(root, {
+      'prisma/schema.prisma': 'datasource db {\n  provider = "postgresql"\n  url = env("HR_DSN")\n}\n',
+      '.env.example': 'HR_DSN=postgres://localhost/hrcenter\n',
+    });
+    const hint = await detectDbHint(root);
+    assert.equal(hint?.engine, 'postgres');
+    assert.equal(hint?.database, 'hrcenter');
+    assert.equal(hint?.port, 5432); // postgres default when the DSN names none
+    assert.equal(hint?.passwordAt, undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('says nothing rather than guessing when the repo declares no database', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wowlidator-dbhint-'));
+    await writeFixture(root, { '.env': 'API_KEY=abc\n', 'docker-compose.yml': 'services:\n  web:\n    image: nginx\n' });
+    assert.equal(await detectDbHint(root), null);
+    await rm(root, { recursive: true, force: true });
   });
 });

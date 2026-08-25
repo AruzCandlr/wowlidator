@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { lenientObject } from '../providers/model-output.js';
 
 import { SELECTOR_SYNTAX_RULES, captureAxTree } from '../healer/jit-healer.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 import {
   LlmFactory,
   generateStructuredForModel,
@@ -278,7 +279,25 @@ answer is "none", write a different assertion.
 - Leave unused fields as empty strings.
 ${POLICY_RULES[policy]}
 
+${DETERMINISM_RULES}
+
+${procedure('HOW TO BUILD THE SUITE', [
+  'Inventory the page from the tree: its forms (fields + submit), its navigation (links with url=), its lists/tables (repeated rows), its filters/toggles. Only what the tree shows.',
+  'For each inventoried thing, in TREE ORDER, decide the one functional case that proves it works, then the one edge case the policy allows, then a usability case only where the tree shows friction. Stop at the case limit; earlier things in the tree win.',
+  'Name each case "<kind>: <what it proves>" using the control\'s own accessible name — the same control always yields the same name.',
+  'For each case: the fewest steps that reach the claim, then the assertion that would FAIL if it did not hold. Every selector in canonical form from the tree.',
+  'List defects last, only those the tree positively shows.',
+])}
+
 ${SELECTOR_SYNTAX_RULES}
+
+${selfCheck([
+  'Every case has at least one expect* step that would fail if the feature were broken.',
+  'No case asserts a value it just typed, and no expectText repeats the text used to find the element.',
+  'Every selector token appears in the tree, in canonical form; every expectUrl fragment comes from a url= in the tree.',
+  'Cases follow tree order, and no two cases prove the same thing.',
+  'The policy\'s limits are respected: nothing submits valid data under read-only, nothing writes under forms, nothing deletes ever.',
+])}
 
 If a "Project context" section is present below, it describes what this route
 renders, what that component uses, and what already covers it, drawn from a
@@ -301,6 +320,13 @@ function buildUserPrompt(request: GenerateRequest): string {
     `Page URL: ${request.url}`,
     `Generate at most ${request.maxCases} test cases.`,
   ];
+  if (request.focus) lines.push(`Focus area: ${request.focus}`);
+  if (request.projectContext) lines.push('', request.projectContext);
+  lines.push('', 'Accessibility tree:', request.axTree);
+  if (request.interactions) lines.push('', request.interactions);
+  // Rejection feedback last — the tree and context above stay a byte-identical
+  // prefix across retries, so a provider's implicit prompt cache can bill the
+  // resent capture at cache rates.
   if (request.feedback?.length) {
     lines.push(
       '',
@@ -308,10 +334,6 @@ function buildUserPrompt(request: GenerateRequest): string {
       ...request.feedback.map((entry) => `  - ${entry}`),
     );
   }
-  if (request.focus) lines.push(`Focus area: ${request.focus}`);
-  if (request.projectContext) lines.push('', request.projectContext);
-  lines.push('', 'Accessibility tree:', request.axTree);
-  if (request.interactions) lines.push('', request.interactions);
   return lines.join('\n');
 }
 

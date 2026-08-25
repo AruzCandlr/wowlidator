@@ -101,6 +101,14 @@ const flowStepSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('setLocalStorage'), key: z.string(), value: z.string() }),
   z.object({ action: z.literal('clearStorage') }),
   z.object({
+    action: z.literal('signOut'),
+    intent,
+  }).describe(
+    "End the session through the application's own sign-out control (searched name-gated, " +
+      'then behind ARIA-marked identity menus). The persona-switch step: signOut, goto the ' +
+      "sign-in page, fill the next account's credentials.",
+  ),
+  z.object({
     action: z.literal('setClock'),
     time: z
       .string()

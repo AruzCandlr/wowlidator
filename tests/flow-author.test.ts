@@ -19,11 +19,13 @@ import {
   LlmFlowAuthorModel,
   caseFlows,
   groundCredentialFills,
+  groundCredentialValues,
   strandedCredentialFill,
   MAX_REPORTED_VIOLATIONS,
   composeRefusal,
   type Violation,
   countPinnedName,
+  volatileCountAssertion,
   duplicateCredentialSubmit,
   notEndToEnd,
   loginProofCannotFail,
@@ -38,9 +40,17 @@ import {
   type AuthorRequest,
   type AuthorResult,
   type FlowAuthorModel,
+  groundLoginProof,
+  fromTreeNotation,
+  typedCredentialValues,
+  credentialEchoAssertions,
+  switchesPersona,
+  groundPersonaSwitches,
 } from '../src/generator/flow-author.js';
 import {
+  fillRouteIds,
   journeyCaptureNote,
+  literalDestinations,
   shouldSignInForCapture,
 } from '../src/cli/commands/authoring.js';
 import type { FlowStep } from '../src/engine/runner.js';
@@ -207,8 +217,13 @@ describe('FlowAuthor', () => {
     const authored = await author.author('verify outcome cards and the exemption surface');
 
     assert.equal(calls, 1, 'a mechanical omission must not cost a second model call');
-    assert.deepEqual(authored.flow.steps[6], { action: 'goto', url: '/en/login' });
+    // Two mechanical repairs compose: the goto to the sign-in page the flow
+    // itself named, and — because the identities differ — a signOut in front
+    // of it, so the switch travels the application's own sign-out path.
+    assert.equal(authored.flow.steps[6]?.action, 'signOut');
+    assert.deepEqual(authored.flow.steps[7], { action: 'goto', url: '/en/login' });
     assert.match(authored.notes, /inserted 1 goto/);
+    assert.match(authored.notes, /signOut step\(s\) before persona switches/);
     assert.equal(strandedCredentialFill(authored.flow.steps), null);
   });
 
@@ -436,6 +451,70 @@ describe('groundCredentialFills', () => {
     const repaired = groundCredentialFills(setup, steps, '/en/login');
     assert.equal(repaired.grounded, 1);
     assert.deepEqual(repaired.steps[0], { action: 'goto', url: '/en/login' });
+  });
+});
+
+describe('groundCredentialValues', () => {
+  const AS = { email: 'admin@cnext.test', password: 'admin2026' };
+  const login = (password: string): FlowStep[] => [
+    { action: 'goto', url: '/en/login' },
+    { action: 'fill', selector: 'role=textbox[name="Work email" i]', value: 'admin@cnext.test' },
+    { action: 'click', selector: 'role=button[name="Next" i]' },
+    { action: 'fill', selector: 'input[type="password"]', value: password, intent: 'Fill password field' },
+    { action: 'click', selector: 'role=button[name="Sign in" i]' },
+    { action: 'expectHidden', selector: 'role=button[name="Sign in" i]' },
+  ];
+
+  it('replaces an invented password with the supplied one', () => {
+    // The be100 shape (19 of 107 flows, live): the model was handed the
+    // account and typed `AdminPass123!` anyway — a whole red run per flow.
+    const steps = login('AdminPass123!');
+    assert.equal(groundCredentialValues(steps, AS), 1);
+    assert.equal((steps[3] as { value: string }).value, 'admin2026');
+  });
+
+  it('touches nothing when the flow already types the supplied password', () => {
+    const steps = login('admin2026');
+    assert.equal(groundCredentialValues(steps, AS), 0);
+  });
+
+  it('leaves another persona’s sign-in alone', () => {
+    // A single --as must not overwrite a multi-persona catalog.
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/login' },
+      { action: 'fill', selector: 'role=textbox[name="Work email" i]', value: 'hrbp@cnext.test' },
+      { action: 'fill', selector: 'input[type="password"]', value: 'hrbp2026' },
+      { action: 'click', selector: 'role=button[name="Sign in" i]' },
+      { action: 'expectHidden', selector: 'role=button[name="Sign in" i]' },
+    ];
+    assert.equal(groundCredentialValues(steps, AS), 0);
+    assert.equal((steps[2] as { value: string }).value, 'hrbp2026');
+  });
+
+  it('leaves a deliberate wrong-password test alone', () => {
+    // A negative login test asserts an error message, not the login proof —
+    // no expectHidden in the segment means the flow never claims success.
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/login' },
+      { action: 'fill', selector: 'role=textbox[name="Work email" i]', value: 'admin@cnext.test' },
+      { action: 'fill', selector: 'input[type="password"]', value: 'wrong-on-purpose' },
+      { action: 'click', selector: 'role=button[name="Sign in" i]' },
+      { action: 'expectText', selector: 'body', value: 'Invalid credentials' },
+    ];
+    assert.equal(groundCredentialValues(steps, AS), 0);
+    assert.equal((steps[2] as { value: string }).value, 'wrong-on-purpose');
+  });
+
+  it('never overwrites the email fill itself, however its intent reads', () => {
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/login' },
+      { action: 'fill', selector: 'role=textbox[name="Work email" i]', value: 'admin@cnext.test', intent: 'Fill password credentials email' },
+      { action: 'fill', selector: 'input[type="password"]', value: 'guess' },
+      { action: 'expectHidden', selector: 'role=button[name="Sign in" i]' },
+    ];
+    assert.equal(groundCredentialValues(steps, AS), 1);
+    assert.equal((steps[1] as { value: string }).value, 'admin@cnext.test');
+    assert.equal((steps[2] as { value: string }).value, 'admin2026');
   });
 });
 
@@ -1232,6 +1311,43 @@ describe('countPinnedName', () => {
   });
 });
 
+describe('volatileCountAssertion', () => {
+  it('refuses a bare number read off the tree that the request never states', () => {
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/benefits/plans' },
+      { action: 'expectVisible', selector: 'text="75"' },
+    ];
+    assert.deepEqual(
+      volatileCountAssertion(steps, 'ตรวจสอบจำนวน Total plans ปัจจุบัน'),
+      { index: 1, value: '75' },
+    );
+  });
+
+  it('a number the request itself states is the claim, and stands', () => {
+    // The sheet's word is the claim — refusing it would untest the case.
+    const steps: FlowStep[] = [{ action: 'expectText', selector: 'role=status', value: '120' }];
+    assert.equal(volatileCountAssertion(steps, 'the days-remaining tile shows 120'), null);
+  });
+
+  it('ignores expectCount, labeled text, and non-expect steps', () => {
+    const steps: FlowStep[] = [
+      { action: 'expectCount', selector: 'role=row', count: 15 } as unknown as FlowStep,
+      { action: 'expectVisible', selector: 'text=Total plans' },
+      { action: 'fill', selector: 'role=textbox[name="Amount" i]', value: '500' },
+      { action: 'expectText', selector: 'role=heading', value: 'Benefit Plan Catalog' },
+    ];
+    assert.equal(volatileCountAssertion(steps, 'check the catalog'), null);
+  });
+
+  it('catches the unquoted selector form too', () => {
+    const steps: FlowStep[] = [{ action: 'expectVisible', selector: 'text=68' }];
+    assert.deepEqual(volatileCountAssertion(steps, 'reimbursement tile is present'), {
+      index: 0,
+      value: '68',
+    });
+  });
+});
+
 describe('interruptedCredentialSubmit', () => {
   const fillEmail: FlowStep = { action: 'fill', selector: 'role=textbox[name="Work email" i]', value: 'a@b.test' };
   const fillPassword: FlowStep = { action: 'fill', selector: 'role=textbox >> nth=1', value: 'pw', intent: 'password' };
@@ -1420,7 +1536,7 @@ describe('supplied credentials reach the model as their own labelled block', () 
     assert.match(wire, /use these characters exactly/i);
     assert.match(
       full().replace(/\\n/g, ' ').replace(/\s+/g, ' '),
-      /never substitute a different/i,
+      /never substitute one source's address for the other's/i,
       'and the system prompt forbids improving on them',
     );
   });
@@ -1577,22 +1693,31 @@ describe('best-attempt-wins across the authoring budget', () => {
     return model;
   }
 
-  /** Refused as WEAK: an agent leg that nothing but a URL check follows. */
+  /**
+   * Refused as WEAK: an agent leg that nothing but a URL check follows. The
+   * heading check in front of it is what keeps the flow a claim at all — a
+   * flow whose ONLY assertions are a URL (or the sign-in proof) is the
+   * vacuous shape, refused as fatal below, never accepted as thin.
+   */
   const thin: Partial<AuthorResult> = {
     steps: [
+      { action: 'expectVisible', selector: 'role=heading[name="Overtime"]' },
       { action: 'workflow', goal: 'submit the overtime request' },
       { action: 'expectUrl', value: '/en/overtime' },
     ],
   };
 
-  it('keeps a thin flow rather than handing back nothing', async () => {
-    // The re-asks come back worse — no assertion at all, which is FATAL — so
-    // the budget ends with the first answer as the only usable one.
+  it('accepts a thin flow at once, with the note, rather than re-asking', async () => {
+    // A weak-only refusal used to spend the whole re-ask budget and then take
+    // the first answer anyway — measured, the model could not see the page the
+    // workflow leg ends on and came back with the same leg every time. Now the
+    // workflow step records the page before and after the agent acted, so the
+    // thin flow is accepted on the first call and the thinness is on `notes`.
     const model = scripted([thin, { steps: [{ action: 'click', selector: 'role=button' }] }]);
     const authored = await new FlowAuthor({ model }).author('submit an overtime request');
 
-    assert.equal(model.calls, AUTHOR_ATTEMPTS, 'every attempt is spent before settling');
-    assert.equal(authored.flow.steps.length, 2, 'the thin answer, not the assertion-less one');
+    assert.equal(model.calls, 1, 'a weak-only refusal costs one call, not the budget');
+    assert.equal(authored.flow.steps.length, 3, 'the thin answer is kept');
     assert.match(
       authored.notes,
       /nothing checks what it did/,
@@ -1620,18 +1745,38 @@ describe('best-attempt-wins across the authoring budget', () => {
     assert.equal(authored.notes, '');
   });
 
-  it('prefers the attempt that proves the most', async () => {
-    const oneAssertion: Partial<AuthorResult> = {
-      steps: [
-        { action: 'workflow', goal: 'submit it' },
-        { action: 'expectVisible', selector: 'role=list' },
-        { action: 'expectUrl', value: '/en/overtime' },
-      ],
-    };
-    // Both are refused as weak; the second proves strictly more.
-    const model = scripted([thin, oneAssertion, oneAssertion]);
+  it('a weak refusal alongside a fatal one still refuses and re-asks', async () => {
+    // Leniency is for thinness only. A flow that is thin AND says something
+    // untrue (here: no assertion at all is fatal) goes back to the model with
+    // both complaints, and the thin-but-true answer wins the budget.
+    const model = scripted([
+      { steps: [{ action: 'workflow', goal: 'submit it' }, { action: 'click', selector: 'role=button' }] },
+      thin,
+    ]);
     const authored = await new FlowAuthor({ model }).author('submit an overtime request');
+    assert.equal(model.calls, 2, 'the fatal first answer is re-asked; the thin second is accepted');
     assert.equal(authored.flow.steps.length, 3);
+    assert.match(authored.notes, /nothing checks what it did/);
+  });
+
+  it("refuses be100's vacuous shape outright: a workflow leg followed only by a URL check", async () => {
+    // Measured, 2026-08-21: 20 of 22 `pass**` cases were login + goto +
+    // workflow + expectUrl — green about rows whose Expected Output they never
+    // touched. That shape is fatal through the whole budget; the case is
+    // blocked and re-authored on a resume, never handed over.
+    const model = scripted([
+      {
+        steps: [
+          { action: 'workflow', goal: 'open the Type filter' },
+          { action: 'expectUrl', value: '/en/admin/benefits/plans' },
+        ],
+      },
+    ]);
+    await assert.rejects(
+      new FlowAuthor({ model }).author('PL_04_05 the Type filter lists Record and Reimbursement'),
+      (error: unknown) => error instanceof AuthoringError && /proves nothing about its claim/.test((error as Error).message),
+    );
+    assert.equal(model.calls, AUTHOR_ATTEMPTS, 'every attempt was asked, with the reason');
   });
 });
 
@@ -1669,6 +1814,408 @@ describe('the system prompt teaches that a captured second page is not absent', 
  * both are the parts that must not be got wrong: one guards a click on
  * someone's application, the other is the only record that a click happened.
  */
+describe('a tree-notation selector is rewritten, not shipped', () => {
+  it('turns StaticText[text="…"] into the text engine', async () => {
+    // glm-4.5-flash writes the AX tree's own notation as a selector; as CSS it
+    // matches a tag named StaticText, i.e. nothing, ever.
+    const model = new LlmFlowAuthorModel({
+      model: jsonModel('m', {
+        name: 'f', rationale: '', notes: '',
+        setup: [], teardown: [],
+        steps: [
+          { action: 'expectText', case: null, selector: 'StaticText[text="20 Jul 2026"]', value: '20 Jul 2026', url: '', key: '', name: '', intent: 'read the hire date' },
+        ],
+      }, { inputTokens: 0, outputTokens: 0 }),
+      id: 'mock:author',
+    });
+    const result = await model.author({ prompt: 'x', policy: 'forms' });
+    assert.deepEqual(result.steps[0], {
+      action: 'expectText',
+      selector: 'text="20 Jul 2026"',
+      value: '20 Jul 2026',
+      intent: 'read the hire date',
+    });
+  });
+});
+
+describe('fromTreeNotation', () => {
+  it('reads single quotes too, and the DOM-attribute spellings of a name', () => {
+    // A 7B model's whole catalog, 2026-08-21: every selector a guaranteed miss.
+    assert.equal(fromTreeNotation("StaticText[text='HR']"), 'text="HR"');
+    assert.equal(fromTreeNotation("textbox[placeholder='Work email']"), 'input[placeholder="Work email"]');
+    assert.equal(fromTreeNotation("role=textbox[placeholder='Work email']"), 'input[placeholder="Work email"]');
+    assert.equal(fromTreeNotation("heading[title='Benefit Plan Catalog']"), 'role=heading[name="Benefit Plan Catalog"]');
+    assert.equal(fromTreeNotation("role=button[aria-label='Menu']"), 'role=button[name="Menu"]');
+    // A real CSS selector is never touched.
+    assert.equal(fromTreeNotation("input[placeholder='x']"), "input[placeholder='x']");
+    assert.equal(fromTreeNotation('.card[title="x"]'), '.card[title="x"]');
+  });
+  it('rewrites each tree-notation shape to real selector syntax', () => {
+    assert.equal(fromTreeNotation('StaticText[text="20 Jul 2026"]'), 'text="20 Jul 2026"');
+    assert.equal(
+      fromTreeNotation('role=link[url*="/en/workflows/probation/PB-002"]'),
+      'a[href*="/en/workflows/probation/PB-002"]',
+    );
+    assert.equal(fromTreeNotation('role=cell[text="Somchai Sukjai"]'), 'role=cell[name="Somchai Sukjai"]');
+  });
+
+  it('carries a chained tail through the rewrite', () => {
+    assert.equal(
+      fromTreeNotation('role=link[text="Review"] >> nth=0'),
+      'role=link[name="Review"] >> nth=0',
+    );
+  });
+
+  it('leaves real selectors exactly as written', () => {
+    for (const sel of ['role=button[name="Sign in" i]', 'text="extended"', 'a[href*="/x"]', '.card > span']) {
+      assert.equal(fromTreeNotation(sel), sel);
+    }
+  });
+});
+
+describe('an absence check on a bare word is quoted, not shipped', () => {
+  it('narrows expectHidden text=extended to the exact form', async () => {
+    const model = new LlmFlowAuthorModel({
+      model: jsonModel('m', {
+        name: 'f', rationale: '', notes: '', setup: [], teardown: [],
+        steps: [
+          { action: 'expectHidden', case: null, selector: 'text=extended', value: '', url: '', key: '', name: '', intent: 'raw code must not leak' },
+          { action: 'expectHidden', case: null, selector: 'text=pending_hr', value: '', url: '', key: '', name: '', intent: 'raw code must not leak' },
+        ],
+      }, { inputTokens: 0, outputTokens: 0 }),
+      id: 'mock:author',
+    });
+    const result = await model.author({ prompt: 'x', policy: 'forms' });
+    assert.equal((result.steps[0] as { selector: string }).selector, 'text="extended"');
+    // A snake_case token is safe either way and stays as written.
+    assert.equal((result.steps[1] as { selector: string }).selector, 'text=pending_hr');
+  });
+});
+
+describe('notEndToEnd counts a link click as travel', () => {
+  it('a flow that navigates by clicking links is end-to-end', () => {
+    assert.equal(
+      notEndToEnd(
+        [],
+        [
+          { action: 'click', selector: 'role=tab[name="Team" i]' },
+          { action: 'click', selector: 'role=link[name="Probation Reviews" i]' },
+          { action: 'expectVisible', selector: 'role=heading[name="Probation Reviews" i]' },
+        ] as FlowStep[],
+        'http://x.test/en/login',
+      ),
+      null,
+    );
+  });
+
+  it('a flow that only clicks buttons on its start page still is not', () => {
+    assert.equal(
+      notEndToEnd(
+        [],
+        [{ action: 'click', selector: 'role=button[name="Next" i]' }] as FlowStep[],
+        'http://x.test/en/login',
+      ),
+      'one-page',
+    );
+  });
+});
+
+describe('groundLoginProof', () => {
+  const login = (proof: FlowStep): FlowStep[] => [
+    { action: 'goto', url: 'http://x.test/en/login' },
+    { action: 'fill', selector: 'role=textbox[name="Work email" i]', value: 'a@b.test' },
+    { action: 'click', selector: 'role=button[name="Next" i]' },
+    { action: 'fill', selector: 'input[type="password"]', value: 'pw' },
+    { action: 'click', selector: 'role=button[name="Sign in" i]' },
+    proof,
+  ];
+
+  it('replaces a proof the sign-in URL already contains with the submit control gone', () => {
+    const setup = login({ action: 'expectUrl', value: '/en/' });
+    const note = groundLoginProof(setup, []);
+    assert.match(note ?? '', /could not fail/);
+    assert.deepEqual(setup[5], {
+      action: 'expectHidden',
+      selector: 'role=button[name="Sign in" i]',
+      intent: 'the sign-in took: the submit control "role=button[name="Sign in" i]" is no longer on the page',
+    });
+    assert.equal(loginProofCannotFail(setup), null, 'and the lint no longer fires');
+  });
+
+  it('leaves a proof that can fail alone', () => {
+    const setup = login({ action: 'expectUrl', value: '/en/admin/system' });
+    assert.equal(groundLoginProof(setup, []), null);
+    assert.equal(setup[5]?.action, 'expectUrl');
+  });
+
+  // Live: a sheet said "HR Admin", the shell renders "ผู้ดูแลระบบ HR", and
+  // the model asserted text="HRIS ADMIN" — in no tree, not in the request.
+  it('replaces a text proof that quotes what nothing showed', () => {
+    const setup = login({ action: 'expectVisible', selector: 'text="HRIS ADMIN"' });
+    const note = groundLoginProof(setup, [], 'button "ผู้ดูแลระบบ HR"\nSign in as the HR Admin');
+    assert.match(note ?? '', /appears in no tree/);
+    assert.equal(setup[5]?.action, 'expectHidden');
+  });
+
+  it('keeps a text proof the tree or the request grounds', () => {
+    const setup = login({ action: 'expectVisible', selector: 'text="ผู้ดูแลระบบ HR"' });
+    assert.equal(groundLoginProof(setup, [], 'button "ผู้ดูแลระบบ HR"'), null);
+    assert.equal(setup[5]?.action, 'expectVisible');
+  });
+
+  it('looks past the consent gate for the proof', () => {
+    const setup = login({ action: 'when', visible: 'role=button[name="Accept and continue" i]', then: [] } as unknown as FlowStep);
+    setup.push({ action: 'expectUrl', value: '/en/' });
+    assert.match(groundLoginProof(setup, []) ?? '', /could not fail/);
+    assert.equal(setup[6]?.action, 'expectHidden');
+  });
+});
+
+// PL_02_02, live (2026-08-20): setup asserted `expectVisible
+// text="admin@cnext.test"` — the very email the flow had just typed — against
+// an identity plate that renders a display name, role label and user id and
+// never the email. 42 seconds of ladder, patience, healer ("does not appear
+// anywhere in the accessibility tree") and reconstruction to disprove a
+// string that was input, not output; then a high defect against a working
+// application. A check generated out of the scope of the test is re-judged
+// for necessity: dropped when the claim's own assertions carry the proof,
+// refused with the informed re-ask when it is all the proof there is.
+describe('credential echo assertions', () => {
+  const signIn: FlowStep[] = [
+    { action: 'goto', url: 'http://x.test/en/login' },
+    { action: 'fill', selector: 'role=textbox[name="Work email" i]', value: 'admin@cnext.test' },
+    { action: 'click', selector: 'role=button[name="Next" i]' },
+    { action: 'fill', selector: 'input[type="password"]', value: 'admin2026' },
+    { action: 'click', selector: 'role=button[name="Sign in" i]' },
+    { action: 'expectHidden', selector: 'role=button[name="Sign in" i]' },
+    { action: 'goto', url: '/en/admin/benefits/plans' },
+  ];
+
+  it('collects the values typed on a sign-in page, email and password alike', () => {
+    assert.deepEqual(typedCredentialValues(signIn, []), ['admin@cnext.test', 'admin2026']);
+  });
+
+  it('does not treat a business-form fill as a credential', () => {
+    const body: FlowStep[] = [
+      { action: 'goto', url: 'http://x.test/en/employees' },
+      { action: 'fill', selector: 'role=textbox[name="Manager email" i]', value: 'boss@cnext.test' },
+    ];
+    assert.deepEqual(typedCredentialValues([], body), []);
+  });
+
+  it('flags the PL_02_02 shape: expectVisible of the typed email', () => {
+    const setup: FlowStep[] = [
+      ...signIn,
+      { action: 'expectVisible', selector: 'text="admin@cnext.test"' },
+    ];
+    const typed = typedCredentialValues(setup, []);
+    assert.deepEqual(credentialEchoAssertions(setup, typed), [7]);
+  });
+
+  it('a tree that really renders the value rescues the assertion', () => {
+    const setup: FlowStep[] = [
+      ...signIn,
+      { action: 'expectVisible', selector: 'text="admin@cnext.test"' },
+    ];
+    const typed = typedCredentialValues(setup, []);
+    const tree = 'StaticText "Signed in as admin@cnext.test"';
+    assert.deepEqual(credentialEchoAssertions(setup, typed, tree), []);
+  });
+
+  it('never flags expectHidden — a credential NOT displayed is a legitimate claim', () => {
+    const steps: FlowStep[] = [{ action: 'expectHidden', selector: 'text="admin2026"' }];
+    const typed = typedCredentialValues(signIn, steps);
+    assert.deepEqual(credentialEchoAssertions(steps, typed), []);
+  });
+
+  it('flags an expectText whose value echoes the credential', () => {
+    const steps: FlowStep[] = [
+      { action: 'expectText', selector: 'body', value: 'admin@cnext.test' },
+    ];
+    const typed = typedCredentialValues(signIn, steps);
+    assert.deepEqual(credentialEchoAssertions(steps, typed), [0]);
+  });
+
+  it('flags nothing when no credential was typed', () => {
+    const steps: FlowStep[] = [{ action: 'expectVisible', selector: 'text="admin@cnext.test"' }];
+    assert.deepEqual(credentialEchoAssertions(steps, []), []);
+  });
+
+  it('the pipeline drops the echo when the claim’s own assertions carry the proof', async () => {
+    const author = new FlowAuthor({
+      model: stubModel({
+        name: 'PL_02_02 Benefit Plan Catalog wording',
+        setup: [
+          ...signIn,
+          { action: 'expectVisible', selector: 'text="admin@cnext.test"', intent: 'user email shown in chrome' },
+        ],
+        steps: [
+          { action: 'expectVisible', selector: 'role=heading[name="Benefit Plans" i]', intent: 'the title' },
+          { action: 'expectVisible', selector: 'text="Benefits Admin"', intent: 'the breadcrumb' },
+        ],
+      }),
+    });
+    const authored = await author.author('check the Benefit Plan Catalog wording matches the spec');
+    assert.equal(authored.flow.setup?.length, signIn.length, 'the echo left setup');
+    assert.equal(
+      authored.flow.setup?.some((s) => JSON.stringify(s).includes('admin@cnext.test') && s.action.startsWith('expect')),
+      false,
+    );
+    assert.equal(authored.flow.steps.length, 2, 'the claim’s own assertions are untouched');
+    assert.match(authored.notes, /out-of-scope check/);
+  });
+
+  it('the pipeline refuses when the echo is all the proof there is', async () => {
+    const author = new FlowAuthor({
+      model: stubModel({
+        name: 'who am i',
+        setup: [],
+        steps: [
+          // The sign-in block WITHOUT its expectHidden proof: the echo is the
+          // only assertion anywhere, so dropping it would leave a flow that
+          // proves nothing — the informed re-ask is the honest outcome.
+          ...signIn.filter((s) => s.action !== 'expectHidden'),
+          { action: 'expectVisible', selector: 'text="admin@cnext.test"', intent: 'user email shown' },
+        ],
+      }),
+    });
+    await assert.rejects(
+      () => author.author('check the signed-in user'),
+      (error: unknown) =>
+        error instanceof AuthoringError && /credential .*input, not expected output/.test((error as Error).message),
+    );
+  });
+});
+
+// A flow that signs in as two different people is an end-to-end journey
+// across the application's session machinery, and every switch must travel
+// the app's own sign-out path — never fill a login form while signed in
+// (the app hides it), never fake the switch with clearStorage (a
+// cookie-backed session survives the wipe).
+describe('persona switches', () => {
+  const loginAs = (email: string, password: string): FlowStep[] => [
+    { action: 'goto', url: 'http://x.test/en/login' },
+    { action: 'fill', selector: 'role=textbox[name="Work email" i]', value: email },
+    { action: 'click', selector: 'role=button[name="Next" i]' },
+    { action: 'fill', selector: 'input[type="password"]', value: password },
+    { action: 'click', selector: 'role=button[name="Sign in" i]' },
+    { action: 'expectHidden', selector: 'role=button[name="Sign in" i]' },
+  ];
+
+  it('switchesPersona sees two identities across two sign-in segments', () => {
+    const steps = [
+      ...loginAs('admin@cnext.test', 'admin2026'),
+      { action: 'goto', url: '/en/admin' } as FlowStep,
+      ...loginAs('hrbp@cnext.test', 'hrbp2026'),
+    ];
+    assert.deepEqual(switchesPersona([], steps), ['admin@cnext.test', 'hrbp@cnext.test']);
+  });
+
+  it('one persona, even re-signed-in, is not a switch — and a business fill never counts', () => {
+    const steps = [
+      ...loginAs('admin@cnext.test', 'admin2026'),
+      { action: 'goto', url: '/en/employees' } as FlowStep,
+      { action: 'fill', selector: 'role=textbox[name="Manager email" i]', value: 'boss@cnext.test' } as FlowStep,
+      ...loginAs('admin@cnext.test', 'admin2026'),
+    ];
+    assert.deepEqual(switchesPersona([], steps), ['admin@cnext.test']);
+  });
+
+  it('groundPersonaSwitches puts a signOut in front of the second sign-in goto', () => {
+    const steps = [...loginAs('admin@cnext.test', 'a'), ...loginAs('hrbp@cnext.test', 'b')];
+    const fixed = groundPersonaSwitches([], steps);
+    assert.equal(fixed.inserted, 1);
+    const at = fixed.steps.findIndex((s) => s.action === 'signOut');
+    assert.equal(at, loginAs('x', 'y').length, 'immediately before the second login goto');
+    assert.equal(fixed.steps[at + 1]?.action, 'goto');
+  });
+
+  it('a switch that already signs out is left alone', () => {
+    const steps = [
+      ...loginAs('admin@cnext.test', 'a'),
+      { action: 'signOut' } as FlowStep,
+      ...loginAs('hrbp@cnext.test', 'b'),
+    ];
+    assert.equal(groundPersonaSwitches([], steps).inserted, 0);
+  });
+
+  it('a setup identity counts as the previous persona for the body', () => {
+    const fixed = groundPersonaSwitches(loginAs('admin@cnext.test', 'a'), loginAs('hrbp@cnext.test', 'b'));
+    assert.equal(fixed.inserted, 1);
+    assert.equal(fixed.steps[0]?.action, 'signOut');
+  });
+
+  it('the pipeline marks the flow e2e, inserts the signOut, and says so', async () => {
+    const author = new FlowAuthor({
+      model: stubModel({
+        name: 'admin creates, hrbp approves',
+        steps: [
+          ...loginAs('admin@cnext.test', 'a'),
+          ...loginAs('hrbp@cnext.test', 'b'),
+          { action: 'expectVisible', selector: 'role=heading[name="Approvals" i]', intent: 'the queue' },
+        ],
+      }),
+    });
+    const authored = await author.author('admin creates a request, then the HRBP approves it');
+    assert.equal(authored.flow.scope, 'e2e');
+    assert.equal(authored.flow.steps.filter((s) => s.action === 'signOut').length, 1);
+    assert.match(authored.notes, /signOut step\(s\) before persona switches/);
+  });
+
+  it('a single-persona flow is not marked e2e', async () => {
+    const author = new FlowAuthor({
+      model: stubModel({
+        steps: [
+          ...loginAs('admin@cnext.test', 'a'),
+          { action: 'expectVisible', selector: 'role=heading[name="Plans" i]', intent: 'the page' },
+        ],
+      }),
+    });
+    const authored = await author.author('check the plans page');
+    assert.equal(authored.flow.scope, undefined);
+  });
+});
+
+describe('the journey capture reads where the request says it goes', () => {
+  const start = 'http://localhost:3000/en/login';
+
+  it('takes a URL the request names outright, on the run\'s own origin', () => {
+    assert.deepEqual(
+      literalDestinations(
+        '2. Go to the probation screen for employee EMP-0005 (http://localhost:3000/en/admin/employees/EMP-0005/probation).',
+        start,
+      ),
+      ['http://localhost:3000/en/admin/employees/EMP-0005/probation'],
+    );
+  });
+
+  it('reads a bare path too, and never the sign-in, consent or API paths', () => {
+    assert.deepEqual(
+      literalDestinations(
+        'open /en/workflows/probation; the login is /en/login; consent at /en/consent; seed via /api/db/seed',
+        start,
+      ),
+      ['http://localhost:3000/en/workflows/probation'],
+    );
+  });
+
+  it('ignores another origin — that page is not this application', () => {
+    assert.deepEqual(literalDestinations('see https://docs.example.com/guide/x', start), []);
+  });
+
+  it('fills a route id from an id-shaped token in the request, and nothing else', () => {
+    assert.equal(
+      fillRouteIds('/:locale/admin/employees/:id/probation', 'the probation screen for employee EMP-0005'),
+      '/:locale/admin/employees/EMP-0005/probation',
+    );
+    assert.equal(
+      fillRouteIds('/:locale/admin/employees/:id/probation', 'the probation screen for the employee'),
+      '/:locale/admin/employees/:id/probation',
+      'an ordinary word is never substituted for an id',
+    );
+  });
+});
+
 describe('shouldSignInForCapture', () => {
   const credentials = { email: 'employee@cnext.test', password: 'employee2026' };
 

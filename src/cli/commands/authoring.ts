@@ -6,7 +6,7 @@
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
-import type { Locator, Page } from 'playwright';
+import type { Page } from 'playwright';
 
 import {
   LlmCatalogModel,
@@ -19,7 +19,7 @@ import {
 } from '../../catalog/catalog.js';
 import { LlmDraftModel, draftCatalog } from '../../catalog/draft.js';
 import { extractDocumentFile } from '../../catalog/extract.js';
-import { CONTEXT_DOC_MAX_CHARS, selectRelevantContext } from '../../catalog/retrieve.js';
+import { CONTEXT_DOC_MAX_CHARS, referencedSources, selectRelevantContext } from '../../catalog/retrieve.js';
 import { bm25 } from '../../context/relevance.js';
 import {
   parseSequenceDiagram,
@@ -31,6 +31,7 @@ import {
 import {
   describeCase,
   parseTestCaseTable,
+  recordedResult,
   renderTestCaseTable,
   tableToClaims,
   type TestCaseRow,
@@ -43,17 +44,29 @@ import {
 import { ContextEngine } from '../../context/context-engine.js';
 import { findRouteForUrl, routesForDescription, toPromptContext } from '../../context/query.js';
 import { concreteRouteUrl } from '../../context/route-match.js';
-import { graphFileFor, resolveRepo } from '../../context/repo-registry.js';
-import type { ProjectGraph, ProjectNode } from '../../context/types.js';
+import {
+  graphFileFor,
+  navDestination,
+  resolveRepo,
+  upsertRepo,
+  type NavLink,
+  type NavMap,
+} from '../../context/repo-registry.js';
+import type { ProjectGraph } from '../../context/types.js';
 import { formatCoverage, meaningfulCoverage } from '../../coverage/ax-coverage.js';
-import { formatProofSummary, writeProofBundle } from '../../engine/proof-bundle.js';
-import { runFlow, withPage, type Flow } from '../../engine/runner.js';
+import {
+  formatProofSummary,
+  writeProofBundle,
+  type GenerationProvenance,
+} from '../../engine/proof-bundle.js';
+import { runFlow, withPage, withPages, type Flow } from '../../engine/runner.js';
 import { pilotCapture } from '../../context/capture-pilot.js';
 import {
   ApiTestGenerator,
   LlmApiGeneratorModel,
   NoSpecError,
 } from '../../generator/api-test-generator.js';
+import { statedPolarity } from '../../engine/polarity.js';
 import {
   AuthoringError,
   DEFAULT_AUTHOR_MAX_NODES,
@@ -65,7 +78,9 @@ import {
 } from '../../generator/flow-author.js';
 import { LlmGeneratorModel, TestGenerator } from '../../generator/test-generator.js';
 import type { GeneratedSuite } from '../../generator/test-generator.js';
-import { captureAxTree } from '../../healer/jit-healer.js';
+import { captureAxNodes, captureAxTree } from '../../healer/jit-healer.js';
+import { performSignIn, acceptConsentGate } from '../../engine/sign-in.js';
+import { probeInteractions } from '../../context/page-probe.js';
 import { formatTrend } from '../../history/run-history.js';
 import {
   reportGroupForUrl,
@@ -84,20 +99,36 @@ import {
   writeFlowFile,
   writeMachineReports,
 } from '../artifacts.js';
-import { EXIT, exitCodeFor, suiteExit } from '../exit.js';
+import { EXIT, exitCodeFor, suiteExit, type CaseOutcome } from '../exit.js';
+import {
+  isErrorOutcome,
+  isFailedOutcome,
+  ledgerPathFor,
+  markForRerun,
+  markVacuous,
+  readLedger,
+  remaining,
+  summariseLedger,
+  writeLedger,
+} from '../suite-progress.js';
+import { vacuousFlow } from '../../generator/vacuous.js';
+import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, mapPool } from '../case-plan.js';
+import { healHintsFrom } from '../../context/heal-hints.js';
 import type { CliOptions } from '../options.js';
+import { pauseRequested } from '../pause.js';
 import {
   assertRolesResolvable,
   buildAgent,
   buildCapturePilot,
   buildDataModel,
+  buildFlowReviewer,
   buildHealer,
   buildStepRepair,
   lineLogger,
   planLogger,
   stepLogger,
 } from '../runtime.js';
-import { runCases } from '../run-cases.js';
+import { runCases, type SuiteCase } from '../run-cases.js';
 
 export async function cmdGenerate(url: string | undefined, options: CliOptions): Promise<number> {
   // `--api` reads the indexed spec rather than a page, so it needs no url.
@@ -205,6 +236,16 @@ export async function cmdGenerate(url: string | undefined, options: CliOptions):
   // Each case is written out as a standalone flow whether or not it runs now,
   // so `wowlidator run <that file>` works later without re-generating.
   for (const [index, testCase] of suite.cases.entries()) {
+    // Same reason as the catalog path: the file outlives the run, and a later
+    // `wowlidator run` of it must land in this suite's group rather than
+    // reading as a flow somebody wrote by hand.
+    testCase.flow.authoredBy = {
+      model: suite.model,
+      generatedAt: suite.generatedAt,
+      sourceUrl: suite.sourceUrl,
+      kind: testCase.kind,
+      rationale: testCase.rationale,
+    };
     await writeFlowFile(
       join(
         dir,
@@ -414,6 +455,86 @@ export async function cmdDraft(subject: string | undefined, options: CliOptions)
  * express is not a reason to answer none of the rest. It is reported and the
  * loop goes on.
  */
+/** The authoring summary: what was written, by which model, and where. */
+function printAuthored(
+  authored: AuthoredFlow,
+  cases: readonly { name: string; flow: Flow }[],
+  flowPaths: readonly string[],
+  claims: number,
+  group: string | undefined,
+  dir: string,
+): void {
+  const totalSteps =
+    (authored.flow.setup?.length ?? 0) +
+    authored.flow.steps.length +
+    (authored.flow.teardown?.length ?? 0);
+
+  process.stdout.write(
+    `authored "${authored.flow.name}" — ${totalSteps} step(s) in ${cases.length} case(s) for ${claims} claim(s)\n` +
+      `  model      ${authored.model} (${authored.latencyMs}ms, ${authored.inputTokens ?? 0} in / ${authored.outputTokens ?? 0} out tokens)\n` +
+      `  grounded   ${authored.grounded ? `yes — selectors checked against ${authored.sourceUrl}` : 'NO — selectors are guesses; verify every one before trusting this'}\n` +
+      (group === undefined ? '' : `  folder     ${dir}\n`),
+  );
+  for (const [index, testCase] of cases.entries()) {
+    process.stdout.write(
+      `  · ${testCase.name} (${testCase.flow.steps.length} steps)\n` +
+        `    flow     ${flowPaths[index]}\n`,
+    );
+  }
+  if (authored.droppedSteps > 0) {
+    process.stdout.write(
+      `  ! dropped ${authored.droppedSteps} malformed step(s) the model emitted\n`,
+    );
+  }
+  if (authored.review !== undefined) {
+    const r = authored.review;
+    process.stdout.write(
+      `  review     ${r.flagged} ungrounded step(s): ${r.replaced} repointed, ${r.inserted} inserted, ` +
+        `${r.kept} confirmed, ${r.unsure} still unsure, ${r.rejected.length} proposal(s) rejected ` +
+        `(${r.model}, ${r.latencyMs}ms, ${r.inputTokens} in / ${r.outputTokens} out tokens)\n`,
+    );
+    for (const line of r.notes) process.stdout.write(`    · ${line}\n`);
+    for (const line of r.rejected) process.stdout.write(`    ! ${line}\n`);
+  }
+}
+
+/** One authored row of a test-case table, with the sheet facts wowUI groups on. */
+interface TableCase {
+  name: string;
+  flow: Flow;
+  scenarioId: string;
+  /** `<scenarioId> <scenario title>` — the collapsible group label in wowUI. */
+  scenario: string;
+  caseTitle: string;
+  /** The sheet's recorded Actual Result, normalised — accuracy's ground truth. */
+  knownResult?: 'passed' | 'failed' | undefined;
+}
+
+/**
+ * `Flow.caseContext` for one sheet row — the compact card the runtime model
+ * roles (healer, agent) read so a repair or a workflow turn knows the claim
+ * the step serves. The sheet's own words, whitespace-folded and bounded:
+ * context must never grow into a second copy of the catalog. The Note column
+ * rides along because it is where a sheet says the things that decide honest
+ * behaviour ("Cancelled", "KNOWN FAIL", "confirmed 22 Jul") — exactly what a
+ * model needs before spending turns proving a removed feature absent.
+ */
+export function caseCard(row: TestCaseRow): string | undefined {
+  const cut = (label: string, text: string, max: number): string | null => {
+    const folded = text.replace(/\s+/g, ' ').trim();
+    if (folded === '') return null;
+    return `${label}: ${folded.length > max ? `${folded.slice(0, max)}…` : folded}`;
+  };
+  const lines = [
+    cut('Case', `${row.caseId} ${row.testCase}`, 160),
+    cut('Expected', row.expected, 420),
+    cut('Test data', row.testData, 120),
+    cut('Persona', row.persona, 80),
+    cut('Note', row.note, 200),
+  ].filter((line): line is string => line !== null);
+  return lines.length === 0 ? undefined : lines.join('\n');
+}
+
 async function authorEachRow(
   rows: readonly TestCaseRow[],
   author: FlowAuthor,
@@ -422,13 +543,53 @@ async function authorEachRow(
     summary: string;
     context: readonly Awaited<ReturnType<typeof extractDocumentFile>>[];
     log: ((line: string) => void) | undefined;
+    /** The saved repository's graph, for the per-row journey capture. */
+    graph?: ProjectGraph | null | undefined;
+    /**
+     * Called the moment a row's case is complete, before the next row is
+     * authored — the seam that lets a run start while authoring continues.
+     * `first` is the pass's first authored flow, whose model and time stamp
+     * every case of the pass (the group identity wowUI reads).
+     */
+    onCase?: ((testCase: TableCase, first: AuthoredFlow) => Promise<void>) | undefined;
+    /**
+     * Holds authoring to the scenario the runner is in (`ScenarioGate`).
+     * Present only on the pipelined path — gating a run that starts after
+     * the last row is authored would deadlock it by construction.
+     */
+    gate?: ScenarioGate | null | undefined;
   },
-): Promise<{ first: AuthoredFlow; cases: { name: string; flow: Flow; scenarioId: string }[] }> {
-  const cases: { name: string; flow: Flow; scenarioId: string }[] = [];
+): Promise<{ first: AuthoredFlow; cases: TableCase[] }> {
+  // Kept by sheet position, compacted at the end: rows authored side by side
+  // finish in any order, and the list handed back must still read as the
+  // sheet. (`onCase` fires in completion order — that is the point of it.)
+  const slots: (TableCase | undefined)[] = new Array(rows.length).fill(undefined);
   let first: AuthoredFlow | undefined;
   const refused: string[] = [];
+  const workers = authorWorkers(options.authorConcurrency, options.config.roles.generator.provider);
+  if (workers === 1 && options.authorConcurrency === undefined && rows.length > 1) {
+    context.log?.(
+      `authoring rows one at a time: the generator role is on ${options.config.roles.generator.provider}, ` +
+        'which answers one call at a time (pass --author-concurrency to override)',
+    );
+  }
+  // Rows authored beside each other interleave their narration; the case id
+  // in front is what keeps a line readable. A sequential run's output is
+  // exactly what it was.
+  const rowLog = (row: TestCaseRow): ((line: string) => void) | undefined =>
+    workers > 1 && context.log ? (line) => context.log?.(`[${row.caseId}] ${line}`) : context.log;
 
-  const authorRow = async (row: TestCaseRow, page?: Page): Promise<void> => {
+  const authorRow = async (row: TestCaseRow, index: number, page?: Page): Promise<void> => {
+    const log = rowLog(row);
+    const scenarioKey = row.scenarioId || 'ungrouped';
+    if (context.gate) {
+      // Author no further than the scenario the runner is in: a row of a
+      // later scenario waits here until every earlier scenario's cases have
+      // finished running. Workers take rows in sheet order, so blocking the
+      // next row blocks the pool — which is the point.
+      await context.gate.waitFor(scenarioKey, () => pauseRequested());
+      if (pauseRequested()) return;
+    }
     // Per row, not once for the loop. Every row is authored in its own call
     // against the same open page, so whole context documents were multiplied
     // by the row count — a twelve-row sheet with one 120,000-character spec
@@ -436,17 +597,30 @@ async function authorEachRow(
     // about rows this call is not writing. The row's own steps and
     // expectations are the strongest query available anywhere in the system.
     const described = describeCase(row);
-    const selected = selectRelevantContext(
-      context.context,
-      `${row.testCase}\n${described}`,
-      {
-        budgetChars: options.contextBudget,
-        onWarn: (line) => process.stderr.write(`  ! ${line}\n`),
-      },
-    );
+    // A row that CITES another source for its expected value ("as per the
+    // Master Benefit List", "ตามเอกสาร Requirement") is the row whose own
+    // words are the weakest query for that value — the value lives in the
+    // cited document, and the citation is a few tokens drowned in step
+    // narration. The cited phrases are boosted in the retrieval query
+    // (repeated — term frequency is the lever BM25 actually has), so the
+    // section holding the real value outranks sections that merely share the
+    // row's step vocabulary, and the prompt below can demand the value be
+    // quoted from it rather than invented.
+    const cited = referencedSources(`${row.testCase}\n${described}`);
+    const retrievalQuery =
+      cited.length === 0
+        ? `${row.testCase}\n${described}`
+        : `${cited.join('\n')}\n${cited.join('\n')}\n${row.testCase}\n${described}`;
+    if (cited.length > 0) {
+      log?.(`  ${row.caseId}: the case cites ${cited.join('; ')} — retrieving it from the background and the repository`);
+    }
+    const selected = selectRelevantContext(context.context, retrievalQuery, {
+      budgetChars: options.contextBudget,
+      onWarn: (line) => process.stderr.write(`  ! ${line}\n`),
+    });
     // One line per row in the narration, not a stdout note each: twelve
     // disclosure lines about background would bury the twelve about the cases.
-    if (selected.retrieved) context.log?.(`  ${row.caseId}: ${selected.note}`);
+    if (selected.retrieved) log?.(`  ${row.caseId}: ${selected.note}`);
     const prompt = buildAuthoringPrompt(
       [
         {
@@ -458,32 +632,104 @@ async function authorEachRow(
       ],
       { summary: context.summary, context: selected.documents, cases: [described] },
     );
-    context.log?.(`writing ${row.caseId}: ${row.testCase}…`);
+    log?.(`writing ${row.caseId}: ${row.testCase}…`);
+    // **Each row's journey ends on its own page, so each row gets its own
+    // destination capture.** The journey capture used to exist only on the
+    // `wow go "text"` path; a catalog of end-to-end rows was authored from the
+    // sign-in page's tree alone, and every leg past it went to a `workflow`
+    // step — measured, 228 of 416 step-seconds in one run, most of them
+    // failing. Ranked against the row's own words (its steps and expected
+    // output are the best query for "which route is this row about"), read
+    // in a second tab so `page` stays the start page.
+    const journeyTree =
+      page === undefined
+        ? undefined
+        : await captureJourneyTree(page, options, context.graph ?? null, described, log, {
+            // The Menu column is the sheet saying where the row goes, in the
+            // application's own labels; the title and steps second.
+            where: [row.menu, row.testCase, row.steps].filter((t) => t !== '').join('\n'),
+          });
+    // The repository slice ranked against THIS row's words — the shared
+    // author-wide section describes the whole project; the routes that decide
+    // this row's expectUrl and workflow destination are the row's own. The
+    // cited phrases ride along for the same reason they boost the document
+    // query: a row deferring to "the master list" may be naming a table or
+    // component the graph declares.
+    const rowProjectContext = repoPromptSection(
+      context.graph ?? null,
+      options.url,
+      log,
+      cited.length === 0 ? described : `${described}\n${cited.join('\n')}`,
+    );
     try {
-      const one = await author.author(prompt, page);
-      first ??= one;
-      cases.push({
-        name: `${row.caseId} ${row.testCase}`,
-        flow: { ...one.flow, name: `${row.caseId} ${row.testCase}` },
-        scenarioId: row.scenarioId || 'ungrouped',
+      const one = await author.author(prompt, page, {
+        journeyTree,
+        ...(rowProjectContext === '' ? {} : { projectContext: rowProjectContext }),
       });
+      first ??= one;
+      // The sheet's own Positive/Negative column is the author's word on what
+      // this row means to prove; it travels in the flow file so every run of
+      // it — including re-runs and repairs — reports the same reading. A
+      // blank cell stays blank and `runFlow` infers deterministically.
+      const polarity = statedPolarity(row.polarity);
+      // The card the runtime roles read (`Flow.caseContext`): the claim in
+      // the sheet's own words, so a heal or an agent turn knows what the step
+      // is proving — not only which selector broke. Bounded, and in the file
+      // so re-runs and repairs keep it, the `authoredBy` rule.
+      const card = caseCard(row);
+      // The sheet's recorded Actual Result, when it holds one: the ground
+      // truth accuracy compares this case's verdict against. Travels on the
+      // provenance stamp, like scenario and caseTitle — a fact about the
+      // sheet row, not about any one run.
+      const knownResult = recordedResult(row.actual);
+      const testCase: TableCase = {
+        name: `${row.caseId} ${row.testCase}`,
+        flow: {
+          ...one.flow,
+          name: `${row.caseId} ${row.testCase}`,
+          ...(polarity === undefined ? {} : { polarity }),
+          ...(card === undefined ? {} : { caseContext: card }),
+        },
+        scenarioId: row.scenarioId || 'ungrouped',
+        scenario: `${row.scenarioId} ${row.scenario}`.trim() || 'ungrouped',
+        caseTitle: row.testCase,
+        ...(knownResult === undefined ? {} : { knownResult }),
+      };
+      slots[index] = testCase;
+      await context.onCase?.(testCase, first);
+      context.gate?.authored(scenarioKey);
     } catch (error) {
       if (!(error instanceof AuthoringError)) throw error;
+      // A refused row still advances the gate: a scenario that authors
+      // nothing must clear, or every scenario after it waits forever.
+      context.gate?.authored(scenarioKey);
       refused.push(`${row.caseId}: ${error.message.split('\n')[0] ?? ''}`);
       process.stderr.write(`  ! ${row.caseId} could not be written — ${error.message.split('\n')[0]}\n`);
     }
   };
 
+  // **Rows are authored in a pool, one start tab per worker.** Authoring a
+  // row is mostly waiting on a model, and twelve rows waited one after the
+  // other — measured at roughly a minute each. A worker owns its tab because
+  // the probe and the capture pilot act on the start page (the AX read alone
+  // would be safe to share); the per-row journey capture was already in a
+  // fresh context of its own. Starts stay in sheet order, so the first case
+  // queued is usually the first row of the sheet.
+  const tabs = Math.min(workers, rows.length);
   if (options.url) {
-    await withPage(options.cdp, async (page) => {
-      context.log?.(`opening ${options.url}…`);
-      await page.goto(options.url as string, { waitUntil: 'domcontentloaded' });
-      await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
-      for (const row of rows) await authorRow(row, page);
+    await withPages(options.cdp, tabs, async (pages) => {
+      context.log?.(`opening ${options.url}${tabs > 1 ? ` in ${tabs} tabs` : ''}…`);
+      for (const page of pages) {
+        await page.goto(options.url as string, { waitUntil: 'domcontentloaded' });
+        await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+      }
+      if (tabs > 1) context.log?.(`authoring ${rows.length} row(s), up to ${tabs} at a time`);
+      await mapPool(rows, tabs, (row, index, slot) => authorRow(row, index, pages[slot]!), () => pauseRequested());
     });
   } else {
-    for (const row of rows) await authorRow(row);
+    await mapPool(rows, tabs, (row, index) => authorRow(row, index), () => pauseRequested());
   }
+  const cases = slots.filter((c): c is TableCase => c !== undefined);
 
   if (first === undefined) {
     throw new AuthoringError(
@@ -732,9 +978,7 @@ function repoPromptSection(
  * likely to be "Sign in with Microsoft" as the submit, and clicking the wrong
  * one navigates someone's browser to an identity provider.
  */
-const IDENTITY_FIELD =
-  'input[type="text"], input[type="email"], input[type="tel"], input:not([type])';
-const SUBMIT_CONTROL = 'button[type="submit"], input[type="submit"]';
+const CONSENT_URL_PATTERN = /\/(consent|pdpa|terms|agreement)(\/|$|\?)/i;
 
 /** Why a journey capture gave up, so the wording can be tested without a browser. */
 export type JourneyCaptureGiveUp =
@@ -788,14 +1032,6 @@ export function shouldSignInForCapture(state: {
   return LOGIN_URL_PATTERN.test(state.landedUrl);
 }
 
-/** The first of these that a user could actually see and act on. */
-async function firstVisible(scope: Page | Locator, selector: string): Promise<Locator | null> {
-  const all = await scope.locator(selector).all();
-  for (const one of all) {
-    if (await one.isVisible().catch(() => false)) return one;
-  }
-  return null;
-}
 
 /**
  * One sign-in on the capture tab, so `--capture-journey` works cold.
@@ -813,42 +1049,230 @@ async function signInOnCaptureTab(
   tab: Page,
   credentials: { email: string; password: string },
 ): Promise<{ ok: true } | { ok: false; reason: JourneyCaptureGiveUp }> {
-  const password = await firstVisible(tab, 'input[type="password"]');
-  if (password === null) {
-    return { ok: false, reason: { kind: 'no-form-field', missing: 'no visible password field' } };
-  }
+  // The procedure lives in the engine now (`src/engine/sign-in.ts`) — the
+  // runner's session bootstrap runs the same one, so a sign-in that works for
+  // a capture works for a run and vice versa. This wrapper only maps the
+  // engine's plain-string outcome onto the capture's typed give-up reasons.
+  const outcome = await performSignIn(tab, credentials);
+  if (outcome.ok) return { ok: true };
+  return { ok: false, reason: { kind: 'no-form-field', missing: outcome.reason } };
+}
 
-  // Scope the identity field to the password's OWN form. A page can carry a
-  // search box and a newsletter input alongside the login; the form is what
-  // says which one belongs to the password.
-  const form = tab.locator('form:has(input[type="password"])').first();
-  const scope: Page | Locator = (await form.count().catch(() => 0)) > 0 ? form : tab;
-  const identity = await firstVisible(scope, IDENTITY_FIELD);
-  if (identity === null) {
-    return {
-      ok: false,
-      reason: { kind: 'no-form-field', missing: 'a password field but no visible identity field beside it' },
+/** Re-exported shape kept for the two capture callers below. */
+async function passConsentGate(tab: Page): Promise<boolean> {
+  return acceptConsentGate(tab);
+}
+
+/**
+ * A tab in a context of its own, for anything that signs in on the person's
+ * behalf to read a page.
+ *
+ * The capture tabs used to share the start page's context, and the state of
+ * that context is whatever the last thing left there — measured on the live
+ * application: a session with no consent decision, so every capture landed on
+ * /en/consent and read the consent page as the destination. A fresh context
+ * has nothing in it: the capture always signs in, always passes the gate, and
+ * reads the page it meant to; and nothing it does can leak into the runs that
+ * follow, which used to inherit the shared context's session. Closing the
+ * context is the whole cleanup.
+ */
+async function openCaptureTab(page: Page): Promise<{ tab: Page; close: () => Promise<void> }> {
+  const browser = page.context().browser();
+  if (browser === null) {
+    // No browser handle (an embedder's page): fall back to a tab beside it.
+    const tab = await page.context().newPage();
+    return { tab, close: () => tab.close().catch(() => undefined) };
+  }
+  const context = await browser.newContext();
+  const tab = await context.newPage();
+  return { tab, close: () => context.close().catch(() => undefined) };
+}
+
+/** How many shell tabs the navigation learner will switch through. */
+const NAV_TAB_LIMIT = 8;
+const NAV_TAB_SETTLE_MS = 400;
+
+/** Repositories whose navigation this process already tried to learn. Once. */
+const navLearnedThisProcess = new Set<string>();
+
+/**
+ * Read the application's own navigation from a signed-in shell, and remember
+ * it with the repository.
+ *
+ * One tab, one sign-in (undone before the tab closes, exactly as the journey
+ * capture does), the shell's links, plus whatever its ARIA-marked disclosures
+ * reveal — a collapsed sidebar rail is one such disclosure and, on the
+ * application this was measured against, the one that holds the whole menu
+ * (19 links behind "ขยายเมนู", "Probation Reviews" among them). Bounded by
+ * the probe's own budget and safety model: only disclosures are ever clicked.
+ * Persisted on the registry entry so the next catalog run, and the next
+ * session, read it for free. Never throws — a menu that could not be read is
+ * a ranking that has to do without it, which is what it did before.
+ */
+async function learnNavigationMap(
+  page: Page,
+  options: CliOptions,
+  slug: string,
+  log?: ((line: string) => void) | undefined,
+): Promise<NavMap | undefined> {
+  if (options.url === undefined || !options.credentials) return undefined;
+  let origin: string;
+  try {
+    origin = new URL(options.url).origin;
+  } catch {
+    return undefined;
+  }
+  let tab: Page | undefined;
+  let closeTab: (() => Promise<void>) | undefined;
+  try {
+    ({ tab, close: closeTab } = await openCaptureTab(page));
+    await tab.goto(options.url, { waitUntil: 'domcontentloaded' });
+    await tab.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+    if (LOGIN_URL_PATTERN.test(tab.url())) {
+      log?.(`navigation map: signing in as ${options.credentials.email} to read the application's menu…`);
+      const outcome = await signInOnCaptureTab(tab, options.credentials);
+      if (!outcome.ok || LOGIN_URL_PATTERN.test(tab.url())) {
+        log?.(
+          `navigation map: could not sign in (${outcome.ok ? `landed on ${tab.url()}` : journeyCaptureNote(outcome.reason)}) — the menu was not read`,
+        );
+        return undefined;
+      }
+    }
+    await passConsentGate(tab);
+    const links = new Map<string, NavLink>();
+    const keep = (name: string, url: string, via?: string): void => {
+      let path: string;
+      try {
+        const parsed = new URL(url, origin);
+        if (parsed.origin !== origin) return;
+        path = parsed.pathname;
+      } catch {
+        return;
+      }
+      const label = name.replace(/\s+/g, ' ').trim();
+      if (label === '' || path === '/' || LOGIN_URL_PATTERN.test(path)) return;
+      const key = `${label} → ${path}`;
+      if (!links.has(key)) links.set(key, { label, path, ...(via === undefined ? {} : { via }) });
     };
+    for (const node of await captureAxNodes(tab, 600)) {
+      if (node.role === 'link' && node.url) keep(node.name, node.url);
+    }
+    const report = await probeInteractions(tab, { maxProbes: 8 });
+    for (const probe of report.probes) {
+      for (const node of probe.revealed) {
+        if (node.role === 'link' && node.url) keep(node.name, node.url, probe.trigger);
+      }
+    }
+    // **A shell's groups are tabs, and each tab shows a different set of
+    // links.** On the measured application the sidebar is a rail of
+    // `role="tab"` groups (Me / Org / Team / HR / Admin / Setup) — not
+    // disclosures, so the probe above never opens them, and the panel only
+    // ever shows the group the landing page belongs to. A tab is ARIA's own
+    // word for "switches the view and does nothing else", which is why the
+    // learner may click it where the general probe (whose blast radius is
+    // every page a repair touches) declines to. Bounded, and the context is
+    // thrown away afterwards, so nothing needs restoring.
+    const tabs = await tab.locator('role=tab').all();
+    for (const [index, group] of tabs.slice(0, NAV_TAB_LIMIT).entries()) {
+      const label = ((await group.innerText().catch(() => '')) || `tab ${index + 1}`)
+        .replace(/\s+/g, ' ')
+        .trim();
+      try {
+        if (!(await group.isVisible())) continue;
+        await group.click({ timeout: 2_000 });
+        await tab.waitForTimeout(NAV_TAB_SETTLE_MS);
+      } catch {
+        continue;
+      }
+      for (const node of await captureAxNodes(tab, 600)) {
+        if (node.role === 'link' && node.url) keep(node.name, node.url, label);
+      }
+    }
+    const nav: NavMap = {
+      learnedAt: new Date().toISOString(),
+      origin,
+      as: options.credentials.email,
+      links: [...links.values()],
+    };
+    log?.(`navigation map: read ${nav.links.length} destination(s) from the application's own menu`);
+    const entry = await resolveRepo(slug);
+    if (entry) await upsertRepo({ ...entry, nav });
+    return nav;
+  } catch (error) {
+    log?.(`navigation map: ${error instanceof Error ? error.message : String(error)} — not read`);
+    return undefined;
+  } finally {
+    await closeTab?.();
   }
+}
 
-  await identity.fill(credentials.email);
-  await password.fill(credentials.password);
+/** How many ranked routes the journey capture will try before giving up. */
+const JOURNEY_ROUTE_CANDIDATES = 5;
 
-  // One re-assert, not a retry: a click that lands before the application
-  // hydrates has its controlled inputs reset, which is the defect this very
-  // application files on every login run. Checking the value costs a
-  // millisecond and is the difference between signing in and reporting that
-  // the credentials were refused when they were never submitted.
-  if ((await password.inputValue().catch(() => '')) !== credentials.password) {
-    await identity.fill(credentials.email);
-    await password.fill(credentials.password);
+/**
+ * Page URLs the request itself names, on the run's own origin, in the order
+ * written — the sign-in page, a consent page and API paths excluded. Absolute
+ * URLs first, then bare paths ("/en/workflows/probation").
+ */
+export function literalDestinations(text: string, startUrl: string): string[] {
+  let origin: string;
+  let startPath: string;
+  try {
+    const parsed = new URL(startUrl);
+    origin = parsed.origin;
+    startPath = parsed.pathname;
+  } catch {
+    return [];
   }
+  const out: string[] = [];
+  const keep = (path: string): void => {
+    const clean = path.replace(/[.,;:!?)\]'"]+$/, '');
+    if (
+      clean.length <= 1 ||
+      clean === startPath ||
+      /^\/api\//i.test(clean) ||
+      LOGIN_URL_PATTERN.test(clean) ||
+      CONSENT_URL_PATTERN.test(clean)
+    ) {
+      return;
+    }
+    const url = origin + clean;
+    if (!out.includes(url)) out.push(url);
+  };
+  for (const match of text.matchAll(/https?:\/\/[^\s"'<>()\]]+/gi)) {
+    try {
+      const url = new URL(match[0].replace(/[.,;:!?)\]'"]+$/, ''));
+      if (url.origin === origin) keep(url.pathname);
+    } catch {
+      // not a URL after all
+    }
+  }
+  for (const match of text.matchAll(/(?:^|[\s"'(])(\/[A-Za-z][A-Za-z0-9._~%-]*(?:\/[A-Za-z0-9._~%-]+)+)/g)) {
+    keep(match[1] as string);
+  }
+  return out;
+}
 
-  const submit = await firstVisible(scope, SUBMIT_CONTROL);
-  if (submit !== null) await submit.click();
-  else await password.press('Enter');
-  await tab.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
-  return { ok: true };
+/**
+ * Fill a route pattern's non-locale parameters from id-shaped tokens the
+ * request mentions (EMP-0005, PB-001, RULE-TRV-002). Only such tokens: an
+ * ordinary word substituted for `:id` would be a page this invented. Leaves
+ * the pattern untouched when nothing fits, so `concreteRouteUrl` reports it.
+ */
+export function fillRouteIds(pattern: string, text: string): string {
+  const ids = [...text.matchAll(/\b([A-Z]{2,}(?:-[A-Z0-9]+)*-?\d{2,})\b/g)].map((m) => m[1] as string);
+  if (ids.length === 0) return pattern;
+  let next = 0;
+  return pattern
+    .split('/')
+    .map((segment) => {
+      if (!segment.startsWith(':') || segment.slice(1).toLowerCase() === 'locale') return segment;
+      const id = ids[next];
+      if (id === undefined) return segment;
+      next += 1;
+      return id;
+    })
+    .join('/');
 }
 
 async function captureJourneyTree(
@@ -857,6 +1281,12 @@ async function captureJourneyTree(
   graph: ProjectGraph | null,
   description: string,
   log?: ((line: string) => void) | undefined,
+  /**
+   * The part of the request that names WHERE it goes — a sheet's Menu column
+   * and title — when the caller has it apart from the rest. Matched against
+   * the application's own menu labels; the whole description is the fallback.
+   */
+  hints: { where?: string | undefined } = {},
 ): Promise<string | undefined> {
   // `--scope e2e` turns this on by itself. An end-to-end test whose
   // destination page was never read cannot be grounded in it: measured, 9 of 9
@@ -875,32 +1305,111 @@ async function captureJourneyTree(
     return undefined;
   }
 
+  // **A URL the request names outright outranks any ranking.** A test-case
+  // row frequently says where it goes in so many words ("Go to
+  // http://localhost:3000/en/admin/employees/EMP-0005/probation"), and that
+  // is evidence, not a guess — the BM25 ranking below is for the rows that
+  // only say "Team → Probation Reviews". Measured before this: PB_01_01's row
+  // named its page in step 2 and the ranker chose `…/:id/change-type` from
+  // the same words, which needed an id and was skipped.
   const startRoute = findRouteForUrl(graph, options.url);
-  const candidates = routesForDescription(graph, description).filter(
-    (route) => route.id !== startRoute?.id && route.meta?.['type'] !== 'api',
-  );
-  if (candidates.length === 0) {
-    log?.('journey capture: no indexed route matches the description — skipped');
-    return undefined;
+  const literal = literalDestinations(description, options.url);
+  let resolved: { ok: true; url: string } | undefined;
+  if (literal.length > 0) {
+    resolved = { ok: true, url: literal[0] as string };
+    log?.(`journey capture: the request names ${resolved.url} — reading it`);
   }
-
-  // The top-ranked one only. A second page doubles the navigation on someone
-  // else's application for a rapidly diminishing return — the same call
-  // `page-probe.ts` makes about a second level of disclosure.
-  const route = candidates[0] as ProjectNode;
-  const resolved = concreteRouteUrl(route.name, options.url);
-  if (!resolved.ok) {
-    log?.(`journey capture: ${resolved.reason} — skipped`);
-    return undefined;
+  // **The application's own menu, before any ranking over the code.** A
+  // sheet says "Team → Probation Reviews"; the code says
+  // `/:locale/workflows/probation`; only the deployed sidebar knows they are
+  // the same place. Learned once per repository from a signed-in shell and
+  // remembered on the registry entry — see `learnNavigationMap`.
+  if (resolved === undefined && options.repo !== undefined) {
+    const entry = await resolveRepo(options.repo);
+    let origin: string | undefined;
+    try {
+      origin = new URL(options.url).origin;
+    } catch {
+      origin = undefined;
+    }
+    let nav = entry?.nav && entry.nav.origin === origin ? entry.nav : undefined;
+    if (nav === undefined && entry && !navLearnedThisProcess.has(entry.slug)) {
+      navLearnedThisProcess.add(entry.slug);
+      nav = await learnNavigationMap(page, options, entry.slug, log);
+    }
+    const hit = navDestination(hints.where ?? description, nav);
+    if (hit !== null && origin !== undefined) {
+      resolved = { ok: true, url: origin + hit.path };
+      log?.(
+        `journey capture: the application's menu names "${hit.label}" → ${hit.path}` +
+          (hit.via ? ` (behind "${hit.via}")` : '') +
+          ' — reading it',
+      );
+    }
+  }
+  if (resolved === undefined) {
+    const candidates = routesForDescription(graph, description, JOURNEY_ROUTE_CANDIDATES).filter(
+      (route) => route.id !== startRoute?.id && route.meta?.['type'] !== 'api',
+    );
+    if (candidates.length === 0) {
+      log?.('journey capture: no indexed route matches the description — skipped');
+      return undefined;
+    }
+    // Best-ranked FIRST, and the first that resolves to a real URL. A pattern
+    // that needs an id takes one the request itself mentions (EMP-0005,
+    // PB-001 — an id-shaped token in the row's own words), else the next
+    // candidate is tried. One page is read either way: a second doubles the
+    // navigation on someone else's application for a diminishing return —
+    // the call `page-probe.ts` makes about a second level of disclosure.
+    const skipped: string[] = [];
+    for (const route of candidates) {
+      const attempt = concreteRouteUrl(fillRouteIds(route.name, description), options.url);
+      if (attempt.ok) {
+        resolved = attempt;
+        break;
+      }
+      skipped.push(`${route.name}: ${attempt.reason}`);
+    }
+    if (resolved === undefined) {
+      log?.(`journey capture: no candidate route resolves to a page — ${skipped[0] ?? 'skipped'}`);
+      return undefined;
+    }
   }
 
   let extra: Page | undefined;
+  let closeExtra: (() => Promise<void>) | undefined;
+  let landingAfterSignIn: string | undefined;
   try {
-    extra = await page.context().newPage();
+    ({ tab: extra, close: closeExtra } = await openCaptureTab(page));
+    // **Sign in first whenever credentials allow it, whether or not the
+    // destination would have demanded it.** Two reasons, both measured on an
+    // application whose routes are not guarded server-side: an unsigned tab
+    // reads the page in a rendering the flow will never see (the flow signs
+    // in), and a capture that never signs in never observes where the
+    // application lands a signed-in user — the one piece of evidence that
+    // stops the author guessing a landing path, which four cases in one run
+    // did, identically, and failed on for 10 seconds each.
+    if (
+      options.credentials &&
+      shouldSignInForCapture({ landedUrl: options.url, credentials: options.credentials, alreadyTried: false })
+    ) {
+      await extra.goto(options.url, { waitUntil: 'domcontentloaded' });
+      await extra.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+      if (LOGIN_URL_PATTERN.test(extra.url())) {
+        log?.(`journey capture: signing in as ${options.credentials.email} first…`);
+        const outcome = await signInOnCaptureTab(extra, options.credentials);
+        if (outcome.ok && !LOGIN_URL_PATTERN.test(extra.url())) landingAfterSignIn = extra.url();
+      }
+    }
     log?.(`journey capture: reading ${resolved.url}…`);
     await extra.goto(resolved.url, { waitUntil: 'domcontentloaded' });
     await extra.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
 
+    // A gate in the way of the destination is passed, whoever signed in.
+    if (await passConsentGate(extra)) {
+      await extra.goto(resolved.url, { waitUntil: 'domcontentloaded' });
+      await extra.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+    }
     let landed = extra.url();
     if (LOGIN_URL_PATTERN.test(landed)) {
       if (
@@ -926,6 +1435,12 @@ async function captureJourneyTree(
         return undefined;
       }
 
+      // Where the application put the signed-in user, before this navigates
+      // away: real evidence for the one assertion the author otherwise has to
+      // guess — "prove the sign-in took". Measured, without it the author
+      // asserted /en/admin, /en/home and /en/employees for three personas from
+      // route names alone, and any of those wrong is a blocked case.
+      landingAfterSignIn = extra.url();
       await extra.goto(resolved.url, { waitUntil: 'domcontentloaded' });
       await extra.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
       landed = extra.url();
@@ -943,7 +1458,18 @@ async function captureJourneyTree(
       return undefined;
     }
     log?.(`journey capture: read ${landed}`);
+    const landing =
+      landingAfterSignIn === undefined ||
+      LOGIN_URL_PATTERN.test(landingAfterSignIn) ||
+      CONSENT_URL_PATTERN.test(landingAfterSignIn)
+        ? ''
+        : `SIGN-IN LANDING (observed): after signing in as ${(options.credentials as { email: string }).email}` +
+          ` — and passing the consent gate, when one appeared — the application landed on ${landingAfterSignIn}. ` +
+          'This is the ONLY landing path you may expectUrl, and only for that same account; any ' +
+          'other persona\'s landing is unknown, so its proof of sign-in is expectHidden of the ' +
+          'submit control (see SIGNING IN), never a path inferred from a route or role name.\n\n';
     return (
+      landing +
       `ANOTHER PAGE IN THIS JOURNEY — the accessibility tree of ${landed}, which the request ` +
       'describes. It is NOT the page this run starts on: a selector taken from here resolves ' +
       'only after the flow has navigated to that page, so write the goto or the click that ' +
@@ -958,7 +1484,9 @@ async function captureJourneyTree(
     );
     return undefined;
   } finally {
-    await extra?.close().catch(() => undefined);
+    // The capture ran in a context of its own (`openCaptureTab`); closing it
+    // is the whole cleanup, and nothing it did can reach the runs that follow.
+    await closeExtra?.();
   }
 }
 
@@ -977,7 +1505,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // `--repo` is validated up front, not only where phase 2 loads the graph —
   // otherwise `--claims-only --repo bogus` neither uses nor rejects the flag,
   // and the "unknown selection fails loudly" contract quietly has a gap.
-  if (options.repo !== undefined && (await resolveRepo(options.repo)) === null) {
+  const repoEntry = options.repo === undefined ? null : await resolveRepo(options.repo);
+  if (options.repo !== undefined && repoEntry === null) {
     process.stderr.write(
       `wowlidator catalog: unknown repository "${options.repo}" — see saved ones with: wowlidator context list\n`,
     );
@@ -985,6 +1514,20 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   }
 
   const log = lineLogger(options);
+
+  // Documents remembered WITH the repository ride along automatically — that
+  // is what remembering them was for. Per-run `--context-doc` files come
+  // first (this invocation's word wins the reading order), remembered ones
+  // follow, deduplicated by resolved path so a document both remembered and
+  // passed is read once. Read fresh from disk here, so an updated file is
+  // its own update.
+  const contextDocPaths = [...options.contextDocs];
+  for (const remembered of repoEntry?.contextDocs ?? []) {
+    if (!contextDocPaths.some((doc) => resolve(doc) === remembered)) {
+      contextDocPaths.push(remembered);
+      log?.(`context: reading ${remembered.split('/').pop()} — remembered with ${repoEntry!.slug}`);
+    }
+  }
 
   // --- the document, and its supporting cast --------------------------------
   let document;
@@ -1057,7 +1600,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     if (transcriptionNote !== '') {
       document.note = document.note === '' ? transcriptionNote : `${document.note}; ${transcriptionNote}`;
     }
-    for (const path of options.contextDocs) {
+    for (const path of contextDocPaths) {
       // The whole document, not its first `DEFAULT_MAX_CHARS`. Extraction
       // truncates *positionally*, so a longer spec's last sections were
       // unreachable by every consumer, silently. Once relevance decides what
@@ -1324,10 +1867,12 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     log ?? undefined,
     catalogDescription,
   );
+  const reviewer = buildFlowReviewer(options);
   const author = new FlowAuthor({
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     policy: options.policy,
     probe: options.probe,
+    ...(reviewer === null ? {} : { reviewer }),
     ...(tables.length > 0 ? { tables } : {}),
     ...(projectContext !== '' ? { projectContext } : {}),
     // The third grounding source for expectUrl. A route the application
@@ -1337,6 +1882,10 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       .map((node) => node.name),
     // Supplied by the person, never guessed — see `parseCredentials`.
     ...(options.credentials ? { credentials: options.credentials } : {}),
+    // `--scope e2e` was silently ignored on this path: the flag was read into
+    // the options and never handed to the catalog's author, so a catalog of
+    // end-to-end rows was authored as unit tests of the login page.
+    scope: options.scope,
     onLog: log,
   });
 
@@ -1345,12 +1894,170 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // the general path distils it into, so when the rows are there the author gets
   // them — the difference between a model inventing a journey and being told it.
   const approvedIds = new Set(approvedClaims(claimsFile).map((claim) => claim.source));
-  const rows = table === null ? [] : table.filter((row) => approvedIds.has(row.caseId));
+  const allRows = table === null ? [] : table.filter((row) => approvedIds.has(row.caseId));
+  // `--resume`: the progress ledger beside the claims file says which cases
+  // already have a verdict; only the ones that never ran, or were never
+  // reached, are authored and run again. Stated out loud, with the counts,
+  // because "108 planned, 36 skipped, 72 to run" is the whole point.
+  // The pass stamp every case of this catalog is grouped by. A resume takes
+  // the ORIGINAL pass's stamp from the ledger, so its cases join the group
+  // the first run opened instead of starting a second one for the same
+  // catalog — the stamp identifies the approved list, not the process.
+  // Minted HERE, at initialisation, not lazily from the first authored flow:
+  // the run key below is built on it, and a run that dies while authoring its
+  // first case must still have left a keyed ledger behind.
+  const passStamp: { value: string | null } = { value: new Date().toISOString() };
+  // The catalog run's unique key: the catalog's name plus the pass stamp.
+  // A resume reads the stored key from the prior ledger and keeps it, so one
+  // approved list answers to one key across every pause and continue — and
+  // the cases an earlier pass finished are pulled in under it as finished
+  // tests rather than lost to the resumed subset.
+  const storedRunKey: { value: string | null } = { value: null };
+  const runKeyOf = (): string => storedRunKey.value ?? `${slugify(document.name)}@${passStamp.value}`;
+  // The ledger is kept whenever there is anything to key it on — the claims
+  // file just written counts, so a first pass (`catalog file.csv --run`, no
+  // --claims yet) is resumable too, not only a re-run of a reviewed file.
+  const ledgerClaimsPath = options.claims === undefined ? claimsPath : resolve(options.claims);
+  const ledgerSpec =
+    options.claims === undefined && allRows.length === 0
+      ? undefined
+      : {
+          path: ledgerPathFor(ledgerClaimsPath),
+          planned: allRows.map((r) => r.caseId),
+          resume: options.resume,
+          stamp: () => passStamp.value,
+          runKey: () => runKeyOf(),
+          // Enough to rebuild a resume after this process — and the panel
+          // that may have spawned it — are gone. The password (`--as`) rides
+          // env on purpose and is deliberately NOT recorded.
+          launch: {
+            catalog: resolve(file),
+            claims: ledgerClaimsPath,
+            ...(options.url === undefined ? {} : { url: options.url }),
+            ...(options.repo === undefined ? {} : { repo: options.repo }),
+          },
+        };
+  let rows = allRows;
+  if (options.resume) {
+    const prior = ledgerSpec === undefined ? null : await readLedger(ledgerSpec.path);
+    // `--rerun-vacuous`: every recorded case whose flow on disk asserts
+    // nothing about its claim is marked blocked in the ledger — a vacuous
+    // pass was never a verdict — and the resume below picks it up.
+    if (prior !== null && ledgerSpec !== undefined && options.rerunVacuous) {
+      const marked = await markVacuous(prior, async (flowPath) => {
+        try {
+          const flow = JSON.parse(await readFile(flowPath, 'utf8')) as { setup?: unknown; steps?: unknown };
+          return vacuousFlow(flow as never);
+        } catch {
+          return null;
+        }
+      });
+      await writeLedger(ledgerSpec.path, prior);
+      log?.(
+        marked.length === 0
+          ? '--rerun-vacuous: no recorded case has a vacuous flow'
+          : `--rerun-vacuous: ${marked.length} recorded case(s) proved nothing about their claim and will be re-authored: ${marked.join(', ')}`,
+      );
+    }
+    // `--rerun-errors`: cases the HARNESS ended (an error bundle, or none)
+    // are not verdicts about the application and get another run.
+    // `--rerun-failed`: the failed and dead-end cases go again, with autoheal
+    // on (the flag implies --repair) — a second look at the flow, not a
+    // claim that the application changed.
+    // `--resume-from <caseId>`: run again from that case ONWARD in plan order
+    // — verdicts before it are kept, everything at or after it (whatever its
+    // verdict, passes included) runs again. A fresh process, so the rerun
+    // takes whatever `.env` and the code say NOW — the way to re-run the tail
+    // of a paused suite under a new model or config. Case granularity on
+    // purpose: a case restarts from its own first step, because a browser's
+    // mid-case state cannot be resurrected.
+    if (prior !== null && ledgerSpec !== undefined && options.resumeFrom) {
+      const at = prior.planned.indexOf(options.resumeFrom);
+      const start = at >= 0 ? at : prior.planned.findIndex((id) => id.startsWith(options.resumeFrom!));
+      if (start < 0) {
+        process.stderr.write(
+          `wowlidator catalog: --resume-from "${options.resumeFrom}" matches no planned case. Planned ids: ${prior.planned.slice(0, 8).join(', ')}${prior.planned.length > 8 ? ', …' : ''}\n`,
+        );
+        return EXIT.usage;
+      }
+      const tail = new Set(prior.planned.slice(start));
+      const marked = markForRerun(prior, (_o, id) => tail.has(id), `resume-from ${prior.planned[start]}`);
+      await writeLedger(ledgerSpec.path, prior);
+      log?.(
+        `--resume-from: rerunning from ${prior.planned[start]} — ${marked.length} recorded case(s) rerun, ` +
+          `${start} before it keep their verdicts; the rerun uses the current config`,
+      );
+    }
+    if (prior !== null && ledgerSpec !== undefined && (options.rerunErrors || options.rerunFailed)) {
+      const errors = options.rerunErrors ? markForRerun(prior, isErrorOutcome, 'rerun after error') : [];
+      const failed = options.rerunFailed ? markForRerun(prior, isFailedOutcome, 'heal: re-run with autoheal') : [];
+      await writeLedger(ledgerSpec.path, prior);
+      if (options.rerunErrors) log?.(errors.length === 0 ? '--rerun-errors: no recorded case ended in error' : `--rerun-errors: ${errors.length} case(s) the harness ended will run again: ${errors.join(', ')}`);
+      if (options.rerunFailed) log?.(failed.length === 0 ? '--rerun-failed: no recorded case failed' : `--rerun-failed: ${failed.length} failed case(s) will run again with autoheal: ${failed.join(', ')}`);
+    }
+    if (prior?.generatedAt) {
+      passStamp.value = prior.generatedAt;
+      log?.(`--resume: cases join the pass authored at ${prior.generatedAt}`);
+    }
+    // The stored key outranks a re-derived one: the run's identity was fixed
+    // when the run was initialised, and a resume continues that run.
+    if (prior?.runKey) storedRunKey.value = prior.runKey;
+    if (prior === null) {
+      log?.(`--resume: no progress ledger at ${ledgerSpec?.path ?? '(no --claims file)'} — running everything`);
+    } else {
+      const left = new Set(remaining(prior, allRows.map((r) => r.caseId)));
+      rows = allRows.filter((row) => left.has(row.caseId));
+      const s = summariseLedger(prior);
+      log?.(
+        `--resume: ${s.planned} planned — ${s.passed} passed, ${s.failed} failed${s.review > 0 ? `, ${s.review} proved-?` : ''} already have verdicts and are skipped; ` +
+          `${rows.length} to run (${s.blocked} never ran, ${s.notReached} never reached)` +
+          (prior.ended?.cause ? ` — the last run stopped: ${prior.ended.cause}` : ''),
+      );
+      if (rows.length === 0) {
+        process.stdout.write('nothing left to run — every planned case has a verdict\n');
+        return EXIT.ok;
+      }
+    }
+  }
+
+  // Announced once, at initialisation: this is the name under which the run —
+  // and any later resume of it — appears in the record's run list.
+  if (ledgerSpec !== undefined) {
+    log?.(`catalog run key ${runKeyOf()} — a resume continues this same run under it`);
+  }
 
   let authored: AuthoredFlow;
-  let tableCases: { name: string; flow: Flow; scenarioId: string }[] = [];
+  let tableCases: TableCase[] = [];
+  // One provenance for the whole pass, from its first authored flow: the
+  // same stamp whichever path writes it, so every case groups together.
+  const provenanceOf = (first: AuthoredFlow): GenerationProvenance => ({
+    model: first.model,
+    generatedAt: (passStamp.value ??= first.authoredAt),
+    sourceUrl: first.sourceUrl ?? `catalog: ${document.name}`,
+    kind: 'catalog',
+    rationale: claimsFile.summary || first.rationale,
+    source: document.name,
+    runKey: runKeyOf(),
+  });
+  // Where the pass's artifacts land — the same rule `dir`/`group` below
+  // apply once authoring is done, needed earlier by the pipelined path.
+  const placeFor = (first: AuthoredFlow): { group: string | undefined; dir: string } => {
+    const g = first.sourceUrl === undefined ? undefined : reportGroupForUrl(first.sourceUrl);
+    return { group: g, dir: g === undefined ? resolve(options.reportDir) : pageDir(options, g) };
+  };
   try {
     if (rows.length > 0) {
+      // Say which kind of test these rows become. A 'Test Script / Steps'
+      // column IS the script — each row is a unit test of the screen its
+      // steps land on, and only an explicit --scope e2e turns the journey
+      // demands (notEndToEnd, forced journey capture) on. Said out loud
+      // because the difference decides which refusals can fire, and a person
+      // reading "dead-end" needs to know which contract the flow was held to.
+      log?.(
+        options.scope === 'e2e'
+          ? `rows author as END-TO-END journeys (--scope e2e): each must travel and verify on the page it reaches`
+          : `rows author as UNIT tests (their Steps column is the script; scope ${options.scope}) — pass --scope e2e to demand full journeys`,
+      );
       // **A row is a case. Not a suggestion to the model — the unit itself.**
       //
       // Asking for one flow and letting the model divide it read a 12-row sheet
@@ -1363,13 +2070,120 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       //
       // The cost is one authoring call per row against one open page. That is
       // the price of the guarantee, and it is the guarantee that was asked for.
-      const authoredRows = await authorEachRow(rows, author, options, {
-        summary: claimsFile.summary,
-        context: contextDocs,
-        log,
-      });
-      authored = authoredRows.first;
-      tableCases = authoredRows.cases;
+      // **A case runs the moment it is written, when the pool allows more
+      // than one.** Authoring a row is a model call the browser spends idle;
+      // running a case is browser time the model spends idle. With
+      // `--run` and a concurrency above 1 the two overlap: each authored
+      // case is stamped, written to disk and pushed into a `CaseQueue` that
+      // `runCases` is already draining, so the first case is usually proved
+      // before the last row is authored. Concurrency 1 keeps the old order —
+      // author everything, then run — which is also the A/B for a pipelined
+      // result that looks wrong. The queue is closed in a `finally`: a
+      // refused row or a thrown authoring must never leave runs waiting on
+      // a list that will not grow.
+      const pipelined =
+        options.run && Math.max(1, options.concurrency ?? DEFAULT_CONCURRENCY) > 1;
+      const queue = pipelined ? new CaseQueue<SuiteCase>() : null;
+      const drain: { value: Promise<CaseOutcome[]> | null } = { value: null };
+      const placed: { value: { group: string | undefined; dir: string } | null } = { value: null };
+      if (queue !== null) {
+        log?.(`cases will run as they are authored (pipelined; --concurrency 1 authors everything first)`);
+      }
+      // Authoring holds to the scenario the runner is in — a row of scenario
+      // N+1 is not authored while scenario N still has cases running. Only on
+      // the pipelined path: a run that starts after the last row would
+      // deadlock a gate that waits on runs. `--author-lookahead all` restores
+      // the old eager behaviour; a number widens the window by that many
+      // scenarios.
+      const gate =
+        queue === null || options.authorLookahead === 'all'
+          ? null
+          : new ScenarioGate(
+              rows.map((row) => row.scenarioId || 'ungrouped'),
+              { lookahead: typeof options.authorLookahead === 'number' ? options.authorLookahead : 0 },
+            );
+      if (gate !== null) {
+        log?.('authoring keeps pace with the runs: a scenario is authored only once every scenario before it has finished running (--author-lookahead widens this)');
+      }
+      // The healer repairs with the same retrieved context the author reads:
+      // the repository's declarations for the failing page, and the
+      // background documents ranked by the failed step's own words.
+      const suiteHealHints = healHintsFrom(repoContextGraph ?? null, contextDocs);
+      const queuedPaths: string[] = [];
+      try {
+        const authoredRows = await authorEachRow(rows, author, options, {
+          summary: claimsFile.summary,
+          context: contextDocs,
+          log,
+          graph: repoContextGraph,
+          gate,
+          onCase:
+            queue === null
+              ? undefined
+              : async (testCase, first) => {
+                  // The report folder is known from the first authored flow,
+                  // and the consumer starts then: nothing is queued before
+                  // there is somewhere for its report to go.
+                  placed.value ??= placeFor(first);
+                  const { group, dir } = placed.value;
+                  drain.value ??= runCases(queue, options, {
+                    dir,
+                    group,
+                    indexTitle: `wowlidator catalog — ${document.name}`,
+                    ledger: ledgerSpec,
+                    healHints: suiteHealHints,
+                    onCaseDone: (finished) => {
+                      if (finished.scenarioId !== undefined) gate?.ran(finished.scenarioId);
+                    },
+                  });
+                  // Same stamp and same file the non-pipelined path writes
+                  // below — built here because the run needs both now.
+                  testCase.flow.authoredBy = {
+                    ...provenanceOf(first),
+                    scenario: testCase.scenario,
+                    caseTitle: testCase.caseTitle,
+                    ...(testCase.knownResult === undefined ? {} : { knownResult: testCase.knownResult }),
+                  };
+                  const flowPath = await writeFlowFile(
+                    catalogFlowPath(options, {
+                      dir: join(dir, slugify(testCase.scenarioId)),
+                      group,
+                      name: testCase.flow.name,
+                      index: rows.length === 1 ? undefined : queuedPaths.length + 1,
+                    }),
+                    testCase.flow,
+                  );
+                  queuedPaths.push(flowPath);
+                  log?.(`  queued ${testCase.name} → ${flowPath}`);
+                  queue.push({
+                    name: testCase.name,
+                    flow: testCase.flow,
+                    flowPath,
+                    kind: 'catalog',
+                    scenarioId: testCase.scenarioId,
+                    ...(group === undefined ? {} : { group: `${group}/${slugify(testCase.scenarioId)}` }),
+                    generatedBy: testCase.flow.authoredBy,
+                  });
+                  gate?.queued(testCase.scenarioId);
+                },
+        });
+        authored = authoredRows.first;
+        tableCases = authoredRows.cases;
+      } catch (error) {
+        // Authoring broke; the cases already queued are still running and
+        // still owed their reports. Let them finish before the error lands,
+        // or they are abandoned mid-run with their proofs half-written.
+        queue?.close();
+        if (drain.value !== null) await drain.value.catch(() => undefined);
+        throw error;
+      } finally {
+        queue?.close();
+      }
+      if (drain.value !== null && placed.value !== null) {
+        printAuthored(authored, tableCases, queuedPaths, approved.length, placed.value.group, placed.value.dir);
+        const outcomes = await drain.value;
+        return suiteExit(outcomes);
+      }
     } else {
       const approvedText = approvedClaims(claimsFile)
         .map((claim) => claim.claim)
@@ -1417,9 +2231,26 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // divide is one case, and behaves exactly as it always did.
   // One task per row when the catalog was a table; otherwise the model's own
   // division of the single flow it wrote.
-  const cases: { name: string; flow: Flow; scenarioId?: string | undefined }[] =
+  const cases: (Pick<TableCase, 'name' | 'flow'> & Partial<TableCase>)[] =
     tableCases.length > 0 ? tableCases : caseFlows(authored);
   const flowPaths: string[] = [];
+  // One provenance for the whole pass, stamped on every case's flow BEFORE it
+  // is written and again carried on its run: the flow file outlives the run,
+  // and a re-run or a repair of it has to land in this catalog's group rather
+  // than among hand-written flows. (It was once stamped after the write, so
+  // every file on disk lacked it and only the first run ever grouped.)
+  const catalogProvenance = provenanceOf(authored);
+  // The pass-wide provenance plus the two per-case facts a sheet states —
+  // scenario and test-case title — so the run list can group by the former
+  // and print the latter without re-reading the sheet.
+  for (const testCase of cases) {
+    testCase.flow.authoredBy = {
+      ...catalogProvenance,
+      ...(testCase.scenario === undefined ? {} : { scenario: testCase.scenario }),
+      ...(testCase.caseTitle === undefined ? {} : { caseTitle: testCase.caseTitle }),
+      ...(testCase.knownResult === undefined ? {} : { knownResult: testCase.knownResult }),
+    };
+  }
   for (const [index, testCase] of cases.entries()) {
     // A sheet groups its rows by scenario; the folder does the same, so twelve
     // cases land in six classes rather than one flat pile.
@@ -1437,28 +2268,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     );
   }
 
-  const totalSteps =
-    (authored.flow.setup?.length ?? 0) +
-    authored.flow.steps.length +
-    (authored.flow.teardown?.length ?? 0);
-
-  process.stdout.write(
-    `authored "${authored.flow.name}" — ${totalSteps} step(s) in ${cases.length} case(s) for ${approved.length} claim(s)\n` +
-      `  model      ${authored.model} (${authored.latencyMs}ms, ${authored.inputTokens ?? 0} in / ${authored.outputTokens ?? 0} out tokens)\n` +
-      `  grounded   ${authored.grounded ? `yes — selectors checked against ${authored.sourceUrl}` : 'NO — selectors are guesses; verify every one before trusting this'}\n` +
-      (group === undefined ? '' : `  folder     ${dir}\n`),
-  );
-  for (const [index, testCase] of cases.entries()) {
-    process.stdout.write(
-      `  · ${testCase.name} (${testCase.flow.steps.length} steps)\n` +
-        `    flow     ${flowPaths[index]}\n`,
-    );
-  }
-  if (authored.droppedSteps > 0) {
-    process.stdout.write(
-      `  ! dropped ${authored.droppedSteps} malformed step(s) the model emitted\n`,
-    );
-  }
+  printAuthored(authored, cases, flowPaths, approved.length, group, dir);
 
   if (!options.run) return 0;
 
@@ -1468,23 +2278,26 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // owed an answer about them. `runCases` also survives a case that *throws*,
   // which a failed case does not: see its note.
   const outcomes = await runCases(
-    cases.map((testCase) => ({
+    cases.map((testCase, index) => ({
+      flowPath: flowPaths[index],
       name: testCase.name,
       flow: testCase.flow,
       kind: 'catalog',
       ...(testCase.scenarioId !== undefined && group !== undefined
         ? { group: `${group}/${slugify(testCase.scenarioId)}` }
         : {}),
-      generatedBy: {
-        model: authored.model,
-        generatedAt: authored.authoredAt,
-        sourceUrl: authored.sourceUrl ?? `catalog: ${document.name}`,
-        kind: 'catalog',
-        rationale: claimsFile.summary || authored.rationale,
-      },
+      // The flow's own stamp, not the pass-wide one: it carries the scenario
+      // and case title the run list groups and labels by.
+      generatedBy: testCase.flow.authoredBy ?? catalogProvenance,
     })),
     options,
-    { dir, group, indexTitle: `wowlidator catalog — ${document.name}` },
+    {
+      dir,
+      group,
+      indexTitle: `wowlidator catalog — ${document.name}`,
+      ledger: ledgerSpec,
+      healHints: healHintsFrom(repoContextGraph ?? null, contextDocs),
+    },
   );
 
   return suiteExit(outcomes);
@@ -1528,10 +2341,12 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
   // capture does, so the author itself is built inside `withPage` below — a
   // second tree is a constructor option, and there is no page to read one from
   // out here.
+  const reviewer = buildFlowReviewer(options);
   const authorOptions = {
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     policy: options.policy,
     probe: options.probe,
+    ...(reviewer === null ? {} : { reviewer }),
     ...(tables.length > 0 ? { tables } : {}),
     ...(projectContext !== '' ? { projectContext } : {}),
     // The third grounding source for expectUrl. A route the application

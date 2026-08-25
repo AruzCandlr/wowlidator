@@ -15,7 +15,18 @@ import type { ProofBundleBuilder } from '../engine/proof-bundle.js';
 import type { DefectCategory, DefectSeverity } from '../engine/proof-bundle.js';
 import { parseJson, recordOf, type ApiRequestSpec, type ApiResponse, type ApiTransport } from './api-client.js';
 import type { RedactionPolicy } from './redact.js';
-import { VariableStore, extractPath, stringifyExtracted } from './variables.js';
+import { UnknownVariableError, VariableStore, extractPath, stringifyExtracted } from './variables.js';
+
+/**
+ * An assertion ran before any `request` step — a flow-ordering fault, not a
+ * response the application gave. Its own class (matched by name in the
+ * runner's `classifyStepFailure`, like `DbUnavailableError`) so the step
+ * scores `error`, never `failed`: the application was never contacted, and a
+ * backend defect about it sent a reader hunting an endpoint no one called.
+ */
+export class NoResponseError extends Error {
+  override readonly name = 'NoResponseError';
+}
 
 /** A `request` step's parameters, as authored in a `.flow.json`. */
 export interface FlowRequestSpec {
@@ -172,6 +183,16 @@ export class ApiActions {
           saveError =
             `could not save {{${name}}}: "${path}" did not resolve in the response body ` +
             `(status ${response.status}, ${response.sizeBytes} bytes)`;
+          // A refused request cannot carry the body the save expects, so the
+          // missing path is a consequence, not the finding — seen live as a
+          // 405 with 0 bytes filed as "response did not contain what the test
+          // needed", which sent a reader into the body of a response that was
+          // never going to have one.
+          if (response.status >= 400) {
+            saveError +=
+              ` — the request itself was refused (${response.status} ${response.statusText}); ` +
+              'the missing path is a consequence of that, not a finding about the body';
+          }
           break;
         }
         this.variables.set(name, stringifyExtracted(value));
@@ -200,11 +221,25 @@ export class ApiActions {
   /** Assert the last response's status. Accepts one status or a set of them. */
   async expectStatus(expected: number | readonly number[], intent?: string): Promise<void> {
     const allowed = typeof expected === 'number' ? [expected] : [...expected];
-    await this.#assert('expectStatus', { expected: allowed, intent }, intent, () => {
+    const detail: Record<string, unknown> = { expected: allowed, intent };
+    await this.#assert('expectStatus', detail, intent, () => {
       const response = this.#requireResponse('expectStatus');
+      detail['actual'] = `${response.status} ${response.statusText}`.trim();
       if (!allowed.includes(response.status)) {
+        // 405/501 are method-level refusals: the endpoint exists but was asked
+        // the wrong way, which in practice is the TEST's own method drifting
+        // from the spec, not a backend defect. Measured live (BE catalogs,
+        // 2026-08-24): every 405 seen at this step was an authored method the
+        // API never offered, filed as a backend failure. The claim still
+        // fails — a wrong status is a wrong status — but the message says
+        // where to look first.
+        const methodDrift =
+          response.status === 405 || response.status === 501
+            ? ' — a method-level refusal usually means the request\'s own method is wrong ' +
+              '(test drift from the endpoint\'s spec), not a backend defect; check the spec before filing one'
+            : '';
         throw new Error(
-          `expected status ${allowed.join(' or ')}, got ${response.status} ${response.statusText}`,
+          `expected status ${allowed.join(' or ')}, got ${response.status} ${response.statusText}${methodDrift}`,
         );
       }
     });
@@ -220,9 +255,10 @@ export class ApiActions {
     path: string,
     options: { value?: string | undefined; intent?: string | undefined } = {},
   ): Promise<void> {
+    const detail: Record<string, unknown> = { path, expected: options.value, intent: options.intent };
     await this.#assert(
       'expectJson',
-      { path, expected: options.value, intent: options.intent },
+      detail,
       options.intent,
       () => {
         const response = this.#requireResponse('expectJson');
@@ -232,8 +268,11 @@ export class ApiActions {
         }
         const actual = extractPath(parsed, path);
         if (actual === undefined) {
+          detail['actual'] = '(path did not resolve)';
           throw new Error(`"${path}" did not resolve in the response body`);
         }
+        detail['actual'] = stringifyExtracted(actual);
+        if (options.value === undefined) detail['expected'] = `"${path}" resolves`;
         if (options.value !== undefined) {
           const rendered = stringifyExtracted(actual);
           const expected = this.variables.interpolate(options.value);
@@ -249,10 +288,12 @@ export class ApiActions {
 
   /** Assert a response header. Names are compared case-insensitively. */
   async expectHeader(name: string, value: string, intent?: string): Promise<void> {
-    await this.#assert('expectHeader', { header: name, expected: value, intent }, intent, () => {
+    const detail: Record<string, unknown> = { header: name, expected: value, intent };
+    await this.#assert('expectHeader', detail, intent, () => {
       const response = this.#requireResponse('expectHeader');
       const actual = response.headers[name.toLowerCase()];
       const expected = this.variables.interpolate(value);
+      detail['actual'] = actual ?? '(header absent)';
       if (actual === undefined) throw new Error(`response has no ${name} header`);
       if (actual !== expected) {
         throw new Error(
@@ -264,7 +305,9 @@ export class ApiActions {
 
   #requireResponse(action: string): ApiResponse {
     if (!this.#lastResponse) {
-      throw new Error(`${action} has nothing to assert against — no request step has run yet`);
+      throw new NoResponseError(
+        `${action} has nothing to assert against — no request step has run yet`,
+      );
     }
     return this.#lastResponse;
   }
@@ -319,6 +362,15 @@ export class ApiActions {
         detail,
         error: message,
       });
+      // A fault of the FLOW's own making files no defect against anyone: an
+      // unknown {{variable}} (nothing saved it) and an assertion with no
+      // request before it say nothing about the endpoint — measured live as
+      // `backend`/`high` defects that sent readers hunting an API the run
+      // never reached. The step still fails loudly; the runner's
+      // `classifyStepFailure` scores both `error` by name.
+      if (error instanceof UnknownVariableError || error instanceof NoResponseError) {
+        throw error;
+      }
       // `backend`, not `functional`: there is no selector, no page, and
       // nothing a test author can repair — a failed HTTP assertion routes to
       // whoever owns the endpoint. It is also what keeps the proof bundle's

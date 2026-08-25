@@ -40,6 +40,13 @@ export interface CliOptions {
    */
   agentCapture: boolean;
   /**
+   * Review each authored flow against the codebase and documents before it
+   * is written (`--no-author-review` disables). On by default, like the
+   * capture pilot, and for the same reason: an ungrounded step poisons every
+   * run of the case. Degrades silently when the agent role has no key.
+   */
+  authorReview: boolean;
+  /**
    * In-run step reconstruction: a failed step is rebuilt by the repair model
    * against the live page and retried, up to 3 total tries, before final
    * classification. On by default (`--no-reconstruct` disables); degrades
@@ -94,6 +101,27 @@ export interface CliOptions {
   maxPages: number | undefined;
   /** Healer calls allowed per link during a crawl. */
   maxHeal: number | undefined;
+  /**
+   * How many cases of a suite may run at once. Undefined takes
+   * `DEFAULT_CONCURRENCY`; `1` restores the strictly sequential run this had
+   * before, which is also the A/B test when a parallel result looks wrong.
+   * A case that changes data runs alone whatever this says — see `caseWrites`.
+   */
+  concurrency: number | undefined;
+  /**
+   * How many catalog rows are authored at once (`--author-concurrency`).
+   * Each worker reads the start page in its own tab; the per-row journey
+   * capture was already in a context of its own. 1 authors rows one after
+   * another, the A/B for a batched result that looks wrong.
+   */
+  authorConcurrency: number | undefined;
+  /**
+   * How far authoring may run ahead of the runs on a pipelined catalog
+   * (`--author-lookahead`): the number of scenarios beyond the one currently
+   * being run, `'all'` to author eagerly as before. Default 0 — authoring
+   * holds at the running scenario (`ScenarioGate`).
+   */
+  authorLookahead: number | 'all' | undefined;
   /** Follow navigational buttons as well as links. Opt-in — see the crawler. */
   followButtons: boolean;
   /** Start or recycle a driveable Chrome before running. Default on. */
@@ -131,6 +159,16 @@ export interface CliOptions {
   claimsOnly: boolean;
   /** Read approved claims from this file instead of extracting them again. */
   claims: string | undefined;
+  /** Skip cases the claims file's progress ledger already has a verdict for; run the rest. */
+  resume: boolean;
+  /** Re-author and re-run every recorded case whose flow proves nothing about its claim. Implies `--resume`. */
+  rerunVacuous: boolean;
+  /** Re-run every recorded case the harness ended with an error (not a verdict about the app). Implies `--resume`. */
+  rerunErrors: boolean;
+  /** Rerun the plan from this case id onward, verdicts included. Implies resume. */
+  resumeFrom?: string | undefined;
+  /** Re-run every recorded failed / dead-end case, with autoheal on. Implies `--resume` and `--repair`. */
+  rerunFailed: boolean;
   /** Where `--claims-only` writes the claims it found. */
   claimsOut: string | undefined;
   /** Where `draft` writes the catalog it constructs. */
@@ -163,6 +201,12 @@ export interface CliOptions {
   contextOut: string | undefined;
   /** Rebuild the context graph even if its signature is unchanged. */
   force: boolean;
+  /**
+   * Keep a suite's own list order instead of running readers before writers.
+   * The reorder is the default because a suite that mutates state mid-run
+   * invalidates its own remaining read-assertions — see `readersFirst`.
+   */
+  sheetOrder: boolean;
   /** `run`: on failure, ask AI to rewrite the flow and retry. Default off. */
   repair: boolean;
   /** Total attempts for `--repair`, including the first unmodified run. */
@@ -247,7 +291,7 @@ export function parseCaptureDelay(raw: string | undefined, configured: number): 
  * repository index) and `--context-doc` (background documents) are already
  * one flag apart from doing each other's job, and a third context-shaped
  * noun — `--no-context-retrieval`, `--full-context` — is how that hazard gets
- * worse. `0` says "off" without inventing one.
+ * worse. `0` says "send everything" without inventing one.
  *
  * Rejects rather than clamps, the `parseCaptureDelay` rule: a budget typed
  * wrong is either a prompt with no background in it or one with all of it, and

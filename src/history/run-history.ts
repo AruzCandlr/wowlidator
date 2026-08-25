@@ -14,6 +14,7 @@ import { appendFile, mkdir, readFile, rm } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
 import type { ProofBundle, RunStatus } from '../engine/proof-bundle.js';
+import { isPassing } from '../engine/proof-bundle.js';
 
 export const DEFAULT_HISTORY_PATH = '.wowlidator/history.jsonl';
 /** Runs inspected when classifying a result. */
@@ -84,6 +85,9 @@ export function toHistoryEntry(bundle: ProofBundle): HistoryEntry {
   };
 }
 
+/** In-process serialisation of appends, one chain per history file. */
+const appendChain = new Map<string, Promise<void>>();
+
 export class RunHistory {
   readonly filePath: string;
 
@@ -125,8 +129,17 @@ export class RunHistory {
   }
 
   async append(bundle: ProofBundle): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await appendFile(this.filePath, `${JSON.stringify(toHistoryEntry(bundle))}\n`, 'utf8');
+    // Serialised per file within the process: a suite's cases finish
+    // concurrently now, and two appends of one line each are almost always
+    // fine on a local disk — "almost" is not a property a run history should
+    // rest on, when a chained promise makes it certain for nothing.
+    const previous = appendChain.get(this.filePath) ?? Promise.resolve();
+    const mine = previous.then(async () => {
+      await mkdir(dirname(this.filePath), { recursive: true });
+      await appendFile(this.filePath, `${JSON.stringify(toHistoryEntry(bundle))}\n`, 'utf8');
+    });
+    appendChain.set(this.filePath, mine.catch(() => undefined));
+    await mine;
   }
 
   /**
@@ -156,7 +169,7 @@ export class RunHistory {
  */
 export function analyseTrend(bundle: ProofBundle, previous: readonly HistoryEntry[]): RunTrend {
   const priors = previous.filter((entry) => entry.runId !== bundle.runId);
-  const nowFailed = bundle.status !== 'passed';
+  const nowFailed = !isPassing(bundle.status);
   const signatures = failureSignatures(bundle);
 
   if (priors.length === 0) {
@@ -176,7 +189,7 @@ export function analyseTrend(bundle: ProofBundle, previous: readonly HistoryEntr
   // "newly broken — the previous run passed" when the previous run had
   // status `error`: the walk below stopped at the first non-`failed` entry
   // and fabricated a pass nobody observed. (Seen live in PB-02-01.)
-  const passedOf = (status: string | undefined): boolean => status === 'passed';
+  const passedOf = (status: string | undefined): boolean => status !== undefined && isPassing(status);
 
   let flips = 0;
   for (let i = 1; i < priors.length; i += 1) {

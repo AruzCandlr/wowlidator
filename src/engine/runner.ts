@@ -70,7 +70,28 @@ import {
 import { RunHistory, analyseTrend } from '../history/run-history.js';
 import { HealFailedError, HealUnavailableError, JitHealer, captureAxTree } from '../healer/jit-healer.js';
 import type { FlowRepairModel } from '../repair/flow-repair-model.js';
-import { WorkflowAgent } from '../orchestrator/workflow-agent.js';
+import { WorkflowAgent, cacheAgentMemory, type AgentDbProbe, type PlanStep } from '../orchestrator/workflow-agent.js';
+import { SessionVault, type StoredSession } from './session-vault.js';
+
+/**
+ * One recorded action of a `workflow` step's deterministic script — the
+ * agent's own `PlanStep` shape, re-exported under the flow file's name for
+ * it so flow JSON stays readable without the orchestrator's vocabulary.
+ */
+export type WorkflowScriptStep = PlanStep;
+import { selectorName } from '../orchestrator/agent-guards.js';
+import {
+  AUTO_PROVE_CONFIDENCE,
+  autoReviewRuling,
+  reviewPairs,
+  type ReviewJudge,
+} from './review-judge.js';
+import {
+  agentModelUnavailable,
+  goalEvidence,
+  looksLikeSignIn,
+} from '../orchestrator/goal-evidence.js';
+import { performSignIn, performSignOut, acceptConsentGate, acceptConsentGateAnywhere, CONSENT_GATE_URL_PATTERN } from './sign-in.js';
 import { generateValue, type DataKind } from '../data/mock-data.js';
 import type { DataModel } from '../data/data-model.js';
 import { describeDialog, findDismissButton, openDialogNow, waitForDialog } from './modal.js';
@@ -101,6 +122,7 @@ import {
   type RejectedHeal,
   type ResolutionSource,
 } from './proof-bundle.js';
+import { inferPolarity, type TestPolarity } from './polarity.js';
 
 export const DEFAULT_CDP_URL = 'http://localhost:9222';
 /** Fast-path timeout. Short by design — see the module comment. */
@@ -135,6 +157,12 @@ export interface SmartRunnerOptions {
    * other kind generates deterministically and never needs this at all.
    */
   dataModel?: DataModel | null | undefined;
+  /**
+   * `Flow.caseContext`, threaded to the runtime model roles: every heal and
+   * every agent turn carries the test case the step serves. Context only —
+   * it changes what those models know, never what any step claims.
+   */
+  caseContext?: string | undefined;
   fastTimeoutMs?: number | undefined;
   healedTimeoutMs?: number | undefined;
   /**
@@ -145,6 +173,40 @@ export interface SmartRunnerOptions {
    * see `video.ts`. That is the reason this is a switch and not an assumption.
    */
   video?: VideoMode | undefined;
+  /**
+   * Give this run its own browser context even when it is not being filmed.
+   *
+   * Two runs sharing `browser.contexts()[0]` share its pages, and a suite that
+   * runs its cases concurrently would have them clicking in each other's tabs
+   * — the exact interleaving the panel's one-browser-at-a-time rule exists to
+   * prevent, moved inside a single command. A recorded run already gets its
+   * own context for an unrelated reason (recording is a property of a context),
+   * which is why this only has to cover `--video off`.
+   *
+   * The session is carried across exactly as the recording path carries it, so
+   * isolation does not silently sign the run out.
+   */
+  isolate?: boolean | undefined;
+  /**
+   * Whether a context this run creates starts with the attached browser's
+   * session (cookies + storage). Default true — the reason a filmed run can
+   * still test a page someone signed into by hand. `false` starts EMPTY, and
+   * is what a flow that signs in ITSELF wants: an inherited session is a
+   * different account signed in before its first step, and on this
+   * application a stale admin session left in the browser by an earlier run
+   * put every persona's case on the admin's landing page instead of the login
+   * form. `runFlow` sets it from the flow's own shape — see `signsInItself`.
+   */
+  inheritSession?: boolean | undefined;
+
+  /**
+   * A session banked by an earlier case of the same suite, injected into
+   * this run's own context (`SessionVault` as data — contexts stay
+   * isolated). Used only when `inheritSession` allows inheriting at all;
+   * outranks the attached browser's state when present.
+   */
+  sessionState?: StoredSession | undefined;
+
   /**
    * Stills.
    *
@@ -209,6 +271,12 @@ export interface SmartRunnerOptions {
    * it is frequently the evidence that says which persona a run signed in as.
    */
   credentials?: { email: string; password: string } | undefined;
+  /**
+   * Whether the flow contains its own sign-in (`signsInItself`). Decides the
+   * session bootstrap below: a flow that types credentials must be the one
+   * doing the signing in, and the harness must never race it.
+   */
+  flowSignsInItself?: boolean | undefined;
   /**
    * Ring-buffer cap for the observer. The default (300) suits per-step
    * evidence; a long journey ending in an `expectCalls` over the whole run
@@ -441,7 +509,7 @@ export class StepResolutionError extends Error {
  */
 const DEFAULT_VIEWPORT = { width: 1920, height: 1080 } as const;
 
-export function configuredViewport(
+function configuredViewport(
   raw: string | undefined = process.env['WOWLIDATOR_VIEWPORT'],
 ): { width: number; height: number } | null {
   const value = raw?.trim() ?? '';
@@ -459,6 +527,10 @@ interface SessionInheritance {
   available: number;
   /** Why nothing was inherited, when that is the answer. */
   error?: string | undefined;
+  /** Nothing was inherited ON PURPOSE — the flow signs in itself. Not a finding. */
+  declined?: boolean | undefined;
+  /** The state came from the suite's own vault, not the attached browser. */
+  fromSuite?: boolean | undefined;
 }
 
 /**
@@ -635,6 +707,21 @@ const NON_LATIN_LETTER = /[Ͱ-ϿЀ-ӿ֐-׿؀-ۿ฀-๿぀-ヿ一-鿿가-힯]/;
  * "the detail page is broken" when the page had rendered the same employee's
  * name in Thai.
  */
+/**
+ * A short window of the page's actual text around the part that satisfied the
+ * claim — enough to show the value in its context ("119 days remaining", not
+ * just "days") without inlining a whole page of innerText into the bundle.
+ */
+function excerptAround(actual: string, matched: string): string {
+  const text = actual.trim();
+  if (text.length <= 200) return text;
+  const at = text.indexOf(matched);
+  if (at === -1) return text.slice(0, 200);
+  const start = Math.max(0, at - 60);
+  const end = Math.min(text.length, at + matched.length + 60);
+  return `${start > 0 ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}`;
+}
+
 export function scriptMismatchNote(expected: string, actual: string): string {
   const expectedLatin = LATIN_LETTER.test(expected) && !NON_LATIN_LETTER.test(expected);
   const expectedOther = NON_LATIN_LETTER.test(expected) && !LATIN_LETTER.test(expected);
@@ -681,15 +768,6 @@ function differentPage(before: string, after: string): boolean {
   }
 }
 
-/** Whether a path reads as an authentication page. Presentation only. */
-function looksLikeSignIn(url: string): boolean {
-  try {
-    return /(^|\/)(login|signin|sign-in|auth|sso)(\/|$)/i.test(new URL(url).pathname);
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Whether this URL can hold web storage at all.
  *
@@ -724,6 +802,7 @@ export class SmartRunner {
   readonly #cache: CacheManager;
   readonly #healer: JitHealer | null;
   readonly #agent: WorkflowAgent | null;
+  readonly #caseContext: string | undefined;
   readonly #dataModel: DataModel | null;
   readonly #fastTimeoutMs: number;
   readonly #healedTimeoutMs: number;
@@ -799,6 +878,11 @@ export class SmartRunner {
    * login screen. See `#strandedMessage`.
    */
   #signInDidNotTake = false;
+  /** `--as`, for the session bootstrap; masking holds them separately. */
+  #credentials: { email: string; password: string } | undefined;
+  #flowSignsInItself = false;
+  /** The bootstrap runs once per run — a second bounce is a real finding. */
+  #sessionBootstrapTried = false;
   /** Only a context this runner created may be closed by it — see `close()`. */
   #ownsContext = false;
 
@@ -816,6 +900,7 @@ export class SmartRunner {
     this.#healer = options.healer ?? null;
     this.#agent = options.agent ?? null;
     this.#dataModel = options.dataModel ?? null;
+    this.#caseContext = options.caseContext;
     this.#fastTimeoutMs = options.fastTimeoutMs ?? DEFAULT_FAST_TIMEOUT_MS;
     this.#healedTimeoutMs = options.healedTimeoutMs ?? DEFAULT_HEALED_TIMEOUT_MS;
     this.#screenshots =
@@ -835,6 +920,8 @@ export class SmartRunner {
     this.#secretValues = new Set(
       options.credentials?.password ? [options.credentials.password] : [],
     );
+    this.#credentials = options.credentials;
+    this.#flowSignsInItself = options.flowSignsInItself ?? false;
     this.#networkMaxCalls = options.networkMaxCalls;
     this.#sequenceMark = Date.now();
     // One store, both action families: a `request` step saves `{{orderId}}`
@@ -929,13 +1016,34 @@ export class SmartRunner {
       // `storageState()` is the whole session as data — cookies, and
       // localStorage for every origin the browser visited — so handing it to
       // the new context makes filming invisible to the application.
-      inheritance = await inheritSession(browser);
+      // The suite's own vault outranks the attached browser: a session a
+      // sibling case established seconds ago is the fresher truth.
+      inheritance =
+        options.inheritSession === false
+          ? { state: undefined, available: 0, declined: true }
+          : options.sessionState !== undefined
+            ? { state: options.sessionState, available: options.sessionState.cookies.length, fromSuite: true }
+            : await inheritSession(browser);
       context = await browser.newContext({
         recordVideo: { dir, size },
         ...(viewport ? { viewport } : {}),
         ...(inheritance.state ? { storageState: inheritance.state } : {}),
       });
       await installCursorOverlay(context);
+    } else if (options.isolate === true) {
+      // Same move the recording branch makes, for a different reason: a
+      // context of our own, carrying the browser's session so the application
+      // cannot tell the difference.
+      inheritance =
+        options.inheritSession === false
+          ? { state: undefined, available: 0, declined: true }
+          : options.sessionState !== undefined
+            ? { state: options.sessionState, available: options.sessionState.cookies.length, fromSuite: true }
+            : await inheritSession(browser);
+      context = await browser.newContext({
+        ...(viewport ? { viewport } : {}),
+        ...(inheritance.state ? { storageState: inheritance.state } : {}),
+      });
     } else {
       context = browser.contexts()[0] ?? (await browser.newContext());
     }
@@ -959,6 +1067,10 @@ export class SmartRunner {
 
     const runner = new SmartRunner(browser, context, page, options);
     if (inheritance) runner.#noteSessionInheritance(inheritance);
+    // Whoever created the context closes it. Without this an isolated,
+    // unfilmed run leaves a live context behind in a Chrome that outlives the
+    // process — one per case, every suite.
+    if (options.isolate === true) runner.#ownsContext = true;
     if (dir) {
       runner.#video = { dir, size };
       runner.#videoMode = options.video ?? 'on';
@@ -1033,8 +1145,32 @@ export class SmartRunner {
       this.#lastGotoPath = null;
       this.#lastGotoAskedSignIn = false;
     }
+    const urlBeforeNav = this.page.url();
     try {
       await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+      // **The session bootstrap.** A goto that asked for an ordinary page and
+      // landed on the sign-in screen, in a run that HAS credentials and whose
+      // flow contains no sign-in of its own, is a flow that assumes a session
+      // against a browser that has none — a fresh headless Chrome, an
+      // isolated context. Seen live (BE_Test2.csv, 2026-08-19 16:53): a
+      // test-case-table catalog authored against a signed-in browser, every
+      // case of which then died on the login screen under the session guard.
+      // The rows' own precondition is "a signed-in user", the person supplied
+      // the account (`--as`), and establishing a documented precondition
+      // deterministically is preparation, not the claim — the same contract
+      // as the agent rung. Once per run; a flow that signs in itself is never
+      // raced; no credentials means the honest fatal below stands.
+      const bootstrapped = await this.#bootstrapSession(url);
+      // **Consent-gate recovery** (docs/consent-gate-recovery-spec.md, F1).
+      // A client-side consent gate can render ON the URL this goto asked for
+      // — URL unchanged, consent heading showing — and accepting it bounces
+      // to the app's home landing, abandoning the deep link. Both facts
+      // measured on the BE_Test2 11:52 run, where recovery left to the model
+      // was a coin flip: the one flow whose agent returned to the asked-for
+      // page passed, the three that wandered off by menu label went red.
+      // Deterministic here: detect by content, accept, re-issue this goto
+      // once. Never when the goto asked for the gate itself.
+      const consentSettled = await this.#settleConsentGate(url, urlBeforeNav);
       this.bundle.addStep({
         action: 'goto',
         selector: null,
@@ -1044,10 +1180,14 @@ export class SmartRunner {
         startedAt,
         durationMs: Date.now() - started,
         url: this.page.url(),
-        detail: { url },
+        detail: {
+          url,
+          ...(bootstrapped === null ? {} : { sessionEstablished: bootstrapped }),
+          ...(consentSettled ? { consentAccepted: true } : {}),
+        },
         // The landing state. A navigation is where the page changes most, so
         // this is the frame everything after it is read against.
-        screenshot: await this.#shoot('routine'),
+        screenshot: await this.#shoot(bootstrapped === null && !consentSettled ? 'routine' : 'notable'),
       });
     } catch (error) {
       this.bundle.addStep({
@@ -1393,6 +1533,41 @@ export class SmartRunner {
         });
       },
     );
+  }
+
+  /**
+   * Sign out through the application's own control (`performSignOut`), so a
+   * persona switch exercises the same path a user takes. When the app offers
+   * no name-gated sign-out control anywhere the step falls back to clearing
+   * cookies and storage — the session still ends, and the step's `detail`
+   * says the real path was not exercised rather than letting a wiped session
+   * read as a working sign-out. A `#bareStep`: there is no author-supplied
+   * selector to heal, the `setLocalStorage` category.
+   */
+  async signOut(intent?: string): Promise<void> {
+    const detail: Record<string, unknown> = { intent, urlBefore: this.page.url() };
+    await this.#bareStep('signOut', detail, async () => {
+      const result = await performSignOut(this.page);
+      if (result.ok) {
+        detail['via'] = result.via;
+        detail['urlAfter'] = result.landedUrl;
+        return;
+      }
+      // Fallback: end the session without the app's help. Cookies AND
+      // storage — a cookie-backed session survives a storage wipe entirely.
+      await this.page.context().clearCookies();
+      if (hasStorableOrigin(this.page.url())) {
+        await this.page.evaluate(() => {
+          const g = globalThis as unknown as BrowserGlobals;
+          g.localStorage.clear();
+          g.sessionStorage.clear();
+        });
+      }
+      detail['via'] =
+        `fallback — ${result.reason}; cleared cookies and storage instead, so the ` +
+        'application\'s own sign-out path was NOT exercised';
+      detail['urlAfter'] = this.page.url();
+    });
   }
 
   // --- History navigation --------------------------------------------------
@@ -2008,11 +2183,20 @@ export class SmartRunner {
    * escalation ladder: there's no selector here to heal.
    */
   async expectModal(name?: string, intent?: string): Promise<void> {
-    await this.#bareStep('expectModal', { name, intent }, async () => {
+    const detail: Record<string, unknown> = {
+      name,
+      intent,
+      ...(name === undefined ? {} : { expected: name }),
+    };
+    await this.#bareStep('expectModal', detail, async () => {
       const dialog = await waitForDialog(this.page, this.#healedTimeoutMs);
-      if (!dialog) throw new Error('no dialog or modal is currently visible');
+      if (!dialog) {
+        if (name !== undefined) detail['actual'] = '(no dialog or modal visible)';
+        throw new Error('no dialog or modal is currently visible');
+      }
       if (name) {
         const label = await describeDialog(dialog);
+        detail['actual'] = label;
         if (!label.toLowerCase().includes(name.toLowerCase())) {
           throw new Error(`open dialog ("${label}") does not mention "${name}"`);
         }
@@ -2104,11 +2288,13 @@ export class SmartRunner {
           const matched = accepted.find((candidate) => actual.includes(candidate));
           if (matched !== undefined) {
             if (matched !== expected) detail['matchedRendering'] = matched;
+            detail['actual'] = excerptAround(actual, matched);
             return;
           }
           if (Date.now() >= deadline) break;
           await this.page.waitForTimeout(Math.min(150, Math.max(1, deadline - Date.now())));
         }
+        detail['actual'] = actual.trim().slice(0, 400);
         throw new Error(
           `expected text to contain ${JSON.stringify(expected)}` +
             (anyOf?.length ? ` (or an accepted rendering: ${anyOf.map((a) => JSON.stringify(a)).join(', ')})` : '') +
@@ -2121,8 +2307,21 @@ export class SmartRunner {
   }
 
   async expectVisible(selector: string, intent?: string): Promise<void> {
-    await this.#step('expectVisible', selector, intent, (locator, timeout) =>
-      locator.waitFor({ state: 'visible', timeout }),
+    const detail: Record<string, unknown> = { expected: 'visible' };
+    await this.#step(
+      'expectVisible',
+      selector,
+      intent,
+      async (locator, timeout) => {
+        try {
+          await locator.waitFor({ state: 'visible', timeout });
+          detail['actual'] = 'visible';
+        } catch (error) {
+          detail['actual'] = 'not visible (hidden or absent)';
+          throw error;
+        }
+      },
+      detail,
     );
   }
 
@@ -2134,38 +2333,65 @@ export class SmartRunner {
    * unrelated element and turn a correct pass into a meaningless one.
    */
   async expectHidden(selector: string, intent?: string): Promise<void> {
-    await this.#bareStep('expectHidden', { selector, intent }, async () => {
-      await this.page
-        .locator(selector)
-        .first()
-        .waitFor({ state: 'hidden', timeout: this.#fastTimeoutMs });
+    const detail: Record<string, unknown> = { selector, intent, expected: 'hidden or absent' };
+    await this.#bareStep('expectHidden', detail, async () => {
+      try {
+        await this.page
+          .locator(selector)
+          .first()
+          .waitFor({ state: 'hidden', timeout: this.#fastTimeoutMs });
+        detail['actual'] = 'hidden or absent';
+      } catch (error) {
+        detail['actual'] = 'still visible';
+        throw error;
+      }
     });
   }
 
   async expectEnabled(selector: string, intent?: string): Promise<void> {
-    await this.#step('expectEnabled', selector, intent, async (locator, timeout) => {
-      await locator.waitFor({ state: 'attached', timeout });
-      if (!(await locator.isEnabled({ timeout }))) {
-        throw new Error('expected element to be enabled, but it is disabled');
-      }
-    });
+    const detail: Record<string, unknown> = { expected: 'enabled' };
+    await this.#step(
+      'expectEnabled',
+      selector,
+      intent,
+      async (locator, timeout) => {
+        await locator.waitFor({ state: 'attached', timeout });
+        const enabled = await locator.isEnabled({ timeout });
+        detail['actual'] = enabled ? 'enabled' : 'disabled';
+        if (!enabled) {
+          throw new Error('expected element to be enabled, but it is disabled');
+        }
+      },
+      detail,
+    );
   }
 
   async expectDisabled(selector: string, intent?: string): Promise<void> {
-    await this.#step('expectDisabled', selector, intent, async (locator, timeout) => {
-      await locator.waitFor({ state: 'attached', timeout });
-      if (await locator.isEnabled({ timeout })) {
-        throw new Error('expected element to be disabled, but it is enabled');
-      }
-    });
+    const detail: Record<string, unknown> = { expected: 'disabled' };
+    await this.#step(
+      'expectDisabled',
+      selector,
+      intent,
+      async (locator, timeout) => {
+        await locator.waitFor({ state: 'attached', timeout });
+        const enabled = await locator.isEnabled({ timeout });
+        detail['actual'] = enabled ? 'enabled' : 'disabled';
+        if (enabled) {
+          throw new Error('expected element to be disabled, but it is enabled');
+        }
+      },
+      detail,
+    );
   }
 
   /** Assert how many elements the selector matches. Zero bypasses the ladder. */
   async expectCount(selector: string, expected: number, intent?: string): Promise<void> {
     if (expected === 0) {
       // Same reasoning as expectHidden: absence must not be "repaired".
-      await this.#bareStep('expectCount', { selector, expected, intent }, async () => {
+      const zeroDetail: Record<string, unknown> = { selector, expected, intent };
+      await this.#bareStep('expectCount', zeroDetail, async () => {
         const actual = await this.page.locator(selector).count();
+        zeroDetail['actual'] = actual;
         if (actual !== 0) {
           throw new Error(`expected 0 matches, found ${actual}`);
         }
@@ -2173,6 +2399,7 @@ export class SmartRunner {
       return;
     }
 
+    const detail: Record<string, unknown> = { expected };
     await this.#step(
       'expectCount',
       selector,
@@ -2180,17 +2407,19 @@ export class SmartRunner {
       async (locator, timeout) => {
         await locator.first().waitFor({ state: 'attached', timeout });
         const actual = await locator.count();
+        detail['actual'] = actual;
         if (actual !== expected) {
           throw new Error(`expected ${expected} matches, found ${actual}`);
         }
       },
-      { expected },
+      detail,
     );
   }
 
   /** Assert the current URL contains `expected`. No selector, so no healing. */
   async expectUrl(expected: string, intent?: string): Promise<void> {
-    await this.#bareStep('expectUrl', { expected, intent }, async () => {
+    const detail: Record<string, unknown> = { expected, intent };
+    await this.#bareStep('expectUrl', detail, async () => {
       // Wait, don't peek. A client-side navigation is in flight when this step
       // begins — `click` returns as soon as the click lands, not when the
       // router has finished — so reading `page.url()` synchronously races it
@@ -2209,9 +2438,11 @@ export class SmartRunner {
         await this.page.waitForURL((url) => url.toString().includes(expected), {
           timeout: this.#healedTimeoutMs,
         });
+        detail['actual'] = this.page.url();
       } catch {
         // Report what the URL actually is now, not what the timeout said —
         // "expected X, got Y" is the whole diagnostic value of this step.
+        detail['actual'] = this.page.url();
         throw new Error(
           `expected url to contain ${JSON.stringify(expected)}, got ${JSON.stringify(this.page.url())} — ` +
             'note: if the page shown IS the correct destination, the expectation was derived ' +
@@ -2289,19 +2520,21 @@ export class SmartRunner {
 
   /** Assert an input's current value. */
   async expectValue(selector: string, expected: string, intent?: string): Promise<void> {
+    const detail: Record<string, unknown> = { expected };
     await this.#step(
       'expectValue',
       selector,
       intent,
       async (locator, timeout) => {
         const actual = await locator.inputValue({ timeout });
+        detail['actual'] = actual;
         if (actual !== expected) {
           throw new Error(
             `expected value ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
           );
         }
       },
-      { expected },
+      detail,
     );
   }
 
@@ -2312,6 +2545,7 @@ export class SmartRunner {
     expected: string,
     intent?: string,
   ): Promise<void> {
+    const detail: Record<string, unknown> = { attribute: name, expected };
     await this.#step(
       'expectAttribute',
       selector,
@@ -2319,13 +2553,14 @@ export class SmartRunner {
       async (locator, timeout) => {
         await locator.waitFor({ state: 'attached', timeout });
         const actual = await locator.getAttribute(name);
+        detail['actual'] = actual ?? '(attribute absent)';
         if (actual !== expected) {
           throw new Error(
             `expected @${name} to be ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
           );
         }
       },
-      { attribute: name, expected },
+      detail,
     );
   }
 
@@ -2365,6 +2600,17 @@ export class SmartRunner {
 
   async expectDbRow(spec: FlowDbRowSpec): Promise<void> {
     await this.#db.expectDbRow(spec);
+  }
+
+  /**
+   * The agent's read-only database access, offered only when a database is
+   * actually configured — an absent probe makes `dbCount` fail with advice
+   * instead of a connection error, and never dangles a capability the run
+   * cannot honour. Spread into `RunOptions` at the `agent.run` call sites.
+   */
+  #agentDbProbe(): { dbProbe: AgentDbProbe } | null {
+    if (!this.#db.configured) return null;
+    return { dbProbe: (table, where) => this.#db.probeCount(table, where) };
   }
 
   async expectDbDelta(spec: FlowDbDeltaSpec): Promise<void> {
@@ -2563,7 +2809,7 @@ export class SmartRunner {
    * return to the deterministic fast path. Use for multi-page navigations
    * whose interstitials aren't known ahead of time.
    */
-  async workflow(goal: string): Promise<AgentRecord> {
+  async workflow(goal: string, script?: readonly WorkflowScriptStep[] | undefined): Promise<AgentRecord> {
     const startedAt = new Date().toISOString();
     const started = Date.now();
 
@@ -2587,8 +2833,56 @@ export class SmartRunner {
       throw error;
     }
 
-    const record = await this.#agent.run(this.page, goal);
-    const failed = !record.success;
+    // **What the agent did is recorded as evidence, not only as its own
+    // account.** The step carries what the page showed before and after —
+    // URL, headings, and every request the page itself made while the agent
+    // held it — so a leg nothing asserts on afterwards is still auditable
+    // from the report: which page it ended on, what appeared, what the app
+    // was asked to do. This is the honest form of "let the agent try and
+    // record the screen and API changes as its proof": the agent's claim is
+    // still never the verdict (see below), but the changes it caused are on
+    // the record for a person to judge, and the film shows the rest.
+    const netMark = this.#takeNetMark();
+    const urlBefore = this.page.url();
+    const headingsBefore = await this.#headingsNow();
+    const record = await this.#agent.run(this.page, goal, {
+      memory: cacheAgentMemory(this.#cache),
+      caseContext: this.#caseContext,
+      ...(script === undefined ? {} : { script }),
+      ...(this.#agentDbProbe() ?? {}),
+    });
+    const urlAfter = this.page.url();
+    const headingsAfter = await this.#headingsNow();
+    const traffic = this.#networkEvidence(netMark);
+
+    // **What the agent claims is never the evidence.** The ladder's agent rung
+    // has always obeyed this structurally — it prepares the page and then the
+    // author's own selector is retried — and this action did not: a single
+    // `!record.success` read decided the step, so an agent that met its goal
+    // and then talked itself out of saying so filed a `high` defect against a
+    // working application. See `goal-evidence.ts` for the run this came from.
+    //
+    // The page is asked first. Only when it has nothing to say does the
+    // agent's own account stand.
+    const evidence = record.success ? null : goalEvidence(goal, urlBefore, urlAfter);
+    // A model that could not answer is not an application that could not
+    // comply. Same rule the healer follows for `HealUnavailableError`: a
+    // provider fact, not a page fact, and it must never be worded as "the goal
+    // is unreachable" or counted against the app.
+    const providerFailed = !record.success && evidence === null && agentModelUnavailable(record.summary);
+    const failed = !record.success && evidence === null;
+    // F4 of docs/consent-gate-recovery-spec.md: a failure reported from a
+    // page the flow never asked for names the displacement outright. The
+    // measured shape: an interstitial dumped the agent elsewhere, it wandered
+    // to the wrong page and honestly reported "the button does not exist" —
+    // true of the page it was on, false of the page the step began on. The
+    // note is what routes a reader to the gate finding instead of filing
+    // "the control is missing" against a page that has it.
+    const displaced =
+      failed && !providerFailed && urlAfter !== urlBefore
+        ? ` — note: the agent ended on ${urlAfter}, not the page this step began on (${urlBefore}); ` +
+          'the control it reported on may exist on the original page'
+        : '';
 
     this.bundle.addStep({
       action: 'workflow',
@@ -2598,19 +2892,64 @@ export class SmartRunner {
       status: failed ? 'failed' : 'passed',
       startedAt,
       durationMs: Date.now() - started,
-      url: this.page.url(),
-      detail: { goal, turns: record.turns },
+      url: urlAfter,
+      detail: {
+        goal,
+        turns: record.turns,
+        ...(evidence === null ? {} : { settledBy: evidence.rule, evidence: evidence.reason }),
+        // The before/after the agent produced, as data. Headings are what a
+        // person reads to know which screen they are on; the diff of them is
+        // "what appeared". Capped, like every other evidence list.
+        urlBefore,
+        urlAfter,
+        headingsBefore: headingsBefore.slice(0, 8),
+        headingsAfter: headingsAfter.slice(0, 8),
+        appeared: headingsAfter.filter((h) => !headingsBefore.includes(h)).slice(0, 8),
+        callsMade: traffic.calls.length,
+      },
       agent: record,
+      network: traffic.calls.length > 0 ? traffic.calls : undefined,
       screenshot: await this.#shoot(failed ? 'failure' : 'notable'),
-      error: failed ? record.summary : undefined,
+      error: failed ? `${record.summary}${displaced}` : undefined,
     });
 
+    if (evidence !== null) {
+      // Green, and still a finding: the goal was met, but the agent spent its
+      // whole budget failing to notice, and every run will pay that again
+      // until the goal is tightened or the leg is written as ordinary steps.
+      this.#recordRuntimeDefect(
+        'usability',
+        'low',
+        `Workflow agent under-reported its own success: ${goal}`,
+        `The agent said "${record.summary}" after ${record.turns} turn(s), but ${evidence.reason}. ` +
+          'The step is judged on that evidence rather than on the agent\'s account of itself. ' +
+          'The turns were still paid for: narrow the goal, or replace this leg with ordinary steps.',
+        undefined,
+      );
+    }
+
     if (failed) {
+      if (providerFailed) {
+        // No defect at all. Nothing here is a claim about the application —
+        // the agent never reached it.
+        throw new Error(
+          `workflow agent unavailable: ${record.summary} ` +
+            '(this is a SYSTEM failure — the model, not the application; no defect was filed against the app)',
+        );
+      }
+      const exhausted = record.maxSteps !== null && record.turns >= record.maxSteps;
       this.#recordRuntimeDefect(
         'functional',
-        'high',
+        // Running out of turns is a fact about the budget, not about the
+        // feature: the agent may have been one click away. `high` is reserved
+        // for a goal the agent actively determined it could not reach.
+        exhausted ? 'medium' : 'high',
         `Workflow goal not reached: ${goal}`,
-        record.summary,
+        exhausted
+          ? `${record.summary}${displaced}. The ${record.maxSteps}-turn budget ran out, which is a harness limit rather than ` +
+            'an application fact — nothing here says the feature is broken. Narrow the goal, or settle the ' +
+            'claim with an assertion after this step.'
+          : `${record.summary}${displaced}`,
         undefined,
       );
       throw new Error(`workflow agent failed: ${record.summary}`);
@@ -2796,6 +3135,42 @@ export class SmartRunner {
       // heading still leads when the ladder found one — it is the harder stop
       // — and a live-region message follows, or leads when there is no denial.
       const pageContext = [...(resolution?.pageContext ?? []), ...(await this.#pageMessages())];
+      // **An exact-match miss over text the page HOLDS is a wording question,
+      // not an absence.** `text="X"` and `role=…[name="X"]` demand a whole
+      // element whose text/name IS X; a page rendering X inside a longer
+      // sentence fails them at any timeout while a reader sees the text
+      // plainly on screen (be100 PL_06_10: `text="Plan ID already exists"`
+      // dead-ended against a toast holding exactly that sentence, 40s and a
+      // healer call to disprove nothing). One $0 read settles which case this
+      // is: when the asserted text is contained in the page's own innerText,
+      // the step keeps its failure but carries the evidence
+      // (`expected`/`actual`/`foundInPageText`), and `finish()` classifies
+      // the run proved-? for a human to rule — never a silent pass, never a
+      // bare "could not resolve" about text that is there.
+      if (PRESENCE_ACTIONS.has(action)) {
+        // Only `expectText`'s expected IS content. The state assertions record
+        // a state label there — `expectVisible` writes the literal word
+        // "visible" — and probing the page for THAT stamped `foundInPageText`
+        // on any page that happens to render the English word "visible"
+        // (tests/evidence.test.ts's fixture, live): a dead-ended CSS selector
+        // then read as a wording question about text nobody asserted. For
+        // everything else the only content worth probing is the selector's
+        // own name (`text=`/`role=[name=…]`); a CSS selector has none and is
+        // never stamped.
+        const wanted =
+          action === 'expectText' && typeof detail?.['expected'] === 'string'
+            ? (detail['expected'] as string)
+            : (selectorName(selector) ?? '');
+        const contained = wanted === '' ? null : await this.#textContainedInPage(wanted);
+        if (contained !== null) {
+          detail = {
+            ...(detail ?? {}),
+            expected: wanted,
+            actual: contained,
+            foundInPageText: true,
+          };
+        }
+      }
       this.bundle.addStep({
         action,
         intent,
@@ -2908,6 +3283,16 @@ export class SmartRunner {
    * spent 20s+ per step walking the ladder, and three failed steps in a row
    * carried no network evidence at all while their neighbours did.
    */
+  /** The page's headings right now — the cheapest honest "which screen is this". */
+  async #headingsNow(): Promise<string[]> {
+    try {
+      const texts = await this.page.locator('role=heading').allInnerTexts();
+      return texts.map((t) => t.replace(/\s+/g, ' ').trim()).filter((t) => t !== '');
+    } catch {
+      return [];
+    }
+  }
+
   #takeNetMark(): number | undefined {
     if (!this.#network) return undefined;
     const mark = this.#network.mark();
@@ -3106,6 +3491,23 @@ export class SmartRunner {
    * So the one moment the truth is knowable, it is written down.
    */
   #noteSessionInheritance(inheritance: SessionInheritance): void {
+    // Declined is a decision, not a defect: the flow authenticates itself and
+    // asked for a clean start. Recorded on the bundle's notes so the report
+    // says why this run held no cookies at step 0.
+    if (inheritance.declined) {
+      this.bundle.note(
+        'session: started from an empty context — the flow signs in itself, so the ' +
+          "attached browser's session was deliberately not inherited",
+      );
+      return;
+    }
+    if (inheritance.fromSuite) {
+      this.bundle.note(
+        `session: reused the session a sibling case of this suite established ` +
+          `(${inheritance.state?.cookies.length ?? 0} cookie(s)) — no sign-in was paid for`,
+      );
+      return;
+    }
     const carried = inheritance.state?.cookies.length ?? 0;
     if (inheritance.error !== undefined) {
       this.#recordRuntimeDefect(
@@ -3155,7 +3557,8 @@ export class SmartRunner {
   #videoCut(): VideoCut {
     const steps = this.bundle.steps;
     let sawSuperseded = false;
-    for (const [position, step] of steps.entries()) {
+    let firstBroken: ProofStep | undefined;
+    for (const step of steps) {
       if (step.status === 'passed') continue;
       // A superseded failure is an attempt, not the outcome — its
       // reconstruction passed in its place, and the run went on. Cutting the
@@ -3167,22 +3570,37 @@ export class SmartRunner {
         continue;
       }
       if (step.videoOffsetMs === undefined) continue;
-      // Where the *next* filmed step begins, if the run carried on. The tail
-      // added in `sealVideo` is generous enough to swallow a fast step whole,
-      // and a recording that shows the step after the failure is no longer
-      // "up to the failure" — so the tail is allowed to run out only into
-      // dead time, never into another step.
-      const next = steps.slice(position + 1).find((s) => s.videoOffsetMs !== undefined);
-      return {
-        stepIndex: step.index,
-        atMs: step.videoOffsetMs + step.durationMs,
-        ...(next?.videoOffsetMs === undefined ? {} : { noLaterThanMs: next.videoOffsetMs }),
-      };
+      firstBroken = step;
+      break;
     }
-    // A run rescued mid-flight keeps its WHOLE film: the break and the rescue
-    // are exactly the footage the drift defect asks someone to look at. A run
-    // that passed cleanly still keeps nothing.
-    return sawSuperseded ? 'full' : null;
+    if (firstBroken === undefined) {
+      // A run rescued mid-flight keeps its WHOLE film: the break and the
+      // rescue are exactly the footage the drift defect asks someone to look
+      // at. A run that passed cleanly still keeps nothing.
+      return sawSuperseded ? 'full' : null;
+    }
+    // **The run carried on past the failure, so the film does too.** The
+    // "cut at the first broken step" rule was written when a failure ended
+    // the run, and its premise — everything afterwards is a state the test
+    // no longer understands — stopped being true when steps after a failure
+    // started getting their turn. Measured (BE_Test2, 2026-08-19): a flow
+    // dead-ended clicking "Create Plan" at step 3, clicked the same control
+    // and passed at step 6, passed both assertions — and its recording was
+    // 13 seconds ending at step 1, the one part of the run that proved
+    // nothing. Is the footage after the break relevant? It is the only
+    // evidence of what the run did about the break. The report's player
+    // still opens pre-seeked to the first broken step (`data-failure-offset`),
+    // so the moment the film was kept for is the first frame seen; the rest
+    // is scrub-able rather than gone. A run whose failure was its LAST filmed
+    // step is cut there as before — there is nothing after it to keep.
+    const later = steps.some(
+      (s) => s.index > firstBroken!.index && s.videoOffsetMs !== undefined && !s.superseded,
+    );
+    if (later) return 'full';
+    return {
+      stepIndex: firstBroken.index,
+      atMs: firstBroken.videoOffsetMs! + firstBroken.durationMs,
+    };
   }
 
   /**
@@ -3242,6 +3660,119 @@ export class SmartRunner {
    * without stopping the run: a step whose page was redirected *while it ran*
    * must decline to heal, but it is still an ordinary failed step.
    */
+  /**
+   * Establish the session this flow assumes, when it can be done honestly.
+   * Returns the account it signed in as, or null when nothing was done.
+   */
+/**
+   * F1 of docs/consent-gate-recovery-spec.md: if the page a `goto` landed on
+   * is SHOWING the consent gate — content-detected, because the gate renders
+   * in place on the asked-for URL — accept it and re-issue the same goto
+   * once. Runs whether the flow signed in itself or the bootstrap did; a goto
+   * that asked for the gate's own page keeps its subject and is never
+   * touched. Once per goto: a gate that re-renders after acceptance is an
+   * application finding, and the next step fails honestly with the gate in
+   * its pageContext.
+   */
+  async #settleConsentGate(askedUrl: string, urlBeforeNav: string): Promise<boolean> {
+    try {
+      const asked = new URL(askedUrl, this.page.url() || undefined);
+      // A flow that means to test the consent page is never steered off it.
+      if (CONSENT_GATE_URL_PATTERN.test(asked.pathname)) return false;
+    } catch {
+      return false;
+    }
+    let accepted = await acceptConsentGateAnywhere(this.page);
+    if (!accepted) {
+      // The gate has a THIRD shape on the measured application: the goto
+      // lands on the target URL, and the client guard bounces to /en/consent
+      // a beat AFTER domcontentloaded — so an immediate check sees nothing.
+      // The tell is cheap and does not tax ordinary gotos: the page was ON a
+      // consent URL before this goto (the sign-in just landed there), or is
+      // on one now. Only then is a short bounce-window paid, and the re-check
+      // also catches an in-place gate that finished rendering meanwhile.
+      const expectGate =
+        CONSENT_GATE_URL_PATTERN.test(this.page.url()) ||
+        (() => {
+          try {
+            return CONSENT_GATE_URL_PATTERN.test(new URL(urlBeforeNav).pathname);
+          } catch {
+            return false;
+          }
+        })();
+      if (expectGate) {
+        await this.page
+          .waitForURL((u) => CONSENT_GATE_URL_PATTERN.test(u.pathname), { timeout: 2_000 })
+          .catch(() => undefined);
+        await this.page.waitForTimeout(300).catch(() => undefined);
+        accepted = await acceptConsentGateAnywhere(this.page);
+      }
+    }
+    if (!accepted) return false;
+    // Accepting abandons the deep link (the app lands on its home page), so
+    // the recovery is only done once the goto is re-issued.
+    await this.page.goto(askedUrl, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+    await this.page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+    this.bundle.note(
+      `consent gate: accepted the consent screen that stood in front of ${askedUrl} and returned to it`,
+    );
+    this.#recordRuntimeDefect(
+      'usability',
+      'low',
+      'A consent gate stood in front of the page under test',
+      `The navigation to ${askedUrl} landed on a consent screen; the run accepted it ` +
+        `(name-gated control) and re-issued the navigation. Author the consent accept into ` +
+        `setup (a clickIfVisible right after sign-in) to make the flow self-contained.`,
+      undefined,
+    );
+    return true;
+  }
+
+  async #bootstrapSession(askedUrl: string): Promise<string | null> {
+    if (this.#credentials === undefined) return null;
+    if (this.#flowSignsInItself) return null;
+    if (this.#sessionBootstrapTried) return null;
+    if (this.#lastGotoAskedSignIn) return null;
+    // A consent gate is the session HALF established — accept it and go on.
+    if (await acceptConsentGate(this.page)) {
+      if (!looksLikeSignIn(this.page.url())) return null;
+    }
+    if (!looksLikeSignIn(this.page.url())) return null;
+    this.#sessionBootstrapTried = true;
+
+    const outcome = await performSignIn(this.page, this.#credentials);
+    if (!outcome.ok) {
+      // Disclosed and left to the ordinary fatal: a sign-in the harness could
+      // not complete says the credentials or the form are the problem, and
+      // pretending otherwise would bury it.
+      this.bundle.note(
+        `session bootstrap: signing in as ${this.#credentials.email} did not take — ${outcome.reason}`,
+      );
+      return null;
+    }
+    await this.page.goto(askedUrl, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+    await this.page
+      .waitForLoadState('networkidle', { timeout: 10_000 })
+      .catch(() => undefined);
+    this.bundle.note(
+      `session bootstrap: the flow assumes a signed-in user and the browser had no session, ` +
+        `so the run signed in as ${this.#credentials.email} and returned to ${askedUrl}`,
+    );
+    // Green, and still a finding: the flow depends on a precondition it does
+    // not establish, and every fresh browser will pay this again until the
+    // sign-in is authored into setup (or --as keeps being supplied).
+    this.#recordRuntimeDefect(
+      'usability',
+      'low',
+      'The flow assumes a signed-in user',
+      `Its first navigation landed on the sign-in page, so the run established the session ` +
+        `itself with the supplied --as credentials (${this.#credentials.email}). Author the ` +
+        `sign-in into setup to make the flow self-contained.`,
+      undefined,
+    );
+    return this.#credentials.email;
+  }
+
   #strandedMessage(): string | null {
     // The sign-in that never took, as opposed to the session that was lost.
     // `#strandedMessage`'s original question is "were we bounced AWAY from
@@ -3268,7 +3799,11 @@ export class SmartRunner {
       lastGotoPath: this.#lastGotoPath,
     });
     if (neverSignedIn !== null) return neverSignedIn;
-    if (this.#lastGotoAskedSignIn || this.#lastAction === 'click') return null;
+    // `click` is exempt (following a "Sign out" control is a legitimate way
+    // to arrive) and so is `signOut`, which is that same arrival made
+    // explicit — a persona switch MEANS to be on the sign-in page next.
+    if (this.#lastGotoAskedSignIn || this.#lastAction === 'click' || this.#lastAction === 'signOut')
+      return null;
     const current = this.page.url();
     if (!looksLikeSignIn(current)) return null;
     if (this.#lastGotoPath === null) return null;
@@ -3286,6 +3821,11 @@ export class SmartRunner {
       `point can say anything about the feature under test.\n` +
       `  Every later step would be asserted against the login screen, and a heal could ` +
       `"fix" one onto a login control and report it green.\n` +
+      (this.#credentials === undefined && !this.#flowSignsInItself
+        ? `  The flow contains no sign-in of its own and the run was given no account: pass ` +
+          `--as <email>:<password> and the run will establish the session itself before ` +
+          `continuing.\n`
+        : '') +
       `  Fix the flow's sign-in: log in through the UI before the steps that need it, ` +
       `and if it seeds a token with setLocalStorage, navigate again afterwards so the ` +
       `application reads it.`
@@ -3417,6 +3957,32 @@ export class SmartRunner {
    * page said nothing", because a diagnostic that can fail a step by itself
    * would be worse than the miss it prevents.
    */
+  /**
+   * Is `wanted` contained in the page's own rendered text? The excerpt around
+   * the match when it is, null when it is not (or the page cannot be read).
+   * `innerText`, not `textContent`, for the reason `expectText` reads it: a
+   * user has never seen a `<script>` payload. Whitespace is folded on both
+   * sides and matching is case-insensitive — an exact-match instrument
+   * already failed; this read only decides whether the text is on screen at
+   * all, and the excerpt it returns is the evidence a human rules on.
+   */
+  async #textContainedInPage(wanted: string): Promise<string | null> {
+    try {
+      const body = await this.page.evaluate(() => {
+        const doc = (globalThis as unknown as { document?: { body?: { innerText?: string } } }).document;
+        return doc?.body?.innerText ?? '';
+      });
+      const hay = body.replace(/\s+/g, ' ');
+      const needle = wanted.replace(/\s+/g, ' ').trim();
+      if (needle === '') return null;
+      const at = hay.toLowerCase().indexOf(needle.toLowerCase());
+      if (at < 0) return null;
+      return excerptAround(hay, hay.slice(at, at + needle.length));
+    } catch {
+      return null;
+    }
+  }
+
   async #pageMessages(): Promise<string[]> {
     try {
       // Two reads, not one comma-separated selector: Playwright's `role=`
@@ -3863,7 +4429,14 @@ export class SmartRunner {
       // right now — e.g. a strict-mode violation ("resolved to 126 elements")
       // needs a very different fix than a plain not-found timeout.
       const failureReason = attempts[attempts.length - 1];
-      outcome = await this.#healer.heal({ page: this.page, action, selector, intent, failureReason });
+      outcome = await this.#healer.heal({
+        page: this.page,
+        action,
+        selector,
+        intent,
+        failureReason,
+        caseContext: this.#caseContext,
+      });
     } catch (error) {
       if (error instanceof HealUnavailableError) {
         // The provider failed, not the page. Counted apart and worded apart:
@@ -3985,7 +4558,11 @@ export class SmartRunner {
 
     let record: AgentRecord;
     try {
-      record = await this.#agent.run(this.page, goal);
+      record = await this.#agent.run(this.page, goal, {
+        memory: cacheAgentMemory(this.#cache),
+        caseContext: this.#caseContext,
+        ...(this.#agentDbProbe() ?? {}),
+      });
     } catch (error) {
       // `run` is documented never to throw; belt and braces, because a throw
       // here would turn a failed step into a failed run.
@@ -4041,6 +4618,7 @@ export class SmartRunner {
           failureReason:
             `the control was not reachable until an agent acted (${record.summary}); ` +
             `this is the page as it now stands`,
+          caseContext: this.#caseContext,
         });
         const value = (await run(
           this.page.locator(outcome.selector),
@@ -4152,6 +4730,14 @@ export class SmartRunner {
    * Flush the cache and detach. For a CDP connection Playwright disconnects
    * rather than killing the browser, so the user's Chrome survives the run.
    */
+  /**
+   * This run's session as data, for the suite's vault — cookies plus
+   * localStorage, the same serialization the recording context inherits by.
+   */
+  async exportSession(): Promise<StoredSession> {
+    return this.#context.storageState();
+  }
+
   async close(): Promise<ProofBundle> {
     try {
       this.#flagUnrequestedNavigation();
@@ -4304,6 +4890,42 @@ export async function withPage<T>(
   }
 }
 
+/**
+ * `withPage`, for `count` tabs at once in the browser's shared context — one
+ * per authoring worker. Every tab is closed when `fn` settles, however it
+ * settles; the browser itself is only disconnected from, never killed.
+ */
+export async function withPages<T>(
+  cdpUrl: string | undefined,
+  count: number,
+  fn: (pages: Page[]) => Promise<T>,
+): Promise<T> {
+  const url = cdpUrl ?? DEFAULT_CDP_URL;
+  let browser: Browser;
+  try {
+    browser = await chromium.connectOverCDP(url);
+  } catch (error) {
+    throw new Error(
+      `could not attach to a browser at ${url}: ${describe(error)}\n` +
+        'Start Chrome with --remote-debugging-port first (npm run chrome).',
+    );
+  }
+
+  const context = browser.contexts()[0] ?? (await browser.newContext());
+  const pages: Page[] = [];
+  try {
+    for (let i = 0; i < Math.max(1, count); i += 1) {
+      const page = await context.newPage();
+      await applyViewport(page);
+      pages.push(page);
+    }
+    return await fn(pages);
+  } finally {
+    for (const page of pages) await page.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
+  }
+}
+
 // --- Declarative flows -----------------------------------------------------
 
 export type FlowStep =
@@ -4349,8 +4971,13 @@ export type FlowStep =
   /** Type key by key — for autocomplete/typeahead/masked fields `fill` cannot wake. */
   | { action: 'type'; selector: string; value: string; intent?: string | undefined }
   | { action: 'waitFor'; selector: string; intent?: string | undefined }
-  /** Hand the browser to the agent until `goal` is satisfied. */
-  | { action: 'workflow'; goal: string }
+  /**
+   * Hand the browser to the agent until `goal` is satisfied. `script` is a
+   * deterministic journey a previous successful run recorded on this very
+   * step (see `withWorkflowScripts`): replayed before any model turn, and
+   * the agent takes over only where the replay no longer grounds.
+   */
+  | { action: 'workflow'; goal: string; script?: WorkflowScriptStep[] | undefined }
   // --- keyboard ---
   | { action: 'press'; key: string; selector?: string | undefined; intent?: string | undefined }
   | { action: 'expectFocused'; selector: string; intent?: string | undefined }
@@ -4409,6 +5036,13 @@ export type FlowStep =
   // --- state seeding (setup/teardown) ---
   | { action: 'setLocalStorage'; key: string; value: string }
   | { action: 'clearStorage' }
+  /**
+   * End the session the way a user does — the application's own sign-out
+   * control (searched name-gated on the page, then behind ARIA-marked
+   * identity menus). The persona-switch step: sign out, goto the sign-in
+   * page, fill the next account's credentials.
+   */
+  | { action: 'signOut'; intent?: string | undefined }
   /**
    * Pin the page's clock to a fixed moment (ISO date or date-time), so a
    * claim that depends on "today" — an urgency tier, a due-date boundary, an
@@ -4506,6 +5140,42 @@ export interface RunPlan {
 
 export interface Flow {
   name: string;
+  /**
+   * The authoring pass that wrote this flow, when a model did.
+   *
+   * Written into the file, not merely into the run, because the file outlives
+   * the run: re-running an authored case, or repairing it, produces a bundle
+   * that would otherwise carry no provenance at all — and wowUI would file it
+   * under "Authored flows" rather than beside the catalog it came from. The
+   * flow is the artifact, so the artifact records where it came from.
+   */
+  authoredBy?: GenerationProvenance | undefined;
+  /**
+   * Whether this test means to prove acceptance or refusal. Stamped by the
+   * catalog path when the sheet's own Positive/Negative column states it —
+   * the author's word, which always wins. Absent, `runFlow` infers it
+   * deterministically from the flow's own words and assertions
+   * (`inferPolarity`), so every bundle carries the label either way.
+   */
+  polarity?: TestPolarity | undefined;
+  /**
+   * The test case this flow proves, as a compact card — the claim and its
+   * expected output in the sheet's own words, stamped by the catalog path.
+   * In the file for the same reason `authoredBy` is: the file outlives the
+   * run, and the runtime roles (healer, agent) read it so a repair or a
+   * workflow turn knows WHAT the step is trying to prove, not only which
+   * selector failed. Context for those models, never an instruction — the
+   * claim itself lives in the steps.
+   */
+  caseContext?: string | undefined;
+  /**
+   * How far this test reaches. Stamped `e2e` by the authoring path when the
+   * flow switches personas (`switchesPersona` in `flow-author.ts`): a test
+   * that signs in as two different people is a journey across the
+   * application's own session machinery, not a unit check of one screen,
+   * whatever scope the request asked for.
+   */
+  scope?: 'unit' | 'e2e' | undefined;
   /** Prefixed to relative `goto` urls. */
   baseUrl?: string | undefined;
   /**
@@ -4575,15 +5245,23 @@ function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] 
   if (error instanceof Error && error.cause instanceof StepResolutionError) return 'dead-end';
   // Harness and grounding facts are errors even under an `expect` name: an
   // unreachable database, an unattached observer, a table the schema does not
-  // declare — calling any of them a test failure would blame the app for the
-  // harness's (or the flow's) problem. Matched by error name so this module
-  // does not import the whole db/api families for four classes.
+  // declare, an unknown {{variable}} nothing saved, an assertion with no
+  // request before it — calling any of them a test failure would blame the
+  // app for the harness's (or the flow's) problem. Matched by error name so
+  // this module does not import the whole db/api families for six classes.
+  // (The variable and no-response names joined 2026-08-24: the identical
+  // unknown-variable fault was already `error` on a `request` step and
+  // `failed` + a backend defect on an `expectJson` — the asymmetry the api
+  // CLAUDE.md's "an unknown variable is an error" rule always meant to rule
+  // out.)
   if (
     error instanceof Error &&
     (error.name === 'DbUnavailableError' ||
       error.name === 'DbGroundingError' ||
       error.name === 'ObservationUnavailableError' ||
-      error.name === 'ObservationTruncatedError')
+      error.name === 'ObservationTruncatedError' ||
+      error.name === 'UnknownVariableError' ||
+      error.name === 'NoResponseError')
   ) {
     return 'error';
   }
@@ -4598,6 +5276,27 @@ function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] 
  * run is complete — every step got its turn — so the message is a tally plus
  * one line per issue, worded the way each kind deserves.
  */
+/**
+ * The run completed and some steps did not pass — a TALLY, not a fatal.
+ *
+ * Its own type because the bundle has to tell the two apart: a fatal (the
+ * session guard, a dead browser) says the claims were asserted against the
+ * wrong page and no passing assertion may outrank it; a tally says exactly
+ * what the step records already say. Recording the tally as the run error
+ * used to make the qualified pass unreachable — every run with a broken step
+ * carried a run-level error, which is the one thing `passed-with-issues` must
+ * never override (PL_02_03, live: 7/9 steps, both assertions green, verdict
+ * dead-end).
+ */
+class StepIssuesError extends Error {
+  readonly issues: readonly StepIssue[];
+  constructor(issues: readonly StepIssue[]) {
+    super(summarizeIssues(issues));
+    this.name = 'StepIssuesError';
+    this.issues = issues;
+  }
+}
+
 function summarizeIssues(issues: readonly StepIssue[]): string {
   const label = { failed: 'failed', error: 'error', 'dead-end': 'dead end' } as const;
   const counts = { failed: 0, error: 0, 'dead-end': 0 };
@@ -4624,6 +5323,26 @@ export const STEP_RECONSTRUCT_TRIES = 3;
  * same reason healing does.
  */
 function reconstructionFutile(error: unknown): boolean {
+  // Harness and grounding facts — the same names `classifyStepFailure` scores
+  // as `error`, not `failed`: an unreachable database, an undeclared table, a
+  // missing network observer. No rewrite of the step can connect a database
+  // that is not configured, so asking for one spends a model call to fail
+  // identically (be100, 2026-08-23: every `expectDbRow` failing on "database
+  // unavailable" was sent for reconstruction anyway).
+  if (
+    error instanceof Error &&
+    (error.name === 'DbUnavailableError' ||
+      error.name === 'DbGroundingError' ||
+      error.name === 'ObservationUnavailableError' ||
+      error.name === 'ObservationTruncatedError' ||
+      // No rewrite of the step can save a variable nothing set, or conjure
+      // the request an assertion needed to have before it — same futility
+      // rule, two more names (2026-08-24).
+      error.name === 'UnknownVariableError' ||
+      error.name === 'NoResponseError')
+  ) {
+    return true;
+  }
   if (!(error instanceof StepResolutionError)) return false;
   return error.attempts.some(
     (line) =>
@@ -4927,7 +5646,17 @@ async function executeSteps(
         const recordedIndex = runner.bundle.steps.length - 1;
 
         const repair = runner.stepRepair;
-        if (repair && failures < STEP_RECONSTRUCT_TRIES && !reconstructionFutile(error)) {
+        // `canExpress` guards the ask the schema refuses every answer to: a
+        // step whose action the repair schema cannot spell (DB, HTTP,
+        // workflow) makes the model echo the action, fail validation on
+        // every identical temperature-0 retry, and open the structured-output
+        // breaker for the rest of the run.
+        if (
+          repair &&
+          failures < STEP_RECONSTRUCT_TRIES &&
+          !reconstructionFutile(error) &&
+          repair.canExpress?.(original.action) !== false
+        ) {
           const proposal = await askReconstruction(
             runner,
             repair,
@@ -5111,6 +5840,10 @@ async function askReconstruction(
       attempt,
       history,
     });
+    // The call was made whatever the answer says — a `canFix: false` costs the
+    // same tokens a fix does, and a bill that omits the refusals understates
+    // exactly the runs that struggled most.
+    runner.bundle.noteModelSpend(proposal.inputTokens ?? 0, proposal.outputTokens ?? 0);
     if (!proposal.canFix) return null;
     return {
       insertBefore: proposal.insertBefore,
@@ -5179,13 +5912,16 @@ async function executeStep(
         await runner.waitFor(step.selector, step.intent);
         break;
       case 'workflow':
-        await runner.workflow(step.goal);
+        await runner.workflow(step.goal, step.script);
         break;
       case 'setLocalStorage':
         await runner.setLocalStorage(step.key, step.value);
         break;
       case 'clearStorage':
         await runner.clearStorage();
+        break;
+      case 'signOut':
+        await runner.signOut(step.intent);
         break;
       case 'setClock':
         await runner.setClock(step.time, step.intent);
@@ -5337,7 +6073,7 @@ export async function executeFlow(runner: SmartRunner, flow: Flow): Promise<void
   }
 
   if (fatal) throw fatal;
-  if (issues.length > 0) throw new Error(summarizeIssues(issues));
+  if (issues.length > 0) throw new StepIssuesError(issues);
 }
 
 export interface RunFlowOptions {
@@ -5350,6 +6086,40 @@ export interface RunFlowOptions {
   healedTimeoutMs?: number | undefined;
   /** Film the run with a drawn-in pointer. Default `on`; see `video.ts`. */
   video?: VideoMode | undefined;
+  /**
+   * Give this run its own browser context even when it is not being filmed.
+   *
+   * Two runs sharing `browser.contexts()[0]` share its pages, and a suite that
+   * runs its cases concurrently would have them clicking in each other's tabs
+   * — the exact interleaving the panel's one-browser-at-a-time rule exists to
+   * prevent, moved inside a single command. A recorded run already gets its
+   * own context for an unrelated reason (recording is a property of a context),
+   * which is why this only has to cover `--video off`.
+   *
+   * The session is carried across exactly as the recording path carries it, so
+   * isolation does not silently sign the run out.
+   */
+  isolate?: boolean | undefined;
+  /**
+   * Whether a context this run creates starts with the attached browser's
+   * session (cookies + storage). Default true — the reason a filmed run can
+   * still test a page someone signed into by hand. `false` starts EMPTY, and
+   * is what a flow that signs in ITSELF wants: an inherited session is a
+   * different account signed in before its first step, and on this
+   * application a stale admin session left in the browser by an earlier run
+   * put every persona's case on the admin's landing page instead of the login
+   * form. `runFlow` sets it from the flow's own shape — see `signsInItself`.
+   */
+  inheritSession?: boolean | undefined;
+
+  /**
+   * The suite's session vault. Before the run, a banked session for this
+   * flow's origin is injected (unless the flow signs in itself); after it,
+   * a run that ends signed in on that origin banks its own state — so one
+   * sign-in serves the whole suite. See `engine/session-vault.ts`.
+   */
+  sessionVault?: SessionVault | undefined;
+
   screenshots?: ScreenshotMode | undefined;
   captureDelayMs?: number | undefined;
   /** Let the agent make an unreachable control reachable. Default false. */
@@ -5363,6 +6133,13 @@ export interface RunFlowOptions {
    * preparation may be inserted before it). Null/absent disables.
    */
   stepRepair?: FlowRepairModel | null | undefined;
+  /**
+   * The auto-review judge: one small `agent`-role call when a run lands on
+   * proved-?, ruling it `proved` at `AUTO_PROVE_CONFIDENCE` or better — see
+   * `src/engine/review-judge.ts`. Null/absent leaves every proved-? for a
+   * human, exactly as before the judge existed.
+   */
+  reviewJudge?: ReviewJudge | null | undefined;
   /**
    * Pause before each step, in ms. Zero (the default) keeps the hot path
    * hot. Under `video: 'always'` the default becomes
@@ -5517,7 +6294,23 @@ async function executeApiSteps(
  * the one exception, and it correctly reports nothing measured rather than 0%,
  * which would read as "every control was missed".
  */
+/**
+ * The label the bundle carries: the flow's own statement when the catalog
+ * stamped one, a deterministic inference otherwise. Inference reads the
+ * flow's name (on the catalog path that is the row's claim verbatim), every
+ * step's intent, and the step shapes that can only mean refusal.
+ */
+function flowPolarity(flow: Flow): { polarity: TestPolarity; source: 'stated' | 'inferred' } {
+  if (flow.polarity !== undefined) return { polarity: flow.polarity, source: 'stated' };
+  const steps = [...(flow.setup ?? []), ...flow.steps];
+  const text = [flow.name, ...steps.map((step) => ('intent' in step ? (step.intent ?? '') : ''))]
+    .filter((t) => t !== '')
+    .join('\n');
+  return { polarity: inferPolarity(text, steps as never), source: 'inferred' };
+}
+
 export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Promise<ProofBundle> {
+  const apiPolarity = flowPolarity(flow);
   const bundle = new ProofBundleBuilder({
     name: flow.name,
     cdpUrl: null,
@@ -5525,6 +6318,8 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
     healerModel: null,
     generatedBy: options.generatedBy,
     onStep: options.onStep,
+    polarity: apiPolarity.polarity,
+    polaritySource: apiPolarity.source,
   });
   if (options.defects?.length) bundle.addDefects(options.defects);
 
@@ -5579,7 +6374,7 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
   }
 
   bundle.setVariables(variables.snapshotForReport());
-  if (issues.length > 0) bundle.recordRunError(new Error(summarizeIssues(issues)));
+  if (issues.length > 0) bundle.recordIssueTally(new StepIssuesError(issues).message);
   const sealed = bundle.finish();
 
   if (options.historyPath !== null) {
@@ -5605,6 +6400,34 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
  * A flow with no UI steps is dispatched to `runApiFlow` and never touches
  * Chrome — see `isBrowserFree`.
  */
+/**
+ * Does this flow authenticate on its own — a credential-shaped fill (a password
+ * field by selector or intent, or the taught nameless-textbox idiom on a
+ * sign-in page) anywhere in its setup or body?
+ *
+ * Decides whether a run should START with the attached browser's session. A
+ * flow that signs in itself and also inherits a session begins as a different
+ * account than it is about to become; measured on the application this was
+ * written against, a stale admin session left in the browser by an earlier
+ * run put an HRBP case on the admin landing page before its first step, and
+ * the sign-in form the flow expected was not there.
+ */
+export function signsInItself(flow: Flow): boolean {
+  const steps: FlowStep[] = [...(flow.setup ?? []), ...flow.steps];
+  let onSignIn = false;
+  for (const step of steps) {
+    if (step.action === 'goto') {
+      onSignIn = looksLikeSignIn(step.url);
+      continue;
+    }
+    if (step.action !== 'fill' && step.action !== 'type') continue;
+    const text = `${step.selector} ${step.intent ?? ''}`;
+    if (/password|passwd|pwd/i.test(text)) return true;
+    if (onSignIn && /role=textbox\s*>>\s*nth=/i.test(step.selector)) return true;
+  }
+  return false;
+}
+
 export async function runFlow(
   sourceFlow: Flow,
   options: RunFlowOptions = {},
@@ -5643,6 +6466,7 @@ export async function runFlow(
   const healer =
     options.healer !== undefined ? options.healer : (options.makeHealer?.(cache) ?? null);
 
+  const polarity = flowPolarity(flow);
   const bundle = new ProofBundleBuilder({
     name: flow.name,
     cdpUrl: options.cdpUrl ?? DEFAULT_CDP_URL,
@@ -5650,10 +6474,20 @@ export async function runFlow(
     healerModel: healer?.model.id ?? null,
     generatedBy: options.generatedBy,
     onStep: options.onStep,
+    polarity: polarity.polarity,
+    polaritySource: polarity.source,
   });
 
   // Generator findings belong in the report even if the run dies at connect.
   if (options.defects?.length) bundle.addDefects(options.defects);
+
+  // The one origin this flow tests, for the suite's session vault: banked
+  // state is only ever injected into — and saved from — a matching origin.
+  const vaultOrigin = flowOriginOf(flow);
+  const bankedSession =
+    options.sessionVault !== undefined && vaultOrigin !== null
+      ? (options.sessionVault.get(vaultOrigin) ?? undefined)
+      : undefined;
 
   let runner: SmartRunner;
   try {
@@ -5664,9 +6498,18 @@ export async function runFlow(
       healer,
       agent: options.agent,
       dataModel: options.dataModel,
+      // The flow's own card: the file is the artifact, so a re-run or a
+      // repair still tells the runtime roles what the case proves.
+      caseContext: flow.caseContext,
       fastTimeoutMs: options.fastTimeoutMs,
       healedTimeoutMs: options.healedTimeoutMs,
       video: options.video,
+      isolate: options.isolate,
+      // Explicit wins; else the flow's own shape decides. A flow that types a
+      // password wants to be the account it types, not the one the browser
+      // was left signed in as.
+      inheritSession: options.inheritSession ?? !signsInItself(flow),
+      flowSignsInItself: signsInItself(flow),
       screenshots: options.screenshots,
       captureDelayMs: options.captureDelayMs,
       agentAssist: options.agentAssist,
@@ -5682,24 +6525,59 @@ export async function runFlow(
       transport: options.transport,
       db: options.db,
       dbClient: options.dbClient,
+      ...(bankedSession === undefined ? {} : { sessionState: bankedSession }),
     });
   } catch (error) {
     // Died before a single test step could run. The bundle still goes to run
     // history — a launch that failed at attach is a result worth recalling,
     // not a run that never happened.
     bundle.recordRunError(error);
-    return appendToHistory(bundle.finish(), bundle, options);
+    return appendToHistory(bundle.finish(), bundle, options, flow.caseContext);
   }
 
   try {
     await executeFlow(runner, flow);
   } catch (error) {
     // The step itself is already recorded; keep the message at run level too.
-    bundle.recordRunError(error);
+    // A tally of step issues is kept apart from a fatal — see StepIssuesError.
+    if (error instanceof StepIssuesError) bundle.recordIssueTally(error.message);
+    else bundle.recordRunError(error);
+  }
+
+  // Bank the session for the suite's later cases — observation-gated: only a
+  // run that ENDS on this origin, off the sign-in page, with cookies to its
+  // name, has a session worth carrying. Never a verdict: any failure here is
+  // a convenience lost, not a run changed.
+  if (options.sessionVault !== undefined && vaultOrigin !== null) {
+    try {
+      const url = runner.page.url();
+      if (url.startsWith(vaultOrigin) && !looksLikeSignIn(url)) {
+        const state = await runner.exportSession();
+        options.sessionVault.put(vaultOrigin, state);
+      }
+    } catch {
+      // The context may already be gone (a run-level error) — nothing to bank.
+    }
   }
 
   const sealed = await runner.close();
-  return appendToHistory(sealed, bundle, options);
+  return appendToHistory(sealed, bundle, options, flow.caseContext);
+}
+
+/** The origin a flow tests against — its baseUrl, else its first goto. */
+function flowOriginOf(flow: Flow): string | null {
+  const gotos = [...(flow.setup ?? []), ...flow.steps].filter(
+    (step): step is Extract<FlowStep, { action: 'goto' }> => step.action === 'goto',
+  );
+  for (const candidate of [flow.baseUrl, ...gotos.map((g) => g.url)]) {
+    if (candidate === undefined) continue;
+    try {
+      return new URL(candidate).origin;
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 /**
@@ -5710,7 +6588,44 @@ async function appendToHistory(
   sealed: ProofBundle,
   bundle: ProofBundleBuilder,
   options: RunFlowOptions,
+  caseContext?: string,
 ): Promise<ProofBundle> {
+  // The auto-review judge, before the history write so the ruling is part of
+  // the record a recall reads. One small call, only on proved-? runs, only
+  // when a judge was built (agent role resolvable, not switched off). A
+  // ruling stamps `review` — `effectiveStatus` then reads the run as passed
+  // or failed everywhere, both ways at the bar since the gate widened to
+  // every wording mismatch — and anything short of the bar leaves the
+  // human's queue exactly as it was, with the judge's opinion on `notes`.
+  if (sealed.status === 'needs-review' && options.reviewJudge) {
+    try {
+      const pairs = reviewPairs(sealed);
+      if (pairs.length > 0) {
+        const judge = options.reviewJudge;
+        const judgement = await judge.judge({
+          flowName: sealed.name,
+          caseContext,
+          pairs,
+        });
+        const ruling = autoReviewRuling(judgement, judge.id);
+        if (ruling !== null) {
+          sealed.review = ruling;
+          sealed.notes = [
+            ...(sealed.notes ?? []),
+            `auto-review: ruled ${ruling.verdict} by ${judge.id} at confidence ${judgement.confidence.toFixed(2)} — ${judgement.reasoning.split('\n')[0] ?? ''}`,
+          ];
+        } else {
+          sealed.notes = [
+            ...(sealed.notes ?? []),
+            `auto-review: left for a human — ${judge.id} said ${judgement.satisfied ? 'satisfied' : 'not satisfied'} at confidence ${judgement.confidence.toFixed(2)} (bar ${AUTO_PROVE_CONFIDENCE})`,
+          ];
+        }
+      }
+    } catch (error) {
+      // A judge fault never changes a verdict — the run stays proved-?.
+      sealed.notes = [...(sealed.notes ?? []), `auto-review: could not run — ${describe(error)}`];
+    }
+  }
   if (options.historyPath === null) return sealed;
   try {
     const history = new RunHistory(options.historyPath ?? undefined);

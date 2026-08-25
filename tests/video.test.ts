@@ -415,7 +415,16 @@ describe('recording a run (CDP)', { skip: skipBrowser }, () => {
     }
   });
 
-  it('keeps the run up to the failure, and stops there', async () => {
+  it('keeps the WHOLE run when it carried on past the failure', async () => {
+    // The old rule cut the film at the first broken step, on the premise that
+    // everything after it happened in a state the test no longer understood.
+    // That premise died when steps after a failure started getting their
+    // turn: measured on BE_Test2 (2026-08-19), a flow dead-ended clicking
+    // "Create Plan" at step 3, clicked it again and passed at step 6, passed
+    // both assertions — and its 13-second recording ended at step 1. What the
+    // run did ABOUT the break is the evidence; the player still opens on the
+    // break (data-failure-offset), so the moment the film was kept for is the
+    // first frame seen.
     const bundle = await runFlow(
       {
         name: 'fails midway',
@@ -423,7 +432,7 @@ describe('recording a run (CDP)', { skip: skipBrowser }, () => {
           { action: 'goto', url: `${origin}/` },
           { action: 'expectVisible', selector: 'role=heading[name="Invoice 4471"]' },
           { action: 'expectVisible', selector: 'role=button[name="Nonexistent"]' },
-          // Runs after the failure, and must not appear in the recording.
+          // Runs after the failure, and must now appear in the recording.
           { action: 'expectVisible', selector: 'role=button[name="Approve"]' },
         ],
       },
@@ -433,15 +442,11 @@ describe('recording a run (CDP)', { skip: skipBrowser }, () => {
     const video = bundle.video;
     assert.ok(video, 'a failing run must be captured');
     assert.ok(video.data, 'a short recording is well under the embed ceiling');
-    assert.equal(video.endsAtStep, 2, 'it should be cut at the step that failed');
+    assert.equal(video.endsAtStep, undefined, 'nothing is cut — the run went on, so does the film');
 
     const trailing = bundle.steps[3];
     assert.equal(trailing?.status, 'passed', 'the run should have continued past the failure');
-    // The step after the failure lies past the cut, so its offset is stripped
-    // at seal time — a "play from here" pointing past the last frame would be
-    // a dead control. Its absence IS the proof the recording stops at the
-    // failure; the failing step itself must still be addressable.
-    assert.equal(trailing.videoOffsetMs, undefined, 'no offset may point past the cut');
+    assert.equal(typeof trailing.videoOffsetMs, 'number', 'the step after the failure is on film');
     const failing = bundle.steps[2];
     assert.ok(
       failing?.videoOffsetMs !== undefined && failing.videoOffsetMs < (video.durationMs ?? 0),
@@ -449,9 +454,24 @@ describe('recording a run (CDP)', { skip: skipBrowser }, () => {
     );
   });
 
-  it('cuts at the first failure, not the last', async () => {
-    // Once a step has failed the run continues in a state the test no longer
-    // understands, so later failures are usually consequences of the first.
+  it('still cuts at the failure when it was the last filmed step', async () => {
+    // Nothing after the break to keep: a tail of dead time is not evidence.
+    const bundle = await runFlow(
+      {
+        name: 'fails last',
+        steps: [
+          { action: 'goto', url: `${origin}/` },
+          { action: 'expectVisible', selector: 'role=button[name="Nonexistent"]' },
+        ],
+      },
+      { cdpUrl: CDP_URL, historyPath: null, coverage: false },
+    );
+    assert.equal(bundle.video?.endsAtStep, 1);
+  });
+
+  it('two failures: the film runs through both', async () => {
+    // The run carried past the first failure to the second, so both are on
+    // film; which one a reader sees first is the report's pre-seek, not a cut.
     const bundle = await runFlow(
       {
         name: 'two failures',
@@ -463,8 +483,10 @@ describe('recording a run (CDP)', { skip: skipBrowser }, () => {
       },
       { cdpUrl: CDP_URL, historyPath: null, coverage: false },
     );
-    assert.equal(bundle.video?.endsAtStep, 1);
+    assert.equal(bundle.video?.endsAtStep, undefined, 'kept whole');
+    assert.equal(typeof bundle.steps[2]?.videoOffsetMs, 'number', 'the second failure is on film');
   });
+
 
   it('captures a still for a failure and none for a passing step', async () => {
     // The point of the change: the film carries the ordinary steps, and a

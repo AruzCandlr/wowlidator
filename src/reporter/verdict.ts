@@ -23,7 +23,7 @@ import type { ProofBundle, ProofStep } from '../engine/proof-bundle.js';
 export type Owner = 'frontend' | 'backend' | 'mixed';
 
 export interface Verdict {
-  status: 'passed' | 'failed' | 'error' | 'dead-end';
+  status: 'passed' | 'passed-with-issues' | 'needs-review' | 'failed' | 'error' | 'dead-end';
   /** One line: outcome, flow name. */
   headline: string;
   /** What broke, in the author's own words where they gave any. */
@@ -43,6 +43,23 @@ export interface Verdict {
  */
 export const VERDICT_COPY = {
   passedHeadline: (name: string) => `PASSED — ${name}`,
+  passedWithIssuesHeadline: (name: string) =>
+    `PASS** — ${name} (every claim held; ** marks a step that only acted and broke — not a validation failure)`,
+  passedWithIssuesWhat: (assertions: number, broken: number) =>
+    `All ${assertions} claim${assertions === 1 ? '' : 's'} held, but ${broken} step${broken === 1 ? '' : 's'} that ` +
+    'only acted (a click, a navigation, an agent leg) broke along the way. The claims are proved ' +
+    'by the assertions that passed; the broken steps are listed below and filed as findings — ' +
+    'read them before trusting the green, because a claim that holds whether or not the action ' +
+    'before it landed may be a claim about the wrong thing.',
+  needsReviewHeadline: (name: string) =>
+    `PROVED-? — ${name} (a human must confirm: the wording on the page is a near-miss of the claim)`,
+  needsReviewWhat: (unsure: number) =>
+    `${unsure} assertion${unsure === 1 ? '' : 's'} failed only on WORDING, and closely: the page ` +
+    'produced the right kind of thing under a name the claim does not quite match. Whether that is ' +
+    'a spec violation or an acceptable rendering is a decision, not a measurement — the unsure ' +
+    'steps below carry the exact expected-vs-actual pair as proof. Confirm the run proved or ' +
+    'failed in the panel (or write `review` into the proof bundle); until then it counts as ' +
+    'neither a pass nor a product failure.',
   failedHeadline: (name: string) => `FAILED — ${name}`,
   errorHeadline: (name: string) => `ERROR — ${name} (the run hit errors; this is not an assertion failure)`,
   deadEndHeadline: (name: string) => `DEAD END — ${name} (a control could not be found by any means; nothing left to try)`,
@@ -202,6 +219,34 @@ export function buildVerdict(bundle: ProofBundle): Verdict {
       history,
       owner: null,
       firstFailingStep: null,
+    };
+  }
+  if (bundle.status === 'passed-with-issues') {
+    const counted = bundle.steps.filter((s) => !s.superseded);
+    const assertions = counted.filter((s) => /^expect|^snapshot$|^fillEach$|^fillRetry$/.test(s.action)).length;
+    const broken = counted.filter((s) => s.status !== 'passed').length;
+    return {
+      status: 'passed-with-issues',
+      headline: VERDICT_COPY.passedWithIssuesHeadline(bundle.name),
+      what: VERDICT_COPY.passedWithIssuesWhat(assertions, broken),
+      side: null,
+      history,
+      owner: null,
+      // The first broken step is where the reader should look, even on a pass.
+      firstFailingStep: failing?.index ?? null,
+    };
+  }
+
+  if (bundle.status === 'needs-review') {
+    const unsure = bundle.steps.filter((s) => !s.superseded && s.unsure !== undefined).length;
+    return {
+      status: 'needs-review',
+      headline: VERDICT_COPY.needsReviewHeadline(bundle.name),
+      what: VERDICT_COPY.needsReviewWhat(unsure),
+      side: null,
+      history,
+      owner: null,
+      firstFailingStep: failing?.index ?? null,
     };
   }
 

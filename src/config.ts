@@ -28,7 +28,7 @@ import type { ScreenshotMode, VideoMode } from './engine/runner.js';
 export const LLM_ROLES = ['healer', 'generator', 'agent', 'data'] as const;
 export type LlmRole = (typeof LLM_ROLES)[number];
 
-export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai'] as const;
+export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 /** Which env var carries each provider's key, and where to get one. */
@@ -71,7 +71,67 @@ export const PROVIDER_META: Record<
     consoleUrl: 'https://z.ai/manage-apikey/apikey-list',
     freeTier: 'paid API with free trial credit; GLM models',
   },
+  // DeepSeek — OpenAI-compatible endpoint at api.deepseek.com. `deepseek-chat`
+  // (V3) for every role here; `deepseek-reasoner` (R1) thinks before it
+  // answers and bills the thinking against the output budget.
+  deepseek: {
+    envKey: 'DEEPSEEK_API_KEY',
+    label: 'DeepSeek',
+    consoleUrl: 'https://platform.deepseek.com/api_keys',
+    freeTier: 'paid API, low per-token price; deepseek-chat / deepseek-reasoner',
+  },
+  // A model served on this machine — mlx_lm.server, llama.cpp, vLLM, LM Studio:
+  // anything speaking the OpenAI-compatible /v1 API. Default base URL is
+  // http://localhost:8080/v1 (`LOCAL_LLM_BASE_URL` overrides). No key is
+  // required: `LOCAL_LLM_API_KEY` is optional and a placeholder is supplied
+  // when it is unset, so every "does this role have a key" gate stays true.
+  local: {
+    envKey: 'LOCAL_LLM_API_KEY',
+    label: 'Local (localhost:8080)',
+    consoleUrl: 'http://localhost:8080/v1/models',
+    freeTier: 'your own hardware; OpenAI-compatible server (mlx_lm, llama.cpp, vLLM)',
+  },
 };
+
+/**
+ * Providers that answer one call at a time — a local MLX server prefills
+ * serially. Authoring runs one row at a time on them (`authorWorkers`) and
+ * every structured call goes through `SerialGate` (`providers/serial-gate.ts`).
+ */
+export const SERIAL_PROVIDERS: ReadonlySet<string> = new Set(['local']);
+
+/** Where the `local` provider's server listens. */
+export const DEFAULT_LOCAL_LLM_BASE_URL = 'http://localhost:8080/v1';
+export function localLlmBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.LOCAL_LLM_BASE_URL?.trim();
+  return raw === undefined || raw === '' ? DEFAULT_LOCAL_LLM_BASE_URL : raw.replace(/\/+$/, '');
+}
+
+/**
+ * A base URL for a local server on this port — what the panel's port field
+ * turns into. Two `rerise` instances (a 9B for authoring, a 4B for repairs)
+ * differ only by port, so a port is the whole of what a person picks.
+ */
+export function localBaseUrlForPort(port: number): string {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new ConfigError(`"${port}" is not a TCP port`);
+  }
+  return `http://localhost:${port}/v1`;
+}
+
+/** The port a local base URL points at, or null when it names none we can read. */
+export function portOfBaseUrl(baseUrl: string): number | null {
+  try {
+    const u = new URL(baseUrl);
+    if (u.port !== '') return Number(u.port);
+    return u.protocol === 'https:' ? 443 : u.protocol === 'http:' ? 80 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Sent as the bearer token when `LOCAL_LLM_API_KEY` is unset; local servers ignore it. */
+export const LOCAL_LLM_PLACEHOLDER_KEY = 'local';
 
 /**
  * Defaults chosen to match each role's shape.
@@ -92,10 +152,62 @@ export const DEFAULT_ROLE_MODELS: Record<LlmRole, { provider: ProviderName; mode
   data: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
 };
 
+/**
+ * The id sent to a provider whose server decides the model.
+ *
+ * One alias per provider, because servers differ: mlx_lm.server maps
+ * `default_model` (its literal default for a missing `model` field) to the
+ * `--model` it was started with, and treats ANY other id — `default`
+ * included — as a Hugging Face repo to fetch, failing with "cannot find an
+ * appropriate cached snapshot" offline. Measured live 2026-08-21. EmmieDev's
+ * alias is `default`.
+ */
+export const FIXED_MODEL_ALIAS: Readonly<Partial<Record<ProviderName, string>>> = {
+  emmiedev: 'default',
+  local: 'default_model',
+};
+export function fixedModelFor(provider: ProviderName): string | undefined {
+  return FIXED_MODEL_ALIAS[provider];
+}
+
+/**
+ * Providers that serve exactly one model and ignore the `model` field of a
+ * request: the loaded model answers whatever id is named. EmmieDev's `default`
+ * is the original case; the `local` server is the same shape — the model is
+ * chosen where the server is started, not per request. For these a role has
+ * no model to pick: `WOWLIDATOR_<ROLE>_MODEL` is ignored, the panel shows no
+ * model field, and the alias is what gets recorded as the run's model label.
+ */
+export const FIXED_MODEL_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'local']);
+
+/**
+ * The model a provider is known to run this codebase's structured calls on,
+ * for a role whose provider was re-pointed without naming a model. Starting
+ * points, not facts — `wowlidator doctor` is the only way to know an id still
+ * resolves, the same caveat `DEFAULT_ROLE_MODELS` carries.
+ */
+export const DEFAULT_PROVIDER_MODELS: Record<ProviderName, string> = {
+  google: 'gemini-3.6-flash',
+  groq: 'openai/gpt-oss-120b',
+  openrouter: 'google/gemini-3.6-flash',
+  emmiedev: 'default',
+  zai: 'glm-4.5-flash',
+  deepseek: 'deepseek-chat',
+  local: 'default_model',
+};
+
+
 export interface RoleConfig {
   role: LlmRole;
   provider: ProviderName;
   modelId: string;
+  /**
+   * Where this role's server listens — set only for the `local` provider,
+   * from `WOWLIDATOR_<ROLE>_BASE_URL`, else `LOCAL_LLM_BASE_URL`, else the
+   * default port. Per role, because one machine can run two local servers
+   * and a role is the unit a provider is chosen at.
+   */
+  baseUrl?: string | undefined;
 }
 
 export interface WowlidatorConfig {
@@ -157,18 +269,25 @@ const videoSchema = z.enum(['on', 'off']);
 const envSchema = z.object({
   WOWLIDATOR_HEALER_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_HEALER_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_HEALER_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_GENERATOR_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_GENERATOR_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_GENERATOR_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_AGENT_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_AGENT_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_AGENT_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_DATA_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_DATA_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_DATA_BASE_URL: z.string().url().optional(),
 
   GOOGLE_GENERATIVE_AI_API_KEY: z.string().min(1).optional(),
   GROQ_API_KEY: z.string().min(1).optional(),
   OPENROUTER_API_KEY: z.string().min(1).optional(),
   EMMIEDEV_API_KEY: z.string().min(1).optional(),
   ZAI_API_KEY: z.string().min(1).optional(),
+  DEEPSEEK_API_KEY: z.string().min(1).optional(),
+  LOCAL_LLM_API_KEY: z.string().min(1).optional(),
+  LOCAL_LLM_BASE_URL: z.string().url().optional(),
 
   WOWLIDATOR_LLM_MAX_RETRIES: z.coerce.number().int().min(0).max(10).optional(),
   WOWLIDATOR_CDP_URL: z.string().min(1).optional(),
@@ -294,11 +413,34 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
     name: LlmRole,
     provider: ProviderName | undefined,
     modelId: string | undefined,
-  ): RoleConfig => ({
-    role: name,
-    provider: provider ?? DEFAULT_ROLE_MODELS[name].provider,
-    modelId: modelId ?? DEFAULT_ROLE_MODELS[name].modelId,
-  });
+    baseUrl?: string | undefined,
+  ): RoleConfig => {
+    const resolvedProvider = provider ?? DEFAULT_ROLE_MODELS[name].provider;
+    // Only `local` has a server to point at; a base URL on any other provider
+    // is ignored rather than sent somewhere the SDK would not honour it.
+    const resolvedBase =
+      resolvedProvider === 'local'
+        ? (baseUrl?.trim() || undefined)?.replace(/\/+$/, '') ?? localLlmBaseUrl(env)
+        : undefined;
+    // A provider named without a model must not inherit a model id that
+    // belongs to a DIFFERENT provider. Seen live: `WOWLIDATOR_GENERATOR_PROVIDER=zai`
+    // alone resolved to `zai:gemini-3.6-flash` — the generator role's Google
+    // default — and `doctor` reported the provider broken when the id was.
+    // The role's own default is kept only when the provider is its own; any
+    // other provider gets that provider's known-good model.
+    // A fixed-model provider has nothing to choose — whatever `.env` names,
+    // the server answers with the model it loaded, so the alias is the truth.
+    const fixed = fixedModelFor(resolvedProvider);
+    if (fixed !== undefined) {
+      return { role: name, provider: resolvedProvider, modelId: fixed, baseUrl: resolvedBase };
+    }
+    const resolvedModel =
+      modelId ??
+      (resolvedProvider === DEFAULT_ROLE_MODELS[name].provider
+        ? DEFAULT_ROLE_MODELS[name].modelId
+        : DEFAULT_PROVIDER_MODELS[resolvedProvider]);
+    return { role: name, provider: resolvedProvider, modelId: resolvedModel };
+  };
 
   const apiKeys: Partial<Record<ProviderName, string[]>> = {};
   const googleKeys = parseApiKeys(e.GOOGLE_GENERATIVE_AI_API_KEY);
@@ -306,18 +448,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
   const openrouterKeys = parseApiKeys(e.OPENROUTER_API_KEY);
   const emmiedevKeys = parseApiKeys(e.EMMIEDEV_API_KEY);
   const zaiKeys = parseApiKeys(e.ZAI_API_KEY);
+  const deepseekKeys = parseApiKeys(e.DEEPSEEK_API_KEY);
   if (googleKeys.length > 0) apiKeys.google = googleKeys;
   if (groqKeys.length > 0) apiKeys.groq = groqKeys;
   if (openrouterKeys.length > 0) apiKeys.openrouter = openrouterKeys;
   if (emmiedevKeys.length > 0) apiKeys.emmiedev = emmiedevKeys;
   if (zaiKeys.length > 0) apiKeys.zai = zaiKeys;
+  if (deepseekKeys.length > 0) apiKeys.deepseek = deepseekKeys;
+  // A local server needs no key; the placeholder keeps the role-readiness gates honest.
+  const localKeys = parseApiKeys(e.LOCAL_LLM_API_KEY);
+  apiKeys.local = localKeys.length > 0 ? localKeys : [LOCAL_LLM_PLACEHOLDER_KEY];
 
   return {
     roles: {
-      healer: role('healer', e.WOWLIDATOR_HEALER_PROVIDER, e.WOWLIDATOR_HEALER_MODEL),
-      generator: role('generator', e.WOWLIDATOR_GENERATOR_PROVIDER, e.WOWLIDATOR_GENERATOR_MODEL),
-      agent: role('agent', e.WOWLIDATOR_AGENT_PROVIDER, e.WOWLIDATOR_AGENT_MODEL),
-      data: role('data', e.WOWLIDATOR_DATA_PROVIDER, e.WOWLIDATOR_DATA_MODEL),
+      healer: role('healer', e.WOWLIDATOR_HEALER_PROVIDER, e.WOWLIDATOR_HEALER_MODEL, e.WOWLIDATOR_HEALER_BASE_URL),
+      generator: role('generator', e.WOWLIDATOR_GENERATOR_PROVIDER, e.WOWLIDATOR_GENERATOR_MODEL, e.WOWLIDATOR_GENERATOR_BASE_URL),
+      agent: role('agent', e.WOWLIDATOR_AGENT_PROVIDER, e.WOWLIDATOR_AGENT_MODEL, e.WOWLIDATOR_AGENT_BASE_URL),
+      data: role('data', e.WOWLIDATOR_DATA_PROVIDER, e.WOWLIDATOR_DATA_MODEL, e.WOWLIDATOR_DATA_BASE_URL),
     },
     apiKeys,
     maxRetries: e.WOWLIDATOR_LLM_MAX_RETRIES ?? DEFAULT_MAX_RETRIES,

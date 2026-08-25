@@ -3,25 +3,27 @@
  * history, and context. Split out of cli.ts verbatim.
  */
 
-import { readdir, rm } from 'node:fs/promises';
+import { readdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-
-import { generateText } from 'ai';
 
 import { CacheManager } from '../../cache/cache-manager.js';
 import { connectDb, defaultDbConfig, maskDsn } from '../../db/client.js';
-import { LLM_ROLES, PROVIDER_META, describeRouting } from '../../config.js';
+import { LLM_ROLES, describeRouting } from '../../config.js';
 import { ContextEngine } from '../../context/context-engine.js';
+import { detectDbHint } from '../../context/db-hint.js';
 import {
   graphFileFor,
   listRepos,
+  mergedContextDocs,
   mergedScanInputs,
   resolveRepo,
   slugFor,
   upsertRepo,
 } from '../../context/repo-registry.js';
+import { SUPPORTED_EXTENSIONS, formatFor } from '../../catalog/extract.js';
 import { summarize as summarizeContext } from '../../context/query.js';
 import { RunHistory } from '../../history/run-history.js';
+import { probeIsUsable, probeRole } from '../../providers/probe.js';
 import type { CliOptions } from '../options.js';
 
 /**
@@ -37,42 +39,30 @@ export async function cmdDoctor(options: CliOptions): Promise<number> {
     const entry = options.config.roles[role];
     const label = `${role.padEnd(9)} ${entry.provider}:${entry.modelId}`;
 
-    if (!options.factory.canResolve(role)) {
-      process.stdout.write(`  ✗ ${label}\n      no API key — ${PROVIDER_META[entry.provider].envKey} is unset\n`);
+    // The probe is shared with the panel's Machinery page: one real call over
+    // the failover path a run would take, classified by cause. Sequential
+    // here on purpose — a rotation discovered for one role stays active for
+    // every later role sharing the provider, which is what a run gets too.
+    const probe = await probeRole(options.factory, role);
+    if (!probeIsUsable(probe.status)) {
+      process.stdout.write(`  ✗ ${label}\n      ${probe.detail}\n`);
+      for (const attempt of probe.attempts.slice(0, -1)) {
+        process.stdout.write(`      key ${attempt.keyIndex + 1}: ${attempt.detail}\n`);
+      }
       failures += 1;
       continue;
     }
-
-    const started = Date.now();
-    try {
-      // Routed through failover so `doctor` exercises the exact path a real
-      // run would take — if key 1 is dead, this both proves key 2 works and
-      // leaves it active for every subsequent role sharing the provider.
-      const { text, usage } = await options.factory.callWithFailover(role, (resolved) =>
-        // Smallest possible round trip that still proves the model id is real.
-        generateText({
-          model: resolved.model,
-          prompt: 'Reply with the single word: ok',
-          // Generous on purpose: reasoning models spend output budget on
-          // thinking, and a 16-token cap makes a healthy model look empty.
-          maxOutputTokens: 512,
-          maxRetries: 0,
-        }),
-      );
-      const reply = text.trim();
-      const tokens = `${usage.inputTokens ?? '?'} in / ${usage.outputTokens ?? '?'} out`;
-      const keyCount = options.config.apiKeys[entry.provider]?.length ?? 1;
-      const keyNote =
-        keyCount > 1 ? `, key ${options.factory.activeKeyIndex(entry.provider) + 1}/${keyCount}` : '';
-      process.stdout.write(
-        `  ${reply === '' ? '!' : '✓'} ${label}\n` +
-          `      responded in ${Date.now() - started}ms, ${tokens}${keyNote}` +
-          `${reply === '' ? ' — EMPTY reply; model may not suit this role' : ` (${JSON.stringify(reply.slice(0, 24))})`}\n`,
-      );
-    } catch (error) {
-      const detail = error instanceof Error ? error.message.split('\n')[0] : String(error);
-      process.stdout.write(`  ✗ ${label}\n      ${detail}\n`);
-      failures += 1;
+    const mark = probe.status === 'empty' ? '!' : '✓';
+    const reply = probe.reply === null ? '' : ` (${JSON.stringify(probe.reply)})`;
+    const quota =
+      probe.quota?.remainingTokens !== null && probe.quota?.remainingTokens !== undefined
+        ? `\n      ${probe.quota.remainingTokens.toLocaleString()} tokens left` +
+          (probe.quota.limitTokens !== null ? ` of ${probe.quota.limitTokens.toLocaleString()}` : '') +
+          (probe.quota.resetTokens !== null ? ` (resets in ${probe.quota.resetTokens})` : '')
+        : '';
+    process.stdout.write(`  ${mark} ${label}\n      ${probe.detail}${reply}${quota}\n`);
+    for (const attempt of probe.attempts) {
+      process.stdout.write(`      key ${attempt.keyIndex + 1}: ${attempt.detail}\n`);
     }
   }
 
@@ -250,9 +240,42 @@ export async function cmdContext(
       // wowUI's Re-scan posts only the path, and building bare would drop
       // every operation/table node. See `mergedScanInputs`: the one merged
       // pair feeds both the build and the entry, so they cannot drift.
-      const { openapi, dbSchema } = mergedScanInputs(await resolveRepo(arg), {
-        openapi: options.openapi,
-        dbSchema: options.dbSchema,
+      // Made absolute HERE, at the command boundary, before the engine or the
+      // registry sees them. The schema ingester resolves a relative source
+      // against the repository being indexed — right for a file inside it,
+      // and wrong for the way people actually type this: from their own
+      // directory, naming a schema file that lives elsewhere. Seen live: a
+      // repo saved with `--db-schema examples/hrms/x.sql` re-indexed with zero
+      // tables and a warning nobody read, and every catalog against it
+      // authored without DB checks. A URL (`--openapi https://…`) is left as
+      // typed.
+      const prior = await resolveRepo(arg);
+      // Context documents remembered with the repo — markdown, text, PDF,
+      // PowerPoint, Excel or CSV, validated here where a refusal can name the
+      // file. Paths are stored absolute and read fresh at authoring time, so
+      // an edited file updates the remembered context by itself; re-adding a
+      // file of the same name replaces the remembered path.
+      const rememberedDocs: string[] = [];
+      for (const doc of options.contextDocs) {
+        const absolute = resolve(doc);
+        if (formatFor(absolute) === undefined) {
+          process.stderr.write(
+            `wowlidator context add: cannot remember "${doc}" — it reads ${SUPPORTED_EXTENSIONS.join(' ')}\n`,
+          );
+          return 2;
+        }
+        try {
+          await stat(absolute);
+        } catch {
+          process.stderr.write(`wowlidator context add: no such context document: ${doc}\n`);
+          return 2;
+        }
+        rememberedDocs.push(absolute);
+      }
+      const contextDocs = mergedContextDocs(prior, rememberedDocs);
+      const { openapi, dbSchema } = mergedScanInputs(prior, {
+        openapi: options.openapi === undefined || /^[a-z]+:\/\//i.test(options.openapi) ? options.openapi : resolve(options.openapi),
+        dbSchema: options.dbSchema === undefined ? undefined : resolve(options.dbSchema),
       });
       const repoEngine = new ContextEngine({
         rootDir: arg,
@@ -263,6 +286,17 @@ export async function cmdContext(
         dbRemoteOk: process.env['WOWLIDATOR_DB_REMOTE_OK'] === '1',
       });
       const graph = await repoEngine.build({ force: options.force });
+      // What the repo's own files say about its database — a hint for the
+      // panel and for anyone asking "what do I set WOWLIDATOR_DB_URL to?".
+      // Best-effort file parsing; never a connection, never a password.
+      const dbHint = (await detectDbHint(resolve(arg))) ?? prior?.dbHint;
+      if (dbHint !== undefined) {
+        process.stdout.write(
+          `  db hint    ${dbHint.engine} at ${dbHint.host ?? '?'}:${dbHint.port ?? '?'}` +
+            `${dbHint.database === undefined ? '' : `/${dbHint.database}`} (from ${dbHint.source})` +
+            `${dbHint.passwordAt === undefined ? '' : ` — password: ${dbHint.passwordAt}`}\n`,
+        );
+      }
       await upsertRepo({
         slug,
         path: resolve(arg),
@@ -270,9 +304,18 @@ export async function cmdContext(
         nodes: graph.nodes.length,
         openapi,
         dbSchema,
+        // A re-scan must not forget what a signed-in capture learned or the
+        // documents remembered alongside the code — same rule as
+        // `mergedScanInputs` for the scan's own inputs.
+        nav: prior?.nav,
+        contextDocs,
+        dbHint,
       });
       process.stdout.write(
-        `${summarizeContext(graph)}\n\nsaved as ${slug} — ground a run in it with --repo ${slug}\n`,
+        `${summarizeContext(graph)}\n\nsaved as ${slug} — ground a run in it with --repo ${slug}\n` +
+          (contextDocs === undefined
+            ? ''
+            : `  remembers  ${contextDocs.length} context document(s): ${contextDocs.map((d) => d.split('/').pop()).join(', ')}\n`),
       );
       return 0;
     }

@@ -23,11 +23,13 @@ import type { AddressInfo } from 'node:net';
 
 import {
   LlmFlowRepairModel,
+  repairSchemaCanExpress,
   type FlowRepairModel,
   type RepairProposal,
   type RepairRequest,
 } from '../src/repair/flow-repair-model.js';
 import { FlowRepairLoop, applyRepair, buildInvestigationGoal } from '../src/repair/flow-repair-loop.js';
+import { RepairMemory } from '../src/repair/repair-memory.js';
 import { runFlow, type Flow, type FlowStep } from '../src/engine/runner.js';
 import { jsonModel } from './helpers.js';
 
@@ -190,6 +192,28 @@ describe('LlmFlowRepairModel', () => {
   });
 });
 
+describe('canExpress', () => {
+  // The live failure this contract exists for (be100, 2026-08-23): every
+  // `expectDbRow` failure was sent for reconstruction, the model echoed the
+  // action the schema cannot spell, six identical temperature-0 mismatches
+  // opened the structured-output breaker, and 90+ cases were blocked against
+  // a model that was answering fine.
+  it('refuses actions outside the repair schema vocabulary, keeps the ladder ones', () => {
+    for (const action of ['expectDbRow', 'expectDbDelta', 'dbSnapshot', 'request', 'expectStatus', 'expectCalls', 'workflow']) {
+      assert.equal(repairSchemaCanExpress(action), false, `${action} must be refused`);
+    }
+    for (const action of ['click', 'fill', 'goto', 'expectText', 'expectVisible', 'waitFor']) {
+      assert.equal(repairSchemaCanExpress(action), true, `${action} must stay repairable`);
+    }
+  });
+
+  it('is answered by LlmFlowRepairModel without demanding a key', () => {
+    const model = new LlmFlowRepairModel();
+    assert.equal(model.canExpress('expectDbRow'), false);
+    assert.equal(model.canExpress('click'), true);
+  });
+});
+
 describe('applyRepair', () => {
   const flow: Flow = {
     name: 'f',
@@ -228,6 +252,121 @@ describe('applyRepair', () => {
     assert.deepEqual(revised.steps, [flow.steps[0], inserted, replacement, ...tail]);
     // The caller's flow is never mutated.
     assert.equal(flow.steps.length, 4);
+  });
+});
+
+describe('RepairMemory', () => {
+  // The live shape that forced the memory (be100.csv, 2026-08-25): a
+  // dead-click hydration race on a two-step login, fixed by inserting a
+  // second "Next" click before the password fill — rediscovered identically
+  // by every case in the catalog.
+  const nextClick: FlowStep = { action: 'click', selector: 'role=button[name="Next"]' };
+  const passwordFill: FlowStep = {
+    action: 'fill',
+    selector: 'input[type="password"]',
+    value: 'admin2026',
+    intent: 'Enter the admin password',
+  };
+  const loginFlow = (fill: FlowStep): Flow => ({
+    name: 'case',
+    steps: [
+      { action: 'goto', url: 'http://localhost:3000/en/login' },
+      { action: 'fill', selector: 'role=textbox[name="Work email"]', value: 'admin@x.test' },
+      nextClick,
+      fill,
+    ],
+  });
+  const insertFix: RepairProposal = {
+    canFix: true,
+    insertBefore: [nextClick],
+    replacement: passwordFill,
+    rewriteFollowing: [],
+    reasoning: 'the form needs a second Next click',
+  };
+  const remember = (memory: RepairMemory, proposal: RepairProposal = insertFix): boolean =>
+    memory.record({
+      url: 'http://localhost:3000/en/login',
+      failedStep: passwordFill,
+      // In the failing flow the fill already sat behind a "Next" click — the
+      // same step the fix inserts, which is exactly what makes idempotence
+      // detection need this context.
+      precededBy: nextClick,
+      proposal,
+      learnedFrom: 'PL_01_01',
+    });
+
+  it('pre-applies a proven insert-before fix to a later flow on the same page', () => {
+    const memory = new RepairMemory();
+    assert.equal(remember(memory), true);
+    const later = loginFlow({ ...passwordFill, intent: 'Enter password' });
+    const { flow: adapted, applied } = memory.adapt(later);
+    // The extra click lands where the repair put it; the case's own step —
+    // its own intent included — survives, because the repair never changed it.
+    assert.deepEqual(adapted.steps.slice(2), [
+      nextClick,
+      nextClick,
+      { ...passwordFill, intent: 'Enter password' },
+    ]);
+    assert.equal(applied.length, 1);
+    assert.match(applied[0]!, /learned from "PL_01_01"/);
+    // The input is never mutated.
+    assert.equal(later.steps.length, 4);
+  });
+
+  it('refits a replacement: only the fields the repair changed carry over', () => {
+    const memory = new RepairMemory();
+    remember(memory, {
+      ...insertFix,
+      insertBefore: [],
+      replacement: { ...passwordFill, selector: 'input[name="pw"]' },
+    });
+    const later = loginFlow({ ...passwordFill, value: 'other-secret', intent: 'their own words' });
+    const { flow: adapted } = memory.adapt(later);
+    // New selector from the repair; the later case's own value and intent kept.
+    assert.deepEqual(adapted.steps[3], {
+      action: 'fill',
+      selector: 'input[name="pw"]',
+      value: 'other-secret',
+      intent: 'their own words',
+    });
+  });
+
+  it('does not fire on the same selector reached via a different page', () => {
+    const memory = new RepairMemory();
+    remember(memory);
+    const elsewhere: Flow = {
+      name: 'other',
+      steps: [{ action: 'goto', url: '/en/settings' }, passwordFill],
+    };
+    const { flow: adapted, applied } = memory.adapt(elsewhere);
+    assert.deepEqual(adapted, elsewhere);
+    assert.equal(applied.length, 0);
+  });
+
+  it('is idempotent: a flow already carrying the fix is left alone', () => {
+    const memory = new RepairMemory();
+    remember(memory);
+    const once = memory.adapt(loginFlow(passwordFill)).flow;
+    const { flow: twice, applied } = memory.adapt(once);
+    assert.deepEqual(twice, once);
+    assert.equal(applied.length, 0);
+  });
+
+  it('refuses a tail rewrite — a regenerated tail is one case\'s goal, not a shared fix', () => {
+    const memory = new RepairMemory();
+    const refused = remember(memory, {
+      ...insertFix,
+      rewriteFollowing: [{ action: 'expectText', selector: '#x', value: 'y' }],
+    });
+    assert.equal(refused, false);
+    assert.equal(memory.size, 0);
+  });
+
+  it('keeps the first proven fix for a step — 107 rediscoveries do not churn it', () => {
+    const memory = new RepairMemory();
+    assert.equal(remember(memory), true);
+    assert.equal(remember(memory, { ...insertFix, reasoning: 'a later, different theory' }), false);
+    assert.equal(memory.size, 1);
   });
 });
 

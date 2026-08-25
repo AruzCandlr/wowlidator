@@ -17,9 +17,9 @@ import { after, before, describe, it } from 'node:test';
 
 import { BACKEND_TIER_ACTIONS, type ProofBundle } from '../src/engine/proof-bundle.js';
 import { SUPPORTED_EXTENSIONS } from '../src/catalog/extract.js';
-import { UiCommandError, buildArgv, commandById } from '../src/ui/commands.js';
+import { UiCommandError, buildArgv, commandById, buildEnvOverlay } from '../src/ui/commands.js';
 import { UploadError, deleteDocument, safeName, saveDocument } from '../src/ui/uploads.js';
-import { clearProofCache, readProof, readProofIndex, toCard } from '../src/ui/proofs.js';
+import { clearProofCache, groupAccuracy, groupRuns, groupScenarios, inferredCaseTitle, inferredScenario, readProof, readProofIndex, tallyVerdicts, toCard } from '../src/ui/proofs.js';
 import { renderWowUi } from '../src/ui/wow-ui-html.js';
 import { applyProgressLine, formatProgressReadout, type JobProgress } from '../src/ui/jobs.js';
 import { ModelSelection, ModelSelectionError } from '../src/ui/models.js';
@@ -124,6 +124,53 @@ describe('the wowUI page', () => {
     for (const field of ['Start verification', 'Add Context', 'Add Catalog', 'Describe',
       'Anything to look at especially', 'Page to prove it against', 'Options for this run only']) {
       assert.ok(html.includes(field), `the launcher lost "${field}"`);
+    }
+  });
+
+  it('shows the claims at a glance above the checks table, and why a red run is red below it', () => {
+    // claimsSummary: the test's polarity plus every assertion's
+    // expected-vs-actual, rendered on expand ABOVE the step table — a reader
+    // sees what was demanded and what the page really held before any
+    // scrolling. whyBlock: the same pure verdict the HTML report leads with,
+    // served alongside the bundle, rendered UNDER the table only when the run
+    // is failed / error / dead-end.
+    for (const marker of ['claimsSummary', 'whyBlock', 'Expected vs actual', 'Why it ',
+      'polarityTag', 'expectedActualOf', '.claims-summary', '.why-block']) {
+      assert.ok(html.includes(marker), `the page lost "${marker}"`);
+    }
+    // The why block reads the server-computed verdict, cached beside the bundle.
+    assert.match(html, /S\.verdicts\[/);
+  });
+
+  it('shows a catalog group\'s accuracy as agreement with the sheet, as a percent', () => {
+    // accuracyLine mirrors groupAccuracy in ui/proofs.ts: verdicts matching
+    // the sheet's recorded Actual Result (generatedBy.knownResult), rendered
+    // on both catalog headers (the flows view and the history view), only on
+    // catalogs, and only when the sheet recorded results to compare against.
+    for (const marker of ['accuracyOf', 'accuracyLine', "'accuracy '", 'knownResult',
+      'vs sheet', 'unscored', 'if (a.scored === 0) return null']) {
+      assert.ok(html.includes(marker), `the page lost "${marker}"`);
+    }
+  });
+
+  it('offers Autoheal in front of the fold, wired to --repair', () => {
+    // The launcher's checkbox, and the flag it becomes. Suites heal per case
+    // through the same FlowRepairLoop `run --repair` uses.
+    for (const marker of ['Autoheal enabled', 'M.autoheal', 'extras.repair = true']) {
+      assert.ok(html.includes(marker), `the page lost "${marker}"`);
+    }
+  });
+
+  it('remembers context documents with a repository, and accepts PowerPoint', () => {
+    for (const marker of ['Remember document…', "'context-doc': [doc.path]", '.pptx']) {
+      assert.ok(html.includes(marker), `the page lost "${marker}"`);
+    }
+  });
+
+  it('carries the proved-? flow: chips, the review block, and the ruling endpoint', () => {
+    for (const marker of ['proved-?', 'reviewBlock', 'effStatus', "'/review'",
+      'Confirm proved', 'Confirm failed', 'needs-review']) {
+      assert.ok(html.includes(marker), `the page lost "${marker}"`);
     }
   });
 
@@ -372,6 +419,32 @@ describe('the command whitelist', () => {
   it('still requires what the command cannot run without', () => {
     assert.throws(() => buildArgv(run, { claims: 'c.json' }), UiCommandError);
   });
+
+  it('expands a repeatable positional into consecutive argv entries', () => {
+    // wowUI's group-level "Rerun all" / "Heal all" send the flow list this
+    // way: one job, one browser slot, instead of a refused job per case.
+    const spec = commandById('run')!;
+    assert.deepEqual(
+      buildArgv(spec, { flow: ['a.flow.json', 'b.flow.json'] }),
+      ['run', 'a.flow.json', 'b.flow.json'],
+    );
+    // A lone string is the single-flow form every existing caller sends — it
+    // is still exactly one argv entry, so nothing can be smuggled through it.
+    assert.deepEqual(buildArgv(spec, { flow: 'a.flow.json' }), ['run', 'a.flow.json']);
+    // Flags still follow every positional.
+    assert.deepEqual(
+      buildArgv(spec, { flow: ['a.flow.json', 'b.flow.json'], repair: true }),
+      ['run', 'a.flow.json', 'b.flow.json', '--repair'],
+    );
+  });
+
+  it('refuses an empty or missing repeatable positional the command requires', () => {
+    const spec = commandById('run')!;
+    assert.throws(() => buildArgv(spec, {}), UiCommandError);
+    assert.throws(() => buildArgv(spec, { flow: [] }), UiCommandError);
+    assert.throws(() => buildArgv(spec, { flow: ['a.flow.json', ''] }), UiCommandError);
+    assert.throws(() => buildArgv(spec, { flow: ['a.flow.json', 'b\0.json'] }), UiCommandError);
+  });
 });
 
 describe('documents the panel stores', () => {
@@ -432,6 +505,14 @@ describe('reading proof bundles', () => {
       JSON.stringify(bundle({ runId: 'run-3', finishedAt: '2026-08-10T08:00:00.000Z' })),
       'utf8',
     );
+    // A hidden run: parked under archived/ by the panel's Hide button. Still
+    // on disk, still a valid bundle — and it must never be listed.
+    await mkdir(join(dir, 'archived'), { recursive: true });
+    await writeFile(
+      join(dir, 'archived', 'hidden.json'),
+      JSON.stringify(bundle({ runId: 'run-hidden', finishedAt: '2026-08-10T09:00:00.000Z' })),
+      'utf8',
+    );
   });
 
   after(() => clearProofCache());
@@ -440,6 +521,18 @@ describe('reading proof bundles', () => {
     const index = await readProofIndex(dir);
     assert.deepEqual(index.cards.map((c) => c.runId), ['run-2', 'run-1', 'run-3']);
     assert.equal(index.skipped, 2, 'the two non-bundles');
+  });
+
+  it('never lists a run hidden under archived/ — cleared from screen, kept on disk', async () => {
+    const index = await readProofIndex(dir);
+    assert.ok(!index.cards.some((c) => c.runId === 'run-hidden'));
+    // And a renamed run carries its original name for the flow-file lookup.
+    const renamed = toCard(
+      { ...JSON.parse(JSON.stringify(bundle({ runId: 'r' }))), name: 'My better name', renamedFrom: 'PL_01_01 old name' },
+      '/x/r.json',
+    );
+    assert.equal(renamed.name, 'My better name');
+    assert.equal(renamed.renamedFrom, 'PL_01_01 old name');
   });
 
   it('never puts a screenshot in the list', async () => {
@@ -652,6 +745,28 @@ describe('which model each role runs on', () => {
     });
   });
 
+  it('carries a local port as a base URL, and only for local', () => {
+    // Two rerise servers differ by port alone, so the port is the whole of
+    // the choice — and it is a property of a server on this machine, so a
+    // port sent with any other provider is dropped rather than recorded.
+    const models = new ModelSelection();
+    models.select('generator', 'local', 'default_model', 8081);
+    assert.deepEqual(models.envOverlay(), {
+      WOWLIDATOR_GENERATOR_PROVIDER: 'local',
+      WOWLIDATOR_GENERATOR_MODEL: 'default_model',
+      WOWLIDATOR_GENERATOR_BASE_URL: 'http://localhost:8081/v1',
+    });
+    const view = models.describeRoles(config).find((r) => r.role === 'generator')!;
+    assert.equal(view.port, 8081);
+
+    models.select('healer', 'groq', 'llama-3.3-70b-versatile', 8081);
+    assert.equal(models.envOverlay()['WOWLIDATOR_HEALER_BASE_URL'], undefined);
+    assert.equal(models.describeRoles(config).find((r) => r.role === 'healer')!.port, null);
+
+    assert.throws(() => models.select('agent', 'local', 'default_model', 70000), ModelSelectionError);
+    assert.throws(() => models.select('agent', 'local', 'default_model', 0.5), ModelSelectionError);
+  });
+
   it('accepts an id no catalogue listed', () => {
     // The list is a convenience, not an authority: it goes stale, the provider
     // can be unreachable, and a brand-new id is exactly what someone is here
@@ -705,5 +820,338 @@ describe('which model each role runs on', () => {
     assert.equal(google.keyed, false);
     assert.equal(google.models.length, 0);
     assert.equal(google.fetchedAt, null);
+  });
+});
+
+describe('grouping runs by the pass that authored them', () => {
+  /** A card as the list serves it, with just the fields grouping reads. */
+  function card(
+    runId: string,
+    at: string,
+    provenance: { generatedAt: string; source?: string; scenario?: string; caseTitle?: string; rationale?: string; knownResult?: 'passed' | 'failed' } | null,
+    status: 'passed' | 'failed' | 'dead-end' | 'error' | 'needs-review' = 'passed',
+    polarity?: 'positive' | 'negative',
+    name = runId,
+  ) {
+    return toCard(
+      bundle({
+        runId,
+        name,
+        status,
+        startedAt: at,
+        finishedAt: at,
+        ...(polarity === undefined ? {} : { polarity, polaritySource: 'stated' }),
+        ...(provenance === null
+          ? {}
+          : {
+              generatedBy: {
+                model: 'stub',
+                generatedAt: provenance.generatedAt,
+                sourceUrl: 'http://localhost:3000/en/login',
+                kind: 'catalog',
+                rationale: provenance.rationale ?? '6 cases',
+                ...(provenance.source === undefined ? {} : { source: provenance.source }),
+                ...(provenance.scenario === undefined ? {} : { scenario: provenance.scenario }),
+                ...(provenance.caseTitle === undefined ? {} : { caseTitle: provenance.caseTitle }),
+                ...(provenance.knownResult === undefined ? {} : { knownResult: provenance.knownResult }),
+              },
+            }),
+      }),
+      `/tmp/${runId}.json`,
+    );
+  }
+
+  it('puts one authoring pass in one group, titled by its document', () => {
+    const groups = groupRuns([
+      card('a', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1', source: 'probation.xlsx' }),
+      card('b', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1', source: 'probation.xlsx' }),
+      card('c', '2026-08-19T03:42:00.000Z', { generatedAt: 'T1', source: 'probation.xlsx' }),
+    ]);
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0]?.title, 'probation.xlsx');
+    assert.equal(groups[0]?.runs.length, 3);
+    assert.equal(groups[0]?.total, 3);
+  });
+
+  // The requirement in one test: the same catalog run twice is two groups, not
+  // one group of twelve with a pass rate averaged over two different builds.
+  it('makes a NEW group when the same catalog is run again', () => {
+    const groups = groupRuns([
+      card('later-a', '2026-08-19T05:00:00.000Z', { generatedAt: 'T2', source: 'probation.xlsx' }),
+      card('later-b', '2026-08-19T05:01:00.000Z', { generatedAt: 'T2', source: 'probation.xlsx' }),
+      card('early-a', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1', source: 'probation.xlsx' }),
+      card('early-b', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1', source: 'probation.xlsx' }),
+    ]);
+    assert.equal(groups.length, 2, 'same document, two passes, two groups');
+    assert.deepEqual(
+      groups.map((g) => g.title),
+      ['probation.xlsx', 'probation.xlsx'],
+    );
+    // Newest group first, and each one holds only its own pass.
+    assert.deepEqual(groups[0]?.runs.map((r) => r.runId), ['later-a', 'later-b']);
+    assert.deepEqual(groups[1]?.runs.map((r) => r.runId), ['early-a', 'early-b']);
+  });
+
+  it('tallies each group on its own runs', () => {
+    const groups = groupRuns([
+      card('a', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1', source: 'x.xlsx' }, 'passed'),
+      card('b', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1', source: 'x.xlsx' }, 'failed'),
+    ]);
+    assert.equal(groups[0]?.passed, 1);
+    assert.equal(groups[0]?.failed, 1);
+  });
+
+  it('leaves a run nobody authored as a group of its own', () => {
+    const groups = groupRuns([
+      card('hand-written', '2026-08-19T03:40:00.000Z', null),
+      card('also-hand', '2026-08-19T03:41:00.000Z', null),
+    ]);
+    assert.equal(groups.length, 2, 'unrelated runs must not imply a relationship');
+    assert.equal(groups[0]?.kind, 'run');
+  });
+
+  it('falls back to the page URL when no document was recorded', () => {
+    const groups = groupRuns([card('a', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1' })]);
+    assert.equal(groups[0]?.title, 'http://localhost:3000/en/login');
+  });
+
+  it('spans the group from its earliest start to its latest finish', () => {
+    const groups = groupRuns([
+      card('a', '2026-08-19T03:45:00.000Z', { generatedAt: 'T1', source: 'x.xlsx' }),
+      card('b', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1', source: 'x.xlsx' }),
+    ]);
+    assert.equal(groups[0]?.startedAt, '2026-08-19T03:40:00.000Z');
+    assert.equal(groups[0]?.finishedAt, '2026-08-19T03:45:00.000Z');
+  });
+
+  it('is empty for an empty list', () => {
+    assert.deepEqual(groupRuns([]), []);
+  });
+
+  // A catalog's roll-up is asked for as a share, not a count: "proved 60%,
+  // dead-end 20%, error 20%" of a five-case sheet. Every kind is its own
+  // bucket — dead-end and error are not "failed" here — and the percentages
+  // are of the whole group.
+  it('tallies each verdict kind as a count and a percentage of the group', () => {
+    const groups = groupRuns([
+      card('a', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1' }, 'passed'),
+      card('b', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1' }, 'passed'),
+      card('c', '2026-08-19T03:42:00.000Z', { generatedAt: 'T1' }, 'passed'),
+      card('d', '2026-08-19T03:43:00.000Z', { generatedAt: 'T1' }, 'dead-end'),
+      card('e', '2026-08-19T03:44:00.000Z', { generatedAt: 'T1' }, 'error'),
+    ]);
+    const tally = groups[0]!.tally;
+    assert.deepEqual(tally.passed, { count: 3, percent: 60 });
+    assert.deepEqual(tally.deadEnd, { count: 1, percent: 20 });
+    assert.deepEqual(tally.error, { count: 1, percent: 20 });
+    assert.deepEqual(tally.failed, { count: 0, percent: 0 });
+    assert.deepEqual(tally.needsReview, { count: 0, percent: 0 });
+    assert.deepEqual(tallyVerdicts([]).passed, { count: 0, percent: 0 }, 'an empty list divides by nothing');
+  });
+
+  // Accuracy is agreement with the sheet's own recorded results: the Actual
+  // Result column is a person's verdict on each case, and the score is how
+  // often wowlidator's verdict matches it — passed where they saw Passed,
+  // failed where they saw Failed. Positive/Negative cannot score a run (a
+  // negative case is still expected to pass, by the app refusing), a
+  // dead-end/error run delivered no verdict and agrees with nothing, and a
+  // row the sheet left unverdicted is disclosed as unscored, never invented
+  // into either side.
+  it('scores accuracy as agreement with the sheet\'s recorded Actual Result', () => {
+    const groups = groupRuns([
+      // Human saw Passed, run passed — agreement.
+      card('a', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1', knownResult: 'passed' }, 'passed'),
+      // Human filed a bug, run failed — agreement: the known defect was found.
+      card('b', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1', knownResult: 'failed' }, 'failed'),
+      // Human saw Passed, run failed — a false alarm, disagreement.
+      card('c', '2026-08-19T03:42:00.000Z', { generatedAt: 'T1', knownResult: 'passed' }, 'failed'),
+      // Human saw Passed, run errored — no verdict delivered, disagreement.
+      card('d', '2026-08-19T03:43:00.000Z', { generatedAt: 'T1', knownResult: 'passed' }, 'error'),
+      // The sheet recorded nothing (Cancelled/Pending/blank) — unscored.
+      card('e', '2026-08-19T03:44:00.000Z', { generatedAt: 'T1' }, 'passed'),
+    ]);
+    assert.deepEqual(groups[0]!.accuracy, { agreed: 2, scored: 4, unscored: 1, percent: 50 });
+    assert.deepEqual(
+      groupAccuracy([]),
+      { agreed: 0, scored: 0, unscored: 0, percent: 0 },
+      'an empty list divides by nothing',
+    );
+  });
+
+  // A case retried until it passed is one case of the sheet, not several
+  // chances at agreement. The list arrives newest-first, so the latest
+  // verdict is the one scored.
+  it('collapses retries to the latest verdict when scoring accuracy', () => {
+    const groups = groupRuns([
+      card('retry-2', '2026-08-19T04:00:00.000Z', { generatedAt: 'T1', knownResult: 'passed' }, 'passed', undefined, 'PL_01_01 menu'),
+      card('retry-1', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1', knownResult: 'passed' }, 'failed', undefined, 'PL_01_01 menu'),
+      card('b', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1', knownResult: 'failed' }, 'passed'),
+    ]);
+    // Two distinct cases: the retried one agrees on its latest run; the case
+    // whose known bug the run missed does not.
+    assert.deepEqual(groups[0]!.accuracy, { agreed: 1, scored: 2, unscored: 0, percent: 50 });
+  });
+
+  // Bundles written before the stamp existed still carry the case id in
+  // their name, and a sheet numbers cases inside their scenario — so the
+  // id less its last segment is the scenario, and the rest is the title.
+  it('infers the scenario and title from the case id when no stamp was recorded', () => {
+    assert.equal(inferredScenario('PL_02_03 ตรวจสอบความถูกต้อง Create Benefit Plan'), 'PL_02');
+    assert.equal(inferredCaseTitle('PL_02_03 ตรวจสอบความถูกต้อง Create Benefit Plan'), 'ตรวจสอบความถูกต้อง Create Benefit Plan');
+    assert.equal(inferredScenario('TC-12-4 Reject leave'), 'TC-12');
+    assert.equal(inferredScenario('DB_07 seed restore'), 'DB');
+    assert.equal(inferredScenario('Leave Request Submission Flow'), null, 'a plain name is not an id');
+    assert.equal(inferredScenario('PL_02_03'), 'PL_02');
+    assert.equal(inferredCaseTitle('PL_02_03'), null);
+    const groups = groupRuns([
+      card('PL_02_03 Create', '2026-08-19T03:42:00.000Z', { generatedAt: 'T1' }),
+      card('PL_02_01 Menu', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1' }),
+      card('PL_01_01 Visible', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1' }),
+    ]);
+    assert.deepEqual(groups[0]!.scenarios.map((s) => s.title), ['PL_02', 'PL_01']);
+    assert.equal(groups[0]!.scenarios[0]!.runs.length, 2);
+  });
+
+  it('groups a catalog\'s runs by the sheet scenario, in sheet order, and keeps the case title', () => {
+    const groups = groupRuns([
+      card('c3', '2026-08-19T03:42:00.000Z', { generatedAt: 'T1', scenario: 'S2 Leave approval', caseTitle: 'Reject leave' }, 'failed'),
+      card('c2', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1', scenario: 'S1 Login', caseTitle: 'Wrong password' }),
+      card('c1', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1', scenario: 'S1 Login', caseTitle: 'Valid login' }),
+      card('c0', '2026-08-19T03:39:00.000Z', { generatedAt: 'T1' }),
+    ]);
+    const scenarios = groups[0]!.scenarios;
+    assert.deepEqual(scenarios.map((s) => s.title), ['S2 Leave approval', 'S1 Login', 'ungrouped']);
+    assert.equal(scenarios[1]!.runs.length, 2);
+    assert.deepEqual(scenarios[1]!.tally.passed, { count: 2, percent: 100 });
+    assert.deepEqual(scenarios[0]!.tally.failed, { count: 1, percent: 100 });
+    assert.equal(scenarios[1]!.runs[0]!.generatedBy?.caseTitle, 'Wrong password');
+    assert.equal(scenarios[0]!.id, `${groups[0]!.id}|S2 Leave approval`, 'stable across polls');
+    assert.equal(groupScenarios('g', []).length, 0);
+  });
+
+  // A re-run or a repair used to land under "Authored flows", because the
+  // bundle it produced carried no provenance — `wowlidator run x.flow.json`
+  // knows nothing about the catalog that wrote the file. `Flow.authoredBy`
+  // puts it in the file, so the later run reports the same pass and comes
+  // back to the group it belongs to.
+  it('keeps a re-run of an authored case in its original group', () => {
+    const groups = groupRuns([
+      card('rerun-of-a', '2026-08-19T06:00:00.000Z', { generatedAt: 'T1', source: 'probation.xlsx' }),
+      card('a', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1', source: 'probation.xlsx' }),
+      card('b', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1', source: 'probation.xlsx' }),
+    ]);
+    assert.equal(groups.length, 1, 'the re-run belongs to the pass that authored the flow');
+    assert.equal(groups[0]?.runs.length, 3);
+    assert.equal(groups[0]?.title, 'probation.xlsx');
+  });
+});
+
+describe('credentials in the panel', () => {
+  const CONSUMERS = ['go', 'run', 'generate', 'author', 'catalog-run', 'watch'];
+
+  it('every command that consumes --as offers the field; claims-reading does not', () => {
+    for (const id of CONSUMERS) {
+      const spec = commandById(id);
+      assert.ok(spec?.fields.some((f) => f.name === 'as' && f.type === 'secret'), id);
+    }
+    // Claims extraction opens no browser and signs nothing in — a control
+    // there would be a lie.
+    assert.ok(!commandById('catalog-claims')?.fields.some((f) => f.name === 'as'));
+  });
+
+  // The rule the whole design hangs on: argv is what ps prints, what the
+  // panel displays, and what the job record keeps — the password may appear
+  // in none of them.
+  it('a secret never becomes argv, and rides the env overlay instead', () => {
+    const spec = commandById('run')!;
+    const values = { flow: '/tmp/x.flow.json', as: 'employee@cnext.test:pw:with:colons' };
+    const argv = buildArgv(spec, values);
+    assert.ok(!argv.some((a) => a.includes('pw:with:colons')), 'password must not reach argv');
+    assert.ok(!argv.includes('--as'));
+    assert.deepEqual(buildEnvOverlay(spec, values), {
+      WOWLIDATOR_AS: 'employee@cnext.test:pw:with:colons',
+    });
+  });
+
+  it('rejects a malformed pair with a sentence, before any run starts', () => {
+    const spec = commandById('run')!;
+    for (const bad of ['no-colon', ':pw', 'email:']) {
+      assert.throws(
+        () => buildEnvOverlay(spec, { flow: '/tmp/x.flow.json', as: bad }),
+        /email:password/,
+        bad,
+      );
+    }
+  });
+
+  it('an empty value contributes nothing, so the panel environment falls through', () => {
+    const spec = commandById('run')!;
+    assert.deepEqual(buildEnvOverlay(spec, { flow: '/tmp/x.flow.json', as: '' }), {});
+    assert.deepEqual(buildEnvOverlay(spec, { flow: '/tmp/x.flow.json' }), {});
+  });
+
+  it('both surfaces render a secret as a password input', async () => {
+    const { renderWowUi } = await import('../src/ui/wow-ui-html.js');
+    const { renderApp } = await import('../src/ui/app-html.js');
+    assert.match(renderWowUi(), /type: 'password'/);
+    assert.match(renderApp(), /'secret' \? 'password'/);
+  });
+});
+
+describe('a local role addressed by port', () => {
+  it('reads WOWLIDATOR_<ROLE>_BASE_URL per role, falling back to LOCAL_LLM_BASE_URL', async () => {
+    const { loadConfig } = await import('../src/config.js');
+    const cfg = loadConfig({
+      WOWLIDATOR_GENERATOR_PROVIDER: 'local',
+      WOWLIDATOR_GENERATOR_BASE_URL: 'http://localhost:8081/v1/',
+      WOWLIDATOR_HEALER_PROVIDER: 'local',
+      LOCAL_LLM_BASE_URL: 'http://localhost:8080/v1',
+      GROQ_API_KEY: 'k',
+      GOOGLE_GENERATIVE_AI_API_KEY: 'k',
+    } as NodeJS.ProcessEnv);
+    assert.equal(cfg.roles.generator.baseUrl, 'http://localhost:8081/v1');
+    assert.equal(cfg.roles.healer.baseUrl, 'http://localhost:8080/v1');
+    // A base URL on a provider that has no local server is not carried.
+    assert.equal(cfg.roles.agent.baseUrl, undefined);
+  });
+
+  it('hands the role its own base URL when the model is built', async () => {
+    const { createModelForRole } = await import('../src/providers/llm-factory.js');
+    const { loadConfig } = await import('../src/config.js');
+    const cfg = loadConfig({
+      WOWLIDATOR_DATA_PROVIDER: 'local',
+      WOWLIDATOR_DATA_BASE_URL: 'http://localhost:9001/v1',
+      GROQ_API_KEY: 'k',
+      GOOGLE_GENERATIVE_AI_API_KEY: 'k',
+    } as NodeJS.ProcessEnv);
+    const seen: unknown[] = [];
+    createModelForRole('data', cfg, 0, {
+      ...Object.fromEntries(
+        ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local'].map((p) => [
+          p,
+          (_k: string, _m: string, o?: { baseUrl?: string | undefined }) => {
+            seen.push(o?.baseUrl);
+            return {} as never;
+          },
+        ]),
+      ),
+    } as never);
+    assert.deepEqual(seen, ['http://localhost:9001/v1']);
+  });
+
+  it('persists the port beside the provider and comments it out on a move away', async () => {
+    const { persistRoleModel } = await import('../src/ui/models.js');
+    const { mkdtemp, readFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = await mkdtemp(join(tmpdir(), 'wow-env-'));
+    const env = join(dir, '.env');
+    await persistRoleModel('generator', { provider: 'local', modelId: 'default_model', baseUrl: 'http://localhost:8081/v1' }, env);
+    let text = await readFile(env, 'utf8');
+    assert.match(text, /^WOWLIDATOR_GENERATOR_BASE_URL=http:\/\/localhost:8081\/v1$/m);
+    await persistRoleModel('generator', { provider: 'groq', modelId: 'llama-3.3-70b-versatile' }, env);
+    text = await readFile(env, 'utf8');
+    assert.match(text, /^# WOWLIDATOR_GENERATOR_BASE_URL=/m);
+    assert.doesNotMatch(text, /^WOWLIDATOR_GENERATOR_BASE_URL=/m);
   });
 });

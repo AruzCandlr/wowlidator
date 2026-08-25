@@ -54,6 +54,7 @@ export type DocumentFormat =
    * `diagram-image.ts` first, and what reaches extraction is the transcribed
    * `.mmd`. The member exists so uploads can carry the format label.
    */
+  | 'pptx'
   | 'sequence-image';
 
 /** Extensions this module will attempt, and what it treats each as. */
@@ -72,6 +73,8 @@ const FORMATS: Record<string, DocumentFormat> = {
   '.yml': 'yaml',
   '.xlsx': 'xlsx',
   '.xlsm': 'xlsx',
+  '.pptx': 'pptx',
+  '.ppsx': 'pptx',
   '.pdf': 'pdf',
   // Sequence diagrams — Mermaid and PlantUML source. Decided by extension
   // like everything else here; a fenced ```mermaid block inside a `.md` keeps
@@ -160,6 +163,12 @@ export function extractDocument(
       const sheets = readXlsx(bytes);
       text = sheets.text;
       note = sheets.note;
+      break;
+    }
+    case 'pptx': {
+      const deck = readPptx(bytes);
+      text = deck.text;
+      note = deck.note;
       break;
     }
     case 'pdf': {
@@ -378,6 +387,76 @@ function readXlsx(bytes: Buffer): { text: string; note: string } {
   };
 }
 
+/**
+ * A PowerPoint deck, read the same way the workbook is: through the ZIP's
+ * central directory, taking the one narrow thing needed — the text runs.
+ *
+ * One slide is one `ppt/slides/slideN.xml`; visible text lives in `<a:t>`
+ * runs, one paragraph per `<a:p>` (joining runs within a paragraph is what
+ * keeps a title split by formatting from reading as two lines). Slide notes
+ * (`ppt/notesSlides/`) are read too, labelled apart — a speaker note is the
+ * author talking, not the slide asserting — and everything else in the
+ * package (themes, layouts, media) is never touched. A deck whose slides are
+ * pictures of text yields nothing readable and is refused with the cause
+ * named, the same rule as a PDF with no text layer.
+ */
+function readPptx(bytes: Buffer): { text: string; note: string } {
+  const entries = readZip(bytes);
+  const slides = entries
+    .filter((entry) => /^ppt\/slides\/slide\d+\.xml$/.test(entry.name))
+    .sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
+
+  if (slides.length === 0) {
+    throw new EmptyDocumentError('this presentation has no slides wowlidator can read');
+  }
+
+  const notesByslide = new Map<string, string[]>();
+  for (const entry of entries) {
+    const m = /^ppt\/notesSlides\/notesSlide(\d+)\.xml$/.exec(entry.name);
+    if (m) notesByslide.set(m[1] as string, slideParagraphs(entry.data.toString('utf8')));
+  }
+
+  const blocks: string[] = [];
+  let empty = 0;
+  for (const slide of slides) {
+    const n = (/slide(\d+)\.xml$/.exec(slide.name)?.[1] ?? '') as string;
+    const paragraphs = slideParagraphs(slide.data.toString('utf8'));
+    const notes = (notesByslide.get(n) ?? []).filter((line) => !/^\d+$/.test(line));
+    if (paragraphs.length === 0 && notes.length === 0) {
+      empty += 1;
+      continue;
+    }
+    blocks.push(
+      `## Slide ${n}\n${paragraphs.join('\n')}` +
+        (notes.length > 0 ? `\n\n(speaker notes)\n${notes.join('\n')}` : ''),
+    );
+  }
+
+  if (blocks.length === 0) {
+    throw new EmptyDocumentError(
+      'no readable text on any slide — a deck of images (screenshots, exported pictures) has no text layer to read',
+    );
+  }
+
+  return {
+    text: blocks.join('\n\n'),
+    note: empty > 0 ? `${empty} slide(s) with no readable text skipped` : '',
+  };
+}
+
+/** The visible paragraphs of one slide (or notes) XML part, in document order. */
+function slideParagraphs(xml: string): string[] {
+  const paragraphs: string[] = [];
+  for (const para of xml.matchAll(/<a:p\b[^>]*>([\s\S]*?)<\/a:p>/g)) {
+    const runs = [...(para[1] ?? '').matchAll(/<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g)].map((run) =>
+      decodeEntities(run[1] ?? ''),
+    );
+    const line = runs.join('').trim();
+    if (line !== '') paragraphs.push(line);
+  }
+  return paragraphs;
+}
+
 function readSharedStrings(data: Buffer | undefined): string[] {
   if (data === undefined) return [];
   const xml = data.toString('utf8');
@@ -525,7 +604,7 @@ const LONG_CELL_CHARS = 120;
  * thing it must never do. The rows stay adjacent and in order, and the model
  * reads the grouping the same way a person does.
  */
-export function csvToText(raw: string, forceTab = false): { text: string; note: string } {
+function csvToText(raw: string, forceTab = false): { text: string; note: string } {
   const delimiter = forceTab ? '\t' : sniffDelimiter(raw);
   const rows = parseDelimited(raw, delimiter).filter((row) =>
     row.some((cell) => cell.trim() !== ''),

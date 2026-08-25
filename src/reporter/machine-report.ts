@@ -32,7 +32,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
-import { BACKEND_TIER_ACTIONS, type ProofBundle, type ProofStep } from '../engine/proof-bundle.js';
+import { isPassing, BACKEND_TIER_ACTIONS, type ProofBundle, type ProofStep } from '../engine/proof-bundle.js';
 import { buildVerdict } from './verdict.js';
 
 /** Escape for XML text and attribute values. */
@@ -204,7 +204,7 @@ export function renderCtrf(bundles: readonly ProofBundle[], version = '0.2.0'): 
       tool: { name: 'wowlidator', version },
       summary: {
         tests: tests.length,
-        passed: tests.filter((t) => t.status === 'passed').length,
+        passed: tests.filter((t) => isPassing(t.status)).length,
         failed: tests.filter((t) => t.status === 'failed').length,
         skipped: tests.filter((t) => t.status === 'skipped').length,
         pending: 0,

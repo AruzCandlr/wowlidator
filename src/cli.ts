@@ -46,7 +46,7 @@ import { cmdCrawl, cmdRun, cmdWatch } from './cli/commands/run.js';
 
 // Re-exported for the tests (tests/suite-outcomes.test.ts) and for embedders
 // that were importing these from here before the split into src/cli/.
-export { EXIT, neverRan, suiteExit, exitCodeFor, classifyError } from './cli/exit.js';
+export { EXIT, harnessOnly, neverRan, suiteExit, exitCodeFor, classifyError } from './cli/exit.js';
 export type { CaseOutcome } from './cli/exit.js';
 
 /**
@@ -118,6 +118,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'step-delay': { type: 'string' },
       'max-pages': { type: 'string' },
       'max-heal': { type: 'string' },
+      concurrency: { type: 'string' },
+      'author-concurrency': { type: 'string' },
+      'author-lookahead': { type: 'string' },
       'follow-buttons': { type: 'boolean', default: false },
       'no-ensure-chrome': { type: 'boolean', default: false },
       'chrome-profile': { type: 'string' },
@@ -137,6 +140,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'no-heal': { type: 'boolean', default: false },
       'no-agent': { type: 'boolean', default: false },
       'no-agent-capture': { type: 'boolean', default: false },
+      'no-author-review': { type: 'boolean', default: false },
       'no-reconstruct': { type: 'boolean', default: false },
       json: { type: 'boolean', default: false },
       all: { type: 'boolean', default: false },
@@ -155,6 +159,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       as: { type: 'string' },
       'context-out': { type: 'string' },
       force: { type: 'boolean', default: false },
+      'sheet-order': { type: 'boolean', default: false },
       repair: { type: 'boolean', default: false },
       'repair-attempts': { type: 'string' },
       'repair-investigate': { type: 'boolean', default: false },
@@ -167,6 +172,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       // be one flag away from silently doing the other's job.
       'claims-only': { type: 'boolean', default: false },
       claims: { type: 'string' },
+      resume: { type: 'boolean', default: false },
+      'rerun-vacuous': { type: 'boolean', default: false },
+      'rerun-errors': { type: 'boolean', default: false },
+      'resume-from': { type: 'string' },
+      'rerun-failed': { type: 'boolean', default: false },
       'claims-out': { type: 'string' },
       'catalog-out': { type: 'string' },
       'max-cases-drafted': { type: 'string' },
@@ -312,6 +322,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     video,
     agentAssist: values['agent-assist'] === true || config.agentAssist,
     agentCapture: values['no-agent-capture'] !== true,
+    authorReview: values['no-author-review'] !== true,
     reconstruct: values['no-reconstruct'] !== true,
     captureDelayMs,
     stepDelayMs,
@@ -333,6 +344,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     captureJourney: values['capture-journey'] === true,
     maxPages: values['max-pages'] === undefined ? undefined : Number(values['max-pages']),
     maxHeal: values['max-heal'] === undefined ? undefined : Number(values['max-heal']),
+    concurrency:
+      values['concurrency'] === undefined ? undefined : Number(values['concurrency']),
+    authorConcurrency:
+      values['author-concurrency'] === undefined
+        ? undefined
+        : Number(values['author-concurrency']),
+    authorLookahead:
+      values['author-lookahead'] === undefined
+        ? undefined
+        : values['author-lookahead'] === 'all'
+          ? ('all' as const)
+          : Number(values['author-lookahead']),
     followButtons: values['follow-buttons'] === true,
     ensureChrome: values['no-ensure-chrome'] !== true,
     chromeProfile: values['chrome-profile'] ?? DEFAULT_CHROME_PROFILE,
@@ -354,8 +377,20 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     force: values.force,
     // Either refinement implies the loop itself — asking for an investigated
     // or regenerating repair is asking for a repair.
+    resume:
+      values.resume === true ||
+      values['rerun-vacuous'] === true ||
+      values['rerun-errors'] === true ||
+      values['rerun-failed'] === true ||
+      typeof values['resume-from'] === 'string',
+    resumeFrom: typeof values['resume-from'] === 'string' ? values['resume-from'] : undefined,
+    rerunVacuous: values['rerun-vacuous'] === true,
+    rerunErrors: values['rerun-errors'] === true,
+    rerunFailed: values['rerun-failed'] === true,
+    sheetOrder: values['sheet-order'] === true,
     repair:
-      values.repair || values['repair-investigate'] === true || values['repair-regenerate'] === true,
+      values.repair ||
+      values['rerun-failed'] === true || values['repair-investigate'] === true || values['repair-regenerate'] === true,
     repairAttempts,
     repairInvestigate: values['repair-investigate'] === true,
     repairRegenerate: values['repair-regenerate'] === true,
@@ -380,7 +415,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
   switch (command) {
     case 'run':
-      return cmdRun(positionals[1], options);
+      // Several flow files run as one suite — see `cmdRun`.
+      return cmdRun(positionals.slice(1), options);
     case 'generate':
       return cmdGenerate(positionals[1], options);
     case 'author':

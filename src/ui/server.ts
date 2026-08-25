@@ -30,9 +30,9 @@
  */
 
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename as renameFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { extname, join, resolve, sep } from 'node:path';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -46,10 +46,13 @@ import {
 } from '../config.js';
 import { DEFAULT_CONTEXT_CACHE_FILE } from '../context/context-engine.js';
 import { listRepos } from '../context/repo-registry.js';
-import { COMMANDS, UiCommandError, buildArgv, commandById } from './commands.js';
+import { COMMANDS, UiCommandError, buildArgv, buildEnvOverlay, commandById } from './commands.js';
 import { JobRunner } from './jobs.js';
+import { FAILED_RUNS_FILE, FailedRunLog } from './failed-runs.js';
+import { DbStatus } from './db-status.js';
 import { KeySelection, KeySelectionError } from './keys.js';
 import { ModelSelection, ModelSelectionError, persistRoleModel } from './models.js';
+import { RoleCheckError, RoleChecks } from './checks.js';
 import {
   UploadError,
   deleteDocument,
@@ -57,7 +60,10 @@ import {
   saveDocument,
   type UploadKind,
 } from './uploads.js';
-import { readProof, readProofIndex } from './proofs.js';
+import { ARCHIVED_DIR, readProof, readProofIndex, readProofWithPath, groupRuns } from './proofs.js';
+import { listCatalogRuns } from './catalog-runs.js';
+import { ledgerPathFor } from '../cli/suite-progress.js';
+import { buildVerdict } from '../reporter/verdict.js';
 import { renderApp } from './app-html.js';
 import { renderWowUi } from './wow-ui-html.js';
 
@@ -72,6 +78,73 @@ interface ServerContext {
   keys: KeySelection;
   /** Which model each role runs on, when the panel has been asked to change it. */
   models: ModelSelection;
+  /** The last "is this role's model ready?" probe per role. See `ui/checks.ts`. */
+  checks: RoleChecks;
+  /** Jobs that ended without a proof — see `ui/failed-runs.ts`. */
+  failedRuns: FailedRunLog;
+  /** The database's configuration, last probe, and repo-derived hints. See `ui/db-status.ts`. */
+  db: DbStatus;
+}
+
+/**
+ * What `/api/models` answers: the catalogue, each role's pick, and each role's
+ * last readiness check — one body, so the page cannot show a verdict about a
+ * role beside a model it no longer points at (`describe` drops those).
+ */
+function modelsBody(ctx: ServerContext): {
+  providers: ReturnType<ModelSelection['describeCatalogue']>;
+  roles: ReturnType<ModelSelection['describeRoles']>;
+  checks: ReturnType<RoleChecks['describe']>;
+  checking: string[];
+} {
+  return {
+    providers: ctx.models.describeCatalogue(ctx.config),
+    roles: ctx.models.describeRoles(ctx.config),
+    checks: ctx.checks.describe(ctx.config, ctx.models),
+    checking: ctx.checks.checking(),
+  };
+}
+
+/**
+ * Resume modes and the flags they mean, one definition for both resume routes
+ * (`/api/jobs/:id/resume` and `/api/catalog-runs/resume`). Each is a flag the
+ * `catalog-run` spec declares, so the whitelist still says what runs.
+ */
+const RESUME_MODES: Record<string, string> = {
+  continue: '--resume',
+  errors: '--rerun-errors',
+  failed: '--rerun-failed',
+  vacuous: '--rerun-vacuous',
+};
+
+/** A prior run's argv minus any resume flags it already carried. */
+function stripResumeFlags(argv: readonly string[]): string[] {
+  const stripped: string[] = [];
+  let skipNext = false;
+  for (const a of argv) {
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
+    if (a === '--resume-from') {
+      skipNext = true;
+      continue;
+    }
+    if (Object.values(RESUME_MODES).includes(a)) continue;
+    stripped.push(a);
+  }
+  return stripped;
+}
+
+/**
+ * The progress ledger a catalog-run job writes to, derived from its own argv —
+ * the same derivation the Pause button uses. Null when the job carried no
+ * claims file (then it kept no UI-reachable ledger either).
+ */
+function jobLedgerPath(job: { argv: string[] }): string | null {
+  const at = job.argv.indexOf('--claims');
+  const claims = at >= 0 ? job.argv[at + 1] : undefined;
+  return claims === undefined ? null : ledgerPathFor(resolve(claims));
 }
 
 /** The directories a file request may resolve inside, for one config. */
@@ -284,10 +357,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
     try {
       const argv = buildArgv(spec, body.values ?? {});
       // The run starts on whichever key the panel is pointed at, with the rest
-      // still behind it so in-run failover keeps working.
+      // still behind it so in-run failover keeps working. Secret fields ride
+      // the same overlay (WOWLIDATOR_AS): env, never argv, so a password can
+      // appear in no command line, no `ps` output and no job record.
+      // "Clear run history" means every record of a run, including the ones
+      // that never produced a proof.
+      if (spec.id === 'history-clear') await ctx.failedRuns.clear();
       const job = ctx.jobs.start(spec, argv, {
         ...ctx.keys.envOverlay(ctx.config),
         ...ctx.models.envOverlay(),
+        ...buildEnvOverlay(spec, body.values ?? {}),
       });
       json(res, { job: summariseJob(job) }, 201);
     } catch (error) {
@@ -297,7 +376,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
     return;
   }
 
-  const jobMatch = /^\/api\/jobs\/([\w-]+)(\/events|\/stop)?$/.exec(path);
+  const jobMatch = /^\/api\/jobs\/([\w-]+)(\/events|\/stop|\/pause|\/resume)?$/.exec(path);
   if (jobMatch) {
     const job = ctx.jobs.get(jobMatch[1]!);
     if (!job) {
@@ -308,6 +387,69 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
 
     if (tail === '/stop' && req.method === 'POST') {
       json(res, { stopped: ctx.jobs.stop(job.id) });
+      return;
+    }
+
+    // Pause is instant: the suite writes its ledger's pause record and exits
+    // on the spot — interrupted cases keep no verdict, and the ledger's
+    // resume banner re-runs them from their first step, on current code,
+    // keeping every finished verdict.
+    if (tail === '/pause' && req.method === 'POST') {
+      json(res, { paused: ctx.jobs.pause(job.id) });
+      return;
+    }
+
+    // Continue a suite that stopped short: the SAME command the job ran,
+    // plus `--resume`, which the catalog command reads as "skip what the
+    // progress ledger already has a verdict for". Only a command whose spec
+    // declares the flag can be resumed, so the whitelist still says what runs.
+    if (tail === '/resume' && req.method === 'POST') {
+      const spec = commandById(job.commandId);
+      let body: { mode?: string; caseId?: string } = {};
+      try {
+        body = ((await readBody(req)) as typeof body) ?? {};
+      } catch {
+        body = {};
+      }
+      // `continue` runs what never ran; `errors` also re-runs the cases the
+      // harness ended; `failed` re-runs failed/dead-end cases with autoheal;
+      // `vacuous` re-authors cases that proved nothing. Each is a flag the
+      // command's spec declares, so the whitelist still says what runs.
+      const mode = body.mode ?? 'continue';
+      // `from` reruns the plan from one case ONWARD (passes included) on the
+      // current config — the case id is validated to the shape a plan id can
+      // have, and `--resume-from` is a flag the command's spec declares.
+      const caseId = typeof body.caseId === 'string' ? body.caseId.trim() : '';
+      if (mode === 'from' && !/^[A-Za-z0-9._-]{1,80}$/.test(caseId)) {
+        json(res, { error: 'mode "from" needs a caseId of plan-id shape' }, 400);
+        return;
+      }
+      const flag = mode === 'from' ? '--resume-from' : RESUME_MODES[mode];
+      const field = flag?.replace(/^--/, '');
+      const allowed =
+        spec !== undefined && flag !== undefined && spec.fields.some((f) => f.name === field) && job.ended !== null &&
+        (mode === 'continue'
+          ? job.ended.resumable
+          : mode === 'errors'
+            ? job.ended.errors > 0
+            : mode === 'failed'
+              ? job.ended.failed > 0
+              : true);
+      if (!spec || !flag || !allowed) {
+        json(res, { error: `this run cannot be re-run in mode "${mode}"` }, 400);
+        return;
+      }
+      try {
+        const base = stripResumeFlags(job.argv);
+        const argv = mode === 'from' ? [...base, flag, caseId] : [...base, flag];
+        const next = ctx.jobs.start(spec, argv, {
+          ...ctx.keys.envOverlay(ctx.config),
+          ...ctx.models.envOverlay(),
+        });
+        json(res, { job: summariseJob(next) }, 201);
+      } catch (error) {
+        json(res, { error: error instanceof Error ? error.message : String(error) }, 409);
+      }
       return;
     }
 
@@ -346,6 +488,100 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
       json(res, { job });
       return;
     }
+  }
+
+  // ---- catalog runs -------------------------------------------------------
+  // The record's run list for catalogs, read from the ledgers on disk — it
+  // survives a panel restart, unlike the in-memory job list. Each entry is
+  // one catalog run under its unique key (`<catalog>@<stamp>`), pauses and
+  // continues included.
+  if (path === '/api/catalog-runs' && req.method === 'GET') {
+    const runs = await listCatalogRuns(ctx.config.reportDir);
+    const active = new Set(
+      ctx.jobs
+        .list()
+        .filter((job) => job.status === 'running' && job.commandId === 'catalog-run')
+        .map((job) => jobLedgerPath(job))
+        .filter((p): p is string => p !== null),
+    );
+    json(res, { runs: runs.map((run) => ({ ...run, running: active.has(run.ledgerPath) })) });
+    return;
+  }
+
+  // Continue a catalog run from its ledger — no in-memory job required, so a
+  // run outlives the panel that started it (or was started from a terminal).
+  // The argv comes from the same-session job when one exists (it carries every
+  // flag the person chose), else it is rebuilt from the ledger's own `launch`
+  // record through the command whitelist.
+  if (path === '/api/catalog-runs/resume' && req.method === 'POST') {
+    let body: { ledgerPath?: string; mode?: string; caseId?: string };
+    try {
+      body = ((await readBody(req)) as typeof body) ?? {};
+    } catch (error) {
+      json(res, { error: error instanceof Error ? error.message : String(error) }, 400);
+      return;
+    }
+    const mode = body.mode ?? 'continue';
+    const caseId = typeof body.caseId === 'string' ? body.caseId.trim() : '';
+    if (mode === 'from' && !/^[A-Za-z0-9._-]{1,80}$/.test(caseId)) {
+      json(res, { error: 'mode "from" needs a caseId of plan-id shape' }, 400);
+      return;
+    }
+    const flag = mode === 'from' ? '--resume-from' : RESUME_MODES[mode];
+    const spec = commandById('catalog-run');
+    const field = flag?.replace(/^--/, '');
+    if (spec === undefined || flag === undefined || !spec.fields.some((f) => f.name === field)) {
+      json(res, { error: `unknown resume mode "${mode}"` }, 400);
+      return;
+    }
+    // The client picks from the server's own listing; a path it invented is
+    // simply not in the list — the same "the question does not arise" shape
+    // as addressing a proof by runId.
+    const runs = await listCatalogRuns(ctx.config.reportDir);
+    const run = runs.find((r) => r.ledgerPath === resolve(String(body.ledgerPath ?? '')));
+    if (run === undefined) {
+      json(res, { error: 'no such catalog run' }, 404);
+      return;
+    }
+    const priorJobs = ctx.jobs
+      .list()
+      .filter((job) => job.commandId === 'catalog-run' && jobLedgerPath(job) === run.ledgerPath);
+    if (priorJobs.some((job) => job.status === 'running')) {
+      json(res, { error: 'this catalog run is still running' }, 409);
+      return;
+    }
+    try {
+      const last = priorJobs[priorJobs.length - 1];
+      const launch = run.launch ?? null;
+      let base: string[];
+      if (last !== undefined) {
+        base = stripResumeFlags(last.argv);
+      } else if (launch !== null) {
+        base = buildArgv(spec, {
+          catalog: launch.catalog,
+          claims: launch.claims,
+          run: true,
+          ...(launch.url === undefined ? {} : { url: launch.url }),
+          ...(launch.repo === undefined ? {} : { repo: launch.repo }),
+        });
+      } else {
+        json(
+          res,
+          { error: 'this run predates resumable ledgers — continue it from the CLI with --resume' },
+          400,
+        );
+        return;
+      }
+      const argv = mode === 'from' ? [...base, flag, caseId] : [...base, flag];
+      const next = ctx.jobs.start(spec, argv, {
+        ...ctx.keys.envOverlay(ctx.config),
+        ...ctx.models.envOverlay(),
+      });
+      json(res, { job: summariseJob(next) }, 201);
+    } catch (error) {
+      json(res, { error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+    return;
   }
 
   // ---- artefacts on disk --------------------------------------------------
@@ -436,24 +672,44 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
     // Refreshed on read, but cheap: the catalogue is cached for its TTL, so a
     // polling page costs one request per provider every ten minutes.
     await ctx.models.refresh(ctx.config);
-    json(res, {
-      providers: ctx.models.describeCatalogue(ctx.config),
-      roles: ctx.models.describeRoles(ctx.config),
-    });
+    json(res, modelsBody(ctx));
     return;
   }
 
   if (path === '/api/models/refresh' && req.method === 'POST') {
     await ctx.models.refresh(ctx.config, true);
-    json(res, {
-      providers: ctx.models.describeCatalogue(ctx.config),
-      roles: ctx.models.describeRoles(ctx.config),
-    });
+    json(res, modelsBody(ctx));
+    return;
+  }
+
+  // Is the model a role would run on ready right now — a real call, on a
+  // click, never on a poll. `{ role }` checks one; `{}` checks every role.
+  // The probe honours the panel's choices (model override, start key) because
+  // that is what the next run gets. See `ui/checks.ts`.
+  if (path === '/api/models/check' && req.method === 'POST') {
+    let body: { role?: string };
+    try {
+      body = (await readBody(req)) as typeof body;
+    } catch (error) {
+      json(res, { error: error instanceof Error ? error.message : String(error) }, 400);
+      return;
+    }
+    try {
+      if (typeof body.role === 'string' && body.role !== '') {
+        await ctx.checks.check(body.role, ctx.config, ctx.keys, ctx.models);
+      } else {
+        await ctx.checks.checkAll(ctx.config, ctx.keys, ctx.models);
+      }
+      json(res, modelsBody(ctx));
+    } catch (error) {
+      const status = error instanceof RoleCheckError ? 400 : 500;
+      json(res, { error: error instanceof Error ? error.message : String(error) }, status);
+    }
     return;
   }
 
   if (path === '/api/models' && req.method === 'POST') {
-    let body: { role?: string; provider?: string; modelId?: string; reset?: boolean };
+    let body: { role?: string; provider?: string; modelId?: string; port?: number | string | null; reset?: boolean };
     try {
       body = (await readBody(req)) as typeof body;
     } catch (error) {
@@ -465,10 +721,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
         ctx.models.reset(String(body.role));
         await persistRoleModel(String(body.role), null);
       } else {
-        ctx.models.select(String(body.role), String(body.provider), String(body.modelId));
+        // The port travels as a number; an empty field means "the default",
+        // which is how a role is put back on the shared LOCAL_LLM_BASE_URL.
+        const port =
+          body.port === undefined || body.port === null || body.port === ''
+            ? null
+            : Number(body.port);
+        ctx.models.select(String(body.role), String(body.provider), String(body.modelId), port);
+        const view = ctx.models.describeRoles(ctx.config).find((r) => r.role === body.role);
         await persistRoleModel(String(body.role), {
           provider: String(body.provider),
           modelId: String(body.modelId).trim(),
+          baseUrl: port === null ? undefined : (view?.baseUrl ?? undefined),
         });
       }
       // Re-read, so what the page shows next is what the file now says rather
@@ -483,10 +747,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
         // choice is still live for this panel's runs and the next reload will
         // surface the real error rather than losing the selection here.
       }
-      json(res, {
-        providers: ctx.models.describeCatalogue(ctx.config),
-        roles: ctx.models.describeRoles(ctx.config),
-      });
+      json(res, modelsBody(ctx));
     } catch (error) {
       const status = error instanceof ModelSelectionError ? 400 : 500;
       json(res, { error: error instanceof Error ? error.message : String(error) }, status);
@@ -502,6 +763,21 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   if (path === '/api/documents' && req.method === 'GET') {
     const kind = (url.searchParams.get('kind') ?? 'context') as UploadKind;
     json(res, { documents: await listDocuments(kind === 'catalog' ? 'catalog' : 'context') });
+    return;
+  }
+
+  // The database card: configuration (masked), last probe, and what scanned
+  // repositories say their database is. GET is cheap and pollable; the probe
+  // itself runs only on POST — a click, never a poll — because a probe is a
+  // real connection to someone's database.
+  if (path === '/api/db' && req.method === 'GET') {
+    json(res, await ctx.db.describe());
+    return;
+  }
+
+  if (path === '/api/db/check' && req.method === 'POST') {
+    await ctx.db.check();
+    json(res, await ctx.db.describe());
     return;
   }
 
@@ -554,9 +830,165 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   // Two endpoints rather than one, because the difference is megabytes: the
   // list carries no steps and therefore no screenshots, and a run's evidence
   // is fetched only when someone opens it.
+  if (path === '/api/failed-runs' && req.method === 'GET') {
+    json(res, { failedRuns: await ctx.failedRuns.list() });
+    return;
+  }
+
   if (path === '/api/proofs' && req.method === 'GET') {
     const index = await readProofIndex(resolve(ctx.config.proofDir));
-    json(res, { proofs: index.cards, dir: index.dir, skipped: index.skipped });
+    // Grouped server-side rather than in the page: the rule for what belongs
+    // together is a fact about provenance, and a second implementation in
+    // browser JS would be a second place for it to drift.
+    json(res, {
+      proofs: index.cards,
+      groups: groupRuns(index.cards),
+      dir: index.dir,
+      skipped: index.skipped,
+    });
+    return;
+  }
+
+  // A human's ruling on a proved-? run. The ONE write the panel makes to a
+  // bundle: `review` is set beside the machine's status, never over it, so
+  // what the machine deferred and what the person decided are both on the
+  // record. Only a needs-review bundle accepts one — ruling on a settled run
+  // would be a second way to flip verdicts by hand.
+  const reviewMatch = /^\/api\/proofs\/([^/]+)\/review$/.exec(path);
+  if (reviewMatch && req.method === 'POST') {
+    const body = await readBody(req);
+    const verdict = (body as { verdict?: unknown } | null)?.verdict;
+    if (verdict !== 'proved' && verdict !== 'failed') {
+      json(res, { error: 'verdict must be "proved" or "failed"' }, 400);
+      return;
+    }
+    const found = await readProofWithPath(
+      resolve(ctx.config.proofDir),
+      decodeURIComponent(reviewMatch[1]!),
+    );
+    if (found === null) {
+      json(res, { error: 'no proof bundle with that run id' }, 404);
+      return;
+    }
+    if (found.bundle.status !== 'needs-review') {
+      json(res, { error: 'only a needs-review (proved-?) run accepts a ruling' }, 409);
+      return;
+    }
+    if (found.bundle.review !== undefined && found.bundle.review.by === undefined) {
+      // A HUMAN ruling is one decision, made once. Changing it is a
+      // deliberate act on the record — edit the bundle file — not a second
+      // button press. A MODEL ruling (review.by carries the judge) is the
+      // one exception: a human may replace it, never the reverse.
+      json(res, { error: 'this run was already ruled; edit the proof bundle to change it' }, 409);
+      return;
+    }
+    const review = { verdict, at: new Date().toISOString() };
+    const updated = { ...found.bundle, review };
+    // Temp-file + rename, the cache-write rule; the parsed-bundle cache keys
+    // on mtime+size, so the write invalidates it by itself.
+    const tmp = `${found.path}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(updated, null, 2)}\n`, 'utf8');
+    await renameFile(tmp, found.path);
+    json(res, { ok: true, review });
+    return;
+  }
+
+  // Hide a run from the panel: the bundle file MOVES to <proofDir>/archived/
+  // — never deleted, and the walk skips that directory, so the run leaves
+  // every list while the evidence stays on disk. Undo = move the file back.
+  const hideMatch = /^\/api\/proofs\/([^/]+)\/hide$/.exec(path);
+  if (hideMatch && req.method === 'POST') {
+    const found = await readProofWithPath(
+      resolve(ctx.config.proofDir),
+      decodeURIComponent(hideMatch[1]!),
+    );
+    if (found === null) {
+      json(res, { error: 'no proof bundle with that run id' }, 404);
+      return;
+    }
+    const archiveDir = join(resolve(ctx.config.proofDir), ARCHIVED_DIR);
+    await mkdir(archiveDir, { recursive: true });
+    const target = join(archiveDir, found.path.split(sep).pop()!);
+    await renameFile(found.path, target);
+    json(res, { ok: true, movedTo: target });
+    return;
+  }
+
+  // PERMANENTLY delete a run's proof file. The one truly destructive proof
+  // operation, so it follows the uploads-deletion precedent: addressed by
+  // runId through the index (never a client path), and the panel gates it
+  // behind an explicit checkbox confirmation. Hide (archived/) remains the
+  // reversible sibling.
+  const deleteMatch = /^\/api\/proofs\/([^/]+)\/delete$/.exec(path);
+  if (deleteMatch && req.method === 'POST') {
+    const found = await readProofWithPath(
+      resolve(ctx.config.proofDir),
+      decodeURIComponent(deleteMatch[1]!),
+    );
+    if (found === null) {
+      json(res, { error: 'no proof bundle with that run id' }, 404);
+      return;
+    }
+    await unlink(found.path);
+    json(res, { ok: true, deleted: found.path });
+    return;
+  }
+
+  // Rename a run. The new name is display data, stored in the bundle itself;
+  // the ORIGINAL name is kept once on `renamedFrom` so the flow-file lookup
+  // and anything keyed on the recorded name still matches.
+  const renameMatch = /^\/api\/proofs\/([^/]+)\/rename$/.exec(path);
+  if (renameMatch && req.method === 'POST') {
+    const body = (await readBody(req)) as { name?: unknown; group?: unknown } | null;
+    const name = typeof body?.name === 'string' ? body.name.trim() : '';
+    // `group` retitles the catalog group instead — the recorded document name
+    // (generatedBy.source). Grouping keys on the pass stamp (generatedAt), so
+    // a retitle never regroups anything.
+    const group = typeof body?.group === 'string' ? body.group.trim() : '';
+    if (group !== '' && group.length <= 200) {
+      const foundG = await readProofWithPath(
+        resolve(ctx.config.proofDir),
+        decodeURIComponent(renameMatch[1]!),
+      );
+      if (foundG === null) {
+        json(res, { error: 'no proof bundle with that run id' }, 404);
+        return;
+      }
+      if (foundG.bundle.generatedBy === undefined) {
+        json(res, { error: 'this run has no authoring pass to retitle' }, 409);
+        return;
+      }
+      const retitled = {
+        ...foundG.bundle,
+        generatedBy: { ...foundG.bundle.generatedBy, source: group },
+      };
+      const tmpG = `${foundG.path}.tmp`;
+      await writeFile(tmpG, `${JSON.stringify(retitled, null, 2)}\n`, 'utf8');
+      await renameFile(tmpG, foundG.path);
+      json(res, { ok: true, group });
+      return;
+    }
+    if (name === '' || name.length > 200) {
+      json(res, { error: 'name must be 1-200 characters' }, 400);
+      return;
+    }
+    const found = await readProofWithPath(
+      resolve(ctx.config.proofDir),
+      decodeURIComponent(renameMatch[1]!),
+    );
+    if (found === null) {
+      json(res, { error: 'no proof bundle with that run id' }, 404);
+      return;
+    }
+    const updated = {
+      ...found.bundle,
+      name,
+      renamedFrom: found.bundle.renamedFrom ?? found.bundle.name,
+    };
+    const tmp = `${found.path}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(updated, null, 2)}\n`, 'utf8');
+    await renameFile(tmp, found.path);
+    json(res, { ok: true, name, renamedFrom: updated.renamedFrom });
     return;
   }
 
@@ -569,7 +1001,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
       json(res, { error: 'no proof bundle with that run id' }, 404);
       return;
     }
-    json(res, { proof });
+    // The same pure verdict the HTML report leads with, computed here so the
+    // page can say WHY a run failed without a second implementation of the
+    // wording in browser JS — buildVerdict is a pure function of the bundle,
+    // so this cannot contradict the report for the same run.
+    json(res, { proof, verdict: buildVerdict(proof) });
     return;
   }
 
@@ -659,8 +1095,21 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
 }
 
 function summariseJob(job: ReturnType<JobRunner['list']>[number]): Record<string, unknown> {
-  const { lines, ...rest } = job;
-  return { ...rest, lineCount: lines.length };
+  const { lines, cases, ...rest } = job;
+  return {
+    ...rest,
+    lineCount: lines.length,
+    // Cases keep their status and their denominator here but shed their
+    // output, for exactly the reason the job sheds its own: the list is
+    // polled, and six cases' worth of scrollback every few seconds is
+    // megabytes to say what a count already says. The full job endpoint
+    // still carries them, and a running case's lines are already arriving
+    // on the stream.
+    cases: cases.map(({ lines: caseLines, ...entry }) => ({
+      ...entry,
+      lineCount: caseLines.length,
+    })),
+  };
 }
 
 export interface StartUiOptions {
@@ -675,7 +1124,10 @@ export interface StartUiOptions {
 export async function startUi(options: StartUiOptions = {}): Promise<{ url: string; close: () => void }> {
   loadDotEnv();
   const config = loadConfig();
-  const jobs = new JobRunner();
+  const failedRuns = new FailedRunLog(join(dirname(resolve(config.historyPath)), FAILED_RUNS_FILE));
+  // A job that ends without a proof is remembered here, or it is remembered
+  // nowhere once its live row goes.
+  const jobs = new JobRunner({ onFinish: (job) => void failedRuns.record(job) });
 
   // Every directory a file request may resolve inside. The working directory
   // covers flows and examples; the rest are where wowlidator writes.
@@ -685,6 +1137,9 @@ export async function startUi(options: StartUiOptions = {}): Promise<{ url: stri
     roots: rootsFor(config),
     keys: new KeySelection(),
     models: new ModelSelection(),
+    checks: new RoleChecks(),
+    failedRuns,
+    db: new DbStatus(),
   };
   const server = createServer((req, res) => {
     handle(req, res, ctx).catch((error: unknown) => {

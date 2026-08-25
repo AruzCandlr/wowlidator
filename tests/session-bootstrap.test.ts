@@ -1,0 +1,247 @@
+/**
+ * The session bootstrap — a flow that assumes a signed-in user, run against a
+ * browser that has no session.
+ *
+ * Browser-tier, CDP-gated like its siblings: "the harness signed in and the
+ * flow then ran on the page it asked for" is a fact about a real page, and
+ * the live failure this guards (BE_Test2.csv, 2026-08-19 16:53 — ten cases,
+ * every one dead on the login screen) was invisible to every pure assertion.
+ * The fixture is a miniature of that application: a TWO-STEP login (email +
+ * Next, then password), a session cookie, and a protected page that bounces
+ * to /login without it.
+ */
+
+import { after, before, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+
+import { runFlow, type Flow } from '../src/engine/runner.js';
+
+const CDP_URL = process.env['WOWLIDATOR_CDP_URL'] ?? 'http://localhost:9222';
+
+async function cdpAvailable(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${url}/json/version`, { signal: AbortSignal.timeout(2_000) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+const browserReady = await cdpAvailable(CDP_URL);
+const skipBrowser = browserReady
+  ? false
+  : `no CDP endpoint at ${CDP_URL} — start Chrome with --remote-debugging-port=9222 (npm run chrome)`;
+
+const PAGE = (body: string): string =>
+  `<!doctype html><html><head><title>fixture</title></head><body>${body}</body></html>`;
+
+describe('the session bootstrap (CDP)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+
+  before(async () => {
+    server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://x');
+      const cookie = req.headers.cookie ?? '';
+      const signedIn = cookie.includes('session=ok');
+
+      if (url.pathname === '/login') {
+        if (req.method === 'POST') {
+          let raw = '';
+          req.on('data', (chunk) => (raw += chunk));
+          req.on('end', () => {
+            const params = new URLSearchParams(raw);
+            if (params.get('password') === 'pw2026') {
+              res.writeHead(302, { 'set-cookie': 'session=ok; Path=/', location: '/app' });
+            } else {
+              res.writeHead(302, { location: '/login' });
+            }
+            res.end();
+          });
+          return;
+        }
+        // Two screens, like the live application: identity + Next first,
+        // password only after.
+        if (url.searchParams.get('step') === '2') {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end(
+            PAGE(
+              '<form method="post" action="/login">' +
+                '<input type="password" name="password">' +
+                '<button type="submit">Sign in</button></form>',
+            ),
+          );
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(
+          PAGE(
+            '<form method="get" action="/login"><input type="hidden" name="step" value="2">' +
+              '<input type="email" name="email">' +
+              '<button type="submit">Next</button></form>',
+          ),
+        );
+        return;
+      }
+
+      if (url.pathname === '/app') {
+        if (!signedIn) {
+          res.writeHead(302, { location: '/login' });
+          res.end();
+          return;
+        }
+        // The identity menu, like the live application: sign-out lives
+        // BEHIND an ARIA-marked disclosure, invisible until it opens.
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(
+          PAGE(
+            '<h1>Benefit Plans</h1>' +
+              '<button aria-haspopup="menu" aria-expanded="false" ' +
+              'onclick="document.getElementById(\'m\').style.display=\'block\'">Account</button>' +
+              '<div id="m" role="menu" style="display:none">' +
+              '<a role="menuitem" href="/logout">Sign out</a></div>',
+          ),
+        );
+        return;
+      }
+
+      if (url.pathname === '/logout') {
+        res.writeHead(302, { 'set-cookie': 'session=; Path=/; Max-Age=0', location: '/login' });
+        res.end();
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+
+  /** BE_Test2's shape: assume the session, never sign in. */
+  const assumesSession = (): Flow =>
+    ({
+      name: 'assumes a session',
+      steps: [
+        { action: 'goto', url: `${origin}/app` },
+        { action: 'expectVisible', selector: 'role=heading[name="Benefit Plans" i]' },
+      ],
+    }) as Flow;
+
+  it('establishes the session with --as and the flow then runs where it asked to', async () => {
+    const bundle = await runFlow(assumesSession(), {
+      cdpUrl: CDP_URL,
+      video: 'off',
+      isolate: true,
+      screenshots: 'off',
+      healer: null,
+      credentials: { email: 'a@b.test', password: 'pw2026' },
+    });
+
+    assert.equal(bundle.status, 'passed', bundle.error ?? '');
+    const nav = bundle.steps.find((s) => s.action === 'goto');
+    assert.equal(nav?.detail?.['sessionEstablished'], 'a@b.test', 'the step says who signed in');
+    assert.ok(
+      bundle.notes?.some((n) => /session bootstrap/.test(n)),
+      'the run notes the decision',
+    );
+    // Green, and still a finding: the flow depends on a precondition it does
+    // not establish.
+    assert.ok(
+      bundle.defects.some((d) => /assumes a signed-in user/.test(d.title)),
+      'a low finding asks for the sign-in to be authored',
+    );
+  });
+
+  it('without credentials the honest fatal stands, and it names --as', async () => {
+    const bundle = await runFlow(assumesSession(), {
+      cdpUrl: CDP_URL,
+      video: 'off',
+      isolate: true,
+      screenshots: 'off',
+      healer: null,
+    });
+
+    assert.notEqual(bundle.status, 'passed');
+    assert.match(bundle.error ?? '', /--as <email>:<password>/);
+  });
+
+  it('never races a flow that signs in itself', async () => {
+    // The flow's own sign-in must be the one that runs — the bootstrap staying
+    // out is what keeps a persona test testing its persona.
+    const flow: Flow = {
+      name: 'signs in itself',
+      steps: [
+        { action: 'goto', url: `${origin}/login` },
+        { action: 'fill', selector: 'input[type="email"]', value: 'me@b.test' },
+        { action: 'click', selector: 'role=button[name="Next" i]' },
+        { action: 'fill', selector: 'input[type="password"]', value: 'pw2026' },
+        { action: 'click', selector: 'role=button[name="Sign in" i]' },
+        { action: 'expectVisible', selector: 'role=heading[name="Benefit Plans" i]' },
+      ],
+    } as Flow;
+    const bundle = await runFlow(flow, {
+      cdpUrl: CDP_URL,
+      video: 'off',
+      isolate: true,
+      screenshots: 'off',
+      healer: null,
+      credentials: { email: 'other@b.test', password: 'pw2026' },
+    });
+
+    assert.equal(bundle.status, 'passed', bundle.error ?? '');
+    const nav = bundle.steps.find((s) => s.action === 'goto');
+    assert.equal(nav?.detail?.['sessionEstablished'], undefined, 'the bootstrap stayed out');
+  });
+
+  it("signOut travels the application's own sign-out control, and the switch re-logs-in", async () => {
+    // The persona switch as authored: sign in as A, work, signOut (the
+    // engine opens the ARIA-marked identity menu and clicks the app's own
+    // Sign out), then the sign-in page again as B. The goto after signOut
+    // is also the session guard's new exemption at work: the run is on the
+    // sign-in page because a signOut deliberately put it there.
+    const signInAs = (email: string): Flow['steps'] => [
+      { action: 'goto', url: `${origin}/login` },
+      { action: 'fill', selector: 'input[type="email"]', value: email },
+      { action: 'click', selector: 'role=button[name="Next" i]' },
+      { action: 'fill', selector: 'input[type="password"]', value: 'pw2026' },
+      { action: 'click', selector: 'role=button[name="Sign in" i]' },
+      { action: 'expectVisible', selector: 'role=heading[name="Benefit Plans" i]' },
+    ];
+    const flow: Flow = {
+      name: 'switches persona through the real sign-out',
+      steps: [
+        ...signInAs('a@b.test'),
+        { action: 'goto', url: `${origin}/app` },
+        { action: 'signOut' },
+        ...signInAs('b@b.test'),
+      ],
+    } as Flow;
+    const bundle = await runFlow(flow, {
+      cdpUrl: CDP_URL,
+      video: 'off',
+      isolate: true,
+      screenshots: 'off',
+      healer: null,
+    });
+
+    assert.equal(bundle.status, 'passed', bundle.error ?? '');
+    const signOut = bundle.steps.find((s) => s.action === 'signOut');
+    assert.ok(signOut, 'the signOut step ran');
+    assert.match(
+      String(signOut?.detail?.['via'] ?? ''),
+      /menuitem "Sign out" behind/,
+      'the app\'s own control was clicked, behind the identity menu',
+    );
+    assert.match(String(signOut?.detail?.['urlAfter'] ?? ''), /\/login/);
+  });
+});

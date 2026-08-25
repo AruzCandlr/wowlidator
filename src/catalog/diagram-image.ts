@@ -28,6 +28,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { DETERMINISM_RULES } from '../providers/prompt-discipline.js';
 import { basename, extname } from 'node:path';
 
 import { z } from 'zod';
@@ -127,6 +128,11 @@ const SYSTEM_PROMPT = [
   '- The "mermaid" field must start with "sequenceDiagram".',
   '- Anything you cannot read (blur, handwriting, cropping) goes in "unreadable", named specifically — never guessed into the diagram. Use an empty string when everything was legible.',
   '- When given SVG source instead of a picture, the same rules apply to the diagram it DRAWS: participants are the lifeline headers, message order follows the y coordinates, one drawn arrow is one message with its nearby label text joined into one line. Ignore styling, defs, and any element that draws no participant, arrow, frame or label.',
+  '',
+  DETERMINISM_RULES,
+  '',
+  'Aliases are derived, not invented, so the same diagram transcribes the same way twice: the first letter of the participant\'s first word, upper-cased; on a clash, the first letters of its first two words; on a further clash, append the participant\'s 1-based position.',
+  'Before answering, check: every message line uses an alias declared above it; message count equals the arrows drawn; every frame opened is closed; the text starts with "sequenceDiagram".',
 ].join('\n');
 
 export interface LlmDiagramTranscriberOptions {

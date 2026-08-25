@@ -52,7 +52,7 @@ export interface StoredDocument {
   format: string;
 }
 
-export function directoryFor(kind: UploadKind): string {
+function directoryFor(kind: UploadKind): string {
   return resolve(kind === 'catalog' ? CATALOG_DIR : CONTEXT_DOC_DIR);
 }
 

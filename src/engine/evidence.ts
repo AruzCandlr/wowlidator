@@ -157,7 +157,7 @@ async function settleRendering(page: Page): Promise<void> {
   }
 }
 
-export function wantsEvidence(mode: ScreenshotMode, kind: EvidenceKind): boolean {
+function wantsEvidence(mode: ScreenshotMode, kind: EvidenceKind): boolean {
   switch (mode) {
     case 'all':
       return true;

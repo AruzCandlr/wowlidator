@@ -4,6 +4,7 @@
  */
 
 import type { ProofBundle } from '../engine/proof-bundle.js';
+import { effectiveStatus, isPassing } from '../engine/proof-bundle.js';
 
 /**
  * The exit-code contract.
@@ -32,8 +33,29 @@ export const EXIT = {
  * failed run's clothes — reporting it as `failed` would have CI file bugs
  * against an application it never reached.
  */
-export function exitCodeFor(bundle: { status: string; error?: string | undefined }): number {
-  if (bundle.status === 'passed') return EXIT.ok;
+export function exitCodeFor(bundle: {
+  status: string;
+  error?: string | undefined;
+  review?: { verdict: 'proved' | 'failed'; at?: string | undefined } | undefined;
+  steps?: ProofBundle['steps'] | undefined;
+}): number {
+  const status = effectiveStatus(bundle);
+  // A pass with issues exits as a pass: the claims held. The issues are on
+  // the record as findings, where a reader looks for them.
+  if (isPassing(status)) return EXIT.ok;
+  // proved-? — the run awaits a human ruling on a wording near-miss. Neither
+  // ok (nothing is confirmed) nor failed (nothing about the product is
+  // established either): like a blocked case, it produced no verdict yet, and
+  // that is the environment family's meaning in the suite contract.
+  if (status === 'needs-review') return EXIT.environment;
+  // A run the harness alone ended — every broken step an `error`, no claim
+  // contradicted — is the environment family whatever its message says. The
+  // per-step story outranks the message regex below, which only knows the
+  // handful of phrasings that were taught to it (an undeclared table, an
+  // unknown variable and a refused provider all exited 1 before this).
+  if (bundle.steps !== undefined && harnessOnly(bundle as ProofBundle) !== null) {
+    return EXIT.environment;
+  }
   // "The browser went away mid-run" joins the attach failures: a run without
   // a browser is an environment problem wearing a failed run's clothes, and
   // reporting it as `failed` would have CI file bugs against an application
@@ -71,7 +93,7 @@ export function classifyError(error: unknown): number {
   // the application — "regard as system failure" is the contract here: CI
   // must fix the role's routing, not file a bug against the app.
   if (
-    /could not attach to a browser|Browser context management|no API key|ConfigError|failed to produce a valid structured response|structured-output circuit is open|database unavailable|network observation (?:unavailable|truncated)/i.test(
+    /could not attach to a browser|Browser context management|no API key|ConfigError|failed to produce a valid structured response|could not be asked — the provider refused|structured-output circuit is open|day's request quota|rate-limit headroom|database unavailable|network observation (?:unavailable|truncated)/i.test(
       message,
     )
   ) {
@@ -84,13 +106,21 @@ export function classifyError(error: unknown): number {
 export interface CaseOutcome {
   name: string;
   /** `blocked` — it produced no verdict about the application. See `neverRan`. */
-  verdict: 'passed' | 'failed' | 'blocked';
+  /** `review` — proved-?: awaiting a human ruling on a wording near-miss. */
+  verdict: 'passed' | 'failed' | 'blocked' | 'review';
   /** Null only when nothing was produced at all — the call itself threw. */
   bundle: ProofBundle | null;
   /** Where its report landed, when there is one. */
   reportPath?: string | undefined;
   /** Why it is blocked, or which step broke. */
   reason?: string | undefined;
+  /**
+   * True when this verdict was not earned this pass: a resume pulled it from
+   * the catalog run's ledger, where an earlier pass under the same run key
+   * recorded it. It still counts — the resumed catalog is the whole plan —
+   * but the roll-up says which lines are inherited rather than fresh.
+   */
+  carried?: boolean | undefined;
 }
 
 /**
@@ -112,7 +142,7 @@ export interface CaseOutcome {
  * defect sends someone to look for a bug that was never claimed to exist.
  */
 export function neverRan(bundle: ProofBundle): string | null {
-  if (bundle.status === 'passed') return null;
+  if (isPassing(bundle.status)) return null;
   if (bundle.steps.some((step) => step.status !== 'passed')) return null;
   // First line only, same as `failureOf`: this goes on one line of a roll-up
   // that has one line per case, and the engine's attach error carries a
@@ -125,6 +155,40 @@ export function neverRan(bundle: ProofBundle): string | null {
 }
 
 /**
+ * A run the HARNESS ended, with no claim about the application contradicted.
+ *
+ * Returns why, or `null` when some step actually delivered a finding.
+ *
+ * Measured on 544 live bundles (2026-08-24): 136 ended status `error`, and
+ * every recorded cause was the machinery's — `database unavailable: no
+ * connection is configured` (27 steps), the agent giving up or stalling, a
+ * provider refusing the call on quota, `ERR_CONNECTION_REFUSED`, a goto
+ * timeout. Every one of them was scored `failed` by the suite, so a missing
+ * `WOWLIDATOR_DB_URL` read as "the test found a bug" twenty-two times — the
+ * exact false-failure `exitCodeFor` already refuses for a single run, and the
+ * stance the rest of the system already takes (`isErrorOutcome`: "the harness
+ * ended it"; wowUI's "runtime error" label; `--rerun-errors` existing at all).
+ *
+ * The test is per step, not per status: **every non-superseded step that is
+ * not passed has status `error`** — the status the engine reserves for "the
+ * harness could not proceed". One `failed` or `dead-end` step anywhere and
+ * this returns null: a contradicted claim or an unresolvable control is a
+ * finding about the application, and an error step beside it must not soften
+ * that verdict (`run completed with 1 failed, 2 error` stays failed).
+ */
+export function harnessOnly(bundle: ProofBundle): string | null {
+  const status = effectiveStatus(bundle);
+  if (isPassing(status) || status === 'needs-review') return null;
+  const broken = bundle.steps.filter((step) => !step.superseded && step.status !== 'passed');
+  // Nothing broke at all — that is `neverRan`'s territory, not this one's.
+  if (broken.length === 0) return null;
+  if (broken.some((step) => step.status !== 'error')) return null;
+  const first = broken[0]!;
+  const line = (first.error ?? 'runtime error').split('\n')[0]?.trim() || 'runtime error';
+  return `runtime error — the harness ended this case, not the application: ${line}`;
+}
+
+/**
  * The exit code for a list of cases.
  *
  * A real failure outranks everything: something about the application is wrong.
@@ -134,7 +198,10 @@ export function neverRan(bundle: ProofBundle): string | null {
  */
 export function suiteExit(outcomes: readonly CaseOutcome[]): number {
   if (outcomes.some((o) => o.verdict === 'failed')) return EXIT.failed;
-  if (outcomes.some((o) => o.verdict === 'blocked')) return EXIT.environment;
+  // A case awaiting human review is scored with the blocked family: nothing
+  // was proved YET, and that cannot exit 0 — but nothing about the product
+  // was established either, so it must not read as a defect.
+  if (outcomes.some((o) => o.verdict === 'blocked' || o.verdict === 'review')) return EXIT.environment;
   return EXIT.ok;
 }
 

@@ -59,20 +59,21 @@ export { tokenize };
 export const CONTEXT_RETRIEVAL_MIN_CHARS = 8_000;
 
 /**
- * Characters of background per prompt when selection is asked for.
+ * Characters of background per prompt. `--context-budget 0` sends every
+ * context document whole.
  *
- * **The default is 0 — off.** The win is real but narrow (a long spec times
- * many authored rows), and the risk is not: this decides what every authoring
- * prompt sees, and an inaccurate context poisons every test written from it.
- * Same call `--probe`, `--agent-assist` and `--repair` make — a capability
- * that changes what the system does is opted into, not out of. `--context-budget
- * 24000` is the setting to reach for on a twelve-row sheet with a 120,000-
- * character spec, which is where it was measured cutting background by 59%.
+ * On by default since 2026-08-21. It shipped off (this decides what every
+ * authoring prompt sees, the `--probe` / `--agent-assist` argument), and the
+ * measured cost of off was the thing people actually hit: a ten-row sheet
+ * with two spreadsheets remembered on the repository (1,014,914 + 78,752
+ * characters) spent ~50,000 input tokens of background on EVERY authoring
+ * call — the whole "30k tokens per request" — about rows that call was not
+ * writing. With the five rails below in place, the same rows retrieve to
+ * 15–25k characters (~4–6k tokens), each quoting its own sections. The
+ * documents are still sent whole when they fit, when the query cannot tell
+ * the sections apart, or when anything inside here throws.
  */
-export const CONTEXT_BUDGET_CHARS = 0;
-
-/** What `--context-budget` means when someone asks for selection without a size. */
-export const CONTEXT_BUDGET_SUGGESTED = 24_000;
+export const CONTEXT_BUDGET_CHARS = 24_000;
 
 /**
  * A chunk must score at least this much of the best chunk's score to be
@@ -369,6 +370,46 @@ function joinNotes(...notes: string[]): string {
  *
  * Never throws. A failure returns the documents exactly as they arrived.
  */
+/**
+ * The external sources a test case CITES for its expected values — "as per
+ * the Master Benefit List", "ตามเอกสาร Requirement", "refer to section 4.2".
+ *
+ * A row that points at another document for its value is the one row whose
+ * own words are a WEAK retrieval query: the value lives in the cited source,
+ * and the citation phrase is a few tokens drowned in step narration. The
+ * authoring path extracts these phrases and boosts them in the BM25 query
+ * (repetition raises term frequency — crude, deterministic, and enough to
+ * pull the cited section to the top), so the expected value is quoted from
+ * the source instead of invented. Pure text extraction, English and Thai
+ * markers, deduplicated, capped so a runaway match cannot become the query.
+ */
+export function referencedSources(text: string): string[] {
+  const found: string[] = [];
+  const push = (phrase: string | undefined): void => {
+    const cleaned = phrase?.trim().replace(/["'“”]+/g, '').replace(/\s+/g, ' ');
+    if (cleaned !== undefined && cleaned.length >= 3 && cleaned.length <= 80) found.push(cleaned);
+  };
+  // A dot ends the phrase only when it ends a sentence — "section 4.2" and
+  // "spec.pdf" keep theirs (`\.(?=\S)` accepts a dot glued to what follows).
+  const PHRASE = String.raw`((?:[^.;:\n()]|\.(?=\S)){3,80})`;
+  const english = new RegExp(
+    String.raw`(?:refer(?:s|red)?\s+to|according\s+to|as\s+per|per\s+the|as\s+(?:defined|specified|stated|described)\s+in|(?:defined|specified|stated|described)\s+in|based\s+on|see)\s+` +
+      PHRASE,
+    'gi',
+  );
+  for (const match of text.matchAll(english)) push(match[1]);
+  // Thai citation markers. `ตาม` alone is too common ("ตามเงื่อนไข" — "per the
+  // condition") to be a citation by itself, so it only counts followed by a
+  // document-ish noun; the explicit อ้างอิง (cite/reference) family always does.
+  const thai = new RegExp(
+    String.raw`(?:อ้างอิง(?:จาก|ตาม)?|อิงตาม|ดูจาก|ตาม\s*(?:เอกสาร|ไฟล์|สเปค|มาสเตอร์|รายการ|ตาราง|ข้อกำหนด|Requirement|Master|Spec|List)[^\s]*)\s*` +
+      PHRASE,
+    'gi',
+  );
+  for (const match of text.matchAll(thai)) push(match[1]);
+  return [...new Set(found)].slice(0, 5);
+}
+
 export function selectRelevantContext(
   docs: readonly ExtractedDocument[],
   query: string,

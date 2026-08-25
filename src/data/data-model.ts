@@ -12,6 +12,7 @@ import type { LanguageModel } from 'ai';
 import { z } from 'zod';
 
 import { LlmFactory, generateStructuredForModel, type ModelSource } from '../providers/llm-factory.js';
+import { DETERMINISM_RULES, procedure } from '../providers/prompt-discipline.js';
 
 const GenerateValueSchema = z.object({
   value: z.string().describe('The value to type into the field.'),
@@ -48,7 +49,16 @@ attempt produced.
 
 Return a short, realistic value — never a placeholder like "test value" or "TODO", and never
 the exact previous value again. If an observed conflict is given (e.g. "already exists"), the
-new value must plausibly avoid the same conflict.`;
+new value must plausibly avoid the same conflict.
+
+${DETERMINISM_RULES}
+
+${procedure('HOW TO CHOOSE THE VALUE', [
+  'Read the field description and decide its FORMAT first: an identifier (letters+digits, keep the pattern the description or the previous value shows), a code from a fixed set (pick the first plausible one the description names), a free-text label, or a number with a range.',
+  'Produce the plainest realistic value in that format. For an identifier, keep the previous value\'s prefix and change only the numeric tail. For free text, a short noun phrase about the field\'s subject.',
+  'Attempt N > 1: derive the value from the previous one by the smallest change that avoids the observed conflict — increment the tail, append a distinguishing suffix — never a fresh unrelated invention.',
+  'Say in "reasoning" which format you chose and, on a retry, what you changed and why.',
+])}`;
 
 function buildUserPrompt(request: DataGenerateRequest): string {
   const lines = [`Field: ${request.description}`, `Attempt: ${request.attempt}`];

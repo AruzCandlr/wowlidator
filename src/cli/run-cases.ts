@@ -3,16 +3,29 @@
  * Split out of cli.ts verbatim.
  */
 
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { formatCoverage, meaningfulCoverage } from '../coverage/ax-coverage.js';
 import {
+  effectiveStatus,
   formatProofSummary,
+  isPassing,
+  issueSteps,
   writeProofBundle,
+  type AgentRecord,
   type Defect,
   type GenerationProvenance,
+  type ProofBundle,
 } from '../engine/proof-bundle.js';
-import { runFlow, type Flow } from '../engine/runner.js';
+import { runFlow, type Flow, type RunFlowOptions } from '../engine/runner.js';
+import type { HealHintsProvider } from '../context/heal-hints.js';
+import { writeFlowFile } from './artifacts.js';
+import { FlowRepairLoop } from '../repair/flow-repair-loop.js';
+import { LlmFlowRepairModel } from '../repair/flow-repair-model.js';
+import { RepairMemory } from '../repair/repair-memory.js';
+import { SessionVault } from '../engine/session-vault.js';
+import { slugify } from '../reporter/html-reporter.js';
 import { formatTrend } from '../history/run-history.js';
 import { resolveReportPath, writeHtmlReport } from '../reporter/html-reporter.js';
 import {
@@ -20,13 +33,49 @@ import {
   writeSuiteIndex,
   type IndexEntry,
 } from '../reporter/suite-index.js';
-import { failureOf, neverRan, type CaseOutcome } from './exit.js';
-import type { CliOptions } from './options.js';
+import { EXIT, failureOf, harnessOnly, neverRan, type CaseOutcome } from './exit.js';
+import { vacuousFlow } from '../generator/vacuous.js';
 import {
+  caseIdOf,
+  carriedOutcomes,
+  newLedger,
+  readLedger,
+  recordOutcome,
+  remaining,
+  sortByPlan,
+  writeLedger,
+  writeLedgerSync,
+  type LedgerOutcome,
+  type SuiteLedger,
+} from './suite-progress.js';
+import {
+  CaseQueue,
+  DEFAULT_CONCURRENCY,
+  PIPELINED_CONCURRENCY_AFTER_AUTHORING,
+  PIPELINED_CONCURRENCY_WHILE_AUTHORING,
+  caseWrites,
+  readersFirst,
+  runQueue,
+  withWorkflowScripts,
+} from './case-plan.js';
+import {
+  hasGroundTruth,
+  renderTruthTable,
+  truthRows,
+  truthTally,
+  writeTruthTable,
+} from '../reporter/truth-table.js';
+import type { CliOptions } from './options.js';
+import { clearPauseFile, pauseFileFor, pauseRequested, requestPause, resetPause } from './pause.js';
+import {
+  assertRolesResolvable,
   buildAgent,
   buildDataModel,
   buildHealer,
+  buildInvestigationAgent,
   buildStepRepair,
+  buildReviewJudge,
+  emitTagged,
   lineLogger,
   planLogger,
   stepLogger,
@@ -37,8 +86,16 @@ export interface SuiteCase {
   /** How the case is named in the roll-up. */
   name: string;
   flow: Flow;
+  /** Where the flow was written, when it was — recorded in the ledger for `--rerun-vacuous`. */
+  flowPath?: string | undefined;
   /** Report `kind` — `catalog`, or the generator's own classification. */
   kind: string;
+  /**
+   * The sheet's Scenario ID this case belongs to (`PL_03`), when the list
+   * came from a catalog. What `onCaseDone` consumers key on — the authoring
+   * gate advances a scenario only when its queued cases have all finished.
+   */
+  scenarioId?: string | undefined;
   /**
    * Sub-folder for this case's artifacts, when the list has classes of its own.
    * A catalog's Scenario ID is one: the sheet already groups its rows, and a
@@ -46,7 +103,11 @@ export interface SuiteCase {
    * unrelated cases into one directory.
    */
   group?: string | undefined;
-  generatedBy: GenerationProvenance;
+  /**
+   * Absent for a hand-written flow re-run via `wowlidator run a b c` — the run
+   * then reads as authored by nobody, exactly as its single-flow run would.
+   */
+  generatedBy?: GenerationProvenance | undefined;
   /** Static findings, ridden along with one case so they are not lost. */
   defects?: readonly Defect[] | undefined;
 }
@@ -69,29 +130,313 @@ export interface SuiteCase {
  * `proofs-to-artifacts.py` already makes for a step that never ran.
  */
 export async function runCases(
-  cases: readonly SuiteCase[],
+  cases: readonly SuiteCase[] | CaseQueue<SuiteCase>,
   options: CliOptions,
-  where: { dir: string; group: string | undefined; indexTitle: string },
+  where: {
+    dir: string;
+    group: string | undefined;
+    indexTitle: string;
+    /**
+     * Where to keep the suite's progress ledger (see `suite-progress.ts`),
+     * with the case ids the suite set out to prove. Omit and no ledger is
+     * kept — `generate --run` has no claims file to resume from.
+     */
+    ledger?:
+      | {
+          path: string;
+          planned: readonly string[];
+          resume: boolean;
+          /** The pass stamp, once known — read at every write, since it may be decided after the ledger opens. */
+          stamp?: (() => string | null) | undefined;
+          /**
+           * The catalog run's unique key (`<catalog>@<stamp>`) — same late
+           * read as `stamp`, since a resume settles it from the prior ledger.
+           */
+          runKey?: (() => string | null) | undefined;
+          /** What started this run, recorded so a resume can be rebuilt later. */
+          launch?: SuiteLedger['launch'];
+        }
+      | undefined;
+    /**
+     * Called after every case reaches an outcome — verdict, blocked, or
+     * vacuous alike. The seam the scenario gate advances on; must not throw.
+     */
+    onCaseDone?: ((testCase: SuiteCase, outcome: CaseOutcome) => void) | undefined;
+    /**
+     * BM25-retrieved advisory context per heal (`healHintsFrom`) — the
+     * catalog path passes the graph and documents it already holds.
+     */
+    healHints?: HealHintsProvider | undefined;
+  },
 ): Promise<CaseOutcome[]> {
   const log = lineLogger(options);
+  // The ledger: reset on a fresh run, carried forward on a resume, written
+  // after every case so a stop at any point leaves the high-water mark on
+  // disk. A signal (the panel's Stop, Ctrl-C) records its cause on the way
+  // out — synchronously, because nothing may be awaited once it has fired.
+  let ledger: SuiteLedger | null = null;
+  let onSignal: ((signal: NodeJS.Signals) => void) | null = null;
+  // On a resume, the prior outcomes as they stood BEFORE this pass touched
+  // them: the finished cases a resume inherits into its own roll-up and index
+  // rather than re-running. Snapshotted here because `ledger` IS the prior
+  // object and every fresh case overwrites its own entry.
+  let inherited: Record<string, LedgerOutcome> | null = null;
+  if (where.ledger !== undefined) {
+    const prior = where.ledger.resume ? await readLedger(where.ledger.path) : null;
+    if (prior !== null) {
+      inherited = Object.fromEntries(Object.entries(prior.outcomes).map(([id, o]) => [id, { ...o }]));
+    }
+    ledger = prior ?? newLedger(where.indexTitle, where.ledger.planned);
+    ledger.planned = [...where.ledger.planned];
+    ledger.runKey = where.ledger.runKey?.() ?? ledger.runKey;
+    ledger.launch = where.ledger.launch ?? ledger.launch;
+    ledger.ended = null;
+    await writeLedger(where.ledger.path, ledger);
+    onSignal = (signal) => {
+      if (ledger && where.ledger) {
+        ledger.ended = {
+          at: new Date().toISOString(),
+          cause: `stopped by ${signal} with ${remaining(ledger).length} case(s) still to run`,
+          complete: false,
+        };
+        try {
+          writeLedgerSync(where.ledger.path, ledger);
+        } catch {
+          /* the ledger is advisory */
+        }
+      }
+      process.exit(signal === 'SIGINT' ? 130 : 143);
+    };
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+  }
+  const noteOutcome = async (
+    outcome: CaseOutcome,
+    extra: { flowPath?: string | undefined; vacuous?: boolean | undefined; proofPath?: string | undefined } = {},
+  ): Promise<void> => {
+    if (ledger === null || where.ledger === undefined) return;
+    ledger.generatedAt = where.ledger.stamp?.() ?? ledger.generatedAt;
+    ledger.runKey = where.ledger.runKey?.() ?? ledger.runKey;
+    recordOutcome(ledger, outcome, extra);
+    await writeLedger(where.ledger.path, ledger).catch(() => undefined);
+  };
   const entries: IndexEntry[] = [];
-  const outcomes: CaseOutcome[] = [];
 
-  for (const [index, testCase] of cases.entries()) {
-    log?.(`\nrunning "${testCase.name}"…`);
+  // **The list may still be growing.** A catalog pushes each case into a
+  // `CaseQueue` the moment it is authored, so running starts while the model
+  // is still writing the next row (see `cmdCatalog`). Everything below reads
+  // the queue, never a count: the roster is printed per arrival, the schedule
+  // is decided per arrival, and the roll-up waits for the queue to close.
+  const streaming = cases instanceof CaseQueue;
+  // Readers run before writers unless the caller pinned the list's own order.
+  // A streaming suite cannot be reordered — rows run as they are authored.
+  const queue = streaming
+    ? cases
+    : closedQueue(options.sheetOrder ? cases : readersFirst(cases));
+
+  // Outcomes are collected **by index**, never appended: cases finish in
+  // whatever order they finish, and the roll-up, the suite index and the exit
+  // code all have to read as the list someone approved rather than as a
+  // stopwatch result.
+  const collected: (CaseOutcome | undefined)[] = [];
+  const indexed: (IndexEntry | undefined)[] = [];
+
+  // Autoheal (`--repair` on a suite): each case runs through the same
+  // FlowRepairLoop `wow run --repair` uses — on a failed / error / dead-end
+  // outcome the repair model rewrites the flow around the break and the case
+  // reruns itself, up to `options.repairAttempts` total runs. Gated on the
+  // generator role resolving a key; when it cannot, the suite says so once and
+  // runs exactly as before rather than failing ten cases on a missing key.
+  let autoheal = options.repair;
+  if (autoheal) {
+    const gate = assertRolesResolvable(
+      options,
+      options.repairInvestigate ? ['generator', 'agent'] : ['generator'],
+    );
+    if (gate !== null) {
+      process.stderr.write(`  ! autoheal requested, but ${gate} — running without it\n`);
+      autoheal = false;
+    }
+  }
+  // One memory across the whole suite: a fix one case's repair proved is
+  // pre-applied to every later case that walks into the same break on the
+  // same page, instead of each of them rediscovering it with model calls.
+  const repairMemory = autoheal ? new RepairMemory() : null;
+  // One session across the whole suite: the sign-in a case establishes is
+  // banked as storage state and injected into later cases' own isolated
+  // contexts (never a shared context), so a flow that does not sign itself
+  // in starts already authenticated instead of paying for the login again.
+  const sessionVault = new SessionVault();
+
+  // **Pause is instant** (2026-08-24; it used to wait for every in-flight
+  // case, which at 3–5 concurrent lanes of minutes each meant a "pause" that
+  // arrived a quarter of an hour after the click — a pause that slow is not
+  // one). SIGUSR2 (wowUI's Pause button, or `kill -USR2 <pid>` from a
+  // terminal) now writes the ledger's pause record synchronously and exits on
+  // the spot. Interrupted cases keep NO verdict — an interrupted case proved
+  // nothing, and a browser's mid-case state cannot be resurrected anyway —
+  // so `remaining()` includes them and `--resume` re-runs each from its own
+  // first step, in a fresh process on current code, while every finished
+  // verdict is carried into the resumed roll-up. What instant costs is the
+  // partial work of the interrupted lanes; that is the price that was asked
+  // for. Distinct from Stop (SIGINT/SIGTERM) only in intent and wording now:
+  // Stop means "I am done with this run", Pause means "continue it later".
+  //
+  // Without a ledger there is nothing a resume could pick up, so exiting
+  // instantly would only throw finished-in-flight work away: there — and
+  // only there — the old graceful behaviour stands (nothing new starts, the
+  // in-flight cases finish with verdicts).
+  resetPause();
+  const pauseFile = where.ledger === undefined ? undefined : pauseFileFor(where.ledger.path);
+  // A pause file left over from the paused process (the panel writes file AND
+  // signal; the signal usually wins and exits before the file is consumed)
+  // must not pause the very resume it asked for.
+  if (pauseFile !== undefined) clearPauseFile(pauseFile);
+  let pauseFired = false;
+  const onPause = (): void => {
+    if (pauseFired) return;
+    pauseFired = true;
+    requestPause();
+    if (ledger !== null && where.ledger !== undefined) {
+      ledger.ended = {
+        at: new Date().toISOString(),
+        cause:
+          `paused with ${remaining(ledger).length} case(s) still to run — in-flight cases were ` +
+          'interrupted and re-run on resume, on current code',
+        complete: false,
+      };
+      try {
+        writeLedgerSync(where.ledger.path, ledger);
+      } catch {
+        /* the ledger is advisory */
+      }
+      if (pauseFile !== undefined) clearPauseFile(pauseFile);
+      process.stderr.write(
+        '\n— paused instantly: interrupted cases keep no verdict; Continue testing / --resume ' +
+          're-runs each from its first step and keeps every finished verdict —\n',
+      );
+      // The environment family, like a blocked case: the pause says nothing
+      // about the application, and 0 or 1 here would claim it does. The
+      // panel labels the job from its pause request, not from this code.
+      process.exit(EXIT.environment);
+    }
+    process.stderr.write(
+      '\n— pausing: no progress ledger to resume from, so cases in flight finish ' +
+        'and nothing new starts —\n',
+    );
+  };
+  if (process.platform !== 'win32') process.on('SIGUSR2', onPause);
+  // The file route reaches runs no signal can: an orphaned suite (the panel
+  // restarted after spawning it), or one started in another terminal —
+  // `touch <ledger>.pause`. Polled here so the file is as instant as the
+  // signal (it used to be noticed only when the next case would have
+  // started, which on long cases was the same quarter-hour wait), and still
+  // checked before every dispatch via `shouldPause` below as the backstop.
+  const pausePoll =
+    pauseFile === undefined
+      ? null
+      : setInterval(() => {
+          if (pauseRequested(pauseFile)) onPause();
+        }, 500);
+  pausePoll?.unref();
+
+  // Pool size. An explicit `--concurrency` is fixed for the whole run, as it
+  // always was. A streaming (pipelined) suite with none stated runs 3 beside
+  // the authoring pool and widens to 5 the moment the queue closes and the
+  // model goes idle — `runQueue` re-reads this before every dispatch.
+  const concurrencyOf = (): number =>
+    options.concurrency !== undefined
+      ? Math.max(1, options.concurrency)
+      : streaming
+        ? queue.closed
+          ? PIPELINED_CONCURRENCY_AFTER_AUTHORING
+          : PIPELINED_CONCURRENCY_WHILE_AUTHORING
+        : DEFAULT_CONCURRENCY;
+  // One tag per case, and only when something else may be running beside it:
+  // a sequential run's output stays exactly what it was. A streaming list has
+  // no count to consult yet, so it is tagged whenever the pool allows more
+  // than one — the tag is what lets a reader (and wowUI) tell them apart.
+  const parallel = concurrencyOf() > 1 && (streaming || queue.length > 1);
+  const tagOf = (index: number): string | undefined => (parallel ? `[c${index + 1}]` : undefined);
+
+  // The roster, per arrival. For a closed list that is the whole plan up
+  // front, as before; for a queue it is one line as each case is queued.
+  const exclusive: boolean[] = [];
+  const scheduleOf = (testCase: SuiteCase, index: number): boolean => {
+    if (exclusive[index] === undefined) exclusive[index] = caseWrites(testCase.flow);
+    return exclusive[index]!;
+  };
+  if (parallel && !streaming) {
+    const alone = queue.items.filter((c, i) => scheduleOf(c, i)).length;
+    const reordered = !options.sheetOrder && alone > 0 && alone < queue.length;
+    process.stdout.write(
+      `\n  cases      ${queue.length}, up to ${concurrencyOf()} at a time` +
+        (alone > 0 ? ` (${alone} change data and run alone)` : '') +
+        (reordered ? `\n             readers run first, before anything changes the data they assert on (--sheet-order keeps the list's own order)` : '') +
+        `\n`,
+    );
+    for (const [index, testCase] of queue.items.entries()) {
+      process.stdout.write(
+        `  [c${index + 1}]      ${scheduleOf(testCase, index) ? 'alone  ' : 'shared '} ${testCase.name}\n`,
+      );
+    }
+    process.stdout.write('\n');
+  } else if (parallel) {
+    process.stdout.write(
+      options.concurrency !== undefined
+        ? `\n  cases      run as they are authored, up to ${concurrencyOf()} at a time (a case that changes data runs alone)\n`
+        : `\n  cases      run as they are authored — up to ${PIPELINED_CONCURRENCY_WHILE_AUTHORING} at a time while authoring, ` +
+          `${PIPELINED_CONCURRENCY_AFTER_AUTHORING} once it finishes (a case that changes data runs alone)\n`,
+    );
+  }
+
+  await runQueue(
+    queue,
+    concurrencyOf,
+    (testCase, index) => scheduleOf(testCase, index),
+    async (testCase, index) => {
+    // A streaming list has no roster to print up front, so each case's
+    // line of it is printed as the case starts.
+    if (streaming && parallel) {
+      process.stdout.write(
+        `  [c${index + 1}]      ${scheduleOf(testCase, index) ? 'alone  ' : 'shared '} ${testCase.name}\n`,
+      );
+    }
+    const tag = tagOf(index);
+    // **A flow that proves nothing about its claim is not run.** Its only
+    // assertions are the sign-in proof and a URL, so the browser would spend
+    // a minute producing a green that says nothing; it is recorded as
+    // blocked — with the reason — and the next `--resume` re-authors it.
+    const vacuous = vacuousFlow(testCase.flow);
+    if (vacuous !== null) {
+      const reason = `vacuous flow — ${vacuous}; re-authored on --resume`;
+      emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
+      if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
+      collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
+      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, vacuous: true });
+      where.onCaseDone?.(testCase, collected[index]!);
+      return;
+    }
+    if (parallel) emitTagged(tag, `case "${testCase.name}" started\n`);
+    else log?.(`\nrunning "${testCase.name}"…`);
     try {
-      const bundle = await runFlow(testCase.flow, {
+      const caseRunOptions: RunFlowOptions = {
         cdpUrl: options.cdp,
+        // Concurrent cases must not share a browser context, whatever the
+        // video mode says — see `SmartRunnerOptions.isolate`.
+        isolate: parallel,
         cachePath: options.cache,
+        sessionVault,
         screenshots: options.screenshots,
         video: options.video,
         agentAssist: options.agentAssist,
         captureDelayMs: options.captureDelayMs,
       stepDelayMs: options.stepDelayMs,
-        makeHealer: buildHealer(options),
+        makeHealer: buildHealer(options, where.healHints),
       stepRepair: buildStepRepair(options),
+      reviewJudge: buildReviewJudge(options),
         healer: options.heal ? undefined : null,
-        agent: buildAgent(options),
+        agent: buildAgent(options, tag),
         dataModel: buildDataModel(options),
         updateBaselines: options.updateBaselines,
         network: options.network,
@@ -99,11 +444,37 @@ export async function runCases(
         // reach the proof bundle or the emailable report in cleartext.
         credentials: options.credentials,
         historyPath: options.history ? options.historyPath : null,
-        onStep: stepLogger(options),
-        onPlan: planLogger(options),
+        onStep: stepLogger(options, tag),
+        onPlan: planLogger(options, tag),
         defects: testCase.defects,
         generatedBy: testCase.generatedBy,
-      });
+      };
+
+      let bundle;
+      if (autoheal) {
+        // The loop runs the first attempt itself, so the case is not run twice
+        // — a clean first pass is one run, exactly as without autoheal.
+        const loop = new FlowRepairLoop({
+          model: new LlmFlowRepairModel({ factory: options.factory }),
+          maxAttempts: options.repairAttempts,
+          // Repaired attempts land beside the case's own artifacts, one
+          // reviewable file per attempt — never overwriting anything.
+          outDir: testCase.group === undefined ? where.dir : join(where.dir, slugify(testCase.group)),
+          onLog: (line) => emitTagged(tag, `${line}\n`),
+          agent: options.repairInvestigate ? buildInvestigationAgent(options) : null,
+          regenerateFrom: options.repairRegenerate,
+          memory: repairMemory,
+          runOptions: caseRunOptions,
+        });
+        const outcome = await loop.run(testCase.flow, slugify(testCase.name));
+        const repaired = outcome.attempts.filter((a) => a.repair);
+        for (const a of repaired) {
+          emitTagged(tag, `  autoheal   ${a.repair!.flowPath}\n  patch      ${a.repair!.patchPath}\n`);
+        }
+        bundle = outcome.attempts[outcome.attempts.length - 1]!.bundle;
+      } else {
+        bundle = await runFlow(testCase.flow, caseRunOptions);
+      }
 
       const proofPath = await writeProofBundle(bundle, options.out);
       const target = resolveReportPath(
@@ -120,59 +491,219 @@ export async function runCases(
       );
       const reportPath = target === null ? null : await writeHtmlReport(bundle, target);
 
-      process.stdout.write(
+      emitTagged(
+        tag,
         `\n${formatProofSummary(bundle)}\n` +
           (meaningfulCoverage(bundle) ? `  ${formatCoverage(bundle.coverage!)}\n` : '') +
           (bundle.trend ? `  ${formatTrend(bundle.trend)}\n` : '') +
           `  proof      ${proofPath}\n` +
           (reportPath === null ? '' : `  report     ${reportPath}\n`),
       );
-      const blocked = neverRan(bundle);
+      // Two ways a run delivers no verdict: it never got going at all
+      // (`neverRan`), or it broke off on the machinery alone — every broken
+      // step an `error`, nothing about the application contradicted
+      // (`harnessOnly`; a database that was never configured, an agent that
+      // gave up, a provider that refused the call). Both score `blocked`,
+      // never `failed`: filing the harness's own gap as a product defect is
+      // the false test failure this suite used to produce 136 times over.
+      const blocked = neverRan(bundle) ?? harnessOnly(bundle);
       if (blocked !== null) {
         // Said out loud, at the moment it happens, and on stderr: this is not a
         // verdict, and a reader scanning stdout for verdicts must not take it
         // for one. It keeps its report — the evidence of what went wrong is
         // still worth having — but it is not filed among the results.
-        process.stderr.write(`  ! never ran: ${blocked}\n`);
+        emitTagged(tag, `  ! no verdict: ${blocked}\n`, 'err');
       }
-      if (reportPath !== null && blocked === null) entries.push({ bundle, reportPath });
-      outcomes.push({
+      if (reportPath !== null && blocked === null) indexed[index] = { bundle, reportPath };
+      collected[index] = {
         name: testCase.name,
-        verdict: blocked !== null ? 'blocked' : bundle.status === 'passed' ? 'passed' : 'failed',
+        verdict:
+          blocked !== null
+            ? 'blocked'
+            // The status a consumer acts on: an auto-review ruling (the
+            // judge at 70%+) or a human ruling outranks the machine's
+            // deferral, so a ruled run scores passed/failed, not 'review'.
+            : effectiveStatus(bundle) === 'needs-review'
+              ? 'review'
+              : isPassing(effectiveStatus(bundle))
+                ? 'passed'
+                : 'failed',
         bundle,
         reportPath: reportPath ?? undefined,
         reason: blocked ?? failureOf(bundle),
-      });
+      };
+      if (parallel) {
+        emitTagged(tag, `case "${testCase.name}" ${blocked !== null ? 'blocked' : bundle.status}\n`);
+      }
+      // Fold successful agent journeys back into the flow file as
+      // deterministic scripts, so the next run of this same file replays
+      // them with no model turn — the flow-file half of `AgentMemory`.
+      // Best-effort on purpose: a script that could not be written costs a
+      // few model turns next run, never a verdict.
+      if (testCase.flowPath !== undefined && blocked === null) {
+        const journeys = bundle.steps
+          .map((step) => step.agent)
+          .filter((record): record is AgentRecord => record !== undefined && record.success);
+        const scripted = withWorkflowScripts(testCase.flow, journeys);
+        if (scripted !== null) {
+          await writeFlowFile(testCase.flowPath, scripted)
+            .then(() => emitTagged(tag, `  scripted   agent journey recorded in the flow for $0 replay\n`))
+            .catch(() => undefined);
+        }
+      }
+      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, proofPath });
+      where.onCaseDone?.(testCase, collected[index]!);
     } catch (error) {
       // The narrower case: something threw before there was a bundle at all —
       // a report that could not be written, an unexpected engine error.
       const reason = error instanceof Error ? error.message.split('\n')[0] ?? '' : String(error);
-      process.stderr.write(`\nBLOCKED ${testCase.name} — ${reason}\n`);
-      outcomes.push({ name: testCase.name, verdict: 'blocked', bundle: null, reason });
+      emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
+      collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
+      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath });
+      where.onCaseDone?.(testCase, collected[index]!);
+    }
+    },
+    () => pauseRequested(pauseFile),
+  ).catch(async (error: unknown) => {
+    if (ledger !== null && where.ledger !== undefined) {
+      ledger.ended = {
+        at: new Date().toISOString(),
+        cause: error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error),
+        complete: false,
+      };
+      await writeLedger(where.ledger.path, ledger).catch(() => undefined);
+    }
+    throw error;
+  });
+  if (onSignal !== null) {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+  }
+  if (process.platform !== 'win32') process.off('SIGUSR2', onPause);
+  if (pausePoll !== null) clearInterval(pausePoll);
+
+  const fresh: CaseOutcome[] = collected.filter((o): o is CaseOutcome => o !== undefined);
+  for (const entry of indexed) if (entry !== undefined) entries.push(entry);
+
+  // **A resume answers for the whole catalog, not for its own subset.** The
+  // planned cases an earlier pass already finished (same ledger, same run key)
+  // are pulled in as finished tests: their verdicts join the roll-up, the exit
+  // code and — where their proof bundle can still be read — the suite index,
+  // so "36 passed then 72 more" reads as one 108-case catalog rather than a
+  // 72-case run that lost a third of its history.
+  const carried: CaseOutcome[] = [];
+  if (inherited !== null && where.ledger !== undefined) {
+    const ranIds = new Set(fresh.map((outcome) => caseIdOf(outcome.name)));
+    for (const { id, outcome: prior } of carriedOutcomes(inherited, where.ledger.planned, ranIds)) {
+      const outcome: CaseOutcome = {
+        name: prior.name ?? id,
+        verdict: prior.verdict,
+        bundle: null,
+        carried: true,
+        ...(prior.reportPath === null || prior.reportPath === undefined ? {} : { reportPath: prior.reportPath }),
+        ...(prior.reason === null || prior.reason === undefined ? {} : { reason: prior.reason }),
+      };
+      // Full fidelity when the evidence is still on disk: the prior pass's own
+      // bundle makes a real index row. Unreadable or unrecorded (an older
+      // ledger) degrades to the verdict line alone — disclosed, never invented.
+      if (prior.proofPath !== null && prior.proofPath !== undefined) {
+        try {
+          const bundle = JSON.parse(await readFile(prior.proofPath, 'utf8')) as ProofBundle;
+          if (typeof bundle?.runId === 'string' && Array.isArray(bundle.steps)) {
+            outcome.bundle = bundle;
+            if (outcome.reportPath !== undefined) {
+              entries.push({ bundle, reportPath: outcome.reportPath });
+            }
+          }
+        } catch {
+          /* the verdict still stands; only the index row is lost */
+        }
+      }
+      carried.push(outcome);
+    }
+    if (carried.length > 0) {
+      process.stdout.write(
+        `\n  carried    ${carried.length} case(s) finished by the earlier run of this catalog` +
+          ` (run key ${ledger?.runKey ?? 'unknown'}) join this roll-up as finished tests\n`,
+      );
     }
   }
+  const outcomes: CaseOutcome[] = sortByPlan([...fresh, ...carried], where.ledger?.planned ?? []);
 
   if (outcomes.length > 1) {
     const blocked = outcomes.filter((o) => o.verdict === 'blocked');
     const failed = outcomes.filter((o) => o.verdict === 'failed');
-    const passed = outcomes.length - blocked.length - failed.length;
+    const review = outcomes.filter((o) => o.verdict === 'review');
+    const passed = outcomes.length - blocked.length - failed.length - review.length;
 
     // One line per listed case, always all of them. The roll-up is the only
     // place the reader can see that the count adds up.
     process.stdout.write(
       `\n${outcomes.length} case(s) — ${passed} passed, ${failed.length} failed` +
+        (review.length > 0 ? `, ${review.length} proved-? awaiting human review` : '') +
         (blocked.length > 0 ? `, ${blocked.length} never ran` : '') +
         '\n',
     );
+    // The suite's whole bill on one line: wall clock summed over the cases
+    // (concurrency means it exceeds the elapsed time — that is the point of
+    // saying "case time") and every runtime model token — heals, agent turns,
+    // data retries, reconstruction asks. Authoring spend is reported where
+    // authoring happens; this line is what the RUNS cost.
+    {
+      // Over the cases THIS pass ran: a carried case's bill was reported by
+      // the pass that paid it, and repeating it here would double-count.
+      const spent = outcomes.filter((o) => o.carried !== true);
+      const wallMs = spent.reduce((a, o) => a + (o.bundle?.durationMs ?? 0), 0);
+      const tokIn = spent.reduce((a, o) => a + (o.bundle?.summary.inputTokens ?? 0), 0);
+      const tokOut = spent.reduce((a, o) => a + (o.bundle?.summary.outputTokens ?? 0), 0);
+      process.stdout.write(
+        `  spent      ${fmtDuration(wallMs)} case time` +
+          (tokIn > 0 || tokOut > 0
+            ? ` · ${fmtCount(tokIn)} in / ${fmtCount(tokOut)} out tokens (runtime model roles)`
+            : ' · 0 runtime model tokens') +
+          '\n',
+      );
+    }
     // Every listed case gets a line, and every line that is not a pass says why.
     // A bare ✗ with nothing after it was the worst of both: it read as a defect
     // and gave nobody anything to act on.
-    const MARK = { passed: '✓', failed: '✗', blocked: '⃠' } as const;
+    const MARK = { passed: '✓', failed: '✗', blocked: '⃠', review: '?' } as const;
     for (const outcome of outcomes) {
+      // A pass whose path broke says so on its own line: the green is the
+      // claims, the parenthesis is the path, and a reader skimming the roll-up
+      // sees both.
+      const withIssues = outcome.bundle?.status === 'passed-with-issues';
+      // A negative test's ✓ means "the application refused it, as required" —
+      // the opposite of what a bare ✓ reads as, so the roll-up says which.
+      const polarity = outcome.bundle?.polarity === 'negative' ? ' [negative]' : '';
+      // `pass**`: the claims held and the verdict is a pass; the asterisks
+      // name the step that only acted and broke, so a reader knows where to
+      // look without mistaking it for a validation failure.
+      const issues = withIssues && outcome.bundle ? issueSteps(outcome.bundle) : [];
+      // The case's own runtime record rides the line in brackets: wall clock
+      // always, tokens only when a runtime model was actually paid.
+      const cost =
+        outcome.bundle === null
+          ? ''
+          : ` [${fmtDuration(outcome.bundle.durationMs)}` +
+            (outcome.bundle.summary.inputTokens > 0 || outcome.bundle.summary.outputTokens > 0
+              ? ` · ${fmtCount(outcome.bundle.summary.inputTokens)} in / ${fmtCount(outcome.bundle.summary.outputTokens)} out tok`
+              : '') +
+            ']';
       process.stdout.write(
-        `  ${MARK[outcome.verdict]} ${outcome.name}` +
+        `  ${MARK[outcome.verdict]} ${outcome.name}${polarity}` +
+          (withIssues
+            ? ` — pass** (** ${issues[0] ?? 'a step that only acted broke'}${issues.length > 1 ? `; +${issues.length - 1} more` : ''})`
+            : '') +
+          (outcome.verdict === 'review'
+            ? ' — proved-? (a wording near-miss; confirm proved or failed in the panel)'
+            : '') +
           (outcome.verdict === 'blocked' ? ' — never ran' : '') +
-          (outcome.reason === undefined ? '' : `: ${outcome.reason}`) +
+          (outcome.reason === undefined || withIssues ? '' : `: ${outcome.reason}`) +
+          cost +
+          // Inherited, not earned this pass: the earlier run of this catalog
+          // (same run key) already finished it, and a resume keeps verdicts.
+          (outcome.carried === true ? ' [finished by the earlier run]' : '') +
           '\n',
       );
     }
@@ -192,7 +723,83 @@ export async function runCases(
       });
       process.stdout.write(`\n  index      ${indexPath}\n`);
     }
+
+    // The truth table: when the catalog's sheet recorded its own results
+    // (an Actual Result column → `knownResult` on every authored case), the
+    // suite's verdicts can be graded against the human's — TP/TN/FP/FN, one
+    // self-contained page listing every case. Pure arithmetic over verdicts
+    // already earned: zero model tokens. Written whatever --report says,
+    // because it is the suite-level result, not a per-case artifact.
+    {
+      const knownByName = new Map<string, 'passed' | 'failed'>();
+      for (const testCase of queue.items) {
+        const known = testCase.flow.authoredBy?.knownResult;
+        if (known !== undefined) knownByName.set(testCase.name, known);
+      }
+      const rows = truthRows(outcomes, knownByName);
+      if (hasGroundTruth(rows)) {
+        const t = truthTally(rows);
+        const truthPath = await writeTruthTable(
+          join(where.dir, 'truth-table.html'),
+          renderTruthTable(
+            { source: where.indexTitle ?? 'catalog', ranAt: new Date().toISOString() },
+            rows,
+          ),
+        ).catch(() => null);
+        process.stdout.write(
+          `  truth      TP ${t.tp} · TN ${t.tn} · FP ${t.fp} · FN ${t.fn} · ` +
+            `no verdict ${t.noVerdict}` +
+            (t.review > 0 ? ` · review ${t.review}` : '') +
+            ` · unscored ${t.unscored}` +
+            (t.accuracy === null ? '' : ` — accuracy ${Math.round(t.accuracy * 100)}% vs sheet`) +
+            (truthPath === null ? '' : `\n  truth page ${truthPath}`) +
+            '\n',
+        );
+      }
+    }
   }
 
+  if (ledger !== null && where.ledger !== undefined) {
+    const left = remaining(ledger);
+    ledger.generatedAt = where.ledger.stamp?.() ?? ledger.generatedAt;
+    ledger.ended = {
+      at: new Date().toISOString(),
+      // Paused outranks the generic wording: every started case finished with
+      // a verdict, so the count that is "left" is exactly where a resume
+      // picks up — and the resume runs on current code, in its own process.
+      cause: pauseRequested()
+        ? `paused with ${left.length} case(s) still to run — resume continues at the exact case, on current code`
+        : left.length === 0
+          ? null
+          : `${left.length} case(s) were never reached or never ran`,
+      complete: left.length === 0,
+    };
+    await writeLedger(where.ledger.path, ledger).catch(() => undefined);
+    process.stdout.write(
+      `  progress   ${where.ledger.path}${left.length === 0 ? '' : ` — ${left.length} left; continue with --resume`}\n`,
+    );
+  }
   return outcomes;
+}
+
+/** `95s` under two minutes, `4m12s` above — a duration a reader scans, not parses. */
+function fmtDuration(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 120) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
+}
+
+/** `950`, `12.3k`, `2.1M` — token counts at the precision anyone acts on. */
+function fmtCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+/** A fixed list as a queue with nothing more to come. */
+function closedQueue(cases: readonly SuiteCase[]): CaseQueue<SuiteCase> {
+  const queue = new CaseQueue<SuiteCase>();
+  for (const testCase of cases) queue.push(testCase);
+  queue.close();
+  return queue;
 }

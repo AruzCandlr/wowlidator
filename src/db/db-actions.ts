@@ -160,7 +160,7 @@ export function quoteIdent(name: string): string {
  * introspected schema is still the gate; this only spells the passing name
  * the way SQL needs it.
  */
-export function quoteTable(name: string): string {
+function quoteTable(name: string): string {
   return name.split('.').map(quoteIdent).join('.');
 }
 
@@ -176,23 +176,47 @@ export function quoteTable(name: string): string {
 export function parseDbConditions(text: string): Record<string, FlowDbValue> | null {
   const trimmed = text.trim();
   if (trimmed === '') return {};
+  const clauses = splitConditions(trimmed);
+  if (clauses === null) return null;
   const out: Record<string, FlowDbValue> = {};
-  for (const clause of splitConditions(trimmed)) {
+  for (const clause of clauses) {
     const match = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/.exec(clause.trim());
     if (!match?.[1] || match[2] === undefined) return null;
     const rawValue = match[2].trim();
-    const unquoted =
-      (rawValue.startsWith("'") && rawValue.endsWith("'")) ||
-      (rawValue.startsWith('"') && rawValue.endsWith('"'))
-        ? rawValue.slice(1, -1)
-        : rawValue;
+    const wrapped =
+      (rawValue.startsWith("'") && rawValue.endsWith("'") && rawValue.length >= 2) ||
+      (rawValue.startsWith('"') && rawValue.endsWith('"') && rawValue.length >= 2);
+    const unquoted = wrapped ? rawValue.slice(1, -1) : rawValue;
+    // A quote loose in the middle of a value is SQL mangled into the flat
+    // form, not a value: `benefit_type = REIMBURSEMENT' OR benefit_type =
+    // 'INFORMATION` (live, BE catalog 2026-08-24) parses "cleanly" into one
+    // impossible value that matches nothing on every run and files a backend
+    // failure about an unaddressable row. A value that needs a quote inside
+    // it is written wrapped in the OTHER quote (`"O'Brien"`), which stays
+    // accepted. Unusable, never guessed — the contract above.
+    if (wrapped ? unquoted.includes(rawValue[0]!) : /['"]/.test(unquoted)) return null;
     out[match[1]] = unquoted.toUpperCase() === 'NULL' ? null : unquoted;
   }
   return out;
 }
 
-/** Split on ` AND ` — outside quotes, so a quoted value may contain the word. */
-function splitConditions(text: string): string[] {
+/**
+ * Split on ` AND ` — outside quotes, so a quoted value may contain the word.
+ *
+ * Two refusals, both from a live catalog (BE, 2026-08-24) where the model
+ * wrote SQL into the AND-only flat form and the mangled predicate matched
+ * nothing on every run — filed as a backend failure about a row that was
+ * never addressable:
+ * - **An unterminated quote is unparseable, not a value.** `benefit_type =
+ *   REIMBURSEMENT' OR benefit_type = 'INFO` opens a quote at the stray
+ *   apostrophe and swallows the rest of the string into one impossible value.
+ * - **A top-level ` OR ` is SQL, and the flat form cannot say it.** Accepting
+ *   it as part of a value silently narrows an either-of claim into an
+ *   equality that can never hold.
+ * Returning null makes the step unusable — the same "unusable, never
+ * guessed" contract `parseDbConditions` already states.
+ */
+function splitConditions(text: string): string[] | null {
   const parts: string[] = [];
   let current = '';
   let quote: string | null = null;
@@ -211,6 +235,7 @@ function splitConditions(text: string): string[] {
       i += 1;
       continue;
     }
+    if (/^\s+OR\s+/i.test(text.slice(i))) return null;
     const rest = /^\s+AND\s+/i.exec(text.slice(i));
     if (rest) {
       parts.push(current);
@@ -221,6 +246,7 @@ function splitConditions(text: string): string[] {
     current += ch;
     i += 1;
   }
+  if (quote !== null) return null;
   parts.push(current);
   return parts;
 }
@@ -339,6 +365,26 @@ export class DbActions {
     });
   }
 
+  /** Whether a database is configured at all — the gate for offering `dbCount` to the agent. */
+  get configured(): boolean {
+    return this.#config !== null || this.#injected !== null;
+  }
+
+  /**
+   * One grounded, read-only count for the agent's `dbCount` action: the same
+   * table/column grounding and read-only session as every assertion here,
+   * with no verdict attached — the number is observation, and judging it
+   * stays with whoever asked. No polling: the agent reads the state as it
+   * stands and can wait and re-count on its own if it suspects a lag.
+   * Throws `DbGroundingError`/`DbUnavailableError` with a readable message.
+   */
+  async probeCount(table: string, where: Record<string, string>): Promise<number> {
+    const client = await this.#ensureClient();
+    const declared = await this.#requireTable(table);
+    this.#requireColumns(declared, Object.keys(where));
+    return this.#countRows(client, declared.name, this.#variables.interpolateDeep({ ...where }));
+  }
+
   /** Assert row(s) matching `where` (and `values`) exist — polling through the budget. */
   async expectDbRow(spec: FlowDbRowSpec): Promise<void> {
     await this.#check('expectDbRow', spec.intent, async () => {
@@ -427,10 +473,25 @@ export class DbActions {
         }
 
         if (Date.now() >= deadline) {
+          // An exact count with no where reads the WHOLE table, and that
+          // number belongs to everyone: another test's rows, seed drift and
+          // concurrent writers all move it. Live (BE catalog, 2026-08-24):
+          // "expected exactly 75 row(s) … found 45" — a sheet's recorded
+          // total against a table other tests had been writing into, filed
+          // as a backend failure. The claim still fails — but the message
+          // names the brittleness so the reader checks the claim before the
+          // backend.
+          const wholeTable =
+            wanted !== undefined && Object.keys(where).length === 0
+              ? ' — this counted the whole table with no where: seed drift, other tests and ' +
+                'concurrent writers all move that number, so check whether the expected count ' +
+                'is still true before reading this as a backend defect; a where keyed on values ' +
+                'this run created makes the claim robust'
+              : '';
           throw new DbCheckFailure(
             `expected ${expectedSummary} in ` +
               `"${table.name}" where ${redactWhereSummary(where)}; found ${observedSummary} ` +
-              `(polled ${Date.now() - started}ms)`,
+              `(polled ${Date.now() - started}ms)${wholeTable}`,
             {
               kind: 'row',
               table: table.name,

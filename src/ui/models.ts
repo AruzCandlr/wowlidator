@@ -51,8 +51,13 @@ import {
   PROVIDERS,
   PROVIDER_META,
   type LlmRole,
+  localLlmBaseUrl,
+  localBaseUrlForPort,
+  portOfBaseUrl,
   type ProviderName,
   type WowlidatorConfig,
+  FIXED_MODEL_PROVIDERS,
+  fixedModelFor,
 } from '../config.js';
 
 /** How long a fetched catalogue is reused. The panel polls; providers do not. */
@@ -82,6 +87,8 @@ export interface ProviderModelsView {
   fetchedAt: string | null;
   /** False when no key is configured — the list may be short or absent. */
   keyed: boolean;
+  /** True when the server ignores the model field — there is nothing to pick. */
+  fixedModel: boolean;
 }
 
 export interface RoleModelView {
@@ -93,6 +100,10 @@ export interface RoleModelView {
   /** What `.env` says, so a person can see what they are departing from. */
   configuredProvider: ProviderName;
   configuredModelId: string;
+  /** Where a `local` role's server listens; null for every other provider. */
+  baseUrl: string | null;
+  /** The port of `baseUrl`, for the panel's field; null when there is none. */
+  port: number | null;
 }
 
 export class ModelSelectionError extends Error {}
@@ -112,7 +123,10 @@ interface CachedModels {
  * clicked a moment ago. Merging them would make "re-read .env" meaningless.
  */
 export class ModelSelection {
-  readonly #chosen = new Map<LlmRole, { provider: ProviderName; modelId: string }>();
+  readonly #chosen = new Map<
+    LlmRole,
+    { provider: ProviderName; modelId: string; baseUrl: string | undefined }
+  >();
   readonly #catalogue = new Map<ProviderName, CachedModels>();
   readonly #inFlight = new Map<ProviderName, Promise<CachedModels>>();
 
@@ -124,7 +138,7 @@ export class ModelSelection {
    * something the user did not type. The model id is checked for shape only;
    * see the note at the top about why it is not checked against the list.
    */
-  select(role: string, provider: string, modelId: string): void {
+  select(role: string, provider: string, modelId: string, port?: number | null): void {
     if (!(LLM_ROLES as readonly string[]).includes(role)) {
       throw new ModelSelectionError(`"${role}" is not a model role`);
     }
@@ -133,15 +147,28 @@ export class ModelSelection {
         `"${provider}" is not a provider wowlidator can use — it has ${PROVIDERS.join(', ')}`,
       );
     }
-    const trimmed = modelId.trim();
+    // A fixed-model provider answers with whatever it loaded; a typed id
+    // would be recorded as the run's model and be false.
+    const trimmed = fixedModelFor(provider as ProviderName) ?? modelId.trim();
     if (!MODEL_ID.test(trimmed)) {
       throw new ModelSelectionError(
         'that does not look like a model id — expected something like "llama-3.3-70b-versatile"',
       );
     }
+    // A port is only meaningful for a server on this machine; for any other
+    // provider it is dropped rather than recorded as a setting that does nothing.
+    let baseUrl: string | undefined;
+    if (provider === 'local' && port !== undefined && port !== null) {
+      try {
+        baseUrl = localBaseUrlForPort(port);
+      } catch (error) {
+        throw new ModelSelectionError(error instanceof Error ? error.message : String(error));
+      }
+    }
     this.#chosen.set(role as LlmRole, {
       provider: provider as ProviderName,
       modelId: trimmed,
+      baseUrl,
     });
   }
 
@@ -158,13 +185,24 @@ export class ModelSelection {
     return LLM_ROLES.map((role) => {
       const configured = config.roles[role];
       const chosen = this.#chosen.get(role);
+      const provider = chosen?.provider ?? configured.provider;
+      // A role moved onto `local` without a port keeps the shared default;
+      // one that stayed on `local` keeps whatever `.env` gave it.
+      const baseUrl =
+        provider !== 'local'
+          ? null
+          : (chosen?.baseUrl ??
+            (configured.provider === 'local' ? configured.baseUrl : undefined) ??
+            localLlmBaseUrl());
       return {
         role,
-        provider: chosen?.provider ?? configured.provider,
+        provider,
         modelId: chosen?.modelId ?? configured.modelId,
         overridden: chosen !== undefined,
         configuredProvider: configured.provider,
         configuredModelId: configured.modelId,
+        baseUrl,
+        port: baseUrl === null ? null : portOfBaseUrl(baseUrl),
       };
     });
   }
@@ -180,6 +218,7 @@ export class ModelSelection {
         note: cached?.note ?? '',
         fetchedAt: cached === undefined ? null : new Date(cached.fetchedAt).toISOString(),
         keyed: (config.apiKeys[provider]?.length ?? 0) > 0,
+        fixedModel: FIXED_MODEL_PROVIDERS.has(provider),
       };
     });
   }
@@ -228,6 +267,7 @@ export class ModelSelection {
       const name = role.toUpperCase();
       overlay[`WOWLIDATOR_${name}_PROVIDER`] = choice.provider;
       overlay[`WOWLIDATOR_${name}_MODEL`] = choice.modelId;
+      if (choice.baseUrl !== undefined) overlay[`WOWLIDATOR_${name}_BASE_URL`] = choice.baseUrl;
     }
     return overlay;
   }
@@ -250,7 +290,7 @@ export class ModelSelection {
  */
 export async function persistRoleModel(
   role: string,
-  choice: { provider: string; modelId: string } | null,
+  choice: { provider: string; modelId: string; baseUrl?: string | undefined } | null,
   envPath = '.env',
 ): Promise<void> {
   const target = resolve(envPath);
@@ -259,6 +299,11 @@ export async function persistRoleModel(
     [`WOWLIDATOR_${name}_PROVIDER`, choice === null ? null : choice.provider],
     [`WOWLIDATOR_${name}_MODEL`, choice === null ? null : choice.modelId],
   ];
+  // The base URL is written only when one was chosen; otherwise the line is
+  // commented out (a reset, or a move off `local`), so a stale port cannot
+  // outlive the provider it belonged to.
+  if (choice?.baseUrl !== undefined) assignments.push([`WOWLIDATOR_${name}_BASE_URL`, choice.baseUrl]);
+  else assignments.push([`WOWLIDATOR_${name}_BASE_URL`, null]);
 
   let text = '';
   try {
@@ -312,10 +357,12 @@ async function fetchModels(
   const stamp = Date.now();
   const fail = (note: string): CachedModels => ({ models: [], note, fetchedAt: stamp });
 
-  // EmmieDev serves exactly one model; there is no catalogue to fetch, so the
-  // list is stated here rather than asked for over the network.
-  if (provider === 'emmiedev') {
-    return { models: [...EMMIEDEV_MODELS], note: '', fetchedAt: stamp };
+  // A fixed-model provider serves exactly one model and ignores the id it is
+  // sent; there is no catalogue worth fetching, so the alias is stated here
+  // rather than asked for over the network.
+  const fixed = fixedModelFor(provider);
+  if (fixed !== undefined) {
+    return { models: [fixed], note: '', fetchedAt: stamp };
   }
 
   // OpenRouter serves its catalogue unauthenticated; the other two cannot say
@@ -397,14 +444,6 @@ const REQUESTS: Record<ProviderName, (key: string | undefined) => ModelRequest> 
     headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
     parse: (body) => openAiShape(body),
   }),
-  // Never reached — `fetchModels` short-circuits emmiedev to `EMMIEDEV_MODELS`
-  // before any request is built. The entry exists because `REQUESTS` is total
-  // over `ProviderName`.
-  emmiedev: () => ({
-    url: 'https://chat.emmiedev.com/v1/models',
-    headers: {},
-    parse: () => [...EMMIEDEV_MODELS],
-  }),
   zai: (key) => ({
     url: 'https://api.z.ai/api/paas/v4/models',
     headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
@@ -412,15 +451,26 @@ const REQUESTS: Record<ProviderName, (key: string | undefined) => ModelRequest> 
     // callable but absent from it, so it is added here rather than lost.
     parse: (body) => [...openAiShape(body), 'glm-4.5-flash'],
   }),
+  deepseek: (key) => ({
+    url: 'https://api.deepseek.com/v1/models',
+    headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
+    parse: (body) => openAiShape(body),
+  }),
+  // Never reached — `fetchModels` short-circuits every `FIXED_MODEL_PROVIDERS`
+  // entry before any request is built. These exist because `REQUESTS` is
+  // total over `ProviderName`.
+  emmiedev: () => ({
+    url: 'https://chat.emmiedev.com/v1/models',
+    headers: {},
+    parse: () => ['default'],
+  }),
+  local: (key) => ({
+    url: `${localLlmBaseUrl()}/models`,
+    headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
+    parse: () => ['default_model'],
+  }),
 };
 
-/**
- * The one id worth offering for chat.emmiedev.com. The server ignores the
- * model field entirely and `default` is its stable alias for whatever model
- * is running (currently `small`) — pinning the alias means a server-side
- * model swap never reaches this codebase.
- */
-const EMMIEDEV_MODELS = ['default'] as const;
 
 /** `{ data: [{ id }] }` — what both OpenAI-compatible catalogues return. */
 function openAiShape(body: unknown): string[] {

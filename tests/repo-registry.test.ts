@@ -13,11 +13,13 @@ import { after, before, describe, it } from 'node:test';
 import {
   graphFileFor,
   listRepos,
+  mergedContextDocs,
   mergedScanInputs,
   resolveRepo,
   slugFor,
   upsertRepo,
   type RepoEntry,
+  navDestination,
 } from '../src/context/repo-registry.js';
 
 let dir: string;
@@ -128,5 +130,69 @@ describe('the registry file', () => {
     } finally {
       await rm(broken, { recursive: true, force: true });
     }
+  });
+});
+
+describe('the learned navigation map', () => {
+  const nav = {
+    learnedAt: '2026-08-19T00:00:00.000Z',
+    origin: 'http://localhost:3000',
+    links: [
+      { label: 'Approval Requests 23 รายการใหม่', path: '/en/admin/approvals', via: 'ขยายเมนู' },
+      { label: 'Probation Reviews', path: '/en/workflows/probation', via: 'ขยายเมนู' },
+      { label: 'Employees', path: '/en/admin/employees', via: 'ขยายเมนู' },
+      { label: 'Reports', path: '/en/reports', via: 'ขยายเมนู' },
+      { label: 'HR', path: '/en/hr' },
+    ],
+  };
+
+  it('resolves a human menu path to the page the application itself links', () => {
+    assert.equal(
+      navDestination('Sidebar → "Team" → "Probation Reviews"', nav)?.path,
+      '/en/workflows/probation',
+    );
+  });
+
+  it('takes the FIRST leaf named — the primary path — when a row spans two surfaces', () => {
+    assert.equal(
+      navDestination(
+        'Steps 1-3: sidebar → "Team" → "Probation Reviews". Step 4: sidebar → "HR" → "Employees" → click the row',
+        nav,
+      )?.path,
+      '/en/workflows/probation',
+    );
+  });
+
+  it('matches a live-count label on its stable head', () => {
+    assert.equal(navDestination('open Approval Requests', nav)?.path, '/en/admin/approvals');
+  });
+
+  it('is null when no label of substance occurs, and for no map at all', () => {
+    assert.equal(navDestination('open the queue', nav), null);
+    assert.equal(navDestination('Sidebar → "Team" → "Probation Reviews"', undefined), null);
+  });
+});
+
+describe('mergedContextDocs — documents remembered with the repository', () => {
+  const entry = (docs?: string[]): RepoEntry => ({
+    slug: 'app-x',
+    path: '/apps/x',
+    indexedAt: '2026-08-20T00:00:00.000Z',
+    nodes: 1,
+    ...(docs === undefined ? {} : { contextDocs: docs }),
+  });
+
+  it('a bare re-add keeps what the entry remembered', () => {
+    assert.deepEqual(mergedContextDocs(entry(['/docs/spec.md']), []), ['/docs/spec.md']);
+  });
+
+  it('a new name accumulates; the same file name replaces — an updated file supersedes', () => {
+    const merged = mergedContextDocs(entry(['/old/spec.md']), ['/new/Spec.md', '/new/rules.pptx']);
+    assert.deepEqual(merged, ['/new/Spec.md', '/new/rules.pptx']);
+  });
+
+  it('nothing remembered and nothing added stays absent, not an empty list', () => {
+    assert.equal(mergedContextDocs(entry(), []), undefined);
+    assert.equal(mergedContextDocs(null, []), undefined);
   });
 });
