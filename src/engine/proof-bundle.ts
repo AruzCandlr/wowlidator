@@ -222,6 +222,19 @@ export type ResolutionSource =
   | 'case'
   | 'narrow'
   /**
+   * The author's selector resolved and only its TEXT missed, and the claim
+   * held against its container instead — a label whose value sits beside it.
+   * Free and deterministic; see `ancestorSelectors` in `engine/runner.ts`.
+   */
+  | 'kin'
+  /**
+   * The agent was asked the assertion's own question — read-only, so it could
+   * not act — named the element holding the answer, and the harness re-ran
+   * the author's comparison against it. The agent's answer is checked, never
+   * believed. See `#agentReread` in `engine/runner.ts`.
+   */
+  | 'agent-read'
+  /**
    * The author's own selector, given one more window at the healed timeout —
    * free, and the last deterministic rung before a model is paid. Exists for
    * content that renders after the fast-path budget (a hydrating detail

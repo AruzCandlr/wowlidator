@@ -391,6 +391,59 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
   });
 });
 
+describe('a read-only agent run', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+
+  before(async () => {
+    // A summary card, the be100 shape: label and value in separate elements,
+    // plus a button the agent must not be able to press.
+    server = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(
+        '<h1>Plans</h1><div id="card"><span>TOTAL PLANS</span><span>75</span></div>' +
+          '<button onclick="document.title=\'the agent acted\'">Delete everything</button>',
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+
+  it('refuses every action that could change the page, and still lets it answer', async () => {
+    // Asking an assertion's question is only safe if the agent structurally
+    // cannot make the claim true. A prompt saying "do not click" is a
+    // promise; this is a guarantee.
+    const { model, seen } = scripted([
+      { action: 'click', selector: 'role=button[name="Delete everything" i]' },
+      { action: 'scroll' },
+      { action: 'finish', selector: '#card', reasoning: 'the card holds the label and the count' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 5 });
+    const { result, title } = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/cards`, { waitUntil: 'domcontentloaded' });
+      const result = await agent.run(page, 'which element holds the text "75" for TOTAL PLANS?', {
+        readOnly: true,
+      });
+      return { result, title: await page.title() };
+    });
+
+    assert.notEqual(title, 'the agent acted', 'the button was never pressed');
+    assert.equal(result.actions.some((a) => a.action === 'click' && a.ok), false);
+    assert.match(seen[1]?.feedback ?? '', /is not available to this run/, 'told once, with the reason');
+    assert.match(seen[1]?.feedback ?? '', /it may only wait, scroll/, 'and told what it may do');
+    // And the answer still comes back: the finish carries the selector.
+    const answer = [...result.actions].reverse().find((a) => a.action === 'finish');
+    assert.equal(answer?.selector, '#card');
+  });
+});
+
 describe('a consent gate met mid-run (CDP)', { skip: skipBrowser }, () => {
   let server: Server;
   let origin: string;

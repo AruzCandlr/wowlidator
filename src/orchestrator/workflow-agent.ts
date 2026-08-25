@@ -77,6 +77,27 @@ export const AGENT_NO_PROGRESS_TURNS = 5;
  * recorded as a harness error with the goal's control on screen.
  */
 export const IDLE_ACTIONS: ReadonlySet<string> = new Set(['wait', 'scroll']);
+/** Everything a `readOnly` run may do: look, look again, and answer. */
+export const READ_ONLY_ACTIONS: ReadonlySet<string> = new Set([...IDLE_ACTIONS, 'finish', 'fail']);
+/**
+ * What a `reveal` run may do: everything read-only, plus the actions that
+ * bring an EXISTING control into reach — open a menu, focus a field, follow a
+ * link. Never `fill`, and never `dbCount`.
+ *
+ * The distinction is the one this codebase has always drawn between preparing
+ * a page and performing a step, and it matters most for an ASSERTION: a claim
+ * an agent typed into existence proves nothing, so the repair pass offered to
+ * an assertion may reveal what is already there and no more. `dbCount` is
+ * excluded for a second reason as well — it is a backend action, and a run
+ * with backend testing off must not reach the database by any route.
+ */
+export const REVEAL_ACTIONS: ReadonlySet<string> = new Set([
+  ...READ_ONLY_ACTIONS,
+  'click',
+  'press',
+  'hover',
+  'goto',
+]);
 /**
  * What a `wait` is worth on a page whose network is ALREADY quiet. The idle
  * wait returns at once there, and a wait that does nothing costs a model
@@ -490,6 +511,27 @@ export interface WorkflowAgentOptions {
 export interface RunOptions {
   memory?: AgentMemory | undefined;
   /**
+   * Look, never touch. Every action that could change the application —
+   * click, fill, press, hover, goto, dbCount — is refused before it runs;
+   * only `wait`, `scroll`, `finish` and `fail` are left.
+   *
+   * The rung this exists for asks the agent a READING question ("where on
+   * this page is the value for that label?") and verifies the answer
+   * deterministically afterwards. The ladder's standing rule is that an
+   * assertion is never offered the agent, because "a claim it made true
+   * proves nothing" — and that rule is about ACTING. Forbidding action
+   * structurally is what makes a reading question safe to ask of an
+   * assertion, rather than a promise in a prompt a model may quietly break.
+   */
+  readOnly?: boolean | undefined;
+  /**
+   * Which actions this run may take at all. `readOnly: true` is the strictest
+   * form (`READ_ONLY_ACTIONS`) and wins over this; `REVEAL_ACTIONS` is the
+   * healing pass offered to an assertion — it may open, focus and navigate to
+   * what already exists, but never type. Absent means the full vocabulary.
+   */
+  allowedActions?: ReadonlySet<string> | undefined;
+  /**
    * The test case this workflow step serves — claim, expected output, persona
    * — a compact card stamped on the flow at authoring (`Flow.caseContext`).
    * Context, never instructions: the goal stays the only thing the agent
@@ -602,6 +644,12 @@ export class WorkflowAgent {
   async run(page: Page, goal: string, runOptions: RunOptions = {}): Promise<WorkflowResult> {
     const startedMs = Date.now();
     const memory = runOptions.memory ?? this.#memory;
+    // What this run may do at all: `readOnly` is the strictest form, an
+    // explicit set is the middle ground (the reveal pass), absent is the full
+    // vocabulary. Enforced before a decision is acted on, so a restriction is
+    // a guarantee rather than a line in a prompt.
+    const allowedActions: ReadonlySet<string> | null =
+      runOptions.readOnly === true ? READ_ONLY_ACTIONS : (runOptions.allowedActions ?? null);
     this.#dbProbe = runOptions.dbProbe ?? null;
     const actions: AgentAction[] = [];
     const history: string[] = [];
@@ -773,7 +821,13 @@ export class WorkflowAgent {
         inputTokens += candidate.inputTokens ?? 0;
         outputTokens += candidate.outputTokens ?? 0;
 
-        const refusal = this.#refuse(candidate, axTree, doneHere, destination, page.url(), ask, goal);
+        const refusal =
+          (allowedActions !== null && !allowedActions.has(candidate.action)
+            ? `"${candidate.action}" is not available to this run — it may only ` +
+              `${[...allowedActions].filter((one) => one !== 'finish' && one !== 'fail').join(', ')}. ` +
+              'Use one of those, or answer now with finish or fail'
+            : null) ??
+          this.#refuse(candidate, axTree, doneHere, destination, page.url(), ask, goal);
         if (refusal === null) {
           decision = candidate;
         } else if (ask === 0) {

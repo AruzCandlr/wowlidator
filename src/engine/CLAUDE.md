@@ -248,3 +248,27 @@ Bad interpolation is also never reconstructed: an unknown `{{var}}` is the flow'
 - `activeElement.blur()` clears `activeElement` but leaves Chrome's *sequential focus navigation starting point* on the old element, so the next Tab resumes from there.
 
 Temporarily setting `tabindex="-1"` on body and focusing it resets both. Don't "simplify" that back to a blur.
+
+## Where determinism ends, it ends in two calls
+
+The standing rule (2026-08-26). A step whose deterministic ladder has failed gets **ONE look** and, only if that look earns it, **ONE repair**. `#agentTriage` owns both and can spend no more; `#agentRescue` is gone, its contract absorbed.
+
+1. **The look** — `readOnly`, so it structurally cannot click, type or navigate. It answers with one of three verdicts in the decision's `value` (a field the schema already has, so no prompt pays for a new one): `proved` + the selector of the element that shows it; `can-heal` + what stands in the way; `fail`. Anything unrecognised reads as `fail` — the safe direction is to spend nothing.
+2. **The repair** — only on `can-heal`, and only under `--agent-assist`, because this stage changes the application and that has always been a decision about someone's system rather than a default. The look is ungated precisely because it cannot act. For an **assertion** the repair is further restricted to `REVEAL_ACTIONS` (open, focus, follow; never `fill`, never `dbCount`): a claim an agent typed into existence proves nothing.
+
+**Neither verdict is believed.** After `proved` the harness re-runs the author's own comparison against the element named; after a repair it re-runs the author's own selector. A step whose claim does not then hold fails exactly as it would have. That is what lets an assertion be offered this at all, where the old `#agentRescue` refused one — its rule was about ACTING, and forbidding action structurally is what makes a reading question safe to ask.
+
+**The healer keeps its place, for the one thing it is good at.** It reads a static tree and proposes a different string — the right tool for a WRONG SELECTOR, the wrong one for a CONTENT miss. Measured (be100 PL_03_01, 2026-08-25): asked why `text=Total plans` did not contain "75", it proposed `text="68"` — find an element containing the expected value, which is circular — at 0.20 confidence, and was rightly refused. So a content-only miss (`isContentMiss` across every attempt) skips the healer entirely and goes straight to triage. Ahead of both sits the free **kin** rung (`ancestorSelectors`, two levels): a summary card is a label and a value in sibling elements, and climbing to the container that holds both costs nothing.
+
+## Backend off means not even present
+
+Three layers, because a rule enforced in one place is a rule with a hole in it:
+
+| Layer | Where | Behaviour |
+|---|---|---|
+| Authoring | `flow-author.ts` | The family is dropped in narrowing with `BACKEND_OFF_REASON`; an indexed schema stops being permission |
+| Loading | `runFlow` | A flow carrying any backend step under `backend: false` is **refused before a browser opens**, naming the steps |
+| Dispatch | `SmartRunner.assertBackendAllowed` | Throws `BackendDisabledError` per step, for a caller that drove the runner directly (MCP, the repair loop, an embedder) |
+
+**Refused, never silently skipped.** A suite that quietly drops assertions goes green having proved less than it claims — the vacuous pass in a new coat. `BackendDisabledError` is harness-class (`classifyStepFailure` → `error`, `reconstructionFutile` → true), so the case is recorded **blocked**: a limit the run was given, never a finding about the application.
+

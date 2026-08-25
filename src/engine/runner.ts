@@ -70,7 +70,7 @@ import {
 import { RunHistory, analyseTrend } from '../history/run-history.js';
 import { HealFailedError, HealUnavailableError, JitHealer, captureAxTree } from '../healer/jit-healer.js';
 import type { FlowRepairModel } from '../repair/flow-repair-model.js';
-import { WorkflowAgent, cacheAgentMemory, type AgentDbProbe, type PlanStep } from '../orchestrator/workflow-agent.js';
+import { REVEAL_ACTIONS, WorkflowAgent, cacheAgentMemory, type AgentDbProbe, type PlanStep } from '../orchestrator/workflow-agent.js';
 import { SessionVault, type StoredSession } from './session-vault.js';
 
 /**
@@ -229,6 +229,13 @@ export interface SmartRunnerOptions {
    * it. Default false — see `#agentRescue` for why this is opt-in.
    */
   agentAssist?: boolean | undefined;
+  /**
+   * Whether this run may exercise the backend at all. Default `true` — the
+   * behaviour every run had before the toggle existed. `false` and no HTTP or
+   * database step may run: not authored, not loaded, not dispatched. See
+   * `backendStepsIn`.
+   */
+  backend?: boolean | undefined;
   /**
    * In-run step reconstruction: on a step's failure, ask this model for a
    * rebuilt step against the live page and retry, up to
@@ -494,7 +501,113 @@ export class StepResolutionError extends Error {
     this.name = 'StepResolutionError';
     this.selector = selector;
     this.attempts = attempts;
+    this.contentOnly = contentOnly;
   }
+
+  /** Every rung resolved the selector and only the CONTENT missed. */
+  readonly contentOnly: boolean;
+}
+
+/**
+ * A backend step in a run that declared it does not test the backend.
+ *
+ * A harness-class fault in the same family as `MethodRefusedError`: it says
+ * nothing about the application, so it is scored `error` and the case is
+ * recorded blocked rather than failed.
+ */
+export class BackendDisabledError extends Error {
+  override readonly name = 'BackendDisabledError';
+}
+
+/**
+ * The backend steps a flow carries, by index — empty when it carries none.
+ *
+ * Used by the two enforcement layers below the author: `runFlow` refuses a
+ * flow that carries any when backend testing is off, and the step dispatcher
+ * refuses each one individually. Three layers on purpose: the author cannot
+ * write them, a flow authored earlier (or edited, or repaired) cannot run
+ * them, and no path reaches the database or an endpoint by accident. "Not
+ * even present" is the rule, and one layer is a rule with a hole in it.
+ */
+export function backendStepsIn(
+  steps: readonly FlowStep[],
+): { index: number; action: string }[] {
+  const found: { index: number; action: string }[] = [];
+  const walk = (list: readonly FlowStep[]): void => {
+    for (const [index, step] of list.entries()) {
+      if (step.action === 'when') {
+        walk(step.then);
+        walk(step.else ?? []);
+        continue;
+      }
+      if (BACKEND_TIER_ACTIONS.has(step.action)) found.push({ index, action: step.action });
+    }
+  };
+  walk(steps);
+  return found;
+}
+
+/** Did this attempt resolve the element and miss only on its text? */
+export function isContentMiss(line: string): boolean {
+  return /expected text to contain/i.test(line);
+}
+
+/**
+ * The ancestors of a selector, nearest first — the free repair for a label
+ * whose value lives beside it.
+ *
+ * A summary card renders as a label and a value in separate elements
+ * (`TOTAL PLANS` / `75`), so `text=Total plans` resolves the LABEL and its own
+ * text can never contain the number. Live (be100 PL_03_01, run of
+ * 2026-08-25 09:59): six assertions failed this way, each reporting
+ * `expected text to contain "68", got "REIMBURSEMENT BY EMPLOYEE AND HR"` —
+ * the element was right and its text was a fragment of the answer. An earlier
+ * authoring of the same claims wrote `>> xpath=..` by hand and read
+ * `TOTAL PLANS / 75`, which is exactly this, done deliberately.
+ *
+ * Two levels only, and only for a CONTENT miss: climbing far enough always
+ * reaches `body`, where every assertion passes and none of them means
+ * anything. Two is the card, the row, the tile — the smallest thing that
+ * holds a label and its value together.
+ */
+export const MAX_KIN_CLIMB = 2;
+
+/**
+ * How many deterministic attempts must fail before the agent is asked at all.
+ *
+ * Three, as asked for directly (2026-08-25): the fast read, the late read,
+ * and at least one repair — by then the page has given the same answer three
+ * times and a fourth deterministic attempt will not differ.
+ */
+export const AGENT_TRIAGE_AFTER = 3;
+
+/** What one read-only look at the page concluded about a step that failed. */
+export type TriageVerdict = 'proved' | 'can-heal' | 'fail';
+
+/**
+ * Read a triage verdict out of the agent's own answer.
+ *
+ * The verdict rides in the decision's `value` because that is a field the
+ * structured schema already has — a new field on every action's shape would
+ * cost every prompt in the system tokens for one rung's sake. `fail` is the
+ * default reading of anything unrecognised: the safe direction here is to
+ * spend nothing and let the step fail on the evidence it already had.
+ */
+export function triageVerdictOf(value: string | null | undefined): TriageVerdict {
+  const word = (value ?? '').trim().toLowerCase();
+  if (word.startsWith('proved')) return 'proved';
+  if (word.startsWith('can-heal') || word.startsWith('can heal')) return 'can-heal';
+  return 'fail';
+}
+
+export function ancestorSelectors(selector: string, levels = MAX_KIN_CLIMB): string[] {
+  const trimmed = selector.trim();
+  if (trimmed === '' || /\bxpath=/.test(trimmed)) return [];
+  const out: string[] = [];
+  for (let level = 1; level <= levels; level += 1) {
+    out.push(`${trimmed} >> xpath=${new Array(level).fill('..').join('/')}`);
+  }
+  return out;
 }
 
 /**
@@ -822,6 +935,8 @@ export class SmartRunner {
   /** The caption now showing, re-applied whenever a navigation wipes it. */
   #caption = '';
   readonly #agentAssist: boolean;
+  /** Whether this run may exercise the backend at all — see `assertBackendAllowed`. */
+  readonly #backend: boolean;
   /**
    * Selectors that already exhausted the ladder in this run, keyed by
    * `url :: selector`, valued with the step index that established it. Never
@@ -908,6 +1023,7 @@ export class SmartRunner {
       options.screenshots ?? ((options.video ?? 'on') !== 'off' ? 'on-failure' : 'all');
     this.#captureDelayMs = options.captureDelayMs ?? DEFAULT_CAPTURE_DELAY_MS;
     this.#agentAssist = options.agentAssist ?? false;
+    this.#backend = options.backend ?? true;
     this.stepRepair = options.stepRepair ?? null;
     this.#stepDelayMs =
       options.stepDelayMs ?? ((options.video ?? 'on') === 'always' ? DEMONSTRATION_STEP_DELAY_MS : 0);
@@ -2810,6 +2926,24 @@ export class SmartRunner {
    * return to the deterministic fast path. Use for multi-page navigations
    * whose interstitials aren't known ahead of time.
    */
+  /**
+   * **Layer three of "not even present."** Throw before a backend step runs.
+   *
+   * `runFlow` already refuses a flow that carries one, so reaching this means
+   * a caller drove the runner directly — the MCP server, the repair loop, an
+   * embedder. Belt and braces on purpose: the rule is that a run with backend
+   * testing off touches no endpoint and no database by ANY route, and a rule
+   * enforced in one place is a rule with a hole in it.
+   */
+  assertBackendAllowed(action: string): void {
+    if (this.#backend || !BACKEND_TIER_ACTIONS.has(action)) return;
+    throw new BackendDisabledError(
+      `"${action}" is a backend step and this run has backend testing turned off. This is a ` +
+        'limit the run was given, not a finding about the application — turn backend testing ' +
+        'on, or prove the claim through the page.',
+    );
+  }
+
   async workflow(goal: string, script?: readonly WorkflowScriptStep[] | undefined): Promise<AgentRecord> {
     const startedAt = new Date().toISOString();
     const started = Date.now();
@@ -3107,7 +3241,14 @@ export class SmartRunner {
     const netMark = this.#takeNetMark();
 
     try {
-      const result = await this.#resolve(action, selector, intent, run, netMark);
+      const result = await this.#resolve(
+        action,
+        selector,
+        intent,
+        run,
+        netMark,
+        typeof detail?.['expected'] === 'string' ? (detail['expected'] as string) : undefined,
+      );
       this.bundle.addStep({
         action,
         intent,
@@ -4066,8 +4207,13 @@ export class SmartRunner {
     run: (locator: Locator, timeoutMs: number) => Promise<unknown>,
     /** Network-observer timestamp taken when this step began, if observing. */
     netMark?: number | undefined,
+    /** The text this step is looking for, when it is looking for one. */
+    expected?: string | undefined,
   ): Promise<ResolveResult<unknown>> {
     const attempts: string[] = [];
+    // Candidates the healer proposed and refused. Evidence about what was
+    // tried, carried onto whatever failure this step ultimately records.
+    let rejectedHeals: RejectedHeal[] | undefined;
 
     // What (if anything) Playwright said intercepted the pointer — fuel for
     // the overlay rung below.
@@ -4449,230 +4595,86 @@ export class SmartRunner {
       }
     }
 
-    // 3. Control plane — costs tokens.
-    if (!this.#healer) {
-      attempts.push('jit: healer disabled');
-      return this.#agentRescue(action, selector, intent, run, attempts);
-    }
-
-    let outcome: Awaited<ReturnType<JitHealer['heal']>>;
-    try {
-      // The most recent attempt is the most direct evidence of what's wrong
-      // right now — e.g. a strict-mode violation ("resolved to 126 elements")
-      // needs a very different fix than a plain not-found timeout.
-      const failureReason = attempts[attempts.length - 1];
-      outcome = await this.#healer.heal({
-        page: this.page,
-        action,
-        selector,
-        intent,
-        failureReason,
-        caseContext: this.#caseContext,
-      });
-    } catch (error) {
-      if (error instanceof HealUnavailableError) {
-        // The provider failed, not the page. Counted apart and worded apart:
-        // "unavailable" must never read as "the control is absent".
-        this.bundle.noteHealUnavailable();
-        attempts.push(`jit: unavailable — ${describe(error)} (a provider fact, not a page fact)`);
-      } else {
-        attempts.push(`jit: ${describe(error)}`);
-      }
-      // The healer's refused candidates are evidence — carry them onto
-      // whatever failure this step ultimately records.
-      const rejectedHeals = error instanceof HealFailedError ? error.rejectedHeals : undefined;
-      try {
-        return await this.#agentRescue(action, selector, intent, run, attempts);
-      } catch (resolutionError) {
-        if (resolutionError instanceof StepResolutionError && rejectedHeals?.length) {
-          resolutionError.rejectedHeals = rejectedHeals;
+    // 2.9. **Kin — $0.** The selector resolved every time and only its TEXT
+    // missed: the element is right and the answer is beside it, not in it.
+    // A summary card is a label and a value in separate elements, so
+    // `text=Total plans` can never contain "75" however long it is given.
+    // Climbing to the card and comparing there is what an author writes by
+    // hand as `>> xpath=..`, and it costs nothing — so it belongs before the
+    // healer, which on this exact shape proposed `text="68"` (find an element
+    // containing the answer: circular) at 0.20 confidence and was rightly
+    // refused. Only for a content miss, and only two levels: climb far enough
+    // and every assertion passes against `body`.
+    if (attempts.length > 0 && attempts.every(isContentMiss)) {
+      for (const kin of ancestorSelectors(selector)) {
+        try {
+          const value = await run(this.page.locator(kin).first(), this.#fastTimeoutMs);
+          this.#recordRuntimeDefect(
+            'usability',
+            'low',
+            `The value is beside the label, not inside it: ${selector}`,
+            `"${selector}" resolves the label alone, whose text can never contain the expected ` +
+              `value; "${kin}" holds both and the claim holds there. Write the assertion against ` +
+              'the container (the card, the row, the tile) so the run stops rediscovering it.',
+            selector,
+          );
+          return { value, resolution: 'kin', resolvedSelector: kin };
+        } catch (error) {
+          attempts.push(`kin "${kin}": ${describe(error)}`);
         }
-        throw resolutionError;
       }
     }
 
-    const heal: HealRecord = {
-      from: selector,
-      to: outcome.selector,
-      strategy: outcome.suggestion.strategy,
-      confidence: outcome.suggestion.confidence,
-      reasoning: outcome.suggestion.reasoning,
-      model: this.#healer.model.id,
-      latencyMs: outcome.latencyMs,
-      inputTokens: outcome.suggestion.inputTokens,
-      outputTokens: outcome.suggestion.outputTokens,
-    };
+    // 3. **Control plane — where determinism ends, and it ends in two calls.**
+    //
+    // The standing rule (2026-08-26, asked for directly): a step whose
+    // deterministic ladder has failed gets ONE look and, at most, ONE repair.
+    // `#agentTriage` owns both and can spend no more.
+    //
+    // The healer keeps its place ahead of that for the one thing it is good
+    // at — a WRONG SELECTOR on the right page. It reads a static tree and
+    // proposes a different string, which is exactly the wrong tool for a
+    // CONTENT miss: measured (be100 PL_03_01), asked why `text=Total plans`
+    // did not contain "75", it proposed `text="68"` — find an element
+    // containing the expected value, which is circular — at 0.20 confidence,
+    // and was rightly refused. So a content miss skips it entirely and goes
+    // to the agent, which can look at the page and answer where the value is.
+    const contentMiss = attempts.length > 0 && attempts.every(isContentMiss);
 
-    try {
-      const value = await run(this.page.locator(outcome.selector), this.#healedTimeoutMs);
-      await this.#flagTimingHeal(selector, outcome.selector);
-      return { value, resolution: 'jit', resolvedSelector: outcome.selector, heal };
-    } catch (error) {
-      // The selector resolved during verification but the action still failed —
-      // don't keep a repair that can't carry the step.
-      this.#cache.delete(cacheKey);
-      attempts.push(`jit "${outcome.selector}": ${describe(error)}`);
-      return this.#agentRescue(action, selector, intent, run, attempts);
-    }
-  }
+    if (!contentMiss) {
+      if (!this.#healer) {
+        attempts.push('jit: healer disabled');
+      } else {
+        let outcome: Awaited<ReturnType<JitHealer['heal']>> | null = null;
+        try {
+          // The most recent attempt is the most direct evidence of what's wrong
+          // right now — e.g. a strict-mode violation ("resolved to 126 elements")
+          // needs a very different fix than a plain not-found timeout.
+          const failureReason = attempts[attempts.length - 1];
+          outcome = await this.#healer.heal({
+            page: this.page,
+            action,
+            selector,
+            intent,
+            failureReason,
+            caseContext: this.#caseContext,
+          });
+        } catch (error) {
+          if (error instanceof HealUnavailableError) {
+            // The provider failed, not the page. Counted apart and worded apart:
+            // "unavailable" must never read as "the control is absent".
+            this.bundle.noteHealUnavailable();
+            attempts.push(`jit: unavailable — ${describe(error)} (a provider fact, not a page fact)`);
+          } else {
+            attempts.push(`jit: ${describe(error)}`);
+          }
+          // The healer's refused candidates are evidence — carry them onto
+          // whatever failure this step ultimately records.
+          rejectedHeals = error instanceof HealFailedError ? error.rejectedHeals : undefined;
+        }
 
-  /**
-   * Last rung: let the agent make the control reachable, then run the
-   * author's own selector against the page it opened up.
-   *
-   * **The division of labour with the healer is the point.** The healer fixes
-   * a *wrong selector on the right page* — it reads one static tree and
-   * proposes a different string. It is helpless against the opposite problem,
-   * a *right selector on the wrong page state*: a control behind a closed
-   * menu, below the fold, or on a view that has not finished hydrating is
-   * simply not in the tree, so there is nothing for it to propose. Only
-   * something that can *act* can fix that, and acting is what the agent does.
-   *
-   * **The author's selector still has to resolve.** The agent is not allowed
-   * to perform the step — it prepares the page, and then the original selector
-   * (and its free variants) is retried exactly as written. That is the same
-   * guarantee the dialog rung gives, and it is what keeps this from becoming a
-   * machine that makes tests pass: if the control the author named is still
-   * not there afterwards, the step still fails.
-   *
-   * **An assertion is never offered this.** A claim that only holds because an
-   * agent went and made it true is worse than a failed claim — the suite goes
-   * green while the feature is broken. `ASSERTION_ACTIONS` decides, the same
-   * list that stops the generator emitting a case with nothing to prove.
-   *
-   * **Opt-in** (`--agent-assist`), because unlike every rung above it this one
-   * *changes the application* before the step runs: it clicks, it types, it
-   * navigates. That is a decision about someone's system, not a default. Same
-   * reasoning as `--follow-buttons` and `--probe`.
-   */
-  async #agentRescue<T>(
-    action: string,
-    selector: string,
-    intent: string | undefined,
-    run: (locator: Locator, timeoutMs: number) => Promise<unknown>,
-    attempts: string[],
-  ): Promise<ResolveResult<T>> {
-    if (!this.#agentAssist || !this.#agent) {
-      throw new StepResolutionError(selector, attempts);
-    }
-    if ((ASSERTION_ACTIONS as readonly string[]).includes(action)) {
-      // Spelled out rather than silently skipped: "the agent could have been
-      // tried here and deliberately was not" is the interesting fact.
-      attempts.push('agent: not offered to an assertion — a claim it made true proves nothing');
-      throw new StepResolutionError(selector, attempts);
-    }
-
-    // The old goal — "make this control reachable" — presumed the control was
-    // merely hidden, and that presumption is what made PB_01_01's PDPA
-    // consent screen unreachable: a full-page "Accept and continue"
-    // interstitial is not a closed menu, not an ARIA dialog (so `modal.ts`
-    // cannot see it) and not a pointer-interception (so the overlay rung
-    // cannot either). Nothing in the ladder was equipped to even ask what was
-    // on the page. So the agent is asked to look first and choose — including
-    // choosing to do nothing, which is a legitimate answer and is recorded as
-    // one.
-    const goal =
-      `The test expected this and it is not on the page: ` +
-      `${intent ?? `the target of "${selector}"`} (selector: "${selector}").\n` +
-      `FIRST look at what IS on the page and decide whether something ` +
-      `unexpected is standing in the way — a consent or privacy screen, an ` +
-      `interstitial, a notice, an onboarding step, or a modal the test does ` +
-      `not mention.\n` +
-      `If something is: decide what an ordinary user would do about it, do ` +
-      `ONLY that, and stop.\n` +
-      `If nothing is in the way, the control may simply be out of reach — ` +
-      `open the menu, tab or disclosure it lives behind, scroll it into view, ` +
-      `or wait for the view to finish loading.\n` +
-      `If nothing is in the way and nothing would reveal it, do NOT act at ` +
-      `all: call finish and say so. Declining is a correct answer here.\n` +
-      `Either way, do NOT perform the test's own step — the test will click ` +
-      `or type into "${selector}" itself. Call finish as soon as you are done.`;
-
-    let record: AgentRecord;
-    try {
-      record = await this.#agent.run(this.page, goal, {
-        memory: cacheAgentMemory(this.#cache),
-        caseContext: this.#caseContext,
-        ...(this.#agentDbProbe() ?? {}),
-      });
-    } catch (error) {
-      // `run` is documented never to throw; belt and braces, because a throw
-      // here would turn a failed step into a failed run.
-      attempts.push(`agent: ${describe(error)}`);
-      throw new StepResolutionError(selector, attempts);
-    }
-
-    // Whatever the agent *says*, the only evidence that counts is the author's
-    // selector resolving. Free variants included, since the agent may have
-    // revealed a control whose name differs only in case.
-    for (const candidate of [selector, relaxRoleName(selector), qualifyBareRole(selector)]) {
-      if (candidate === null) continue;
-      try {
-        const value = (await run(this.page.locator(candidate), this.#healedTimeoutMs)) as T;
-        this.#recordRuntimeDefect(
-          'usability',
-          'medium',
-          'A step only worked after the agent decided what was in the way',
-          `"${selector}" was not reachable until the agent acted. It judged: ` +
-            `${decisionFrom(record, true).observed || record.summary}. It chose: ` +
-            `${decisionFrom(record, true).decided}. ` +
-            `The flow does not describe this interaction — add the step that handles ` +
-            `it (accept the notice, open the menu, switch the tab, scroll) so the run ` +
-            `stops paying a model to rediscover it every time.`,
-          selector,
-        );
-        return {
-          value,
-          resolution: 'agent',
-          resolvedSelector: candidate,
-          agent: record,
-          decision: decisionFrom(record, true),
-        };
-      } catch {
-        // Try the next variant; the aggregate failure is reported below.
-      }
-    }
-
-    // The healer's blind spot is a tree that did not contain the answer, and
-    // the agent has just changed the page — so this is the one moment a second
-    // repair is worth paying for. It is a different question from the first
-    // heal, asked of a different page: the menu is open now, the list has
-    // loaded, the control is finally in the tree. One extra call, at the
-    // bottom of the most expensive rung, and only when the author's own
-    // selector has already been retried and failed.
-    if (this.#healer) {
-      try {
-        const outcome = await this.#healer.heal({
-          page: this.page,
-          action,
-          selector,
-          intent,
-          failureReason:
-            `the control was not reachable until an agent acted (${record.summary}); ` +
-            `this is the page as it now stands`,
-          caseContext: this.#caseContext,
-        });
-        const value = (await run(
-          this.page.locator(outcome.selector),
-          this.#healedTimeoutMs,
-        )) as T;
-        this.#recordRuntimeDefect(
-          'usability',
-          'medium',
-          'A step needed both the agent and a repair',
-          `"${selector}" was neither reachable nor correct: the agent had to act ` +
-            `(${record.summary}) and the selector then had to be repaired to ` +
-            `"${outcome.selector}". Two model calls for one step — worth fixing the ` +
-            `flow rather than paying this every run.`,
-          selector,
-        );
-        return {
-          value,
-          resolution: 'agent',
-          resolvedSelector: outcome.selector,
-          agent: record,
-          decision: decisionFrom(record, true),
-          heal: {
+        if (outcome !== null) {
+          const heal: HealRecord = {
             from: selector,
             to: outcome.selector,
             strategy: outcome.suggestion.strategy,
@@ -4682,25 +4684,205 @@ export class SmartRunner {
             latencyMs: outcome.latencyMs,
             inputTokens: outcome.suggestion.inputTokens,
             outputTokens: outcome.suggestion.outputTokens,
-          },
-        };
-      } catch (error) {
-        attempts.push(`agent+jit: ${describe(error)}`);
+          };
+          try {
+            const value = await run(this.page.locator(outcome.selector), this.#healedTimeoutMs);
+            await this.#flagTimingHeal(selector, outcome.selector);
+            return { value, resolution: 'jit', resolvedSelector: outcome.selector, heal };
+          } catch (error) {
+            // The selector resolved during verification but the action still
+            // failed — don't keep a repair that can't carry the step.
+            this.#cache.delete(cacheKey);
+            attempts.push(`jit "${outcome.selector}": ${describe(error)}`);
+          }
+        }
       }
     }
 
-    attempts.push(
-      `agent: ${record.success ? 'reported success' : 'gave up'} (${record.summary}) but ` +
-        `"${selector}" still does not resolve`,
-    );
-    // The step is failing, and the decision goes with it. "The agent looked
-    // and chose to do nothing" and "the agent was never consulted" are
-    // different facts about a dead-ended step, and only one of them tells a
-    // reader the ladder was exhausted honestly.
+    // 4. **The last rung, and the only one left.** One look; one repair if the
+    // look earned it. Returns null when nothing was accepted, and then the
+    // step fails on the evidence it has already gathered.
+    const triaged = await this.#agentTriage(action, selector, intent, expected, run, attempts);
+    if (triaged !== null) return triaged;
+
     const failure = new StepResolutionError(selector, attempts);
-    failure.decision = decisionFrom(record, false);
+    if (rejectedHeals?.length) failure.rejectedHeals = rejectedHeals;
     throw failure;
   }
+
+  /**
+   * When determinism runs out: one look, then at most one repair.
+   *
+   * Live (be100 PL_03_01, 2026-08-25): six assertions in one case failed as
+   * `expected text to contain "68", got "REIMBURSEMENT BY EMPLOYEE AND HR"`.
+   * The element was right, its text was a fragment of the answer, and the
+   * whole answer — `REIMBURSEMENT BY EMPLOYEE AND HR 68` — sat in the run's
+   * own recorded page excerpt. The healer, which reads one static tree and
+   * proposes a string, offered `text="68"`: find an element containing the
+   * expected value, which is circular, and it was rightly refused at 0.20.
+   * Nothing in the ladder could ask the page the question the step was asking.
+   *
+   * **Two model turns, and never more.** One read-only look returns a verdict
+   * — `proved`, `can-heal`, `fail`. Only `can-heal` buys a second, repairing
+   * run. `fail` returns at once, so a genuinely broken page costs one call.
+   *
+   * **Neither verdict is believed.** After each stage the harness re-runs the
+   * author's own comparison — against the element the agent named, or against
+   * the author's own selector on the page it opened up. A step whose claim
+   * does not hold afterwards fails exactly as it would have. That is what
+   * lets an ASSERTION be offered this at all, where the old `#agentRescue`
+   * was refused one: the read stage cannot act, and the repair stage offered
+   * to an assertion is restricted to actions that REVEAL what already exists
+   * (`REVEAL_ACTIONS` — open, focus, follow; never type), so a claim can be
+   * brought into view but never typed into existence.
+   *
+   * Returns null when nothing was accepted, so the caller falls through and
+   * the step fails on the evidence it already had.
+   */
+  async #agentTriage<T>(
+    action: string,
+    selector: string,
+    intent: string | undefined,
+    expected: string | undefined,
+    run: (locator: Locator, timeoutMs: number) => Promise<unknown>,
+    attempts: string[],
+  ): Promise<ResolveResult<T> | null> {
+    if (!this.#agent) return null;
+    const asserting = (ASSERTION_ACTIONS as readonly string[]).includes(action);
+    const what =
+      intent ??
+      (expected === undefined
+        ? `the target of "${selector}"`
+        : `${JSON.stringify(expected)} for what "${selector}" names`);
+    const lastFailure = attempts[attempts.length - 1] ?? 'it did not resolve';
+
+    // ---- Stage 1: one read-only look -------------------------------------
+    const lookGoal =
+      `A test step has failed ${attempts.length} times and you are being asked to look at the ` +
+      `page ONCE and say which of three things is true. Do NOT click, type or navigate — you ` +
+      `may only wait and scroll.\n` +
+      `THE STEP: ${action} "${selector}"${expected === undefined ? '' : `, expecting ${JSON.stringify(expected)}`}.\n` +
+      `WHAT IT IS FOR: ${what}.\n` +
+      `WHAT WENT WRONG LAST: ${lastFailure}\n` +
+      `Answer by calling finish, with the verdict in "value" and nothing else in it:\n` +
+      `  value="proved" — the page ALREADY shows this, just not where the test looked. Put the ` +
+      `Playwright selector of the element that shows it in "selector". Do not name an element ` +
+      `merely because the text appears in it somewhere; it must be the one this step is about.\n` +
+      `  value="can-heal" — it is not visible yet, but something on this page would reveal it: a ` +
+      `menu to open, a tab to switch, a notice to accept, a page to go to. Say which in ` +
+      `"reasoning".\n` +
+      `  value="fail" — the page genuinely does not offer this. Say why in "reasoning". This is a ` +
+      `correct answer and costs nothing further; prefer it to a guess.`;
+
+    let look: AgentRecord;
+    try {
+      look = await this.#agent.run(this.page, lookGoal, {
+        readOnly: true,
+        caseContext: this.#caseContext,
+      });
+    } catch (error) {
+      attempts.push(`agent-look: ${describe(error)}`);
+      return null;
+    }
+
+    const answer = [...look.actions].reverse().find((one) => one.action === 'finish');
+    const verdict = triageVerdictOf(answer?.value);
+    attempts.push(`agent-look: ${verdict} — ${look.summary}`);
+
+    if (verdict === 'proved') {
+      const named = answer?.selector ?? null;
+      if (named !== null && named.trim() !== '') {
+        try {
+          const value = (await run(this.page.locator(named).first(), this.#healedTimeoutMs)) as T;
+          this.#recordRuntimeDefect(
+            'usability',
+            'low',
+            `The claim holds, but not where the flow looked: ${selector}`,
+            `"${selector}" could not carry this step. Asked to look, the agent named ` +
+              `"${named}", and the claim holds there. Write the step against that element so the ` +
+              'run stops paying a model to rediscover it.',
+            selector,
+          );
+          return { value, resolution: 'agent-read', resolvedSelector: named, agent: look };
+        } catch (error) {
+          // Named and checked, and it did not hold. The agent's account is
+          // never the evidence — this is what that costs it.
+          attempts.push(`agent-look "${named}": ${describe(error)}`);
+        }
+      } else {
+        attempts.push('agent-look: said proved but named no element — an account, not evidence');
+      }
+      return null;
+    }
+
+    if (verdict !== 'can-heal') return null;
+
+    // **The repair is opt-in** (`--agent-assist`), because unlike the look
+    // above it this stage *changes the application* before the step runs: it
+    // clicks, it opens, it navigates. That is a decision about someone's
+    // system, not a default — the same reasoning as `--follow-buttons` and
+    // `--probe`, and the contract the deleted `#agentRescue` carried. The
+    // look stage is ungated precisely because it cannot act.
+    if (!this.#agentAssist) {
+      attempts.push(
+        'agent-heal: not attempted — the agent judged this reachable, but acting on the page ' +
+          'is opt-in (--agent-assist)',
+      );
+      return null;
+    }
+
+    // ---- Stage 2: one repairing run --------------------------------------
+    const healGoal =
+      `You looked at this page and said the test's target can be reached. Do that now, in as few ` +
+      `actions as you can, and then stop.\n` +
+      `WHAT IS NEEDED: ${what}\n` +
+      `WHAT YOU SAID STANDS IN THE WAY: ${decisionFrom(look, true).decided || look.summary}\n` +
+      (asserting
+        ? `This step is an ASSERTION, so you may only REVEAL what is already there — open the ` +
+          `menu, switch the tab, accept the notice, go to the page, scroll. You may not type, ` +
+          `and you must not create, submit or change anything: a claim you made true proves ` +
+          `nothing.\n`
+        : `Do NOT perform the test's own step — the test will act on "${selector}" itself.\n`) +
+      `Call finish as soon as the target is reachable.`;
+
+    let heal: AgentRecord;
+    try {
+      heal = await this.#agent.run(this.page, healGoal, {
+        memory: cacheAgentMemory(this.#cache),
+        caseContext: this.#caseContext,
+        ...(asserting ? { allowedActions: REVEAL_ACTIONS } : {}),
+      });
+    } catch (error) {
+      attempts.push(`agent-heal: ${describe(error)}`);
+      return null;
+    }
+
+    // The author's own selector, and its free variants — exactly the
+    // `#agentRescue` contract. Whatever the agent says it did, this is what
+    // decides the step.
+    for (const candidate of [selector, relaxRoleName(selector), qualifyBareRole(selector)]) {
+      if (candidate === null) continue;
+      try {
+        const value = (await run(this.page.locator(candidate), this.#healedTimeoutMs)) as T;
+        this.#recordRuntimeDefect(
+          'usability',
+          'medium',
+          'A step only worked after the agent revealed what the flow does not describe',
+          `"${selector}" could not carry this step until the agent acted. It judged: ` +
+            `${decisionFrom(look, true).observed || look.summary}. It chose: ` +
+            `${decisionFrom(heal, true).decided || heal.summary}. Add the step that handles this ` +
+            '(accept the notice, open the menu, switch the tab, scroll) so the run stops paying a ' +
+            'model to rediscover it every time.',
+          selector,
+        );
+        return { value, resolution: 'agent', resolvedSelector: candidate, agent: heal };
+      } catch (error) {
+        attempts.push(`agent-heal "${candidate}": ${describe(error)}`);
+      }
+    }
+    return null;
+  }
+
 
   /**
    * Detect and dismiss a blocking dialog, with no wait — called only after
@@ -5296,7 +5478,10 @@ function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] 
       error.name === 'NoResponseError' ||
       // A 405/501 is the endpoint refusing the VERB the test chose — the
       // flow's fault, never the application's (2026-08-25, be100 PL_03_03).
-      error.name === 'MethodRefusedError')
+      error.name === 'MethodRefusedError' ||
+      // A backend step in a run that turned the backend off is a limit the
+      // run was given, never a finding about the application.
+      error.name === 'BackendDisabledError')
   ) {
     return 'error';
   }
@@ -5376,7 +5561,9 @@ function reconstructionFutile(error: unknown): boolean {
       error.name === 'UnknownVariableError' ||
       error.name === 'NoResponseError' ||
       // Nor can a rewrite give a handler a method it does not export.
-      error.name === 'MethodRefusedError')
+      error.name === 'MethodRefusedError' ||
+      // Nor can a rewrite give a run permission it was denied.
+      error.name === 'BackendDisabledError')
   ) {
     return true;
   }
@@ -5900,6 +6087,7 @@ async function executeStep(
   baseUrl: string | undefined,
   issues: StepIssue[],
 ): Promise<void> {
+  runner.assertBackendAllowed(step.action);
   {
     switch (step.action) {
       case 'use':
@@ -6161,6 +6349,13 @@ export interface RunFlowOptions {
   captureDelayMs?: number | undefined;
   /** Let the agent make an unreachable control reachable. Default false. */
   agentAssist?: boolean | undefined;
+  /**
+   * Whether this run may exercise the backend at all. Default `true` — the
+   * behaviour every run had before the toggle existed. `false` and no HTTP or
+   * database step may run: not authored, not loaded, not dispatched. See
+   * `backendStepsIn`.
+   */
+  backend?: boolean | undefined;
   /**
    * In-run step reconstruction: on a step's failure, ask this model for a
    * rebuilt step against the live page and retry, up to
@@ -6476,6 +6671,26 @@ export async function runFlow(
   const flow = hasIncludes(sourceFlow)
     ? await expandFlow(sourceFlow, { dir: options.flowDir ?? process.cwd() })
     : sourceFlow;
+
+  // **Layer two of "not even present".** A flow carrying a backend step under
+  // `backend: false` is refused HERE, before a browser opens and before a
+  // single step runs — and refused, never silently skipped: a suite that
+  // quietly drops assertions goes green having proved less than it claims,
+  // which is the vacuous-pass failure in a new coat. The steps are named, so
+  // the fix is obvious (turn the toggle on, or re-author the case).
+  if (options.backend === false) {
+    const offenders = backendStepsIn([...(flow.setup ?? []), ...flow.steps]);
+    if (offenders.length > 0) {
+      throw new BackendDisabledError(
+        `"${flow.name}" carries ${offenders.length} backend step(s) — ` +
+          `${[...new Set(offenders.map((one) => one.action))].join(', ')} — but this run has ` +
+          'backend testing turned off. Nothing was run: a case whose claim needs the backend ' +
+          'cannot be proved by silently dropping the step that proves it. Turn backend testing ' +
+          'on (and give the run a database URL), or re-author the case to prove its claim ' +
+          'through the page.',
+      );
+    }
+  }
 
   // Announced before the browser-free branch, so both paths report a plan and
   // a progress bar does not silently stay empty for an API-only flow.

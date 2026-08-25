@@ -33,6 +33,7 @@ import {
   stringifyExtracted,
 } from '../src/api/variables.js';
 import { harnessOnly } from '../src/cli/exit.js';
+import { backendStepsIn } from '../src/engine/runner.js';
 import { ContextEngine } from '../src/context/context-engine.js';
 import {
   ApiTestGenerator,
@@ -327,6 +328,20 @@ describe('frontend and backend result split', () => {
     assert.equal(bare.backendHint, undefined);
     // It is a note, never a verdict: the step passed and the run is clean.
     assert.equal(builder.finish().status, 'passed');
+  });
+
+  it('finds every backend step a flow carries, including inside a when branch', () => {
+    assert.deepEqual(
+      backendStepsIn([
+        { action: 'goto', url: '/x' },
+        { action: 'expectVisible', selector: 'text=Plans' },
+        { action: 'request', method: 'GET', url: '/api/plans' },
+        { action: 'when', visible: 'text=x', then: [{ action: 'expectDbRow', table: 't', where: {} }] },
+      ]).map((one) => one.action),
+      ['request', 'expectDbRow'],
+      'a branch is still part of the flow',
+    );
+    assert.deepEqual(backendStepsIn([{ action: 'expectVisible', selector: 'text=x' }]), []);
   });
 
   it('routes defects by category, because they route to different teams', () => {
@@ -962,6 +977,34 @@ describe('api flow steps (CDP)', { skip: skipBrowser }, () => {
     assert.equal(bundle.status, 'passed', bundle.error ?? 'a 401 assertion should pass');
     assert.equal(bundle.summary.failed, 0);
     assert.equal(bundle.summary.apiFailures, 0, 'a 401 is a result, not a transport failure');
+  });
+
+  it('refuses a flow carrying a backend step when the run has backend off', async () => {
+    // "Not even present" is the rule the user set. The author cannot write
+    // one; this is the layer for a flow authored earlier, edited by hand, or
+    // rewritten by the repair loop. Refused, never silently skipped — a suite
+    // that quietly drops assertions goes green having proved less than it
+    // claims, which is the vacuous pass in a new coat.
+    const flow: Flow = {
+      name: 'db claim, backend off',
+      baseUrl: origin,
+      steps: [
+        { action: 'goto', url: '/' },
+        { action: 'expectDbRow', table: 'benefit_plan', where: {}, count: '1' },
+      ],
+    };
+    await assert.rejects(
+      () => runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'be-off.json'), backend: false }),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.name === 'BackendDisabledError' &&
+        /carries 1 backend step\(s\)/.test(error.message) &&
+        /expectDbRow/.test(error.message),
+    );
+    // On (the default) it is nobody's business — the step runs and fails on
+    // its own terms, because no database is configured here.
+    const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'be-on.json') });
+    assert.ok(bundle.steps.some((step) => step.action === 'expectDbRow'), 'the step ran');
   });
 
   it('scores a 405 as the test\'s own method drift, never a backend defect', async () => {

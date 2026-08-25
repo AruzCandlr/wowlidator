@@ -2461,6 +2461,7 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
     screenshots: options.screenshots,
     video: options.video,
     agentAssist: options.agentAssist,
+      backend: options.backend,
     captureDelayMs: options.captureDelayMs,
       stepDelayMs: options.stepDelayMs,
     makeHealer: buildHealer(options),

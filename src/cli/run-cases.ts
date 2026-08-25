@@ -430,6 +430,7 @@ export async function runCases(
         screenshots: options.screenshots,
         video: options.video,
         agentAssist: options.agentAssist,
+      backend: options.backend,
         captureDelayMs: options.captureDelayMs,
       stepDelayMs: options.stepDelayMs,
         makeHealer: buildHealer(options, where.healHints),

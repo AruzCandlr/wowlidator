@@ -28,6 +28,7 @@ import { ProofBundleBuilder, formatStepLine, isPassing, type ProofStep } from '.
 import {
   NATIVE_SUBMIT_UNNAMED,
   StepResolutionError,
+  triageVerdictOf,
   fillsLostToHydration,
   nativeFormResubmitDetected,
   signInDidNotTakeMessage,
@@ -37,6 +38,7 @@ import {
   type Flow,
   type FlowStep,
 } from '../src/engine/runner.js';
+import { WorkflowAgent, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
 import {
   LlmHealerModel,
   JitHealer,
@@ -191,6 +193,24 @@ describe('cache-manager', () => {
     const cache = new CacheManager({ filePath: path, warn: false });
     await cache.load();
     assert.equal(cache.size, 0);
+  });
+});
+
+describe('triageVerdictOf', () => {
+  it('reads the three verdicts, and treats anything else as fail', () => {
+    // The verdict rides in the decision's `value` — a field the structured
+    // schema already has, so no prompt in the system pays for a new one.
+    assert.equal(triageVerdictOf('proved'), 'proved');
+    assert.equal(triageVerdictOf('  PROVED — the card shows it '), 'proved');
+    assert.equal(triageVerdictOf('can-heal'), 'can-heal');
+    assert.equal(triageVerdictOf('can heal, the menu is closed'), 'can-heal');
+    assert.equal(triageVerdictOf('fail'), 'fail');
+    // The safe direction: anything unrecognised spends nothing further and
+    // lets the step fail on the evidence it already had.
+    assert.equal(triageVerdictOf('maybe?'), 'fail');
+    assert.equal(triageVerdictOf(''), 'fail');
+    assert.equal(triageVerdictOf(null), 'fail');
+    assert.equal(triageVerdictOf(undefined), 'fail');
   });
 });
 
@@ -802,6 +822,129 @@ describe('ladder guards: dead ends, denial, timing (CDP)', { skip: skipBrowser }
       server.close((error) => (error ? reject(error) : resolve())),
     );
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it('spends one look on a fail verdict, and never a second call', async () => {
+    // The rule: a step whose deterministic ladder has failed gets ONE look
+    // and, only if that look earns it, ONE repair. A page that genuinely does
+    // not offer the thing costs exactly one call — `fail` returns at once.
+    const calls: string[] = [];
+    const agentModel = {
+      id: 'stub:triage',
+      async decide(observation: AgentObservation) {
+        calls.push(observation.goal);
+        return {
+          action: 'finish' as const,
+          selector: '',
+          value: 'fail',
+          url: '',
+          reasoning: 'the page does not offer this at all',
+        };
+      },
+    };
+    const bundle = await runFlow(
+      {
+        name: 'fail verdict',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'expectVisible', selector: 'role=button[name="Nowhere at all" i]' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'triage-fail.json'),
+        fastTimeoutMs: 400,
+        healer: null,
+        agent: new WorkflowAgent({ model: agentModel, maxSteps: 3 }),
+        agentAssist: true,
+      },
+    );
+
+    assert.notEqual(bundle.status, 'passed', 'a page that lacks the control still fails');
+    assert.equal(calls.length, 1, 'one look, and no repair bought by a fail verdict');
+    const step = bundle.steps.find((one) => one.action === 'expectVisible');
+    assert.match(step?.error ?? '', /agent-look: fail/);
+  });
+
+  it('spends a second call only on can-heal, and still checks the result', async () => {
+    // `can-heal` is the one verdict that buys a repair — and the repair is
+    // checked, never believed: the author's own selector must resolve
+    // afterwards or the step fails exactly as it would have.
+    const goals: string[] = [];
+    const agentModel = {
+      id: 'stub:triage',
+      async decide(observation: AgentObservation) {
+        const first = !goals.includes(observation.goal);
+        if (first) goals.push(observation.goal);
+        // Look: say it can be reached. Repair: claim to have done it.
+        return goals.length === 1
+          ? { action: 'finish' as const, selector: '', value: 'can-heal', url: '', reasoning: 'a menu is closed' }
+          : { action: 'finish' as const, selector: '', value: '', url: '', reasoning: 'opened it' };
+      },
+    };
+    const bundle = await runFlow(
+      {
+        name: 'can-heal verdict',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'expectVisible', selector: 'role=button[name="Still nowhere" i]' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'triage-heal.json'),
+        fastTimeoutMs: 400,
+        healer: null,
+        agent: new WorkflowAgent({ model: agentModel, maxSteps: 3 }),
+        agentAssist: true,
+      },
+    );
+
+    assert.equal(goals.length, 2, 'exactly two goals: one look, one repair — never a third');
+    // The agent said it opened the way; the control still is not there, so
+    // the step fails. Its account of itself decides nothing.
+    assert.notEqual(bundle.status, 'passed');
+    const step = bundle.steps.find((one) => one.action === 'expectVisible');
+    assert.match(step?.error ?? '', /agent-look: can-heal/);
+    assert.match(step?.error ?? '', /agent-heal/);
+  });
+
+  it('will not act on a can-heal verdict unless acting was opted into', async () => {
+    // The look is ungated — it cannot change anything. The repair changes the
+    // application, and that has always been a decision about someone's
+    // system rather than a default.
+    const goals: string[] = [];
+    const agentModel = {
+      id: 'stub:triage',
+      async decide(observation: AgentObservation) {
+        goals.push(observation.goal);
+        return { action: 'finish' as const, selector: '', value: 'can-heal', url: '', reasoning: 'a menu is closed' };
+      },
+    };
+    const bundle = await runFlow(
+      {
+        name: 'can-heal, no assist',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'expectVisible', selector: 'role=button[name="Not here either" i]' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'triage-noassist.json'),
+        fastTimeoutMs: 400,
+        healer: null,
+        agent: new WorkflowAgent({ model: agentModel, maxSteps: 3 }),
+        // agentAssist deliberately absent — the default.
+      },
+    );
+
+    assert.equal(goals.length, 1, 'the look happened; the repair did not');
+    const step = bundle.steps.find((one) => one.action === 'expectVisible');
+    assert.match(step?.error ?? '', /acting on the page is opt-in \(--agent-assist\)/);
   });
 
   it('never repays an identical dead end — one fast attempt, no second heal', async () => {
