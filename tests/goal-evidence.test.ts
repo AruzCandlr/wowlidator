@@ -23,6 +23,7 @@ import {
   goalEvidence,
   goalMentionsSignIn,
   looksLikeSignIn,
+  verificationOnlyGoal,
 } from '../src/orchestrator/goal-evidence.js';
 import { WorkflowAgent, type AgentDecision } from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
@@ -137,6 +138,31 @@ describe('goalEvidence', () => {
       goalEvidence('Open and inspect all seven probation cases one by one', 'http://x.test/a', 'http://x.test/b'),
       null,
     );
+  });
+});
+
+describe('verificationOnlyGoal', () => {
+  it('is true for a goal that asks only to look — the assertion\'s job, not the agent\'s', () => {
+    // be100 PL_03_01 (2026-08-25): this goal cost five turns, ended "agent
+    // stalled", failed the step with a `high` defect — and the next step's
+    // expectText "75" passed against the very page the agent stood on.
+    assert.equal(verificationOnlyGoal('verify the Total Plans summary card shows count 75'), true);
+    assert.equal(verificationOnlyGoal('check that the Records box reads 5'), true);
+    assert.equal(
+      verificationOnlyGoal('ตรวจสอบจำนวน Reimbursement by HR ที่แสดงบนหน้าจอ'),
+      true,
+      'the sheet\'s own language counts',
+    );
+  });
+
+  it('is false the moment the goal asks for any work', () => {
+    // Narrow on purpose: a leg that acts and then checks is a real leg, and
+    // its failure is a real failure.
+    assert.equal(verificationOnlyGoal('open the Status dropdown and verify Active is listed'), false);
+    assert.equal(verificationOnlyGoal('click Create Plan, then check the dialog title'), false);
+    assert.equal(verificationOnlyGoal('navigate to the plans page and confirm that it loaded'), false);
+    // No verify verb at all is not a verification goal either.
+    assert.equal(verificationOnlyGoal('reach the application details page'), false);
   });
 });
 

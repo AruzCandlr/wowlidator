@@ -87,7 +87,15 @@ export function decisionKey(d: DecisionLike): string {
  */
 export function focusTree(nodes: readonly AxNode[], goal: string, maxNodes: number): AxNode[] {
   if (nodes.length <= maxNodes) return [...nodes];
-  const goalTerms = new Set(tokenize(goal).filter((t) => t.length > 2));
+  // A NUMBER in the goal survives the length filter. `tokenize` returns "75"
+  // and the old `length > 2` cut it — so on "verify the Total Plans summary
+  // card shows count 75" the one term that names the answer scored nothing,
+  // the node named "75" ranked below every sidebar link, and the agent was
+  // shown the label with the value removed. Live (be100 PL_03_01,
+  // 2026-08-25): five turns of scrolling for a number that was on screen,
+  // "the required numeric values are not present in the accessibility tree",
+  // and the very next step's `expectText "75"` passed.
+  const goalTerms = new Set(tokenize(goal).filter((t) => t.length > 2 || /^\d+$/.test(t)));
   const score = (n: AxNode): number => {
     const text = `${n.name} ${n.value} ${n.description}`.toLowerCase();
     let hits = 0;
@@ -95,11 +103,27 @@ export function focusTree(nodes: readonly AxNode[], goal: string, maxNodes: numb
     return hits * 10 + (INTERACTIVE_ROLES.has(n.role) ? 1 : 0);
   };
   const order = new Map(nodes.map((n, i) => [n, i]));
-  const kept = [...nodes]
-    .sort((a, b) => score(b) - score(a) || (order.get(a) ?? 0) - (order.get(b) ?? 0))
-    .slice(0, maxNodes);
-  kept.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
-  return kept;
+  const ranked = [...nodes].sort(
+    (a, b) => score(b) - score(a) || (order.get(a) ?? 0) - (order.get(b) ?? 0),
+  );
+  // A matched node's DOCUMENT NEIGHBOURS come with it. A summary card is a
+  // label and a value as sibling nodes — `StaticText "TOTAL PLANS"` then
+  // `StaticText "75"` — and neither reads as the card alone: keeping the
+  // label and cutting the number is exactly the shape that sent PL_03_01
+  // hunting. The neighbour rides in on the match's own rank, so it cannot
+  // push out a higher-scoring node; it only fills the budget ahead of
+  // unrelated ones.
+  const kept = new Set<AxNode>();
+  for (const node of ranked) {
+    if (kept.size >= maxNodes) break;
+    kept.add(node);
+    if (score(node) < 10) continue; // only a goal MATCH earns neighbours
+    const at = order.get(node) ?? -1;
+    for (const near of [nodes[at - 1], nodes[at + 1]]) {
+      if (near !== undefined && kept.size < maxNodes) kept.add(near);
+    }
+  }
+  return [...kept].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
 }
 
 /** Render a focused tree the same way the healer renders its own. */

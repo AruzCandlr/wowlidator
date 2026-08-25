@@ -90,6 +90,7 @@ import {
   agentModelUnavailable,
   goalEvidence,
   looksLikeSignIn,
+  verificationOnlyGoal,
 } from '../orchestrator/goal-evidence.js';
 import { performSignIn, performSignOut, acceptConsentGate, acceptConsentGateAnywhere, CONSENT_GATE_URL_PATTERN } from './sign-in.js';
 import { generateValue, type DataKind } from '../data/mock-data.js';
@@ -2864,7 +2865,28 @@ export class SmartRunner {
     //
     // The page is asked first. Only when it has nothing to say does the
     // agent's own account stand.
-    const evidence = record.success ? null : goalEvidence(goal, urlBefore, urlAfter);
+    let evidence = record.success ? null : goalEvidence(goal, urlBefore, urlAfter);
+    // **A goal that only asks to LOOK is the assertion's job, and the agent's
+    // failure at it is not a fact about the application.** The agent's
+    // contract here is prepare-never-perform; a "verify X shows Y" leg asks
+    // it to be the oracle, and an agent can only ever produce an account of
+    // itself — which this module exists to distrust. Live (be100 PL_03_01,
+    // 2026-08-25): five turns hunting a number that was on the page, "agent
+    // stalled", the step failed with a `high` defect, and the NEXT step's
+    // `expectText "75"` passed against the same page. The leg hands off:
+    // whatever the flow asserts afterwards is the proof, and a step that
+    // asserts nothing afterwards is caught by `unsettledWorkflowClaim` at
+    // authoring time, not invented into a defect here.
+    const deferred = evidence === null && !record.success && verificationOnlyGoal(goal);
+    if (deferred) {
+      evidence = {
+        rule: 'verification-deferred',
+        reason:
+          'the goal asked only to verify, which is an assertion\'s job and not the agent\'s — ' +
+          `the agent's own account (${record.summary}) is not evidence either way, and the ` +
+          'checks that follow this step are what settle the claim',
+      };
+    }
     // A model that could not answer is not an application that could not
     // comply. Same rule the healer follows for `HealUnavailableError`: a
     // provider fact, not a page fact, and it must never be worded as "the goal
@@ -2914,16 +2936,26 @@ export class SmartRunner {
     });
 
     if (evidence !== null) {
-      // Green, and still a finding: the goal was met, but the agent spent its
-      // whole budget failing to notice, and every run will pay that again
-      // until the goal is tightened or the leg is written as ordinary steps.
+      // Green, and still a finding — the turns were paid for either way, and
+      // a leg that keeps costing them is a fact about the FLOW worth a
+      // reader's attention. The two cases read differently, though: one is an
+      // agent that succeeded and failed to notice; the other is a goal that
+      // was never the agent's to answer.
       this.#recordRuntimeDefect(
         'usability',
         'low',
-        `Workflow agent under-reported its own success: ${goal}`,
-        `The agent said "${record.summary}" after ${record.turns} turn(s), but ${evidence.reason}. ` +
-          'The step is judged on that evidence rather than on the agent\'s account of itself. ' +
-          'The turns were still paid for: narrow the goal, or replace this leg with ordinary steps.',
+        deferred
+          ? `Workflow goal asks the agent to verify, which is an assertion's job: ${goal}`
+          : `Workflow agent under-reported its own success: ${goal}`,
+        deferred
+          ? `The agent said "${record.summary}" after ${record.turns} turn(s). ${evidence.reason} ` +
+            'A workflow leg prepares the page; it cannot be the oracle, because an agent produces an ' +
+            'account of itself and never evidence. Write this leg as the assertion it is ' +
+            '(expectText / expectVisible on the value), and keep the agent for the navigation that ' +
+            'reaches the page.'
+          : `The agent said "${record.summary}" after ${record.turns} turn(s), but ${evidence.reason}. ` +
+            'The step is judged on that evidence rather than on the agent\'s account of itself. ' +
+            'The turns were still paid for: narrow the goal, or replace this leg with ordinary steps.',
         undefined,
       );
     }

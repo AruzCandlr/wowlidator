@@ -115,6 +115,41 @@ describe('focusTree', () => {
     assert.ok(kept.findIndex((n) => n.name === 'Probation Reviews') < kept.findIndex((n) => n.name === 'Review'));
   });
 
+  it("keeps the goal's own NUMBER, and the value beside the label it matched", () => {
+    // be100 PL_03_01 (2026-08-25): "verify the Total Plans summary card shows
+    // count 75" against a 345-node page. "75" is two characters, so the old
+    // `length > 2` filter dropped the one term that named the answer; the
+    // node called "75" scored zero and lost its place to sixty sidebar links.
+    // The agent was shown the LABEL with the value removed, spent five turns
+    // scrolling for it, and the next step's expectText "75" passed.
+    const nodes: AxNode[] = [
+      ...Array.from({ length: 40 }, (_, i) => node('link', `Sidebar ${i}`)),
+      node('StaticText', 'TOTAL PLANS'),
+      node('StaticText', '75'),
+      ...Array.from({ length: 40 }, (_, i) => node('button', `Row action ${i}`)),
+    ];
+    const kept = focusTree(nodes, 'verify the Total Plans summary card shows count 75', 12);
+    const names = kept.map((n) => n.name);
+    assert.ok(names.includes('TOTAL PLANS'), 'the label the goal names');
+    assert.ok(names.includes('75'), 'and the count, which is the whole answer');
+    assert.ok(names.indexOf('TOTAL PLANS') < names.indexOf('75'), 'in document order');
+  });
+
+  it('carries a matched label\'s neighbour even when the value shares no goal term', () => {
+    // A summary card is a label and a value as siblings, and the value is
+    // frequently a number the goal does not state. Keeping the label and
+    // cutting the number is the same failure with none of the evidence.
+    const nodes: AxNode[] = [
+      ...Array.from({ length: 30 }, (_, i) => node('link', `Noise ${i}`)),
+      node('StaticText', 'REIMBURSEMENT BY HR'),
+      node('StaticText', '4'),
+      ...Array.from({ length: 30 }, (_, i) => node('button', `Action ${i}`)),
+    ];
+    const kept = focusTree(nodes, 'read the Reimbursement by HR card', 10).map((n) => n.name);
+    assert.ok(kept.includes('REIMBURSEMENT BY HR'));
+    assert.ok(kept.includes('4'), 'the neighbour rides in on the match');
+  });
+
   it('returns everything untouched when it fits', () => {
     const nodes = [node('button', 'A'), node('link', 'B')];
     assert.deepEqual(focusTree(nodes, 'anything', 10), nodes);

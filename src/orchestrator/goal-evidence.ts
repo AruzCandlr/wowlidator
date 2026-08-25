@@ -125,7 +125,7 @@ export function goalMentionsSignIn(goal: string): boolean {
 /** What settled a goal, when something did. */
 export interface GoalEvidence {
   /** Which rule held — recorded on the step so a reader can audit the call. */
-  rule: 'destination' | 'left-sign-in';
+  rule: 'destination' | 'left-sign-in' | 'verification-deferred';
   /** One line, in the report's voice, saying what the page showed. */
   reason: string;
 }
@@ -222,6 +222,48 @@ export function goalEvidence(goal: string, before: string, after: string): GoalE
  * provider fact, not a page fact, and it must never read as "the goal is
  * unreachable".
  */
+/**
+ * Verbs that ask the agent to CHANGE something. A goal carrying any of them
+ * wants work done, and an agent that could not do it failed at something real.
+ */
+const ACTION_VERB =
+  /\b(click|press|open|fill|type|enter|select|choose|submit|save|create|add|insert|delete|remove|edit|update|change|correct|navigate|go to|search|filter|sort|upload|download|sign in|log in|sign out|accept|confirm|apply|toggle|expand|collapse|scroll to)\b/i;
+/**
+ * Verbs that ask only to LOOK. The Thai verb sits outside the `\b` group on
+ * purpose: JavaScript's word boundary is defined over `[A-Za-z0-9_]`, so
+ * `\bตรวจสอบ\b` can never match — there is no word character next to a Thai
+ * one for the boundary to sit on. (Caught by the test that asserts the
+ * sheet's own language counts; be100's goals are written in it.)
+ */
+const VERIFY_VERB = /\b(verify|check|confirm that|ensure|assert|observe|read|see|compare|validate)\b|ตรวจสอบ/i;
+
+/**
+ * Is this goal asking the agent to VERIFY something and nothing else?
+ *
+ * The agent's contract in this codebase is **prepare, never perform**: it
+ * drives the browser to where a claim can be checked, and the flow's own
+ * assertion is what checks it (`#agentRescue` has always worked this way —
+ * the agent prepares the page, then the author's own selector is retried).
+ * A goal like "verify the Total Plans summary card shows count 75" asks the
+ * agent to do the assertion's job instead, and an agent cannot produce
+ * evidence — only an account of itself, which this module exists to distrust.
+ *
+ * Live (be100 PL_03_01, 2026-08-25): that goal, five turns of the agent
+ * scrolling for a number the tree had (the count was being cut from its view
+ * — see `focusTree`), "agent stalled: nothing advanced", the step recorded
+ * failed with a `high` defect — and then `expectText "75"` PASSED against the
+ * very page the agent had been standing on the whole time. The agent never
+ * needed to succeed; it needed to hand off.
+ *
+ * Deliberately narrow: any action verb anywhere in the goal disqualifies it,
+ * so a goal that acts and then checks ("open the dialog and verify the title")
+ * is a real leg whose failure is real. Only a goal that asks for nothing but
+ * looking defers.
+ */
+export function verificationOnlyGoal(goal: string): boolean {
+  return VERIFY_VERB.test(goal) && !ACTION_VERB.test(goal);
+}
+
 export function agentModelUnavailable(summary: string): boolean {
   return /^agent model failed:/i.test(summary);
 }
