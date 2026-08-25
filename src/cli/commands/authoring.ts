@@ -854,6 +854,18 @@ async function tableInventory(
  * transparent re-scan. The scan's openapi/db-schema inputs are carried from
  * the registry so a re-scan never silently drops endpoint or table nodes.
  */
+/**
+ * The PAGE routes a graph declares — api handlers excluded, because a
+ * navigation is not a request and an endpoint is not a page a flow can visit.
+ * One definition, so authoring and the runtime 404 check cannot disagree
+ * about what the application says it serves.
+ */
+function declaredPageRoutes(graph: ProjectGraph | null): readonly string[] {
+  return (graph?.nodes ?? [])
+    .filter((node) => node.kind === 'route' && node.meta?.['type'] !== 'api')
+    .map((node) => node.name);
+}
+
 async function loadRepoGraph(
   options: CliOptions,
   log?: ((line: string) => void) | undefined,
@@ -2140,6 +2152,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
                     dir,
                     group,
                     indexTitle: `wowlidator catalog — ${document.name}`,
+                    declaredRoutes: declaredPageRoutes(repoContextGraph),
                     ledger: ledgerSpec,
                     healHints: suiteHealHints,
                     onCaseDone: (finished) => {
@@ -2305,6 +2318,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       dir,
       group,
       indexTitle: `wowlidator catalog — ${document.name}`,
+      declaredRoutes: declaredPageRoutes(repoContextGraph),
       ledger: ledgerSpec,
       healHints: healHintsFrom(repoContextGraph ?? null, contextDocs),
     },

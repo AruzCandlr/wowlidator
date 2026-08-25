@@ -869,6 +869,17 @@ describe('api flow steps (CDP)', { skip: skipBrowser }, () => {
       // The PL_03_03 shape: a real endpoint that answers writes only. Next.js
       // answers 405 for a handler file with no matching export, and so does
       // this fixture.
+      // A page the app declares and serves, and one it does not have at all.
+      if (url === '/en/admin/benefits/plans') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<h1>Benefit Plan Catalog</h1>');
+        return;
+      }
+      if (url.startsWith('/en/')) {
+        res.writeHead(404, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<h1>404 — not found</h1>');
+        return;
+      }
       if (url === '/api/write-only') {
         if (req.method === 'POST') json(201, { ok: true });
         else json(405, { error: 'method not allowed' });
@@ -977,6 +988,60 @@ describe('api flow steps (CDP)', { skip: skipBrowser }, () => {
     assert.equal(bundle.status, 'passed', bundle.error ?? 'a 401 assertion should pass');
     assert.equal(bundle.summary.failed, 0);
     assert.equal(bundle.summary.apiFailures, 0, 'a 401 is a result, not a transport failure');
+  });
+
+  it('reads a 404 against the codebase: undeclared route is the test\'s fault', async () => {
+    // be100 PL_02_03 (2026-08-25): a flow navigated to a path that answered
+    // 404. `page.goto` resolves for any response, so the navigation recorded
+    // as PASSED and every step after it failed against the error page —
+    // filed against the application. The repository knew the real routes.
+    const declaredRoutes = ['/:locale/admin/benefits/plans', '/:locale/login'];
+    const bundle = await runFlow(
+      {
+        name: 'invented page',
+        baseUrl: origin,
+        steps: [{ action: 'goto', url: '/en/admin/benefits/plans/create' }],
+      },
+      { cdpUrl: CDP_URL, cachePath: join(dir, 'route-404.json'), declaredRoutes },
+    );
+
+    const nav = bundle.steps.find((step) => step.action === 'goto');
+    assert.equal(nav?.status, 'error', 'error, not failed — the test asked for a page that does not exist');
+    assert.match(nav?.error ?? '', /declares no route for it/);
+    assert.match(nav?.error ?? '', /\/:locale\/admin\/benefits\/plans/, 'and names what they meant');
+    assert.equal(
+      bundle.defects.some((defect) => defect.category === 'backend' || defect.severity === 'high'),
+      false,
+      'nothing is filed against an application that never claimed to have this page',
+    );
+    // Every broken step being `error` is what records the case blocked.
+    assert.match(harnessOnly(bundle) ?? '', /the harness ended this case/);
+  });
+
+  it('reads a 404 against the codebase: a declared route not served IS the app failing', async () => {
+    // The opposite finding, and only the codebase can tell them apart.
+    const bundle = await runFlow(
+      { name: 'declared but missing', baseUrl: origin, steps: [{ action: 'goto', url: '/en/admin/benefits/missing' }] },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'route-declared.json'),
+        declaredRoutes: ['/:locale/admin/benefits/missing'],
+      },
+    );
+    const defect = bundle.defects.find((one) => /did not serve a page it declares/.test(one.title));
+    assert.ok(defect, 'the application should serve a page it declares and did not');
+    assert.equal(defect?.severity, 'high');
+  });
+
+  it('keeps no opinion about a 404 when no repository is indexed', async () => {
+    // Silence where the evidence runs out: with nothing indexed there is no
+    // way to tell an invented path from a broken page, and guessing either
+    // way would be worse than the honest failure the later steps produce.
+    const bundle = await runFlow(
+      { name: 'no index', baseUrl: origin, steps: [{ action: 'goto', url: '/en/whatever' }] },
+      { cdpUrl: CDP_URL, cachePath: join(dir, 'route-noindex.json') },
+    );
+    assert.equal(bundle.steps.find((step) => step.action === 'goto')?.status, 'passed');
   });
 
   it('refuses a flow carrying a backend step when the run has backend off', async () => {

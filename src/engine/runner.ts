@@ -10,7 +10,16 @@
  * The escalation ladder is the whole design. Steps 1, 1.5, and 2 cost nothing.
  */
 
-import { chromium, type Browser, type BrowserContext, type Locator, type Page } from 'playwright';
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type Locator,
+  type Page,
+  // Aliased: `Response` alone collides with the DOM/undici global, and the
+  // one a navigation returns is Playwright's.
+  type Response as PlaywrightResponse,
+} from 'playwright';
 import { rm } from 'node:fs/promises';
 
 import { ApiActions, type FlowRequestSpec } from '../api/api-actions.js';
@@ -71,6 +80,7 @@ import { RunHistory, analyseTrend } from '../history/run-history.js';
 import { HealFailedError, HealUnavailableError, JitHealer, captureAxTree } from '../healer/jit-healer.js';
 import type { FlowRepairModel } from '../repair/flow-repair-model.js';
 import { REVEAL_ACTIONS, WorkflowAgent, cacheAgentMemory, type AgentDbProbe, type PlanStep } from '../orchestrator/workflow-agent.js';
+import { nearestRoutes, routeIsDeclared } from '../context/route-match.js';
 import { SessionVault, type StoredSession } from './session-vault.js';
 
 /**
@@ -236,6 +246,14 @@ export interface SmartRunnerOptions {
    * `backendStepsIn`.
    */
   backend?: boolean | undefined;
+  /**
+   * Route patterns the application's own repository declares, from the
+   * indexed context graph. What lets a 404 be read correctly: on a path the
+   * codebase declares no route for, the TEST asked for a page that does not
+   * exist; on a path it does declare, the APPLICATION failed to serve one it
+   * has. Empty means no repository was indexed and the run keeps no opinion.
+   */
+  declaredRoutes?: readonly string[] | undefined;
   /**
    * In-run step reconstruction: on a step's failure, ask this model for a
    * rebuilt step against the live page and retry, up to
@@ -517,6 +535,25 @@ export class StepResolutionError extends Error {
  */
 export class BackendDisabledError extends Error {
   override readonly name = 'BackendDisabledError';
+}
+
+/**
+ * A navigation the application answered with 4xx, for a path its own codebase
+ * declares no route for.
+ *
+ * Harness-class, in the family of `MethodRefusedError`: the test asked for a
+ * page that does not exist, which says nothing about the application. Live
+ * (be100 PL_02_03, 2026-08-25): a flow navigated to a URL that returned 404,
+ * every later step then failed against the error page, and the run filed
+ * those failures against the app. `page.goto`'s response was being discarded,
+ * so the 404 was recorded as a passing step.
+ *
+ * The distinction the codebase makes possible: a 404 on a path the repository
+ * DOES declare is the opposite finding — the app should serve it and does
+ * not — and that is a real defect, raised as one rather than through this.
+ */
+export class RouteNotFoundError extends Error {
+  override readonly name = 'RouteNotFoundError';
 }
 
 /**
@@ -937,6 +974,8 @@ export class SmartRunner {
   readonly #agentAssist: boolean;
   /** Whether this run may exercise the backend at all — see `assertBackendAllowed`. */
   readonly #backend: boolean;
+  /** What the application's repository declares — see `RouteNotFoundError`. */
+  readonly #declaredRoutes: readonly string[];
   /**
    * Selectors that already exhausted the ladder in this run, keyed by
    * `url :: selector`, valued with the step index that established it. Never
@@ -1024,6 +1063,7 @@ export class SmartRunner {
     this.#captureDelayMs = options.captureDelayMs ?? DEFAULT_CAPTURE_DELAY_MS;
     this.#agentAssist = options.agentAssist ?? false;
     this.#backend = options.backend ?? true;
+    this.#declaredRoutes = options.declaredRoutes ?? [];
     this.stepRepair = options.stepRepair ?? null;
     this.#stepDelayMs =
       options.stepDelayMs ?? ((options.video ?? 'on') === 'always' ? DEMONSTRATION_STEP_DELAY_MS : 0);
@@ -1264,7 +1304,11 @@ export class SmartRunner {
     }
     const urlBeforeNav = this.page.url();
     try {
-      await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+      // **The response is evidence, and it used to be thrown away.** Playwright
+      // resolves `goto` for any response at all, so a 404 recorded as a
+      // passing navigation and every later step then failed against an error
+      // page — attributed to the application (be100 PL_02_03, 2026-08-25).
+      const response = await this.page.goto(url, { waitUntil: 'domcontentloaded' });
       // **The session bootstrap.** A goto that asked for an ordinary page and
       // landed on the sign-in screen, in a run that HAS credentials and whose
       // flow contains no sign-in of its own, is a flow that assumes a session
@@ -1288,6 +1332,11 @@ export class SmartRunner {
       // Deterministic here: detect by content, accept, re-issue this goto
       // once. Never when the goto asked for the gate itself.
       const consentSettled = await this.#settleConsentGate(url, urlBeforeNav);
+      // Judged after the recoveries above, never before: a consent gate or a
+      // session bootstrap can turn a first 4xx into a perfectly good page,
+      // and failing on the first answer would blame the app for a redirect
+      // it was always going to make.
+      await this.#judgeNavigationStatus(url, response);
       this.bundle.addStep({
         action: 'goto',
         selector: null,
@@ -2926,6 +2975,53 @@ export class SmartRunner {
    * return to the deterministic fast path. Use for multi-page navigations
    * whose interstitials aren't known ahead of time.
    */
+  /**
+   * What a navigation's status code means, read against the codebase.
+   *
+   * A 4xx is not one finding but two, and only the repository can tell them
+   * apart:
+   *
+   *   * the path is declared → the application should serve this page and
+   *     did not. A real defect, filed as one.
+   *   * the path is NOT declared → the TEST asked for a page that does not
+   *     exist. Harness-class: it says nothing about the application, and the
+   *     nearest declared routes are named so the flow can be corrected.
+   *
+   * With no repository indexed there is no way to tell, so the run keeps no
+   * opinion and the navigation stands as it always did — a 404 page will fail
+   * the steps that follow on their own evidence.
+   */
+  async #judgeNavigationStatus(asked: string, response: PlaywrightResponse | null): Promise<void> {
+    const status = response?.status() ?? 0;
+    if (status < 400) return;
+    // The page may have been rescued since — a consent gate accepted, a
+    // session established — and what it is showing NOW is what matters.
+    const landed = this.page.url();
+    const declared = routeIsDeclared(landed, this.#declaredRoutes);
+    if (declared === true) {
+      this.#recordRuntimeDefect(
+        'functional',
+        'high',
+        `The application did not serve a page it declares: ${asked}`,
+        `Navigating to ${asked} was answered ${status}. The application's own codebase declares a ` +
+          'route for this path, so this is the application failing to serve a page it has, not the ' +
+          'test asking for one that does not exist.',
+        undefined,
+      );
+      return;
+    }
+    if (declared === null) return; // nothing indexed — no opinion to offer
+    const near = nearestRoutes(landed, this.#declaredRoutes);
+    throw new RouteNotFoundError(
+      `${asked} was answered ${status}, and the application's codebase declares no route for it — ` +
+        'the test asked for a page that does not exist, which is test drift rather than a finding ' +
+        'about the application.' +
+        (near.length === 0
+          ? ' No declared route resembles it closely enough to suggest.'
+          : ` The nearest routes it does declare: ${near.map((one: { pattern: string }) => one.pattern).join(', ')}.`),
+    );
+  }
+
   /**
    * **Layer three of "not even present."** Throw before a backend step runs.
    *
@@ -5481,7 +5577,10 @@ function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] 
       error.name === 'MethodRefusedError' ||
       // A backend step in a run that turned the backend off is a limit the
       // run was given, never a finding about the application.
-      error.name === 'BackendDisabledError')
+      error.name === 'BackendDisabledError' ||
+      // A 404 on a path the codebase declares no route for is the test asking
+      // for a page that does not exist, never the application failing.
+      error.name === 'RouteNotFoundError')
   ) {
     return 'error';
   }
@@ -5563,7 +5662,9 @@ function reconstructionFutile(error: unknown): boolean {
       // Nor can a rewrite give a handler a method it does not export.
       error.name === 'MethodRefusedError' ||
       // Nor can a rewrite give a run permission it was denied.
-      error.name === 'BackendDisabledError')
+      error.name === 'BackendDisabledError' ||
+      // Nor can a rewritten selector conjure a route the application lacks.
+      error.name === 'RouteNotFoundError')
   ) {
     return true;
   }
@@ -6357,6 +6458,14 @@ export interface RunFlowOptions {
    */
   backend?: boolean | undefined;
   /**
+   * Route patterns the application's own repository declares, from the
+   * indexed context graph. What lets a 404 be read correctly: on a path the
+   * codebase declares no route for, the TEST asked for a page that does not
+   * exist; on a path it does declare, the APPLICATION failed to serve one it
+   * has. Empty means no repository was indexed and the run keeps no opinion.
+   */
+  declaredRoutes?: readonly string[] | undefined;
+  /**
    * In-run step reconstruction: on a step's failure, ask this model for a
    * rebuilt step against the live page and retry, up to
    * `STEP_RECONSTRUCT_TRIES` total tries, before final classification.
@@ -6765,6 +6874,14 @@ export async function runFlow(
       screenshots: options.screenshots,
       captureDelayMs: options.captureDelayMs,
       agentAssist: options.agentAssist,
+      // Forwarded explicitly, like everything else here. `connect` takes a
+      // fresh object rather than this one, so a field added to
+      // `RunFlowOptions` and not listed here reaches the runner as undefined
+      // and its guard silently never fires — which is exactly what happened
+      // to both of these when they were added (caught 2026-08-26 by a 404
+      // test that saw `routes=0` inside the runner).
+      backend: options.backend,
+      declaredRoutes: options.declaredRoutes,
       stepRepair: options.stepRepair,
       stepDelayMs: options.stepDelayMs,
       coverage: options.coverage,

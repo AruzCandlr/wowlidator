@@ -139,3 +139,81 @@ export function concreteRouteUrl(pattern: string, startUrl: string): RouteUrlRes
 
   return { ok: true, url: `${origin}/${out.join('/')}` };
 }
+
+/**
+ * The declared routes closest to a path, best first.
+ *
+ * Two questions need this and must answer them the same way: an authored
+ * `goto` to a path the repository declares no route for, and a navigation
+ * that came back 404. Both end in "you meant one of these", and a suggestion
+ * that differed between them would be two opinions about one codebase.
+ *
+ * Scoring is segment-wise and deliberately blunt — there is no cleverness to
+ * be had here, only the shape a person would eyeball. A leading matched
+ * prefix is worth most (`/en/admin/benefits/plan` against
+ * `/:locale/admin/benefits/plans` is obviously the near miss), a `:param`
+ * counts as a weaker match than a literal (it matches anything, so it says
+ * less), and the same segment count is a small bonus. A route sharing nothing
+ * with the path scores zero and is never suggested: silence beats a wrong
+ * suggestion, which is how "did you mean" becomes noise.
+ */
+export function nearestRoutes(
+  path: string,
+  patterns: readonly string[],
+  limit = 3,
+): { pattern: string; score: number }[] {
+  const wanted = (pathnameOf(path) ?? path).split('/').filter(Boolean).map((s) => s.toLowerCase());
+  if (wanted.length === 0) return [];
+
+  const scored = patterns.map((pattern) => {
+    const parts = pattern.split('/').filter(Boolean).map((s) => s.toLowerCase());
+    let score = 0;
+    let prefix = 0;
+    let prefixIntact = true;
+    // Literal agreement is what makes a suggestion mean anything. A pattern
+    // of nothing but `:param` segments matches every path of its length, so
+    // without this `/en/totally/made/up` "resembles" `/:locale/admin/:id` —
+    // three suggestions, all noise, and a reader learns to skip the line.
+    let literals = 0;
+    for (let i = 0; i < Math.max(wanted.length, parts.length); i += 1) {
+      const a = wanted[i];
+      const b = parts[i];
+      if (a === undefined || b === undefined) {
+        prefixIntact = false;
+        continue;
+      }
+      const dynamic = b.startsWith(':') || b.startsWith('*');
+      const hit = dynamic || a === b;
+      if (hit) {
+        // A literal match is worth more than a wildcard: `:locale` matches
+        // anything, so it tells you far less about whether this is the route.
+        score += dynamic ? 1 : 3;
+        if (!dynamic) literals += 1;
+        if (prefixIntact) prefix += 1;
+      } else {
+        prefixIntact = false;
+        // A near-miss segment (plan/plans, benefit/benefits) is the commonest
+        // real mistake and is worth acknowledging, but only just.
+        if (a.startsWith(b) || b.startsWith(a)) score += 1;
+      }
+    }
+    // The prefix is what makes a suggestion recognisable to a reader, so it
+    // is weighted above raw overlap.
+    score += prefix * 2;
+    if (parts.length === wanted.length) score += 1;
+    return { pattern, score: literals === 0 ? 0 : score };
+  });
+
+  return scored
+    .filter((one) => one.score > 0)
+    .sort((a, b) => b.score - a.score || a.pattern.localeCompare(b.pattern))
+    .slice(0, limit);
+}
+
+/** Whether ANY declared route claims this path. Null when nothing is indexed — no opinion. */
+export function routeIsDeclared(path: string, patterns: readonly string[]): boolean | null {
+  if (patterns.length === 0) return null;
+  const wanted = pathnameOf(path) ?? path;
+  return patterns.some((pattern) => matchesRoutePattern(wanted, pattern));
+}
+

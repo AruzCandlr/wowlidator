@@ -39,6 +39,7 @@ import {
   BACKEND_OFF_REASON,
   buildUserPrompt,
   loginProofAssertsLoginPage,
+  ungroundedGoto,
   unindexedRequestMethod,
   wordingClaimAssertsDataValue,
   type AuthorRequest,
@@ -1359,6 +1360,44 @@ describe('wordingClaimAssertsDataValue', () => {
     // Ungrounded authoring cannot tell a label from a row — silence, never a
     // refusal of every honest wording flow.
     assert.equal(wordingClaimAssertsDataValue(claim, steps, ''), null);
+  });
+});
+
+describe('ungroundedGoto', () => {
+  const routes = ['/:locale/admin/benefits/plans', '/:locale/admin/benefits', '/:locale/login'];
+
+  it('refuses a navigation to a page the codebase does not declare, and names the near miss', () => {
+    // be100 PL_02_03: the flow went to a path that answered 404, and every
+    // step after it failed against the error page — attributed to the app.
+    const found = ungroundedGoto(
+      [
+        { action: 'goto', url: '/en/login' },
+        { action: 'goto', url: '/en/admin/benefits/plans/create' },
+      ],
+      routes,
+    );
+    assert.equal(found?.index, 1);
+    assert.equal(found?.url, '/en/admin/benefits/plans/create');
+    assert.equal(found?.near[0], '/:locale/admin/benefits/plans', 'the refusal carries what they meant');
+  });
+
+  it('accepts a declared route, whatever its concrete parameters', () => {
+    assert.equal(
+      ungroundedGoto([{ action: 'goto', url: 'http://localhost:3000/en/admin/benefits/plans' }], routes, 'http://localhost:3000'),
+      null,
+    );
+    assert.equal(ungroundedGoto([{ action: 'goto', url: '/th/login' }], routes), null, ':locale matches any locale');
+  });
+
+  it('keeps no opinion without an index, or about another origin', () => {
+    // Silence is the rule everywhere the evidence runs out: a repo that
+    // declares nothing cannot contradict anything.
+    assert.equal(ungroundedGoto([{ action: 'goto', url: '/en/whatever' }], []), null);
+    assert.equal(
+      ungroundedGoto([{ action: 'goto', url: 'https://accounts.google.com/signin' }], routes, 'http://localhost:3000'),
+      null,
+      "another origin is not this application's routing table's business",
+    );
   });
 });
 

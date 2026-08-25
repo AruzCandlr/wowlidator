@@ -13,10 +13,23 @@
  */
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
 
+/** Read the whole of stdin, for the `-` form. */
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 const htmlPath = process.argv[2];
-const raw = process.argv[3];
-if (!htmlPath || !raw) {
-  console.error("usage: incident-log.mjs <incident.html> '<json entry>'");
+// The entry comes in on stdin when argv omits it or passes `-`. That is the
+// form callers should use: an entry carries prose, and prose in argv is at
+// the mercy of shell quoting and of whatever the platform will accept in an
+// argument — measured 2026-08-26, a 989-byte entry was SIGKILLed before this
+// process could read it, while the same entry on stdin is unremarkable. The
+// argv form is kept for one-line probes by hand.
+const raw = process.argv[3] === undefined || process.argv[3] === '-' ? await readStdin() : process.argv[3];
+if (!htmlPath || raw.trim() === '') {
+  console.error("usage: incident-log.mjs <incident.html> ['<json entry>' | - ]  (entry on stdin by default)");
   process.exit(2);
 }
 const logPath = htmlPath.replace(/\.html$/, '') + '.jsonl';

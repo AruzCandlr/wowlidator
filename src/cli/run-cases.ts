@@ -137,6 +137,15 @@ export async function runCases(
     group: string | undefined;
     indexTitle: string;
     /**
+     * Route patterns the selected repository declares. What lets a 404 be
+     * read correctly at run time: a path the codebase declares no route for
+     * was asked for by the TEST, while one it declares and does not serve is
+     * the application failing. Absent means no repository was indexed and the
+     * run keeps no opinion. Loaded by the caller, which already holds the
+     * graph open for authoring.
+     */
+    declaredRoutes?: readonly string[] | undefined;
+    /**
      * Where to keep the suite's progress ledger (see `suite-progress.ts`),
      * with the case ids the suite set out to prove. Omit and no ledger is
      * kept — `generate --run` has no claims file to resume from.
@@ -431,6 +440,7 @@ export async function runCases(
         video: options.video,
         agentAssist: options.agentAssist,
       backend: options.backend,
+      declaredRoutes: where.declaredRoutes,
         captureDelayMs: options.captureDelayMs,
       stepDelayMs: options.stepDelayMs,
         makeHealer: buildHealer(options, where.healHints),

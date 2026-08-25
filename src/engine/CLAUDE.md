@@ -272,3 +272,19 @@ Three layers, because a rule enforced in one place is a rule with a hole in it:
 
 **Refused, never silently skipped.** A suite that quietly drops assertions goes green having proved less than it claims — the vacuous pass in a new coat. `BackendDisabledError` is harness-class (`classifyStepFailure` → `error`, `reconstructionFutile` → true), so the case is recorded **blocked**: a limit the run was given, never a finding about the application.
 
+## A 404 is two findings, and only the codebase tells them apart
+
+`page.goto` resolves for any response at all, so a navigation that came back 404 was recorded as a **passing** step and every step after it failed against the error page — attributed to the application. Live (be100 PL_02_03, 2026-08-25): the flow had invented a plausible-looking path, and the repository had held the real route list all along.
+
+`#judgeNavigationStatus` reads the response against `declaredRoutes` (the indexed graph's page routes; api handlers excluded, since a navigation is not a request):
+
+- **the path is declared** → the application should serve this page and did not. A real `high` defect, filed as one.
+- **the path is NOT declared** → the TEST asked for a page that does not exist. `RouteNotFoundError`, harness-class (`classifyStepFailure` → `error`, `reconstructionFutile` → true), so the case records **blocked**. The nearest declared routes are named — "that page does not exist" is far less useful than "you meant this one".
+- **nothing indexed** → no opinion. The navigation stands as it always did, and the steps after it fail on their own evidence.
+
+Judged **after** the session bootstrap and the consent gate, never before: either can turn a first 4xx into a perfectly good page, and failing on the first answer would blame the app for a redirect it was always going to make.
+
+`nearestRoutes` (`context/route-match.ts`) scores segment-wise — a matched leading prefix is worth most, a `:param` less than a literal — and requires **at least one literal segment in common**. Without that rule a pattern of nothing but `:param` matches every path of its length, so `/en/totally/made/up` "resembles" three routes and a reader learns to skip the line. The same function serves the authoring lint `ungroundedGoto`, so both halves give one answer about one codebase.
+
+**`runFlow` forwards to `SmartRunner.connect` field by field.** A field added to `RunFlowOptions` and not listed there reaches the runner as `undefined` and its guard silently never fires. Both `backend` and `declaredRoutes` were added and not listed; the 404 test caught it by seeing `routes=0` inside the runner, and `assertBackendAllowed` would otherwise have been dead code shipped green.
+

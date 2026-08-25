@@ -30,7 +30,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # evidence, not bad luck.
 MAX_BARREN_RESUMES=1
 
-log() { node "$HERE/incident-log.mjs" "$INCIDENT" "$1" >/dev/null 2>&1 || true; }
+# The entry goes in on STDIN, never argv: an entry carries prose, and prose in
+# an argument is at the mercy of shell quoting and of what the platform will
+# accept — measured, a 989-byte entry was killed before the logger could read
+# it, and this function's `|| true` would have hidden that forever.
+log() { printf '%s' "$1" | node "$HERE/incident-log.mjs" "$INCIDENT" - >/dev/null 2>&1 || true; }
 state() { node "$HERE/run-state.mjs" "$LEDGER" 2>/dev/null; }
 
 barren=0

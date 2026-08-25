@@ -34,6 +34,7 @@ import { SELECTOR_SYNTAX_RULES, captureAxTree } from '../healer/jit-healer.js';
 import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
 import { matchesRoutePattern } from '../context/context-engine.js';
+import { nearestRoutes, pathnameOf, routeIsDeclared } from '../context/route-match.js';
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
 import { focusTreeText } from '../context/retriever.js';
 import {
@@ -2191,6 +2192,23 @@ export class FlowAuthor {
           );
         }
 
+        const invented = ungroundedGoto(
+          [...(result.setup ?? []), ...result.steps],
+          this.#declaredRoutes,
+          url === undefined ? undefined : new URL(url).origin,
+        );
+        if (invented !== null) {
+          refuse(
+            `the authored flow "${result.name}" navigates to "${invented.url}" (step ${invented.index}), ` +
+              'but the application\'s own codebase declares no route for that path — the page does not ' +
+              'exist, and every step after the navigation would be run against a 404. ' +
+              (invented.near.length === 0
+                ? 'Take the destination from a link in the tree, or reach it by clicking as a user would.'
+                : `The nearest routes it does declare: ${invented.near.join(', ')}. Use one of those, ` +
+                  'or reach the page by clicking as a user would.'),
+          );
+        }
+
         const loginProof = loginProofAssertsLoginPage([...(result.setup ?? []), ...result.steps]);
         if (loginProof !== null) {
           refuse(
@@ -3012,6 +3030,42 @@ export function unindexedRequestMethod(
     // HEAD is served by a GET handler in every framework this indexes.
     if (method === 'HEAD' && declared.has('GET')) continue;
     return { index, method, path, declared: [...declared].sort() };
+  }
+  return null;
+}
+
+/**
+ * A `goto` to a path the application's own codebase declares no route for.
+ *
+ * The prompt already says never to invent an endpoint; this says the same of
+ * a PAGE, and can finally check it. Live (be100 PL_02_03, 2026-08-25): a flow
+ * navigated to a URL that answered 404, every step after it failed against
+ * the error page, and the run filed those failures against the application.
+ * The path was invented — a plausible-looking route derived from a label —
+ * and the repository has held the real list of routes all along.
+ *
+ * Only fires when routes are indexed AND the path looks like an application
+ * page: an absolute URL to another origin is somebody else's business, and a
+ * path with no declared route in a repo that declares none says nothing. The
+ * nearest declared routes ride along in the refusal, because "that page does
+ * not exist" is far less useful than "you meant this one".
+ */
+export function ungroundedGoto(
+  steps: readonly FlowStep[],
+  declaredRoutes: readonly string[] = [],
+  origin?: string | undefined,
+): { index: number; url: string; near: string[] } | null {
+  if (declaredRoutes.length === 0) return null;
+  for (const [index, step] of steps.entries()) {
+    if (step.action !== 'goto') continue;
+    const url = step.url;
+    if (url === '') continue;
+    // Another origin is not this application's routing table's business.
+    if (/^https?:\/\//i.test(url) && origin !== undefined && !url.startsWith(origin)) continue;
+    const path = pathnameOf(url) ?? (url.startsWith('/') ? url : null);
+    if (path === null) continue;
+    if (routeIsDeclared(path, declaredRoutes) !== false) continue;
+    return { index, url, near: nearestRoutes(path, declaredRoutes).map((one) => one.pattern) };
   }
   return null;
 }

@@ -26,6 +26,7 @@ import { detectDbHint } from '../src/context/db-hint.js';
 import { ManifestIngester } from '../src/context/ingesters/manifest-ingester.js';
 import { ComponentIngester } from '../src/context/ingesters/component-ingester.js';
 import { RouteIngester } from '../src/context/ingesters/route-ingester.js';
+import { nearestRoutes, routeIsDeclared } from '../src/context/route-match.js';
 import { TestIngester } from '../src/context/ingesters/test-ingester.js';
 import type { IngestContext, IngestResult, Ingester, ProjectGraph } from '../src/context/types.js';
 
@@ -187,6 +188,47 @@ describe('context engine', () => {
       } finally {
         await rm(root, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('nearestRoutes and routeIsDeclared', () => {
+    const routes = [
+      '/:locale/admin/benefits/plans',
+      '/:locale/admin/benefits/records/:planId',
+      '/:locale/admin/benefits',
+      '/:locale/admin/employees/:id',
+      '/:locale/profile/:tab/benefits',
+    ];
+
+    it('names the route a near-miss path plainly meant', () => {
+      // be100 PL_02_03 (2026-08-25): a flow navigated to a path that answered
+      // 404, and every step after it failed against the error page — filed
+      // against the application. The real route was in the index all along.
+      assert.equal(
+        nearestRoutes('/en/admin/benefits/plans/create', routes)[0]?.pattern,
+        '/:locale/admin/benefits/plans',
+      );
+      // A singular/plural slip is the commonest mistake of all.
+      assert.equal(
+        nearestRoutes('/en/admin/benefits/plan', routes)[0]?.pattern,
+        '/:locale/admin/benefits/plans',
+      );
+    });
+
+    it('says nothing when nothing literal is shared — silence beats a wrong guess', () => {
+      // Every route here has a `:param` first segment, so a purely positional
+      // match would "resemble" this path three ways. Three suggestions, all
+      // noise, and a reader learns to skip the line.
+      assert.deepEqual(nearestRoutes('/en/totally/made/up', routes), []);
+      assert.deepEqual(nearestRoutes('', routes), []);
+    });
+
+    it('answers whether a path is declared, and declines when nothing is indexed', () => {
+      assert.equal(routeIsDeclared('/en/admin/benefits/plans', routes), true);
+      assert.equal(routeIsDeclared('/en/admin/benefits/plans?tab=1', routes), true, 'a query is not part of the route');
+      assert.equal(routeIsDeclared('/en/admin/benefits/nope', routes), false);
+      // No index, no opinion — the caller must not read this as "undeclared".
+      assert.equal(routeIsDeclared('/en/anything', []), null);
     });
   });
 
