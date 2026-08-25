@@ -28,6 +28,7 @@ import { z } from 'zod';
 import { lenientObject } from '../providers/model-output.js';
 import { parseExpectedCallEntry, type ExpectedCall } from '../api/expect-calls.js';
 import { parseDbConditions } from '../db/db-actions.js';
+import { BACKEND_TIER_ACTIONS } from '../engine/proof-bundle.js';
 
 import { SELECTOR_SYNTAX_RULES, captureAxTree } from '../healer/jit-healer.js';
 import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
@@ -294,6 +295,12 @@ export interface AuthorRequest {
    * state.
    */
   tables?: readonly TableInventoryEntry[] | undefined;
+  /**
+   * Whether backend steps may be written at all — see
+   * `FlowAuthorOptions.backend`. Absent means yes, which is what every caller
+   * meant before the toggle existed.
+   */
+  backend?: boolean | undefined;
   /**
    * Controls that exist only after an interaction, from `probeInteractions`.
    * Separate from `axTree` on purpose — "behind a menu" is a different claim
@@ -885,7 +892,7 @@ ${selfCheck([
   'Every unused field is an empty string, and every step has an intent.',
 ])}`;
 
-function buildUserPrompt(request: AuthorRequest): string {
+export function buildUserPrompt(request: AuthorRequest): string {
   const lines = [`Test request: ${request.prompt}`];
   if (request.url) lines.push(`Page URL: ${request.url}`);
   // One line, next to the request it qualifies. The rules for each scope are
@@ -895,6 +902,23 @@ function buildUserPrompt(request: AuthorRequest): string {
       request.scope === 'e2e'
         ? 'Test scope: END-TO-END — the whole journey, and it must leave the page it starts on.'
         : 'Test scope: UNIT — one thing, on this page only.',
+    );
+  }
+  // The toggle, stated before the tables it overrides. A person who turned
+  // the backend off gets visual proof with a note, not a wall of blocked
+  // cases — and the note is the point: it says a stronger proof exists and
+  // this run did not take it.
+  if (request.backend === false) {
+    lines.push(
+      '',
+      'BACKEND TESTING IS OFF for this run. Write NO request, expectStatus, expectJson, ' +
+        'expectHeader, expectCalls, dbSnapshot or expectDb* step — every one of them will be ' +
+        'dropped. Prove each claim through the PAGE: read the number the screen shows, assert the ' +
+        'row the table renders, check the message the form displays. When a claim would be proved ' +
+        'better against HTTP or the database (a count that must match the database, a status a ' +
+        'request returns), still prove it visually AND say so in that step\'s "intent", beginning ' +
+        'with "backend could prove this: " and naming what would be checked. Never skip the claim, ' +
+        'and never pretend the visual check is the stronger one.',
     );
   }
   // Its own labelled section, apart from the tree — "declared in the schema"
@@ -1005,7 +1029,11 @@ export class LlmFlowAuthorModel implements FlowAuthorModel {
 
     let dropped = 0;
     const droppedDetail: DroppedStep[] = [];
-    const allowDb = (request.tables?.length ?? 0) > 0;
+    // Backend off (the run's own toggle) removes the whole family, DB
+    // checks included: the person said this run does not test the backend,
+    // and an indexed schema is permission, not an instruction.
+    const allowBackend = request.backend ?? true;
+    const allowDb = allowBackend && (request.tables?.length ?? 0) > 0;
     const policy = request.policy ?? DEFAULT_MUTATION_POLICY;
     // Narrow and keep each surviving step next to the case it was labelled with:
     // `toFlowStep` returns the runner's own union, which has no room for a label
@@ -1015,10 +1043,19 @@ export class LlmFlowAuthorModel implements FlowAuthorModel {
     const narrow = (steps: z.infer<typeof AuthoredStepSchema>[]): LabelledStep[] => {
       const kept: LabelledStep[] = [];
       for (const raw of steps) {
-        const step = toFlowStep(raw, allowDb, policy);
+        const step = allowBackend || !BACKEND_TIER_ACTIONS.has(raw.action)
+          ? toFlowStep(raw, allowDb, policy)
+          : null;
         if (step === null) {
           dropped += 1;
-          droppedDetail.push({ action: raw.action, reason: dropReasonFor(raw, allowDb, policy), intent: raw.intent });
+          droppedDetail.push({
+            action: raw.action,
+            reason:
+              !allowBackend && BACKEND_TIER_ACTIONS.has(raw.action)
+                ? BACKEND_OFF_REASON
+                : dropReasonFor(raw, allowDb, policy),
+            intent: raw.intent,
+          });
           continue;
         }
         kept.push({ step, label: (raw.case ?? '').trim() });
@@ -1195,6 +1232,17 @@ export function fromTreeNotation(selector: string): string {
  * on. Kept beside `toFlowStep` and derived from the same fields, so the two
  * cannot disagree about what was missing.
  */
+/**
+ * Why a backend step was dropped when the run's backend toggle is off.
+ *
+ * Its own constant because three places must say the same thing: the drop
+ * detail the model is re-asked with, the step note a reader sees
+ * (`backendHint`), and the tests that pin them together.
+ */
+export const BACKEND_OFF_REASON =
+  'this run does not test the backend (the backend toggle is off) — prove the claim through the ' +
+  'page instead, and the step will be marked as one a backend check could prove more directly';
+
 export function dropReasonFor(
   raw: z.infer<typeof AuthoredStepSchema>,
   allowDb: boolean,
@@ -1707,6 +1755,23 @@ export interface FlowAuthorOptions {
    */
   declaredOperations?: readonly string[] | undefined;
   /**
+   * Whether this run tests the BACKEND at all.
+   *
+   * Default `true` — the behaviour every run had before this existed. Set
+   * false and the author may write no `request`, `expectStatus`, `expectJson`,
+   * `expectHeader`, `expectCalls` or `expectDb*` step: a claim that would have
+   * been settled against HTTP or the database is settled through the PAGE
+   * instead, and the step says so (`backendHint`), so a reader knows the
+   * claim has a stronger proof available and this run did not take it.
+   *
+   * The toggle exists because "prove it against the database" and "prove it
+   * on screen" need different things from the person running it — a reachable
+   * database, a spec whose endpoints are indexed — and a run that has neither
+   * should produce honest visual proof with a note, not a wall of blocked
+   * cases.
+   */
+  backend?: boolean | undefined;
+  /**
    * A second look at the accepted flow against the codebase and documents
    * before it is handed back — the level above the lints. Absent means the
    * flow is exactly what the author wrote. See `flow-review.ts`.
@@ -1732,6 +1797,7 @@ export class FlowAuthor {
   /** Route patterns the selected repository declares — grounding for expectUrl. */
   readonly #declaredRoutes: readonly string[];
   readonly #declaredOperations: readonly string[];
+  readonly #backend: boolean;
   readonly #reviewer: FlowReviewer | undefined;
 
   constructor(options: FlowAuthorOptions) {
@@ -1747,6 +1813,7 @@ export class FlowAuthor {
     this.#scope = options.scope;
     this.#declaredRoutes = options.declaredRoutes ?? [];
     this.#declaredOperations = options.declaredOperations ?? [];
+    this.#backend = options.backend ?? true;
     this.#reviewer = options.reviewer;
     this.#onLog = options.onLog;
   }
@@ -1850,6 +1917,7 @@ export class FlowAuthor {
         interactions,
         policy: this.#policy,
         ...(this.#tables?.length ? { tables: this.#tables } : {}),
+        ...(this.#backend ? {} : { backend: false }),
         ...((extra.projectContext ?? this.#projectContext)
           ? { projectContext: extra.projectContext ?? this.#projectContext }
           : {}),

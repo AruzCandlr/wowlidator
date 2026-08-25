@@ -97,6 +97,9 @@ Options:
                        preparation may be inserted before it.
   --no-heal            Disable the JIT healer
   --no-agent           Disable multi-page agentic navigation
+  --no-backend         Author no HTTP or database step: every claim is proved
+                       through the page, and a step a backend check could prove
+                       better is marked as visual-only in the report
   --no-network         Do not observe the page's HTTP traffic. Observing is on
                        by default and costs no tokens: it is what lets a failed
                        step say "the request behind this returned 500" instead

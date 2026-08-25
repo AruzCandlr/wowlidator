@@ -139,6 +139,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       ctrf: { type: 'string' },
       'no-heal': { type: 'boolean', default: false },
       'no-agent': { type: 'boolean', default: false },
+      // Declared literally, like `no-heal`/`no-agent`: parseArgs has no
+      // `--no-x` negation. Backend testing stays ON by default — the
+      // behaviour every run had before the toggle existed.
+      'no-backend': { type: 'boolean', default: false },
+      // Accepted and ignored — backend testing is already the default. It
+      // exists so the panel can state its choice in both directions rather
+      // than relying on a default the two surfaces disagree about.
+      backend: { type: 'boolean', default: false },
       'no-agent-capture': { type: 'boolean', default: false },
       'no-author-review': { type: 'boolean', default: false },
       'no-reconstruct': { type: 'boolean', default: false },
@@ -328,6 +336,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     stepDelayMs,
     heal: values['no-heal'] !== true,
     agent: values['no-agent'] !== true,
+    backend: values['no-backend'] !== true,
     json: values.json,
     all: values.all,
     focus: values.focus,

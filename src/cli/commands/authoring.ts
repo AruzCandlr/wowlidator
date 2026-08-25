@@ -1886,6 +1886,10 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     declaredOperations: (repoContextGraph?.nodes ?? [])
       .filter((node) => node.kind === 'operation')
       .map((node) => node.name),
+    // The run's own backend toggle. Off, no HTTP or database step is written
+    // and the claims are proved through the page with a note — see
+    // `FlowAuthorOptions.backend`.
+    backend: options.backend,
     // Supplied by the person, never guessed — see `parseCredentials`.
     ...(options.credentials ? { credentials: options.credentials } : {}),
     // `--scope e2e` was silently ignored on this path: the flag was read into
@@ -2366,6 +2370,10 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
     declaredOperations: (repoContextGraph?.nodes ?? [])
       .filter((node) => node.kind === 'operation')
       .map((node) => node.name),
+    // The run's own backend toggle. Off, no HTTP or database step is written
+    // and the claims are proved through the page with a note — see
+    // `FlowAuthorOptions.backend`.
+    backend: options.backend,
     // Supplied by the person, never guessed — see `parseCredentials`.
     ...(options.credentials ? { credentials: options.credentials } : {}),
     scope: options.scope,

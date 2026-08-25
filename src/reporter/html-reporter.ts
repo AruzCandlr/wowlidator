@@ -389,6 +389,7 @@ function stepBadges(step: ProofStep, afterFailure = false): string {
     badges.push(`<span class="badge res-${esc(step.resolution)}">${term(label)}</span>`);
   }
   if (step.agent) badges.push('<span class="badge res-agent">agent takeover</span>');
+  if (step.backendHint) badges.push('<span class="badge">visual only</span>');
   // Distinct from the takeover badge: that one says a model drove the step,
   // this one says a model was asked to JUDGE something the flow never
   // mentioned. A reader needs to know a decision was taken on their behalf.
@@ -668,6 +669,13 @@ function decisionBlock(decision: StepDecision): string {
     </div>`;
 }
 
+/**
+ * The workflow leg, foldable. The trace is the evidence behind the summary
+ * and every reader wants it eventually, but a run with a dozen legs is
+ * unreadable with all of them open — so the summary and the goal stay
+ * visible and the turn-by-turn log is one click away. Open by default when
+ * the goal was not reached: that is the case a reader came for.
+ */
 function agentBlock(agent: AgentRecord): string {
   const rows = agent.actions
     .map(
@@ -687,10 +695,13 @@ function agentBlock(agent: AgentRecord): string {
       <div class="callout-title">Workflow agent took over${agent.success ? '' : ' — goal not reached'}</div>
       <p class="goal"><span>goal</span> ${esc(agent.goal)}</p>
       <p class="reason">${esc(agent.summary)}</p>
-      <table class="agent-trace">
-        <thead><tr><th>#</th><th>action</th><th>target</th><th>reasoning</th><th>time</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="5" class="muted">no actions taken</td></tr>'}</tbody>
-      </table>
+      <details${agent.success ? '' : ' open'}>
+        <summary>What the agent did — ${agent.actions.length} action${agent.actions.length === 1 ? '' : 's'}, turn by turn</summary>
+        <table class="agent-trace">
+          <thead><tr><th>#</th><th>action</th><th>target</th><th>reasoning</th><th>time</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5" class="muted">no actions taken</td></tr>'}</tbody>
+        </table>
+      </details>
       <dl class="kv">
         <div><dt>turns</dt><dd>${agent.maxSteps == null ? `${agent.turns} (no ceiling)` : `${agent.turns} / ${agent.maxSteps}`}</dd></div>
         <div><dt>model</dt><dd>${esc(agent.model)}</dd></div>
@@ -988,6 +999,7 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
     ${compare}
     <div class="step-body" hidden>
       ${step.unsure ? `<div class="callout unsure"><div class="callout-title">Proved-? — a human must rule on this step</div><pre>${captured(step.unsure)}</pre></div>` : ''}
+      ${step.backendHint ? `<div class="callout"><div class="callout-title">Proved on screen — a backend check could prove it better</div><p>Backend testing was off for this run, so this claim was settled through the page. ${captured(step.backendHint)}</p><p class="muted">The step passed on its own terms. Turn backend testing on (and give the run a database URL) to prove it against the data itself.</p></div>` : ''}
       ${step.error ? `<div class="callout error"><div class="callout-title">Failure</div><pre>${esc(step.error.split('\n')[0] ?? step.error)}</pre></div>` : ''}
       ${pageContextBlock(step)}
       ${seekControl(step, hasVideo)}

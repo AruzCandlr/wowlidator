@@ -303,6 +303,32 @@ describe('frontend and backend result split', () => {
     );
   });
 
+  it('lifts the backend hint off the intent, at the one recording choke point', () => {
+    // Backend testing was off, so the claim was proved on screen and the
+    // author marked the step. The stored intent must read as a plain
+    // sentence; the hint stands on its own field, where the report and the
+    // panel can show it without parsing prose.
+    const builder = new ProofBundleBuilder({ name: 'visual only', cdpUrl: null, cachePath: null });
+    const base = { selector: null, resolvedSelector: null, resolution: null, startedAt: new Date().toISOString(), durationMs: 4, url: null };
+    const marked = builder.addStep({
+      action: 'expectVisible',
+      intent: 'backend could prove this: the count on screen should equal the benefit_plan rows',
+      status: 'passed',
+      ...base,
+    });
+    assert.equal(marked.backendHint, 'the count on screen should equal the benefit_plan rows');
+    assert.equal(marked.intent, 'the count on screen should equal the benefit_plan rows');
+
+    // An ordinary intent is untouched, and an empty hint is no hint.
+    const plain = builder.addStep({ action: 'expectVisible', intent: 'the card is on screen', status: 'passed', ...base });
+    assert.equal(plain.backendHint, undefined);
+    assert.equal(plain.intent, 'the card is on screen');
+    const bare = builder.addStep({ action: 'expectVisible', intent: 'backend could prove this:', status: 'passed', ...base });
+    assert.equal(bare.backendHint, undefined);
+    // It is a note, never a verdict: the step passed and the run is clean.
+    assert.equal(builder.finish().status, 'passed');
+  });
+
   it('routes defects by category, because they route to different teams', () => {
     const builder = mixedBundle();
     builder.addDefect({ id: 'd1', source: 'runtime', category: 'backend', severity: 'high', title: 'POST /api/shifts returned 500', detail: '' });

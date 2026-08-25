@@ -1003,6 +1003,26 @@ function expectedActualOf(step) {
   return out;
 }
 
+/**
+ * The agent's action log, turn by turn — the evidence behind its summary.
+ *
+ * One formatter for both places that show it (the step row's inline
+ * expansion and the evidence drawer), so the two cannot drift. A
+ * password-shaped fill shows its length, never its characters.
+ */
+function agentActionLog(acts) {
+  return acts.map(function (a, i) {
+    var target = a.selector || a.url || '';
+    var value = a.value
+      ? ' = ' + (/password|passwd|pwd/i.test(a.selector || '') ? '\u2022\u2022\u2022\u2022 (' + a.value.length + ' chars)' : JSON.stringify(a.value))
+      : '';
+    return (a.ok ? '\u2713' : '\u2717') + ' ' + (i + 1) + '. ' + a.action + ' ' + target + value +
+      (a.durationMs !== undefined && a.durationMs !== null ? ' (' + fmtMs(a.durationMs) + ')' : '') +
+      (a.reasoning ? '\n     ' + a.reasoning : '') +
+      (a.error ? '\n     FAILED: ' + String(a.error).split('\n')[0] : '');
+  }).join('\n');
+}
+
 function stepClaim(step) {
   if (step.intent) return step.intent;
   return step.action + (step.selector ? ' ' + step.selector : '');
@@ -2420,6 +2440,14 @@ function checksTable(bundle) {
         title: step.unsure,
         text: 'proved-?' }));
     }
+    /* Proved on screen, when the backend could have proved it better. Not a
+       warning and not a verdict — the visual check really did pass; this says
+       a stronger proof exists and this run was told not to take it. */
+    if (step.backendHint) {
+      what.appendChild(el('span', { class: 'tag',
+        title: 'backend testing was off for this run — a backend check could prove this more directly: ' + step.backendHint,
+        text: 'visual only' }));
+    }
 
     var how = el('td', { style: 'color:var(--muted)' });
     var repro = step.resolvedSelector || step.selector ||
@@ -2461,12 +2489,55 @@ function checksTable(bundle) {
       })
     ]);
 
-    body.appendChild(el('tr', {}, [
-      what, how, took, verdict,
-      el('td', { class: 'col-r' }, [
-        el('button', { type: 'button', class: 'link', text: 'See evidence', onclick: function () { openEvidence(bundle, step, null); } })
-      ])
-    ]));
+    /* A workflow step is the one step whose work is invisible from its row:
+       the agent took the browser for N turns and the row can only say
+       "workflow". Expanding it inline shows the turn-by-turn log right where
+       the step is, without leaving for the drawer — asked for directly, and
+       the same evidence the drawer's Trace tab holds. */
+    var acts = (step.agent && step.agent.actions) || [];
+    var expandKey = 'agent:' + bundle.runId + ':' + step.index;
+    var expanded = S.openTask === expandKey;
+    var lastCell = el('td', { class: 'col-r' }, [
+      step.agent
+        ? el('button', {
+            type: 'button', class: 'link',
+            title: 'the agent drove the browser here — see every action it took',
+            text: (expanded ? '▾ ' : '▸ ') + acts.length + ' agent action' + (acts.length === 1 ? '' : 's'),
+            onclick: function () { S.openTask = expanded ? null : expandKey; render(); }
+          })
+        : null,
+      el('button', { type: 'button', class: 'link', text: 'See evidence', onclick: function () { openEvidence(bundle, step, null); } })
+    ]);
+
+    body.appendChild(el('tr', {}, [what, how, took, verdict, lastCell]));
+
+    if (step.agent && expanded) {
+      var inner = el('td', { colspan: '5', style: 'padding:10px 12px;background:var(--sunken,rgba(0,0,0,.04))' });
+      inner.appendChild(el('div', { class: 'cap', text: 'The goal the agent was given' }));
+      inner.appendChild(el('div', { class: 'repro', text: step.agent.goal }));
+      inner.appendChild(el('div', { class: 'cap', text: 'What it reported' }));
+      inner.appendChild(el('div', { class: 'repro', text: step.agent.summary }));
+      inner.appendChild(el('div', { class: 'kv' }, [
+        el('b', { text: 'turns: ' }),
+        document.createTextNode(
+          step.agent.turns + (step.agent.maxSteps == null ? ' (no ceiling)' : ' of ' + step.agent.maxSteps) +
+          ' \u00b7 ' + step.agent.model + ' \u00b7 ' + fmtMs(step.agent.latencyMs) +
+          ' \u00b7 ' + (step.agent.inputTokens || 0) + ' in / ' + (step.agent.outputTokens || 0) + ' out tokens')
+      ]));
+      if (step.detail && step.detail.settledBy) {
+        inner.appendChild(el('div', { class: 'kv', style: 'color:var(--faint)' }, [
+          el('b', { text: 'settled by ' + step.detail.settledBy + ': ' }),
+          document.createTextNode(String(step.detail.evidence || ''))
+        ]));
+      }
+      if (acts.length === 0) {
+        inner.appendChild(el('div', { class: 'muted2', text: 'the agent took no action at all' }));
+      } else {
+        inner.appendChild(el('div', { class: 'cap', text: 'Every action it took, in order' }));
+        inner.appendChild(el('div', { class: 'repro', text: agentActionLog(acts) }));
+      }
+      body.appendChild(el('tr', {}, [inner]));
+    }
   });
 
   var total = bundle.steps.reduce(function (sum, step) { return sum + (step.durationMs || 0); }, 0);
@@ -2763,17 +2834,7 @@ function evidenceFix(panel, bundle, step) {
     var acts = step.agent.actions || [];
     if (acts.length > 0) {
       panel.appendChild(el('div', { class: 'cap', text: 'What the agent did (' + acts.length + ' action(s))' }));
-      var log = acts.map(function (a, i) {
-        var target = a.selector || a.url || '';
-        var value = a.value
-          ? ' = ' + (/password|passwd|pwd/i.test(a.selector || '') ? '•••• (' + a.value.length + ' chars)' : JSON.stringify(a.value))
-          : '';
-        return (a.ok ? '✓' : '✗') + ' ' + (i + 1) + '. ' + a.action + ' ' + target + value +
-          (a.durationMs !== undefined && a.durationMs !== null ? ' (' + fmtMs(a.durationMs) + ')' : '') +
-          (a.reasoning ? '\n     ' + a.reasoning : '') +
-          (a.error ? '\n     FAILED: ' + String(a.error).split('\n')[0] : '');
-      }).join('\n');
-      panel.appendChild(el('div', { class: 'repro', text: log }));
+      panel.appendChild(el('div', { class: 'repro', text: agentActionLog(acts) }));
     }
   }
 

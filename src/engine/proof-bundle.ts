@@ -192,6 +192,30 @@ export const BACKEND_TIER_ACTIONS: ReadonlySet<string> = new Set([
   'expectCalls',
 ]);
 
+/**
+ * How an authored step announces that a backend check would prove it better.
+ *
+ * A prefix on `intent` rather than a field of its own on every step shape:
+ * the authoring schema is one flat object shared by twenty-odd actions, and a
+ * marker the model writes into prose it is already writing costs nothing to
+ * add and nothing to narrow. It is lifted off the intent when the step is
+ * recorded, so the stored intent reads as the author's plain sentence and the
+ * hint stands on its own field.
+ */
+export const BACKEND_HINT_PREFIX = /^\s*backend could prove this:\s*/i;
+
+/** Split an intent into its plain sentence and the backend hint it carries, or null. */
+export function backendHintOf(
+  intent: string | undefined,
+): { intent: string; hint: string } | null {
+  if (intent === undefined) return null;
+  const match = BACKEND_HINT_PREFIX.exec(intent);
+  if (match === null) return null;
+  const hint = intent.slice(match[0].length).trim();
+  if (hint === '') return null;
+  return { intent: hint, hint };
+}
+
 /** How a selector was resolved for a step. */
 export type ResolutionSource =
   | 'fast'
@@ -379,6 +403,17 @@ export interface ProofStep {
   action: string;
   /** The author's plain-language description of this step, verbatim from `FlowStep.intent`. */
   intent?: string | undefined;
+  /**
+   * What a backend check would have proved about this step, when the run's
+   * backend toggle was off and the claim deserved one.
+   *
+   * The author writes it as an `intent` beginning `backend could prove this:`
+   * (see `BACKEND_HINT_PREFIX`), and it is lifted here — at the one recording
+   * choke point, so every action carries it the same way. Never a defect and
+   * never a verdict: the visual check really did pass, and this says a
+   * stronger proof exists that this run chose not to take.
+   */
+  backendHint?: string | undefined;
   /**
    * Set when this step is the reason a run is `needs-review`: the assertion
    * failed on a near-miss of wording, and this is the proof of the unsure
@@ -799,9 +834,14 @@ export class ProofBundleBuilder {
 
   /** Append a completed step. `index` is assigned automatically. */
   addStep(step: Omit<ProofStep, 'index'>): ProofStep {
+    const hint = backendHintOf(step.intent);
     const recorded: ProofStep = {
       index: this.#steps.length,
       ...step,
+      // Lifted from the intent at the one choke point every action passes
+      // through: the alternative is eighteen call sites each remembering to
+      // do it, which is the same reasoning as the video offset below.
+      ...(hint === null ? {} : { backendHint: hint.hint, intent: hint.intent }),
       // Stamped here rather than at each `addStep` call site: every action in
       // the runner already reports `startedAt`, and there are a dozen and a
       // half of them. One derivation cannot disagree with itself.

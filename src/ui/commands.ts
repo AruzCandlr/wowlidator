@@ -34,6 +34,28 @@ export interface Field {
   required?: boolean;
   /** Hidden behind "more options" — real, but not the common case. */
   advanced?: boolean;
+  /**
+   * Required only when another boolean field on this form is on.
+   *
+   * The backend toggle is the case this exists for: turning backend testing
+   * ON is the moment a database connection stops being optional, and asking
+   * for it up front — before a run spends ten minutes to die on the first DB
+   * step — is the whole point of a toggle. Validated in `buildArgv` /
+   * `buildEnvOverlay`, so the rule holds whatever posts the form.
+   */
+  requiredWhen?: { field: string; equals: true };
+  /**
+   * The flag to send when this boolean is OFF, for a CLI option that is on by
+   * default.
+   *
+   * `backend` is the case: the CLI keeps backend testing ON so every existing
+   * script and catalog behaves as it always did, while the panel offers it as
+   * opt-IN — which is what a person actually wants in front of them, since
+   * most runs have no database configured. The panel therefore states its
+   * choice explicitly in both directions rather than relying on a default
+   * that differs between the two surfaces.
+   */
+  offFlag?: string;
   min?: number;
   /**
    * May be given more than once, becoming `--name a --name b`. The UI sends an
@@ -134,6 +156,41 @@ const AUTOHEAL_FIELD: Field = {
     'break and the test reruns itself, up to 3 total runs. Every rewrite lands as its own ' +
     'reviewable .attempt-N.flow.json plus a .patch; assertions always keep their claim, so a ' +
     'test is never rewritten until it merely passes.',
+};
+
+/**
+ * Whether this run tests the backend at all.
+ *
+ * On, the author may write HTTP and database steps, and `DB_URL_FIELD` below
+ * becomes required — a DB claim with no database is a case that dies ten
+ * minutes in, and asking here costs nothing. Off, no backend step is written:
+ * every claim is proved through the page, and a claim that a backend check
+ * would prove better carries a note saying so (`ProofStep.backendHint`),
+ * which is the honest form of "we did not check that half".
+ */
+const BACKEND_FIELD: Field = {
+  name: 'backend',
+  label: 'Include backend steps',
+  type: 'boolean',
+  default: false,
+  offFlag: 'no-backend',
+  help:
+    'On: the test may call HTTP endpoints and read the database directly, and a database URL is ' +
+    'required below. Off: nothing but the page is used — a claim that wants the backend is still ' +
+    'proved visually, and the step is marked as one a backend check could prove more directly.',
+};
+
+const DB_URL_FIELD: Field = {
+  name: 'db-url',
+  label: 'Database URL',
+  type: 'secret',
+  envVar: 'WOWLIDATOR_DB_URL',
+  placeholder: 'postgres://user@host:5432/database',
+  requiredWhen: { field: 'backend', equals: true },
+  help:
+    'Read-only access for database checks, e.g. postgres://user@localhost:5432/app. It travels to ' +
+    'the CLI as an environment variable, never in the command line. Leave it blank to use whatever ' +
+    'the panel’s own environment already sets.',
 };
 
 const CREDENTIALS_FIELD: Field = {
@@ -355,6 +412,8 @@ export const COMMANDS: readonly CommandSpec[] = [
       POLICY_FIELD,
       AUTOHEAL_FIELD,
       CREDENTIALS_FIELD,
+      BACKEND_FIELD,
+      DB_URL_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -493,6 +552,8 @@ export const COMMANDS: readonly CommandSpec[] = [
       CONCURRENCY_FIELD,
       AUTOHEAL_FIELD,
       CREDENTIALS_FIELD,
+      BACKEND_FIELD,
+      DB_URL_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -559,6 +620,8 @@ export const COMMANDS: readonly CommandSpec[] = [
         advanced: true,
       },
       CREDENTIALS_FIELD,
+      BACKEND_FIELD,
+      DB_URL_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -780,6 +843,8 @@ export const COMMANDS: readonly CommandSpec[] = [
         advanced: true,
       },
       CREDENTIALS_FIELD,
+      BACKEND_FIELD,
+      DB_URL_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -1113,7 +1178,16 @@ export function buildEnvOverlay(
   for (const field of spec.fields) {
     if (field.type !== 'secret' || field.envVar === undefined) continue;
     const raw = values[field.name];
-    if (raw === undefined || raw === null || raw === '') continue;
+    if (raw === undefined || raw === null || raw === '') {
+      // A secret's own required-when lives here, because `buildArgv` skips
+      // secrets entirely — argv is exactly where they must never appear.
+      if (field.requiredWhen !== undefined && values[field.requiredWhen.field] === true) {
+        throw new UiCommandError(
+          `"${field.label}" is required when "${field.requiredWhen.field}" is on`,
+        );
+      }
+      continue;
+    }
     if (typeof raw !== 'string') throw new UiCommandError(`"${field.label}" must be text`);
     if (raw.includes('\0')) throw new UiCommandError(`"${field.name}" contains a NUL byte`);
     if (field.name === 'as') {
@@ -1193,8 +1267,18 @@ export function buildArgv(spec: CommandSpec, values: Record<string, unknown>): s
     }
 
     if (field.type === 'boolean') {
-      if (raw === undefined || raw === false) continue;
-      if (raw !== true) throw new UiCommandError(`"${field.name}" must be true or false`);
+      if (raw !== undefined && raw !== true && raw !== false) {
+        throw new UiCommandError(`"${field.name}" must be true or false`);
+      }
+      if (raw !== true) {
+        // Off, and the CLI's own default is on: say so out loud — but only
+        // when the submission actually SAID off. An absent field means "not
+        // stated", and turning the backend off for every caller that simply
+        // did not mention it would be a behaviour change smuggled in through
+        // a default.
+        if (raw === false && field.offFlag !== undefined) flags.push(`--${field.offFlag}`);
+        continue;
+      }
       flags.push(`--${field.name}`);
       continue;
     }
@@ -1202,6 +1286,14 @@ export function buildArgv(spec: CommandSpec, values: Record<string, unknown>): s
     // A secret is validated here and carried by `buildEnvOverlay`; it must
     // never reach the argv whatever the submission says.
     if (field.type === 'secret') continue;
+
+    if (field.requiredWhen !== undefined && (raw === undefined || raw === null || raw === '')) {
+      if (values[field.requiredWhen.field] === true) {
+        throw new UiCommandError(
+          `"${field.label}" is required when "${field.requiredWhen.field}" is on`,
+        );
+      }
+    }
 
     let text: string;
     if (raw === undefined || raw === null || raw === '') {

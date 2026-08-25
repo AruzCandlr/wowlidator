@@ -36,9 +36,10 @@ import {
   ungroundedUrlExpectation,
   unsynchronizedLoginSubmit,
   dbClaimWithoutDbCheck,
+  BACKEND_OFF_REASON,
+  buildUserPrompt,
   loginProofAssertsLoginPage,
   unindexedRequestMethod,
-  wordingClaimAssertsDataValue,
   wordingClaimAssertsDataValue,
   type AuthorRequest,
   type AuthorResult,
@@ -56,6 +57,7 @@ import {
   literalDestinations,
   shouldSignInForCapture,
 } from '../src/cli/commands/authoring.js';
+import { vacuousFlow } from '../src/generator/vacuous.js';
 import type { FlowStep } from '../src/engine/runner.js';
 import { jsonModel } from './helpers.js';
 
@@ -1196,6 +1198,72 @@ describe('a CSS comment is not a selector', () => {
       { action: 'expectVisible', selector: 'role=table', intent: 'the manager renders' },
     ]);
     assert.equal(result.droppedSteps, 1);
+  });
+});
+
+describe('the backend toggle', () => {
+  /** The flat authored shape, as the model actually returns it. */
+  const authored = {
+    name: 'PL_03_03 count check',
+    rationale: 'the card must agree with the data behind it',
+    notes: '',
+    setup: [],
+    steps: [
+      { action: 'request', selector: '', value: '', url: '', key: 'n = $.counts.hr', name: 'GET /api/benefit-plans', intent: 'read the count' },
+      { action: 'expectStatus', selector: '', value: '200', url: '', key: '', name: '', intent: 'the endpoint answers' },
+      { action: 'expectDbRow', selector: '', value: '', url: '', key: 'benefit_type = REIMBURSEMENT_HR', name: 'benefit_management.benefit_plan', intent: 'the row count' },
+      { action: 'expectVisible', selector: 'text=REIMBURSEMENT BY HR', value: '', url: '', key: '', name: '', intent: 'backend could prove this: the count on screen should equal the benefit_plan rows of that type' },
+    ],
+    teardown: [],
+  };
+  const tables = [{ name: 'benefit_management.benefit_plan', summary: 'benefit_plan_id, benefit_type, status' }];
+  const authorModel = () =>
+    new LlmFlowAuthorModel({
+      model: jsonModel('mock-author', authored, { inputTokens: 100, outputTokens: 40 }),
+      id: 'mock:author',
+    });
+
+  it('writes no backend step when the run says backend is off, and says why', async () => {
+    // The person turned the backend off; the claim is still proved, on screen.
+    const result = await authorModel().author({
+      prompt: 'check the Reimbursement by HR count',
+      backend: false,
+      tables,
+    });
+
+    assert.deepEqual(
+      result.steps.map((step) => step.action),
+      ['expectVisible'],
+      'every HTTP and database step is dropped',
+    );
+    assert.equal(result.droppedSteps, 3);
+    // The model is told WHY, in words it can act on next attempt — and all
+    // three get the same reason, because they were dropped for one.
+    assert.ok(
+      result.dropped.every((one) => one.reason === BACKEND_OFF_REASON),
+      JSON.stringify(result.dropped),
+    );
+    // The claim still has a proof, so this is not a vacuous flow.
+    assert.equal(vacuousFlow({ steps: result.steps, setup: result.setup }), null);
+  });
+
+  it('leaves the backend family alone when the toggle is on (the default)', async () => {
+    const result = await authorModel().author({
+      prompt: 'check the Reimbursement by HR count against the database',
+      tables,
+    });
+    assert.deepEqual(
+      result.steps.map((step) => step.action),
+      ['request', 'expectStatus', 'expectDbRow', 'expectVisible'],
+      'absent means yes — what every caller meant before the toggle existed',
+    );
+  });
+
+  it('names the backend rule in the prompt only when the toggle is off', () => {
+    const off = buildUserPrompt({ prompt: 'a claim', backend: false });
+    assert.match(off, /BACKEND TESTING IS OFF/);
+    assert.match(off, /backend could prove this: /, 'and how to mark the step it settles visually');
+    assert.doesNotMatch(buildUserPrompt({ prompt: 'a claim' }), /BACKEND TESTING IS OFF/);
   });
 });
 

@@ -62,6 +62,17 @@ export interface CliOptions {
   stepDelayMs: number | undefined;
   heal: boolean;
   agent: boolean;
+  /**
+   * Whether this run tests the backend at all (`--no-backend` turns it off).
+   *
+   * On (the default) the author may write HTTP and database steps, and a run
+   * that needs a database must have one configured. Off, no backend step is
+   * written: a claim that would have been settled against HTTP or the
+   * database is settled through the PAGE, and the step carries a
+   * `backendHint` saying what a backend check would have proved — so the
+   * proof is honest about being the weaker of the two available.
+   */
+  backend: boolean;
   json: boolean;
   all: boolean;
   focus: string | undefined;

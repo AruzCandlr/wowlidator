@@ -393,6 +393,53 @@ describe('the command whitelist', () => {
     );
   });
 
+  it('offers the backend toggle on every command that authors a test', () => {
+    for (const id of ['go', 'generate', 'author', 'catalog-run']) {
+      const spec = commandById(id)!;
+      const toggle = spec.fields.find((one) => one.name === 'backend');
+      assert.ok(toggle, `${id} must offer the backend toggle`);
+      assert.equal(toggle?.type, 'boolean');
+      assert.equal(toggle?.default, false, 'opt-in in the panel — most runs have no database');
+      assert.equal(toggle?.offFlag, 'no-backend');
+      const dbUrl = spec.fields.find((one) => one.name === 'db-url');
+      assert.equal(dbUrl?.type, 'secret', 'a connection string never becomes argv');
+      assert.equal(dbUrl?.envVar, 'WOWLIDATOR_DB_URL');
+      assert.deepEqual(dbUrl?.requiredWhen, { field: 'backend', equals: true });
+    }
+  });
+
+  it('states the backend choice in both directions, and only when it was stated', () => {
+    const go = commandById('go')!;
+    // Off: said out loud, because the CLI's own default is ON and every
+    // existing script must keep behaving as it did.
+    assert.deepEqual(buildArgv(go, { target: 'a claim', backend: false }), ['go', 'a claim', '--no-backend']);
+    assert.deepEqual(buildArgv(go, { target: 'a claim', backend: true }), ['go', 'a claim', '--backend']);
+    // Absent means "not stated" — never a silent turn-off for callers that
+    // predate the toggle.
+    assert.deepEqual(buildArgv(go, { target: 'a claim' }), ['go', 'a claim']);
+  });
+
+  it('asks for the database URL exactly when backend testing is on', () => {
+    const go = commandById('go')!;
+    // The point of asking here: a DB claim with no database is a case that
+    // dies ten minutes in.
+    assert.throws(
+      () => buildEnvOverlay(go, { target: 'a claim', backend: true }),
+      (error: unknown) => error instanceof UiCommandError && /required when "backend" is on/.test(error.message),
+    );
+    assert.deepEqual(
+      buildEnvOverlay(go, { target: 'a claim', backend: true, 'db-url': 'postgres://u@localhost:5432/app' }),
+      { WOWLIDATOR_DB_URL: 'postgres://u@localhost:5432/app' },
+    );
+    // Off, it is nobody's business.
+    assert.deepEqual(buildEnvOverlay(go, { target: 'a claim', backend: false }), {});
+    // And a secret never reaches argv, whatever the submission says.
+    assert.equal(
+      buildArgv(go, { target: 'a claim', backend: true, 'db-url': 'postgres://u@h/db' }).join(' ').includes('postgres://'),
+      false,
+    );
+  });
+
   it('carries a fixed flag the form has no control for', () => {
     // "List the claims" and "prove the approved ones" are two panel actions
     // backed by one CLI command; the flag that tells them apart stays declared
