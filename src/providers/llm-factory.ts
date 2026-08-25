@@ -33,6 +33,7 @@ import {
   type WowlidatorConfig,
 } from '../config.js';
 import { localFetch } from './local-fetch.js';
+import { createClaudeCli } from './claude-cli.js';
 import { dedupeKeyFor, serialGateFor } from './serial-gate.js';
 import { logLlmFailure, logLlmRequest, logLlmResponse } from './llm-log.js';
 import {
@@ -139,6 +140,10 @@ export type ModelBuilder = (
  * common denominator — so nothing downstream knows which vendor answered.
  */
 const FACTORIES: Record<ProviderName, ModelBuilder> = {
+  // No key: the CLI carries the operator's own session. See `claude-cli.ts`
+  // for why the system prompt is replaced and the process runs from a
+  // neutral directory.
+  'claude-cli': (_apiKey, modelId) => createClaudeCli({ modelId }),
   google: (apiKey, modelId) => createGoogleGenerativeAI({ apiKey })(modelId),
   groq: (apiKey, modelId) => createGroq({ apiKey })(modelId),
   openrouter: (apiKey, modelId) => createOpenRouter({ apiKey })(modelId),
@@ -908,7 +913,9 @@ const REASONING_OUTPUT_FLOOR: Partial<Record<ProviderName, number>> = {
 // DeepSeek offers `json_object` mode but no schema-constrained channel the
 // OpenAI-compatible provider can hand a schema to, so it is told the schema in
 // prose like the other two.
-const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local']);
+// `claude-cli` joins them: the CLI has no `response_format`, so the schema is
+// stated in the prompt and the JSON parsed out of the reply.
+const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local', 'claude-cli']);
 
 /**
  * Silence the one AI SDK warning this codebase makes untrue.

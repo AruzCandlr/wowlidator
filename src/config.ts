@@ -28,7 +28,7 @@ import type { ScreenshotMode, VideoMode } from './engine/runner.js';
 export const LLM_ROLES = ['healer', 'generator', 'agent', 'data'] as const;
 export type LlmRole = (typeof LLM_ROLES)[number];
 
-export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local'] as const;
+export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 /** Which env var carries each provider's key, and where to get one. */
@@ -36,6 +36,16 @@ export const PROVIDER_META: Record<
   ProviderName,
   { envKey: string; label: string; consoleUrl: string; freeTier: string }
 > = {
+  'claude-cli': {
+    // Deliberately empty: the CLI carries the operator's own logged-in
+    // session, so there is no key to set and the role gate must not demand
+    // one. `KEYLESS_PROVIDERS` is what makes that structural rather than a
+    // special case scattered through the callers.
+    envKey: '',
+    label: 'Claude Code CLI (this machine\'s own session)',
+    consoleUrl: 'https://claude.com/claude-code',
+    freeTier: 'billed to the session already signed in here — no key to configure',
+  },
   google: {
     envKey: 'GOOGLE_GENERATIVE_AI_API_KEY',
     label: 'Google AI Studio (Gemini)',
@@ -132,6 +142,8 @@ export function portOfBaseUrl(baseUrl: string): number | null {
 
 /** Sent as the bearer token when `LOCAL_LLM_API_KEY` is unset; local servers ignore it. */
 export const LOCAL_LLM_PLACEHOLDER_KEY = 'local';
+/** The same idea for the Claude CLI — see where it is assigned. */
+export const CLAUDE_CLI_PLACEHOLDER_KEY = 'claude-cli-session';
 
 /**
  * Defaults chosen to match each role's shape.
@@ -194,6 +206,11 @@ export const DEFAULT_PROVIDER_MODELS: Record<ProviderName, string> = {
   zai: 'glm-4.5-flash',
   deepseek: 'deepseek-chat',
   local: 'default_model',
+  // An alias, not a dated id: the CLI resolves `fable` to whatever the
+  // current Fable is. A DEFAULT and not a fixed model — each role keeps its
+  // own `WOWLIDATOR_<ROLE>_MODEL`, so a run can put the expensive model where
+  // authoring happens and a cheaper one on the healer and the agent.
+  'claude-cli': 'fable',
 };
 
 
@@ -458,6 +475,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
   // A local server needs no key; the placeholder keeps the role-readiness gates honest.
   const localKeys = parseApiKeys(e.LOCAL_LLM_API_KEY);
   apiKeys.local = localKeys.length > 0 ? localKeys : [LOCAL_LLM_PLACEHOLDER_KEY];
+  // The Claude CLI carries the operator's own signed-in session, so there is
+  // no key to set and none to miss. A placeholder keeps `hasKeyForRole` and
+  // the role gate structural — the same move `local` makes above, for the
+  // same reason: a provider that needs no credential must not be modelled as
+  // a provider whose credential is absent.
+  apiKeys['claude-cli'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
 
   return {
     roles: {
@@ -503,7 +526,9 @@ export function describeRouting(config: WowlidatorConfig): string {
     const meta = PROVIDER_META[entry.provider];
     const keys = config.apiKeys[entry.provider] ?? [];
     const key =
-      keys.length === 0
+      meta.envKey === ''
+        ? "this machine's own session"
+        : keys.length === 0
         ? `MISSING ${meta.envKey}`
         : keys.length === 1
           ? 'key set'

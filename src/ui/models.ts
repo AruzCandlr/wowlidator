@@ -469,6 +469,15 @@ const REQUESTS: Record<ProviderName, (key: string | undefined) => ModelRequest> 
     headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
     parse: () => ['default_model'],
   }),
+  // The CLI publishes no catalogue endpoint, so the aliases it accepts are
+  // listed here. Aliases rather than dated ids on purpose: the CLI resolves
+  // each to the current model of that name, which is exactly what an alias
+  // is for. The URL is never fetched — `parse` ignores its body.
+  'claude-cli': () => ({
+    url: 'about:blank',
+    headers: {},
+    parse: () => ['fable', 'opus', 'sonnet', 'haiku'],
+  }),
 };
 
 

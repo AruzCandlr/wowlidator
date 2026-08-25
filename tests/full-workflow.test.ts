@@ -51,7 +51,7 @@ import {
   slugify,
   writeHtmlReport,
 } from '../src/reporter/html-reporter.js';
-import { ConfigError, DEFAULT_ROLE_MODELS, loadConfig, DEFAULT_PROVIDER_MODELS, LOCAL_LLM_PLACEHOLDER_KEY } from '../src/config.js';
+import { CLAUDE_CLI_PLACEHOLDER_KEY, ConfigError, DEFAULT_ROLE_MODELS, loadConfig, DEFAULT_PROVIDER_MODELS, LOCAL_LLM_PLACEHOLDER_KEY } from '../src/config.js';
 import { hasAssertion, hasStorableOrigin, type FlowStep } from '../src/engine/runner.js';
 import {
   canonicalSelector,
@@ -871,9 +871,14 @@ describe('config & llm-factory', () => {
     assert.equal(config.roles.agent.provider, DEFAULT_ROLE_MODELS.agent.provider);
     assert.equal(config.roles.generator.modelId, DEFAULT_ROLE_MODELS.generator.modelId);
     // No keys present, so nothing should claim to be resolvable — except the
-    // local server, which needs none: its placeholder is always there so a
-    // role pointed at it passes every "has a key" gate.
-    assert.deepEqual(config.apiKeys, { local: [LOCAL_LLM_PLACEHOLDER_KEY] });
+    // two providers that need none: the local server, and the Claude CLI,
+    // which carries the operator's own signed-in session. Each keeps a
+    // placeholder so a role pointed at it passes every "has a key" gate,
+    // rather than being modelled as a provider whose credential is missing.
+    assert.deepEqual(config.apiKeys, {
+      local: [LOCAL_LLM_PLACEHOLDER_KEY],
+      'claude-cli': [CLAUDE_CLI_PLACEHOLDER_KEY],
+    });
   });
 
   it('lets any role be re-pointed at any provider', () => {
