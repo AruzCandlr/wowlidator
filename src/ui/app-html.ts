@@ -332,12 +332,23 @@ function show(viewId, prefill) {
 
 /* ------------------------------------------------------------ command forms */
 
+/* Show or hide every field gated on this toggle. Local to the two controls
+   involved — no re-render, so nothing already typed is lost. */
+function syncGated(name, on) {
+  var all = document.querySelectorAll('[data-gated-by="' + name + '"]');
+  for (var i = 0; i < all.length; i += 1) all[i].style.display = on ? '' : 'none';
+}
+
 function renderField(field, prefill) {
   var value = prefill && prefill[field.name] !== undefined ? prefill[field.name] : field['default'];
 
   if (field.type === 'boolean') {
     var box = el('input', { type: 'checkbox', id: 'f-' + field.name, name: field.name });
     box.checked = value === true;
+    /* A field required only when this toggle is on appears only when it is
+       on: asking for a database URL of a run that does not touch the database
+       is a question with no right answer. */
+    box.addEventListener('change', function () { syncGated(field.name, box.checked); });
     return el('div', { class: 'field' }, [
       el('div', { class: 'check' }, [
         box,
@@ -372,11 +383,22 @@ function renderField(field, prefill) {
     if (value !== undefined) input.value = value;
   }
 
-  return el('div', { class: 'field' }, [
-    el('label', { 'for': 'f-' + field.name, text: field.label + (field.required ? ' *' : '') }),
+  var wrap = el('div', { class: 'field' }, [
+    el('label', { 'for': 'f-' + field.name,
+      text: field.label + (field.required || field.requiredWhen ? ' *' : '') }),
     input,
     el('div', { class: 'help', text: field.help })
   ]);
+  /* Gated on a toggle: tagged so that toggle can show and hide it, and
+     hidden to start unless the toggle's own default is on. */
+  if (field.requiredWhen) {
+    wrap.setAttribute('data-gated-by', field.requiredWhen.field);
+    var gateOn = prefill && prefill[field.requiredWhen.field] !== undefined
+      ? prefill[field.requiredWhen.field] === true
+      : false;
+    if (!gateOn) wrap.style.display = 'none';
+  }
+  return wrap;
 }
 
 function renderCommand(view, spec) {
@@ -433,7 +455,14 @@ function submit(spec) {
   spec.fields.forEach(function (field) {
     var input = form.elements[field.name];
     if (!input) return;
-    if (field.type === 'boolean') { if (input.checked) values[field.name] = true; }
+    /* A boolean with an offFlag states its choice in BOTH directions — the
+       CLI option is on by default and unchecking must actually say so. Every
+       other boolean keeps sending nothing when off: absent means "not
+       stated", which is what every command predating offFlag expects. */
+    if (field.type === 'boolean') {
+      if (input.checked) values[field.name] = true;
+      else if (field.offFlag) values[field.name] = false;
+    }
     else if (String(input.value).trim() !== '') values[field.name] = String(input.value).trim();
   });
 

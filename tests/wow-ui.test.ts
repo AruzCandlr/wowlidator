@@ -161,6 +161,36 @@ describe('the wowUI page', () => {
     }
   });
 
+  it('offers the backend toggle in front of the fold, with its database field', () => {
+    // The launcher is hand-built, not generated from commands.ts, so a field
+    // added to the spec does NOT appear here — this pins the control itself.
+    for (const marker of [
+      'Include backend steps',
+      'M.backend',
+      'extras.backend = M.backend === true',
+      "extras['db-url'] = M.dbUrl.trim()",
+      'Database URL',
+    ]) {
+      assert.ok(html.includes(marker), `the page lost "${marker}"`);
+    }
+  });
+
+  it('lets a workflow step open in place, showing what the agent did', () => {
+    for (const marker of ['agent action', 'agentActionLog', 'The goal the agent was given']) {
+      assert.ok(html.includes(marker), `the page lost "${marker}"`);
+    }
+  });
+
+  it('renders whole — a stray backtick truncates the page and takes the launcher with it', () => {
+    // Measured 2026-08-25: one backtick inside a comment closed the template
+    // literal this whole page lives in. It still typechecked, still served,
+    // and silently lost every control below the break — the launcher included.
+    // The last thing the page defines is the guard.
+    assert.ok(html.includes('function renderWowUi'.replace('function ', '')) || html.length > 200_000);
+    assert.ok(html.trimEnd().endsWith('</html>'), 'the document must close');
+    assert.ok(html.includes('Start verification'), 'the launcher must survive to the end');
+  });
+
   it('remembers context documents with a repository, and accepts PowerPoint', () => {
     for (const marker of ['Remember document…', "'context-doc': [doc.path]", '.pptx']) {
       assert.ok(html.includes(marker), `the page lost "${marker}"`);

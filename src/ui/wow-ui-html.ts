@@ -3911,6 +3911,8 @@ function openLauncher() {
     repo: '',          /* slug of a saved repository to ground the run in */
     as: '',            /* email:password the run may sign in with — env-carried, never argv */
     autoheal: false,   /* --repair: a failed / error / dead-end case reruns itself after a fix */
+    backend: false,    /* --backend: may this run call HTTP and read the database at all? */
+    dbUrl: '',         /* WOWLIDATOR_DB_URL — env-carried like the sign-in pair, never argv */
     advanced: false,
     video: 'on',
     screenshots: 'auto',
@@ -4456,6 +4458,32 @@ function launcherBox(M) {
         text: 'fix broken steps with the repair model, then rerun — costs tokens on failure only' })
     ]));
 
+    /* In front of the fold, beside autoheal, because it changes what gets
+       WRITTEN rather than how a written test runs: off, the author proves
+       every claim through the page and marks the ones a backend check would
+       prove better; on, it may call HTTP and read the database, and then it
+       needs somewhere to read it FROM — so the field appears only then, and
+       the run refuses to start without it. */
+    var backendBox = el('input', { type: 'checkbox', onchange: function (e) { M.backend = e.target.checked; renderLauncher(); } });
+    backendBox.checked = M.backend;
+    box.appendChild(el('label', { class: 'autoheal-row', title:
+      'On: the test may call HTTP endpoints and read the database directly, and a database URL is required. Off: nothing but the page is used — a claim that wants the backend is still proved visually, and the step is marked as one a backend check could prove more directly.' }, [
+      backendBox,
+      el('span', { text: 'Include backend steps' }),
+      el('span', { class: 'mono', style: 'color:var(--muted);font-size:11px',
+        text: M.backend ? 'HTTP and database assertions may be written — needs a database URL' : 'page only — backend-shaped claims are proved visually and marked' })
+    ]));
+    if (M.backend) {
+      /* A password box for the same reason as "Sign in as": a connection
+         string carries a credential, must not sit readable in a screenshot of
+         this panel, and reaches the CLI as WOWLIDATOR_DB_URL — an environment
+         variable, never the command line. */
+      var dbUrl = el('input', { type: 'password', class: 'mono', placeholder: 'postgres://user@localhost:5432/database',
+        value: M.dbUrl, oninput: function (e) { M.dbUrl = e.target.value; } });
+      box.appendChild(formField('Database URL', false, dbUrl,
+        'Read-only access for database checks. Leave it blank only if this machine already sets WOWLIDATOR_DB_URL.'));
+    }
+
     box.appendChild(el('button', {
       type: 'button', class: 'btn', style: 'margin-top:8px',
       text: (M.advanced ? '▾' : '▸') + ' Options for this run only — nothing here is stored',
@@ -4573,6 +4601,11 @@ function submitLauncher() {
   if (M.repo) extras.repo = M.repo;
   if (M.as.trim()) extras.as = M.as.trim();
   if (M.autoheal) extras.repair = true;
+  /* Stated either way, never left to a default: the CLI keeps backend testing
+     ON so existing scripts are unchanged, and this panel offers it as opt-in.
+     commands.ts turns the false into --no-backend. */
+  extras.backend = M.backend === true;
+  if (M.backend && M.dbUrl.trim()) extras['db-url'] = M.dbUrl.trim();
 
   if (M.mode === 'describe') {
     var go = { target: M.describe.trim() };
