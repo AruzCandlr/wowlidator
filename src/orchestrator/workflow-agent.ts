@@ -23,7 +23,7 @@ import { SELECTOR_SYNTAX_RULES, captureAxNodes } from '../healer/jit-healer.js';
 import { CONSENT_ACCEPT_NAME, CONSENT_GATE_URL_PATTERN, acceptConsentGateAnywhere, consentGateShowing } from '../engine/sign-in.js';
 import { scopeUrl, type CacheManager } from '../cache/cache-manager.js';
 import type { AxNode } from '../healer/jit-healer.js';
-import { decisionKey, focusTree, renderTree, selectorGrounded, selectorName } from './agent-guards.js';
+import { decisionKey, focusTree, renderTree, selectorGrounded, selectorName, unscopedDestructiveClick } from './agent-guards.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
 import {
   LlmFactory,
@@ -323,6 +323,11 @@ SIGN-IN, when the goal asks for it:
   in "reasoning".
 
 WHAT THE LOOP WILL REFUSE (so answer the way it accepts, the first time):
+- A destructive click (Delete, Remove…) that does not name the row the goal
+  is about. When the goal names an identifier, scope the click to it
+  (role=row[name="<id>" i] >> role=button[name="Delete" i]); never
+  "the first Delete button" — that acts on whatever row comes first, and
+  is refused every time, not re-asked.
 - A selector whose name is not in the tree. Every role name and text you
   quote must be copied from a node above — the tree is the whole evidence,
   and a name that is not in it is a guess that will be sent back to you.
@@ -746,6 +751,7 @@ export class WorkflowAgent {
       // the whole value — it is the first ask that knows what was wrong.
       let decision: AgentDecision | null = null;
       let feedback: string | undefined;
+      let refusedTurn = false;
       for (let ask = 0; ask < 2 && decision === null; ask += 1) {
         let candidate: AgentDecision;
         try {
@@ -767,7 +773,7 @@ export class WorkflowAgent {
         inputTokens += candidate.inputTokens ?? 0;
         outputTokens += candidate.outputTokens ?? 0;
 
-        const refusal = this.#refuse(candidate, axTree, doneHere, destination, page.url(), ask);
+        const refusal = this.#refuse(candidate, axTree, doneHere, destination, page.url(), ask, goal);
         if (refusal === null) {
           decision = candidate;
         } else if (ask === 0) {
@@ -783,6 +789,16 @@ export class WorkflowAgent {
             actions.push(this.#record(actions.length, candidate, page.url(), false, 0, refusal));
             return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens);
           }
+          if (refusal.startsWith('destructive')) {
+            // Never acted on, however the model insists: recorded as a
+            // failed action so the report shows what was refused and why,
+            // and the turn counts as no progress — the run goes on, because
+            // the right row may still be found (or `fail` said honestly).
+            actions.push(this.#record(actions.length, candidate, page.url(), false, 0, refusal));
+            history.push(`click ${candidate.selector} — REFUSED: ${refusal}`);
+            refusedTurn = true;
+            break;
+          }
           if (candidate.action === 'finish') {
             // An unverified finish is recorded as one — never as success.
             summary = `agent claimed finish, but ${refusal}`;
@@ -792,7 +808,18 @@ export class WorkflowAgent {
           decision = candidate;
         }
       }
-      if (decision === null) continue;
+      if (decision === null) {
+        if (refusedTurn) {
+          turnsWithoutProgress += 1;
+          if (turnsWithoutProgress >= AGENT_NO_PROGRESS_TURNS) {
+            summary =
+              `agent stalled: nothing advanced in ${turnsWithoutProgress} consecutive turns` +
+              ` (last refusal: ${actions[actions.length - 1]?.error ?? ''})`;
+            break;
+          }
+        }
+        continue;
+      }
 
       if (decision.action === 'finish') {
         success = true;
@@ -1234,6 +1261,7 @@ export class WorkflowAgent {
     destination: string | null,
     currentUrl: string,
     ask: number,
+    goal: string,
   ): string | null {
     if (decision.action === 'finish') {
       if (destination !== null && !atGoalDestination(currentUrl, destination)) {
@@ -1242,6 +1270,10 @@ export class WorkflowAgent {
       return null;
     }
     if (decision.action === 'fail') return null;
+    // A delete aimed at "whatever row comes first" is refused before any
+    // grounding question: the control exists, and that is the problem.
+    const destructive = unscopedDestructiveClick(decision, goal);
+    if (destructive !== null) return destructive;
     // `scroll` is in this list (2026-08-25): scrolling to a name the tree
     // does not show waited the full action timeout, three turns running, on
     // every "bring row PL_03_… into view" leg whose row was not rendered.

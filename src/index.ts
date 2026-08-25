@@ -480,6 +480,9 @@ export {
 
 export {
   ApiActions,
+  MethodRefusedError,
+  NoResponseError,
+  methodRefused,
   type ApiActionsOptions,
   type FlowRequestSpec,
 } from './api/api-actions.js';

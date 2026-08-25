@@ -1880,6 +1880,12 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     declaredRoutes: (repoContextGraph?.nodes ?? [])
       .filter((node) => node.kind === 'route')
       .map((node) => node.name),
+    // The same grounding, one layer down: `METHOD /path` for every endpoint
+    // the repo declares, so an authored request's METHOD can be checked —
+    // see `unindexedRequestMethod`.
+    declaredOperations: (repoContextGraph?.nodes ?? [])
+      .filter((node) => node.kind === 'operation')
+      .map((node) => node.name),
     // Supplied by the person, never guessed — see `parseCredentials`.
     ...(options.credentials ? { credentials: options.credentials } : {}),
     // `--scope e2e` was silently ignored on this path: the flag was read into
@@ -2353,6 +2359,12 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
     // declares is evidence as good as the tree's own url= attributes.
     declaredRoutes: (repoContextGraph?.nodes ?? [])
       .filter((node) => node.kind === 'route')
+      .map((node) => node.name),
+    // The same grounding, one layer down: `METHOD /path` for every endpoint
+    // the repo declares, so an authored request's METHOD can be checked —
+    // see `unindexedRequestMethod`.
+    declaredOperations: (repoContextGraph?.nodes ?? [])
+      .filter((node) => node.kind === 'operation')
       .map((node) => node.name),
     // Supplied by the person, never guessed — see `parseCredentials`.
     ...(options.credentials ? { credentials: options.credentials } : {}),

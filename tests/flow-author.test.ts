@@ -37,6 +37,9 @@ import {
   unsynchronizedLoginSubmit,
   dbClaimWithoutDbCheck,
   loginProofAssertsLoginPage,
+  unindexedRequestMethod,
+  wordingClaimAssertsDataValue,
+  wordingClaimAssertsDataValue,
   type AuthorRequest,
   type AuthorResult,
   type FlowAuthorModel,
@@ -1193,6 +1196,159 @@ describe('a CSS comment is not a selector', () => {
       { action: 'expectVisible', selector: 'role=table', intent: 'the manager renders' },
     ]);
     assert.equal(result.droppedSteps, 1);
+  });
+});
+
+describe('wordingClaimAssertsDataValue', () => {
+  const claim = 'PL_02_02 ตรวจสอบความถูกต้องของข้อความในหน้า Benefit Plan Catalog — menu: HR > Benefits Admin > Benefit Plans; expected: 2.1 ข้อความสะกดถูกต้องตรงตาม Spec';
+  const tree = [
+    'heading "Benefit Plan Catalog"',
+    'link "Benefits Admin" url="/en/admin/benefits"',
+    'columnheader "Benefit Name"',
+    'button "Create Plan"',
+    'cell "TH_MED_001"',
+    'cell "Medical Reimbursement"',
+  ].join('\n');
+
+  it('refuses a wording claim asserted on a row value the sheet never states (PL_02_02)', () => {
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/benefits/plans' },
+      { action: 'expectVisible', selector: 'text=Medical Reimbursement' },
+    ];
+    assert.deepEqual(wordingClaimAssertsDataValue(claim, steps, tree), { index: 1, value: 'Medical Reimbursement' });
+    // expectText carries the value in `value`.
+    assert.equal(
+      wordingClaimAssertsDataValue(claim, [{ action: 'expectText', selector: 'role=table', value: 'Medical Reimbursement' }], tree)?.value,
+      'Medical Reimbursement',
+    );
+  });
+
+  it('accepts labels the sheet names or the tree shows outside a data row', () => {
+    const steps: FlowStep[] = [
+      { action: 'expectVisible', selector: 'text="Benefit Plans"' },
+      { action: 'expectVisible', selector: 'text="Benefits Admin"' },
+      { action: 'expectVisible', selector: 'text=Create Plan' },
+      { action: 'expectText', selector: 'role=columnheader', value: 'Benefit Name' },
+      { action: 'expectVisible', selector: 'role=heading[name="Benefit Plan Catalog" i]' },
+    ];
+    assert.equal(wordingClaimAssertsDataValue(claim, steps, tree), null);
+  });
+
+  it('never fires for a claim that is not about wording', () => {
+    const steps: FlowStep[] = [{ action: 'expectVisible', selector: 'text=Medical Reimbursement' }];
+    assert.equal(wordingClaimAssertsDataValue('PL_04_03 filter by benefit name shows the matching plan', steps, tree), null);
+  });
+});
+
+describe('wordingClaimAssertsDataValue', () => {
+  const claim =
+    'PL_02_02 ตรวจสอบความถูกต้องของข้อความในหน้า Benefit Plan Catalog — expected: 2.1 ข้อความสะกดถูกต้องตรงตาม Spec';
+  const tree = [
+    'heading "Benefit Plan Catalog"',
+    'link "Benefits Admin" url="/en/admin/benefits"',
+    'columnheader "Benefit Name"',
+    'button "Create Plan"',
+    'cell "TH_MED_001"',
+    'cell "Medical Reimbursement"',
+  ].join('\n');
+
+  it('refuses a wording claim asserted on a row value (PL_02_02)', () => {
+    // The plan name is in the tree — as a CELL. A row is data: a sibling
+    // delete case removed TH_MED_001 45 minutes after this was authored, and
+    // the case dead-ended against a correctly worded page.
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/benefits/plans' },
+      { action: 'expectVisible', selector: 'text=Medical Reimbursement' },
+    ];
+    assert.deepEqual(wordingClaimAssertsDataValue(claim, steps, tree), {
+      index: 1,
+      value: 'Medical Reimbursement',
+    });
+    assert.equal(
+      wordingClaimAssertsDataValue(
+        claim,
+        [{ action: 'expectText', selector: 'role=table', value: 'Medical Reimbursement' }],
+        tree,
+      )?.value,
+      'Medical Reimbursement',
+    );
+  });
+
+  it('accepts labels the spec owns — heading, breadcrumb, column, button', () => {
+    // The shape the earlier authorings of PL_02_02 used, which proved.
+    const steps: FlowStep[] = [
+      { action: 'expectVisible', selector: 'text="Benefit Plan Catalog"' },
+      { action: 'expectVisible', selector: 'text="Benefits Admin"' },
+      { action: 'expectVisible', selector: 'text=Create Plan' },
+      { action: 'expectText', selector: 'role=columnheader', value: 'Benefit Name' },
+    ];
+    assert.equal(wordingClaimAssertsDataValue(claim, steps, tree), null);
+  });
+
+  it('says nothing for a non-wording claim, or with no tree to judge against', () => {
+    const steps: FlowStep[] = [{ action: 'expectVisible', selector: 'text=Medical Reimbursement' }];
+    assert.equal(wordingClaimAssertsDataValue('PL_04_03 filter by benefit name', steps, tree), null);
+    // Ungrounded authoring cannot tell a label from a row — silence, never a
+    // refusal of every honest wording flow.
+    assert.equal(wordingClaimAssertsDataValue(claim, steps, ''), null);
+  });
+});
+
+describe('unindexedRequestMethod', () => {
+  // What the repository declares once its file-convention router is read for
+  // methods: `/api/benefit-plans` answers writes only.
+  const declared = [
+    'POST /api/benefit-plans',
+    'PUT /api/benefit-plans',
+    'DELETE /api/benefit-plans',
+    'GET /api/db/health',
+  ];
+
+  it('refuses the PL_03_03 shape: GET on a path that declares only writes', () => {
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/benefits/plans' },
+      { action: 'request', method: 'GET', url: 'http://localhost:3000/api/benefit-plans' },
+    ];
+    assert.deepEqual(unindexedRequestMethod(steps, declared), {
+      index: 1,
+      method: 'GET',
+      path: '/api/benefit-plans',
+      declared: ['DELETE', 'POST', 'PUT'],
+    });
+  });
+
+  it('accepts a declared method, and ignores the origin and query string', () => {
+    assert.equal(
+      unindexedRequestMethod(
+        [{ action: 'request', method: 'POST', url: 'http://localhost:3000/api/benefit-plans?dry=1' }],
+        declared,
+      ),
+      null,
+    );
+    assert.equal(
+      unindexedRequestMethod([{ action: 'request', method: 'get', url: '/api/db/health' }], declared),
+      null,
+      'the method is compared case-insensitively',
+    );
+    // A GET handler answers HEAD in every framework this indexes.
+    assert.equal(
+      unindexedRequestMethod([{ action: 'request', method: 'HEAD', url: '/api/db/health' }], declared),
+      null,
+    );
+  });
+
+  it('says nothing about a path the index does not declare, or with no index at all', () => {
+    // Silence is the rule: an endpoint outside the index may be a proxy, a
+    // service on another host, or an unindexed repo — and a refusal there
+    // would block honest tests.
+    assert.equal(
+      unindexedRequestMethod([{ action: 'request', method: 'GET', url: '/api/not-indexed' }], declared),
+      null,
+    );
+    assert.equal(
+      unindexedRequestMethod([{ action: 'request', method: 'GET', url: '/api/benefit-plans' }], []),
+      null,
+    );
   });
 });
 

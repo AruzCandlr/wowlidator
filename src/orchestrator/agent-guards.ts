@@ -29,7 +29,16 @@ export interface DecisionLike {
 
 /** The accessible name a role selector asks for, if it asks for one. */
 export function selectorName(selector: string): string | null {
-  const trimmed = selector.trim();
+  // The FIRST segment only. A Playwright selector chains with `>>`, and the
+  // bare-text pattern below is greedy: on `text=PL_03_18 >> xpath=.. >>
+  // role=button[name="Delete"]` it used to read the whole string as the name,
+  // which of course appears in no tree — so a correctly scoped click was
+  // refused as ungrounded and the agent talked itself into finishing instead
+  // (caught 2026-08-25 by the destructive-scope test, which asked for exactly
+  // that shape). Grounding asks "does the thing this selector starts from
+  // exist", and the first segment is that thing; `targetName` below walks the
+  // segments itself for the control the click lands ON.
+  const trimmed = (selector.split('>>')[0] ?? selector).trim();
   const m = /^role=[a-z]+\s*\[name=(?:"([^"]+)"|'([^']+)')/i.exec(trimmed);
   if (m) return (m[1] ?? m[2]) as string;
   const quoted = /^text="([^"]+)"$/.exec(trimmed);
@@ -104,3 +113,54 @@ export function renderTree(nodes: readonly AxNode[], total: number): string {
     `anything is missing.]`
   );
 }
+
+/** A control whose accessible name says it destroys something. */
+export const DESTRUCTIVE_NAME = /^(delete|remove|destroy|purge|discard|erase|ลบ)\b/i;
+/** The identifier-shaped tokens a goal names: PL_03_15_16_17_18, TH_MED_001, BE-CYC-001. */
+const GOAL_IDENTIFIER = /\b[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+){1,}\b/g;
+
+/** The accessible name of the LAST role segment — the control the click lands on. */
+function targetName(selector: string): string | null {
+  const segments = selector.split('>>').map((seg) => seg.trim());
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const name = selectorName(segments[i] ?? '');
+    if (name !== null) return name;
+    if (/^role=/.test(segments[i] ?? '')) return null;
+  }
+  return null;
+}
+
+/**
+ * Why a destructive click must not run as written, or null.
+ *
+ * Live (be100 PL_03_18, 2026-08-25 06:28): the goal named the row to delete
+ * (PL_03_15_16_17_18), the agent could not find it, clicked
+ * `role=button[name="Delete" i] >> nth=0` — the first Delete button on a
+ * 75-row table — confirmed the dialog, and the network shows
+ * `DELETE /api/benefit-plans?planId=TH_MED_001`: a plan the goal never named,
+ * gone for good on an authoritative database, and every later case that
+ * asserted on it dead-ended. Its reasoning said it was the right row. The
+ * rule "no destructive action unless the goal asks" was met on paper.
+ *
+ * So: when the goal names an identifier and the click's target is a
+ * destructive control, the selector must carry one of those identifiers —
+ * the row scoped by the thing the goal is about — or be inside a dialog
+ * (the confirmation of a delete already scoped). A goal that names no
+ * identifier has nothing to scope to and is left to the prompt's rule.
+ */
+export function unscopedDestructiveClick(decision: DecisionLike, goal: string): string | null {
+  if (decision.action !== 'click' || decision.selector.trim() === '') return null;
+  const name = targetName(decision.selector);
+  if (name === null || !DESTRUCTIVE_NAME.test(name.trim())) return null;
+  const ids = [...new Set(goal.match(GOAL_IDENTIFIER) ?? [])].filter((id) => /\d/.test(id));
+  if (ids.length === 0) return null;
+  const selector = decision.selector.toLowerCase();
+  if (/^role=(alert)?dialog\b/.test(selector)) return null;
+  if (ids.some((id) => selector.includes(id.toLowerCase()))) return null;
+  return (
+    `destructive: "${decision.selector}" presses "${name}" without naming which row — the goal is about ` +
+    `${ids.join(' / ')}, and this would act on whatever row comes first. Scope the click to that row ` +
+    `(role=row[name="${ids[0]}" i] >> role=button[name="${name}" i]), or call fail if the row is not on the page`
+  );
+}
+

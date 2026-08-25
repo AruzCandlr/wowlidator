@@ -28,6 +28,34 @@ export class NoResponseError extends Error {
   override readonly name = 'NoResponseError';
 }
 
+/**
+ * The endpoint exists and refused the METHOD — 405, or 501 for a method it
+ * does not implement. A fault of the flow's own making, in the same family as
+ * `UnknownVariableError`: it says the test asked the wrong way, never that
+ * the application is wrong.
+ *
+ * Live (be100 PL_03_03, 2026-08-25): `GET /api/benefit-plans` against a
+ * handler exporting POST, PUT and DELETE only. The run filed a `high`
+ * `backend` defect and a `high` `functional` one, and the case was scored a
+ * failure — against an application answering exactly as written. The prose
+ * was already right ("check the spec before filing one"); it lived inside the
+ * error message, where no verdict could read it. As a NAME it reaches
+ * `classifyStepFailure` (scored `error`, so `harnessOnly` records the case
+ * blocked — no verdict — rather than a defect) and the reconstruction guard
+ * (no rewrite of the step can give a handler a method it does not export).
+ *
+ * The authoring lint `unindexedRequestMethod` is the other half: with the
+ * repository's operations indexed, this shape is refused before it ever runs.
+ */
+export class MethodRefusedError extends Error {
+  override readonly name = 'MethodRefusedError';
+}
+
+/** Whether a status is a method-level refusal: the endpoint is there, the verb is not. */
+export function methodRefused(status: number): boolean {
+  return status === 405 || status === 501;
+}
+
 /** A `request` step's parameters, as authored in a `.flow.json`. */
 export interface FlowRequestSpec {
   method: string;
@@ -200,6 +228,19 @@ export class ApiActions {
       }
     }
 
+    // A method the endpoint does not offer is named as such in the RECORD
+    // too, not only in what is thrown: the record is what the report and the
+    // reader see, and "the response did not contain $.count" sends them into
+    // a body that was never going to have one.
+    const methodDrift = saveError !== undefined && methodRefused(response.status);
+    if (methodDrift) {
+      saveError =
+        `${sent.method} ${sent.url} — the endpoint refused the method ` +
+        `(${response.status} ${response.statusText}); it exists but does not answer ${sent.method}. ` +
+        "This is the test's own method drifting from the endpoint, not a finding about the " +
+        `application. ${saveError}`;
+    }
+
     this.#record('request', intent, startedAt, started, {
       status: saveError ? 'failed' : 'passed',
       detail: { method: sent.method, url: sent.url, status: response.status, intent },
@@ -208,6 +249,11 @@ export class ApiActions {
     });
 
     if (saveError) {
+      // A method the endpoint does not offer files no defect against anyone:
+      // the body the save wanted was never going to exist, and the reason is
+      // the request's own verb. Same rule as `UnknownVariableError` below in
+      // `#assert` — the step still fails loudly, and scores `error`.
+      if (methodDrift) throw new MethodRefusedError(saveError);
       this.#recordDefect(
         'functional',
         'high',
@@ -233,13 +279,19 @@ export class ApiActions {
         // API never offered, filed as a backend failure. The claim still
         // fails — a wrong status is a wrong status — but the message says
         // where to look first.
-        const methodDrift =
-          response.status === 405 || response.status === 501
-            ? ' — a method-level refusal usually means the request\'s own method is wrong ' +
-              '(test drift from the endpoint\'s spec), not a backend defect; check the spec before filing one'
-            : '';
+        // Typed, not merely worded (2026-08-25): as prose inside the message
+        // this reached a reader and no verdict, and PL_03_03 filed the
+        // `backend`/`high` defect anyway. `MethodRefusedError` is rethrown by
+        // `#assert` before any defect is recorded.
+        if (methodRefused(response.status)) {
+          throw new MethodRefusedError(
+            `expected status ${allowed.join(' or ')}, got ${response.status} ${response.statusText}` +
+              ' — a method-level refusal means the request\'s own method is wrong (test drift from the ' +
+              'endpoint\'s spec), not a backend defect; the endpoint exists and does not answer this verb',
+          );
+        }
         throw new Error(
-          `expected status ${allowed.join(' or ')}, got ${response.status} ${response.statusText}${methodDrift}`,
+          `expected status ${allowed.join(' or ')}, got ${response.status} ${response.statusText}`,
         );
       }
     });
@@ -368,7 +420,11 @@ export class ApiActions {
       // `backend`/`high` defects that sent readers hunting an API the run
       // never reached. The step still fails loudly; the runner's
       // `classifyStepFailure` scores both `error` by name.
-      if (error instanceof UnknownVariableError || error instanceof NoResponseError) {
+      if (
+        error instanceof UnknownVariableError ||
+        error instanceof NoResponseError ||
+        error instanceof MethodRefusedError
+      ) {
         throw error;
       }
       // `backend`, not `functional`: there is no selector, no page, and

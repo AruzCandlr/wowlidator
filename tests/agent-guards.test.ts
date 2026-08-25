@@ -19,6 +19,7 @@ import {
   focusTree,
   selectorGrounded,
   selectorName,
+  unscopedDestructiveClick,
 } from '../src/orchestrator/agent-guards.js';
 import { AGENT_ACTIONS, AGENT_NO_PROGRESS_TURNS, WorkflowAgent, parseWherePairs, type AgentDecision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
@@ -56,6 +57,33 @@ describe('selectorGrounded', () => {
   it('says nothing about a selector it cannot read', () => {
     assert.equal(selectorGrounded('input[type="password"]', TREE), null);
     assert.equal(selectorGrounded('role=textbox >> nth=1', TREE), null);
+  });
+});
+
+describe('unscopedDestructiveClick', () => {
+  const goal = 'delete the plan PL_03_15_16_17_18 and confirm';
+  const click = (selector: string) => ({ action: 'click', selector, value: '', url: '' });
+
+  it('refuses "the first Delete button" when the goal names a row', () => {
+    // be100 PL_03_18: this exact selector deleted TH_MED_001, a plan the goal
+    // never named, and the reasoning said it was the right row.
+    const why = unscopedDestructiveClick(click('role=button[name="Delete" i] >> nth=0'), goal);
+    assert.match(why ?? '', /^destructive:/);
+    assert.match(why ?? '', /PL_03_15_16_17_18/);
+    assert.match(why ?? '', /role=row\[name="PL_03_15_16_17_18" i\]/, 'the feedback shows the scoped shape');
+    assert.match(unscopedDestructiveClick(click('role=button[name="Remove" i]'), 'remove TH_MED_001') ?? '', /^destructive/);
+  });
+
+  it('accepts a delete scoped to the goal\'s row, and a confirmation inside a dialog', () => {
+    assert.equal(unscopedDestructiveClick(click('role=row[name="PL_03_15_16_17_18" i] >> role=button[name="Delete" i]'), goal), null);
+    assert.equal(unscopedDestructiveClick(click('text=PL_03_15_16_17_18 >> .. >> role=button[name="Delete"]'), goal), null);
+    assert.equal(unscopedDestructiveClick(click('role=dialog[name="Confirm delete plan" i] >> role=button[name="Delete"]'), goal), null);
+  });
+
+  it('leaves non-destructive clicks, and goals that name no identifier, to the prompt', () => {
+    assert.equal(unscopedDestructiveClick(click('role=button[name="Edit" i] >> nth=0'), goal), null);
+    assert.equal(unscopedDestructiveClick(click('role=button[name="Delete" i] >> nth=0'), 'delete the first draft'), null);
+    assert.equal(unscopedDestructiveClick({ action: 'fill', selector: 'role=textbox[name="Delete reason"]', value: 'x', url: '' }, goal), null);
   });
 });
 
@@ -140,7 +168,10 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
       res.end(
         path === '/en/done'
           ? '<h1>Done</h1>'
-          : '<h1>Start</h1><a id="go" href="/en/done">Continue</a><button>Only button</button>',
+          : path === '/en/rows'
+            ? '<h1>Plans</h1><table><tr><td>TH_MED_001</td><td><button onclick="document.title=\'deleted TH_MED_001\'">Delete</button></td></tr>' +
+              '<tr><td>PL_03_18</td><td><button onclick="document.title=\'deleted PL_03_18\'">Delete</button></td></tr></table>'
+            : '<h1>Start</h1><a id="go" href="/en/done">Continue</a><button>Only button</button>',
       );
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -282,6 +313,31 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     // Two turns of a missing selector, each failing fast — well under the
     // 8 s per action the old path waited.
     assert.ok(Date.now() - started < 12_000, `took ${Date.now() - started} ms`);
+  });
+
+  it('never presses an unscoped Delete, however the model insists, and still lets a scoped one through', async () => {
+    const { model, seen } = scripted([
+      { action: 'click', selector: 'role=button[name="Delete" i] >> nth=0' },
+      { action: 'click', selector: 'role=button[name="Delete" i] >> nth=0' },
+      // The scoped shape a real run used successfully: find the id's cell,
+      // step up to its row, press that row's own Delete.
+      { action: 'click', selector: 'text=PL_03_18 >> xpath=.. >> role=button[name="Delete" i]' },
+      { action: 'finish', reasoning: 'deleted' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 4 });
+    const { result, title } = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/rows`, { waitUntil: 'domcontentloaded' });
+      const result = await agent.run(page, 'delete the plan PL_03_18');
+      return { result, title: await page.title() };
+    });
+    assert.equal(title, 'deleted PL_03_18', 'only the row the goal named was deleted');
+    assert.equal(result.success, true, result.summary);
+    const refused = result.actions[0];
+    assert.equal(refused?.ok, false);
+    assert.match(refused?.error ?? '', /^destructive:/);
+    assert.match(seen[1]?.feedback ?? '', /without naming which row/, 'told once, with the scoped shape');
+    // Refused twice in turn 1 (recorded once, never acted on); turn 2 is the scoped click; turn 3 finishes.
+    assert.equal(result.turns, 3);
   });
 
   it('refuses a goto off every known origin, and allows the goal\'s own', async () => {

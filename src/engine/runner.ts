@@ -5261,7 +5261,10 @@ function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] 
       error.name === 'ObservationUnavailableError' ||
       error.name === 'ObservationTruncatedError' ||
       error.name === 'UnknownVariableError' ||
-      error.name === 'NoResponseError')
+      error.name === 'NoResponseError' ||
+      // A 405/501 is the endpoint refusing the VERB the test chose — the
+      // flow's fault, never the application's (2026-08-25, be100 PL_03_03).
+      error.name === 'MethodRefusedError')
   ) {
     return 'error';
   }
@@ -5339,7 +5342,9 @@ function reconstructionFutile(error: unknown): boolean {
       // the request an assertion needed to have before it — same futility
       // rule, two more names (2026-08-24).
       error.name === 'UnknownVariableError' ||
-      error.name === 'NoResponseError')
+      error.name === 'NoResponseError' ||
+      // Nor can a rewrite give a handler a method it does not export.
+      error.name === 'MethodRefusedError')
   ) {
     return true;
   }

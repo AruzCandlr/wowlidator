@@ -1699,6 +1699,14 @@ export interface FlowAuthorOptions {
    */
   declaredRoutes?: readonly string[] | undefined;
   /**
+   * `METHOD /path` for every endpoint the selected repository declares — from
+   * an OpenAPI document or, since 2026-08-25, from the file-convention
+   * router's own exported handlers. The grounding source for an authored
+   * `request`'s METHOD, which nothing could check before — see
+   * `unindexedRequestMethod`.
+   */
+  declaredOperations?: readonly string[] | undefined;
+  /**
    * A second look at the accepted flow against the codebase and documents
    * before it is handed back — the level above the lints. Absent means the
    * flow is exactly what the author wrote. See `flow-review.ts`.
@@ -1723,6 +1731,7 @@ export class FlowAuthor {
   readonly #scope: TestScope | undefined;
   /** Route patterns the selected repository declares — grounding for expectUrl. */
   readonly #declaredRoutes: readonly string[];
+  readonly #declaredOperations: readonly string[];
   readonly #reviewer: FlowReviewer | undefined;
 
   constructor(options: FlowAuthorOptions) {
@@ -1737,6 +1746,7 @@ export class FlowAuthor {
     this.#journeyTree = options.journeyTree;
     this.#scope = options.scope;
     this.#declaredRoutes = options.declaredRoutes ?? [];
+    this.#declaredOperations = options.declaredOperations ?? [];
     this.#reviewer = options.reviewer;
     this.#onLog = options.onLog;
   }
@@ -2079,6 +2089,37 @@ export class FlowAuthor {
               '  …then pass --repo <slug> to this run.\n' +
               'Check the selected repository is the application under test — a repo with no ' +
               'table nodes silently removes every database claim from the suite.',
+          );
+        }
+
+        const wordingOnData = wordingClaimAssertsDataValue(
+          trimmed,
+          [...(result.setup ?? []), ...result.steps],
+          evidenceTree ?? '',
+        );
+        if (wordingOnData !== null) {
+          refuse(
+            `the authored flow "${result.name}" is for a claim about the page's WORDING, yet ` +
+              `step ${wordingOnData.index} asserts "${wordingOnData.value}" — a value the test case ` +
+              'never states and that the page shows only as a data row, if at all. A row is data, ' +
+              'not spec: it can be deleted or renamed by another case and the assertion fails against ' +
+              'a correctly worded page. Assert the labels the spec owns — the heading, breadcrumb, ' +
+              "column headers, button and filter labels — quoting each from the test case's words or " +
+              'from a heading/label node of the tree.',
+          );
+        }
+
+        const wrongMethod = unindexedRequestMethod(
+          [...(result.setup ?? []), ...result.steps],
+          this.#declaredOperations,
+        );
+        if (wrongMethod !== null) {
+          refuse(
+            `the authored flow "${result.name}" calls ${wrongMethod.method} ${wrongMethod.path}, but the ` +
+              `application declares that path only as ${wrongMethod.declared.join(', ')}. A handler with no ` +
+              `${wrongMethod.method} answers 405 Method Not Allowed — a refusal of the request, never a finding ` +
+              'about the application. Use one of the declared methods, or read the value from the page or the ' +
+              'database instead of inventing a read endpoint.',
           );
         }
 
@@ -2792,6 +2833,119 @@ export function credentialEchoAssertions(
     indexes.push(index);
   }
   return indexes;
+}
+
+/** A claim about how the page is worded, in either of the sheet's languages. */
+const WORDING_CLAIM =
+  /\b(spell\w*|wording|worded|label\w*|caption\w*|typo\w*|terminology|copy text|text (?:is|matches|reads|appears) )\b|ข้อความ|สะกด|คำแสดง|คำที่แสดง|ตัวสะกด/i;
+/** Tree roles whose text is DATA — a row's value, an option — never the page's own wording. */
+const DATA_ROLES = /^(cell|gridcell|rowheader|row|option|listitem|treeitem|menuitem)\b/i;
+
+/** The literal text an `expectVisible` / `expectText` asserts, when it asserts one. */
+function assertedText(step: FlowStep): string | null {
+  if (step.action === 'expectText') return step.value.trim() || null;
+  if (step.action !== 'expectVisible') return null;
+  const m = /^text=(?:"([^"]+)"|'([^']+)'|([^>]+))$/.exec(step.selector.trim());
+  if (m) return (m[1] ?? m[2] ?? m[3] ?? '').trim() || null;
+  return null;
+}
+
+/**
+ * A wording claim asserted on a data row instead of on the page's own labels.
+ *
+ * Live (be100 PL_02_02, 2026-08-25): the claim "ข้อความสะกดถูกต้องตรงตาม Spec"
+ * was authored as `expectVisible text=Medical Reimbursement` — a plan NAME
+ * the sheet never mentions, chosen as a stand-in for "the catalog's text is
+ * right". Forty-five minutes earlier a sibling delete case had removed that
+ * plan; the assertion then dead-ended on every run against a correctly
+ * worded page. The runs before, authored against `text="Benefit Plans"` and
+ * `text="Benefits Admin"`, proved. A wording claim may quote the test case's
+ * own words, or a label the tree shows outside a data role (heading,
+ * columnheader, button, link, breadcrumb); a value found only in a cell is a
+ * row, and a row is not spec. Returns the first offending step, or null.
+ */
+export function wordingClaimAssertsDataValue(
+  prompt: string,
+  steps: readonly FlowStep[],
+  evidenceTree: string,
+): { index: number; value: string } | null {
+  if (!WORDING_CLAIM.test(prompt)) return null;
+  // No tree, no opinion. Ungrounded authoring has nothing to tell a label
+  // from a row with, and a lint that refuses on absent evidence refuses
+  // every honest wording flow too (caught by the echo-pipeline test, whose
+  // breadcrumb assertions are exactly right).
+  if (evidenceTree.trim() === '') return null;
+  const fold = (text: string): string => text.toLowerCase().replace(/\s+/g, ' ').trim();
+  const claim = fold(prompt);
+  const labelLines = evidenceTree
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !DATA_ROLES.test(line))
+    .map(fold);
+  for (const [index, step] of steps.entries()) {
+    const text = assertedText(step);
+    if (text === null) continue;
+    const needle = fold(text);
+    if (needle.length < 3 || claim.includes(needle)) continue;
+    if (labelLines.some((line) => line.includes(needle))) continue;
+    return { index, value: text };
+  }
+  return null;
+}
+
+/**
+ * An authored `request` whose METHOD the indexed endpoints do not declare.
+ *
+ * Live (be100 PL_03_03, 2026-08-25): the flow called `GET /api/benefit-plans`
+ * and the application answered `405 Method Not Allowed`, because that handler
+ * exports POST, PUT and DELETE and no GET. Two `high` defects were filed
+ * against an app behaving exactly as written. The model had not invented the
+ * endpoint — the prompt tells it to take endpoints from the repository and
+ * the PATH was real — it invented the *method*, the half of an endpoint the
+ * index did not hold: the file-convention router emitted `route` nodes built
+ * from the file path alone, and `operation` nodes came only from an OpenAPI
+ * document nobody had supplied.
+ *
+ * With operations indexed the check is exact. It fires ONLY when the path is
+ * declared and the method is not — an endpoint outside the index says
+ * nothing (a proxy, a service on another host, an unindexed repo), and
+ * silence must not become a refusal. Returns the offending step with the
+ * methods that path does answer, or null.
+ */
+export function unindexedRequestMethod(
+  steps: readonly FlowStep[],
+  declaredOperations: readonly string[],
+): { index: number; method: string; path: string; declared: string[] } | null {
+  if (declaredOperations.length === 0) return null;
+  const byPath = new Map<string, Set<string>>();
+  for (const operation of declaredOperations) {
+    const [method, path] = operation.trim().split(/\s+/, 2);
+    if (method === undefined || path === undefined) continue;
+    const key = path.toLowerCase();
+    const set = byPath.get(key) ?? new Set<string>();
+    set.add(method.toUpperCase());
+    byPath.set(key, set);
+  }
+  for (const [index, step] of steps.entries()) {
+    if (step.action !== 'request') continue;
+    const method = (step.method ?? 'GET').toUpperCase();
+    // The path alone: an absolute URL's origin and any query string are not
+    // part of what the index declares.
+    let path: string;
+    try {
+      path = new URL(step.url, 'http://x.test').pathname;
+    } catch {
+      continue;
+    }
+    const declared = byPath.get(path.toLowerCase());
+    // Not indexed at all — no opinion. Only a path the repo DOES declare can
+    // contradict a method.
+    if (declared === undefined || declared.has(method)) continue;
+    // HEAD is served by a GET handler in every framework this indexes.
+    if (method === 'HEAD' && declared.has('GET')) continue;
+    return { index, method, path, declared: [...declared].sort() };
+  }
+  return null;
 }
 
 export function loginProofAssertsLoginPage(steps: readonly FlowStep[]): number | null {

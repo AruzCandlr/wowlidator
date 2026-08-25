@@ -32,6 +32,7 @@ import {
   extractPath,
   stringifyExtracted,
 } from '../src/api/variables.js';
+import { harnessOnly } from '../src/cli/exit.js';
 import { ContextEngine } from '../src/context/context-engine.js';
 import {
   ApiTestGenerator,
@@ -824,6 +825,14 @@ describe('api flow steps (CDP)', { skip: skipBrowser }, () => {
         json(403, { error: 'nope' });
         return;
       }
+      // The PL_03_03 shape: a real endpoint that answers writes only. Next.js
+      // answers 405 for a handler file with no matching export, and so does
+      // this fixture.
+      if (url === '/api/write-only') {
+        if (req.method === 'POST') json(201, { ok: true });
+        else json(405, { error: 'method not allowed' });
+        return;
+      }
       if (url === '/api/orders' && req.method === 'POST') {
         json(201, { data: { id: 'ord_7' }, status: 'new' });
         return;
@@ -927,6 +936,61 @@ describe('api flow steps (CDP)', { skip: skipBrowser }, () => {
     assert.equal(bundle.status, 'passed', bundle.error ?? 'a 401 assertion should pass');
     assert.equal(bundle.summary.failed, 0);
     assert.equal(bundle.summary.apiFailures, 0, 'a 401 is a result, not a transport failure');
+  });
+
+  it('scores a 405 as the test\'s own method drift, never a backend defect', async () => {
+    // be100 PL_03_03 (2026-08-25): `GET /api/benefit-plans` against a handler
+    // exporting POST/PUT/DELETE only. The run filed a `high` backend defect
+    // and a `high` functional one, and the case was scored a failure —
+    // against an application answering exactly as written. The prose said
+    // "check the spec before filing one"; it lived in the error message,
+    // where no verdict could read it.
+    const flow: Flow = {
+      name: 'method-drift',
+      baseUrl: origin,
+      steps: [
+        { action: 'request', method: 'GET', url: '/api/write-only' },
+        { action: 'expectStatus', status: 200 },
+      ],
+    };
+
+    const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'method.json') });
+
+    assert.notEqual(bundle.status, 'passed', 'the claim still fails — a wrong status is a wrong status');
+    const status = bundle.steps.find((step) => step.action === 'expectStatus');
+    assert.equal(status?.status, 'error', 'error, not failed: the flow asked the wrong way');
+    assert.match(status?.error ?? '', /method-level refusal/);
+    assert.equal(
+      bundle.defects.some((defect) => defect.category === 'backend'),
+      false,
+      'no defect routes to whoever owns the endpoint — the endpoint is fine',
+    );
+    // Every broken step being `error` is what lets the suite record the case
+    // blocked (no verdict) instead of filing it as a product failure.
+    assert.equal(
+      bundle.steps.filter((step) => step.status !== 'passed').every((step) => step.status === 'error'),
+      true,
+    );
+    assert.match(harnessOnly(bundle) ?? '', /the harness ended this case, not the application/);
+  });
+
+  it('a 405 on a save files no "response did not contain" defect either', async () => {
+    const flow: Flow = {
+      name: 'method-drift-save',
+      baseUrl: origin,
+      steps: [{ action: 'request', method: 'GET', url: '/api/write-only', save: { n: '$.count' } }],
+    };
+
+    const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'method-save.json') });
+
+    const request = bundle.steps.find((step) => step.action === 'request');
+    assert.equal(request?.status, 'error');
+    assert.match(request?.error ?? '', /refused the method/);
+    assert.equal(
+      bundle.defects.some((defect) => /did not contain what the test needed/.test(defect.title)),
+      false,
+      'the body was never going to hold it — the reason is the verb',
+    );
   });
 
   it('fails the step where a save path misses, not three steps later', async () => {

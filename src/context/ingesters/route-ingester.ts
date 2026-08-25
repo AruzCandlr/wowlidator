@@ -13,6 +13,14 @@ import { posix } from 'node:path';
 import type { IngestContext, IngestResult, Ingester, ProjectEdge, ProjectNode } from '../types.js';
 import { componentId, pascalFromFilename } from '../naming.js';
 
+/**
+ * The HTTP methods a file-convention router exposes by EXPORTING a function
+ * of that name. Next.js App Router: `export async function GET(...)`; the
+ * Pages Router has one default handler and no per-method exports, which is
+ * why only the App Router yields operations here.
+ */
+const HTTP_METHOD_EXPORTS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as const;
+
 const APP_BASENAMES = new Set(['page', 'layout', 'route']);
 const APP_EXTENSIONS = ['tsx', 'ts', 'jsx', 'js'];
 const NEXT_EXTENSION_RE = /\.(tsx|ts|jsx|js)$/;
@@ -57,6 +65,40 @@ async function guessDefaultComponentName(rootDir: string, file: string): Promise
   if (reference?.[1]) return reference[1];
   if (/export\s+default\s+/.test(text)) return pascalFromFilename(file);
   return undefined;
+}
+
+/**
+ * Which HTTP methods an App Router handler file exports.
+ *
+ * Read from the file because the file path cannot say it: `/api/benefit-plans`
+ * as a PATH exists whether or not it answers GET. Live (be100 PL_03_03,
+ * 2026-08-25): the index held `route "/api/benefit-plans"` and nothing else,
+ * the author took the path from the repo exactly as its prompt demands,
+ * guessed `GET`, and the app answered 405 Method Not Allowed — because that
+ * file exports POST, PUT and DELETE only. Two `high` defects were filed
+ * against an application that was behaving correctly. The method is half of
+ * what an endpoint is, and until now the file-convention router indexed the
+ * other half alone.
+ *
+ * A regex, not a parser, on the same "pragmatic beats wrong" rule as
+ * `guessDefaultComponentName` above: the three shapes Next.js documents
+ * (`export async function GET`, `export function GET`, `export const GET =`)
+ * are matched, and a file too odd to read yields no operations rather than
+ * wrong ones — the caller then keeps the methodless route node it always had.
+ */
+async function exportedHttpMethods(rootDir: string, file: string): Promise<string[]> {
+  let text: string;
+  try {
+    text = await readFile(posix.join(rootDir, file), 'utf8');
+  } catch {
+    return [];
+  }
+  const found: string[] = [];
+  for (const method of HTTP_METHOD_EXPORTS) {
+    const re = new RegExp(`export\\s+(?:async\\s+)?(?:function\\s+${method}\\b|const\\s+${method}\\s*[:=])`);
+    if (re.test(text)) found.push(method);
+  }
+  return found;
 }
 
 interface AppRouteMatch {
@@ -113,13 +155,41 @@ export class RouteIngester implements Ingester {
 
       const routePath = toRoutePath(match.segments);
       const nodeId = `route:${file}`;
+      // An api route's methods, read from the file. Recorded on the route
+      // node too (one string, so `meta` stays a flat record) — a reader that
+      // only has the route still learns what it answers.
+      const methods =
+        match.type === 'api' && match.router === 'next-app'
+          ? await exportedHttpMethods(ctx.rootDir, file)
+          : [];
       nodes.push({
         id: nodeId,
         kind: 'route',
         name: routePath,
         file,
-        meta: { router: match.router, type: match.type },
+        meta: {
+          router: match.router,
+          type: match.type,
+          ...(methods.length > 0 ? { methods: methods.join(',') } : {}),
+        },
       });
+
+      // One `operation` per method+path — the same kind, id and `METHOD /path`
+      // name shape the OpenAPI ingester emits, so every consumer (the prompt
+      // slice, route matching, the authoring lint) reads one vocabulary
+      // whether the endpoints came from a spec or from the file system. A
+      // handler file that exports no method at all (a helper, an odd shape
+      // the regex could not read) contributes none, and the route node above
+      // still stands: silence, never a guess.
+      for (const method of methods) {
+        nodes.push({
+          id: `operation:${method} ${routePath}`,
+          kind: 'operation',
+          name: `${method} ${routePath}`,
+          file,
+          meta: { source: 'route-file', router: match.router },
+        });
+      }
 
       if (match.type !== 'api') {
         const componentName = await guessDefaultComponentName(ctx.rootDir, file);

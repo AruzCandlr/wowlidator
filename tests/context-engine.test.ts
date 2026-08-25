@@ -80,6 +80,14 @@ const NEXT_APP_FIXTURE = {
   'app/api/employees/route.ts': `
     export function GET() { return new Response('[]'); }
   `,
+  // The PL_03_03 shape: a real path that answers writes only. Its GET does
+  // not exist, and before methods were indexed nothing could say so.
+  'app/api/benefit-plans/route.ts': `
+    export const dynamic = 'force-dynamic';
+    export async function POST(request: Request) { return new Response('{}'); }
+    export async function PUT(request: Request) { return new Response('{}'); }
+    export const DELETE = async (request: Request) => new Response('{}');
+  `,
   'pages/blog/[slug].tsx': `
     export default function BlogPost() {
       return <article />;
@@ -186,17 +194,66 @@ describe('context engine', () => {
     it('converts App Router dynamic segments and drops route groups', async () => {
       const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
       const result = await new RouteIngester().ingest(ctx);
-      const byFile = new Map(result.nodes.map((node) => [node.file, node]));
+      // Routes only: an api handler now contributes its `operation` nodes to
+      // the same file, and this test is about the route path.
+      const byFile = new Map(
+        result.nodes.filter((node) => node.kind === 'route').map((node) => [node.file, node]),
+      );
 
       assert.equal(byFile.get('app/employees/[id]/page.tsx')?.name, '/employees/:id');
       assert.equal(byFile.get('app/(marketing)/about/page.tsx')?.name, '/about');
       assert.equal(byFile.get('app/api/employees/route.ts')?.meta?.type, 'api');
     });
 
+    it('reads which HTTP methods an api route exports, and emits one operation each', async () => {
+      // be100 PL_03_03 (2026-08-25): `/api/benefit-plans` was indexed from its
+      // file path alone, the author took the real path and guessed GET, and
+      // the app answered 405 — two `high` defects against correct behaviour.
+      // The method is half of what an endpoint is.
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+
+      const plans = result.nodes.find((n) => n.file === 'app/api/benefit-plans/route.ts' && n.kind === 'route');
+      assert.equal(plans?.meta?.['methods'], 'POST,PUT,DELETE', 'all three export shapes are read');
+
+      const operations = result.nodes.filter((n) => n.kind === 'operation').map((n) => n.name).sort();
+      assert.deepEqual(operations, [
+        'DELETE /api/benefit-plans',
+        'GET /api/employees',
+        'POST /api/benefit-plans',
+        'PUT /api/benefit-plans',
+      ]);
+      // The id and `METHOD /path` name are the OpenAPI ingester's own shape,
+      // so every consumer reads one vocabulary whichever source found it.
+      const post = result.nodes.find((n) => n.name === 'POST /api/benefit-plans');
+      assert.equal(post?.id, 'operation:POST /api/benefit-plans');
+      assert.equal(post?.file, 'app/api/benefit-plans/route.ts');
+    });
+
+    it('emits no operation for a page, a layout, or a handler it cannot read', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+      const fromPages = result.nodes.filter(
+        (n) => n.kind === 'operation' && !n.file.startsWith('app/api/'),
+      );
+      assert.deepEqual(fromPages, [], 'only api handlers declare methods');
+      // A file the walk lists but disk does not hold: silence, never a guess —
+      // the route node still stands, with no methods claimed.
+      const missing = await new RouteIngester().ingest({
+        rootDir: dir,
+        files: ['app/api/ghost/route.ts'],
+      });
+      assert.equal(missing.nodes.length, 1);
+      assert.equal(missing.nodes[0]?.kind, 'route');
+      assert.equal(missing.nodes[0]?.meta?.['methods'], undefined);
+    });
+
     it('handles Pages Router index and dynamic files', async () => {
       const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
       const result = await new RouteIngester().ingest(ctx);
-      const byFile = new Map(result.nodes.map((node) => [node.file, node]));
+      const byFile = new Map(
+        result.nodes.filter((node) => node.kind === 'route').map((node) => [node.file, node]),
+      );
 
       assert.equal(byFile.get('pages/index.tsx')?.name, '/');
       assert.equal(byFile.get('pages/blog/[slug].tsx')?.name, '/blog/:slug');
