@@ -9,3 +9,8 @@ healed-selectors.json
 
 # Local provider keys — never commit these.
 .env
+
+# Supervision artefacts — one run’s incidents, not the project’s history.
+incident.html
+incident.jsonl
+supervisor.hold
