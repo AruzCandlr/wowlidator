@@ -1781,6 +1781,21 @@ function taskRow(task) {
         text: fmtTok(latest.inputTokens) + ' in / ' + fmtTok(latest.outputTokens) + ' out'
       }));
     }
+    /* What the person own Claude session was charged for this run, when a
+       session-billed provider ran it. A token count says how much work the
+       control plane did; this says what it cost the account they can go and
+       check. Only ever this run share — the meter is read as a delta. */
+    if (latest.session && latest.session.calls > 0) {
+      counts.appendChild(document.createTextNode(' · '));
+      counts.appendChild(el('b', {
+        style: 'color:var(--accent)',
+        title: latest.session.calls + ' ' + latest.session.provider + ' call(s) for this run — '
+          + fmtTok(latest.session.inputTokens) + ' in (' + fmtTok(latest.session.cachedInputTokens)
+          + ' of it served from cache, billed at a fraction) / ' + fmtTok(latest.session.outputTokens)
+          + ' out, ' + fmtMs(latest.session.wallMs) + ' spent inside the provider',
+        text: '$' + latest.session.costUsd.toFixed(2) + ' session'
+      }));
+    }
   }
 
   var runAgainTitle = null;

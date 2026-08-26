@@ -28,7 +28,7 @@ import type { ScreenshotMode, VideoMode } from './engine/runner.js';
 export const LLM_ROLES = ['healer', 'generator', 'agent', 'data'] as const;
 export type LlmRole = (typeof LLM_ROLES)[number];
 
-export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli'] as const;
+export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli', 'claude-tty'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 /** Which env var carries each provider's key, and where to get one. */
@@ -43,6 +43,16 @@ export const PROVIDER_META: Record<
     // special case scattered through the callers.
     envKey: '',
     label: 'Claude Code CLI (this machine\'s own session)',
+    consoleUrl: 'https://claude.com/claude-code',
+    freeTier: 'billed to the session already signed in here — no key to configure',
+  },
+  // The same session, kept warm: one interactive `claude` per (model, effort)
+  // answers every call instead of a process start per call. See
+  // `providers/claude-tty.ts` for what it cannot promise (no native schema,
+  // no usage figures).
+  'claude-tty': {
+    envKey: '',
+    label: 'Claude Code TTY (this machine\'s session, one warm process)',
     consoleUrl: 'https://claude.com/claude-code',
     freeTier: 'billed to the session already signed in here — no key to configure',
   },
@@ -108,7 +118,10 @@ export const PROVIDER_META: Record<
  * serially. Authoring runs one row at a time on them (`authorWorkers`) and
  * every structured call goes through `SerialGate` (`providers/serial-gate.ts`).
  */
-export const SERIAL_PROVIDERS: ReadonlySet<string> = new Set(['local']);
+// `claude-tty` is one terminal answering one request at a time — the same
+// shape, so it takes the same admission control (and authors one row at a
+// time). `WOWLIDATOR_CLAUDE_TTY_WORKERS` widens the terminal pool behind it.
+export const SERIAL_PROVIDERS: ReadonlySet<string> = new Set(['local', 'claude-tty']);
 
 /** Where the `local` provider's server listens. */
 export const DEFAULT_LOCAL_LLM_BASE_URL = 'http://localhost:8080/v1';
@@ -211,6 +224,9 @@ export const DEFAULT_PROVIDER_MODELS: Record<ProviderName, string> = {
   // own `WOWLIDATOR_<ROLE>_MODEL`, so a run can put the expensive model where
   // authoring happens and a cheaper one on the healer and the agent.
   'claude-cli': 'fable',
+  // The warm terminal is for the roles called every few seconds — healer,
+  // agent, data — where the cheap fast model at low effort measured best.
+  'claude-tty': 'sonnet',
 };
 
 
@@ -505,6 +521,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
   // same reason: a provider that needs no credential must not be modelled as
   // a provider whose credential is absent.
   apiKeys['claude-cli'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
+  apiKeys['claude-tty'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
 
   return {
     roles: {

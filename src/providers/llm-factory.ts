@@ -34,6 +34,7 @@ import {
 } from '../config.js';
 import { localFetch } from './local-fetch.js';
 import { createClaudeCli } from './claude-cli.js';
+import { createClaudeTty } from './claude-tty.js';
 import { dedupeKeyFor, serialGateFor } from './serial-gate.js';
 import { logLlmFailure, logLlmRequest, logLlmResponse } from './llm-log.js';
 import {
@@ -57,7 +58,7 @@ export class MissingApiKeyError extends Error {
         `  ${meta.freeTier}\n` +
         `  Add more than one as a comma-separated list (${meta.envKey}=key1,key2) ` +
         `and wowlidator fails over to the next automatically when one is exhausted.\n` +
-        `Or point the role elsewhere: WOWLIDATOR_${role.toUpperCase()}_PROVIDER=<google|groq|openrouter|emmiedev|zai|deepseek|local>`,
+        `Or point the role elsewhere: WOWLIDATOR_${role.toUpperCase()}_PROVIDER=<google|groq|openrouter|emmiedev|zai|deepseek|local|claude-cli|claude-tty>`,
     );
     this.name = 'MissingApiKeyError';
     this.provider = provider;
@@ -153,6 +154,10 @@ const FACTORIES: Record<ProviderName, ModelBuilder> = {
   // neutral directory.
   'claude-cli': (_apiKey, modelId, options) =>
     createClaudeCli({ modelId, ...(options?.effort === undefined ? {} : { effort: options.effort }) }),
+  // Same session, one warm interactive process per (model, effort) — pooled
+  // in module state, because this builder runs on EVERY failover call.
+  'claude-tty': (_apiKey, modelId, options) =>
+    createClaudeTty({ modelId, ...(options?.effort === undefined ? {} : { effort: options.effort }) }),
   google: (apiKey, modelId) => createGoogleGenerativeAI({ apiKey })(modelId),
   groq: (apiKey, modelId) => createGroq({ apiKey })(modelId),
   openrouter: (apiKey, modelId) => createOpenRouter({ apiKey })(modelId),
@@ -927,7 +932,8 @@ const REASONING_OUTPUT_FLOOR: Partial<Record<ProviderName, number>> = {
 // prose like the other two.
 // `claude-cli` is NOT among them: the CLI takes `--json-schema` and validates
 // against it, so restating the schema in the prompt would only cost tokens.
-const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local']);
+// `claude-tty` IS: an interactive terminal has no schema channel at all.
+const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local', 'claude-tty']);
 
 /**
  * Silence the one AI SDK warning this codebase makes untrue.

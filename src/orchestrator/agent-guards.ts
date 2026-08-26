@@ -188,3 +188,95 @@ export function unscopedDestructiveClick(decision: DecisionLike, goal: string): 
   );
 }
 
+/**
+ * The named thing a goal says should be SHOWING when it is done.
+ *
+ * Goals in a catalog are written to a shape: an action, then the state it
+ * produces — "click Create Plan **so that the Create Plan dialog opens**",
+ * "click its Insert action **so that the popup titled \"Insert New Changes\"
+ * opens**". The second half is a checkable claim about the page, and when it
+ * is already true the whole leg is already done.
+ *
+ * Returns the names to look for, best first. Empty when the goal names no
+ * such state — which is most goals, and they fall through to the model
+ * exactly as before.
+ */
+/**
+ * The name at the END of a phrase, cut at the last connector.
+ *
+ * "the Create Plan button so the Create Plan" is one match of the bare
+ * pattern, and only its tail is the dialog's name — everything up to and
+ * including the last `so`/`that`/`the` belongs to the sentence, not the
+ * surface. Returns null when what is left does not read like a name.
+ */
+function trailingName(phrase: string): string | null {
+  const words = phrase.trim().split(/\s+/).filter(Boolean);
+  const CUT = new Set(['so', 'that', 'the', 'a', 'an', 'and', 'then', 'until', 'button', 'control', 'action', 'link', 'its', 'opens', 'open']);
+  let start = 0;
+  for (let i = 0; i < words.length; i += 1) {
+    if (CUT.has((words[i] ?? '').toLowerCase())) start = i + 1;
+  }
+  const name = words.slice(start).join(' ').trim();
+  // A name is at most a short phrase and starts like one.
+  if (name.length < 2 || name.split(/\s+/).length > 5) return null;
+  return /^[A-Z]/.test(name) ? name : null;
+}
+
+export function goalSurfaceNames(goal: string): string[] {
+  const names: string[] = [];
+  // A quoted name following the word that says what kind of surface it is.
+  const titled = /(?:dialog|popup|modal|panel|drawer|sheet)\s+(?:titled|named|called)?\s*["“]([^"”]{2,80})["”]/gi;
+  for (const m of goal.matchAll(titled)) if (m[1]) names.push(m[1].trim());
+  // The bare form: "the Create Plan dialog opens", "the Confirm delete plan
+  // popup appears". Only the words IMMEDIATELY before the surface noun are
+  // the name — a goal usually names the control first ("click the Create Plan
+  // button so the Create Plan dialog opens"), and a greedy match swallows the
+  // sentence between them and matches nothing on the page.
+  const bare = /([A-Za-z0-9][^.,;"”]{0,60}?)\s+(?:dialog|popup|modal)\b/g;
+  for (const m of goal.matchAll(bare)) {
+    const trimmed = trailingName(m[1] ?? '');
+    if (trimmed !== null) names.push(trimmed);
+  }
+  // A placeholder the author left in ("<plan name>") names nothing.
+  return [...new Set(names)].filter((n) => !/[<>]/.test(n) && n.length >= 2);
+}
+
+/**
+ * Is the state this goal describes ALREADY showing on the page?
+ *
+ * Live (be100, 2026-08-26): six of ten agent runs in one pass finished in one
+ * or two turns having discovered nothing to do — "the tree shows dialog
+ * … already present", "the dialog … is already open". The preceding authored
+ * step had opened it, and the workflow leg then paid a model call, its
+ * process startup and two turns to find that out. Sixty per cent of the
+ * agent's work in that pass was rediscovering a fact the tree already stated.
+ *
+ * Deliberately narrow, and biased to saying no: it fires only when the goal
+ * names a surface AND a node of that role carries that name. A goal that
+ * names nothing, or a name the tree does not show, falls through to the
+ * model exactly as before — the cost of a false yes is a leg that never ran,
+ * which is far worse than a leg that ran needlessly.
+ */
+export function goalAlreadyShowing(goal: string, nodes: readonly AxNode[]): string | null {
+  const names = goalSurfaceNames(goal);
+  if (names.length === 0) return null;
+  const surfaces = nodes.filter((n) => /^(dialog|alertdialog)$/i.test(n.role));
+  if (surfaces.length === 0) return null;
+  for (const name of names) {
+    const needle = name.toLowerCase().trim();
+    const words = needle.split(/\s+/).filter((w) => w.length > 1);
+    if (words.length === 0) continue;
+    const hit = surfaces.find((n) => {
+      const shown = n.name.toLowerCase();
+      // Word-wise, the rule `selectorGrounded` already uses, and for the same
+      // reason: the page's own name is routinely longer than the goal's. The
+      // measured pair is a goal saying "the Create Plan dialog" against a
+      // dialog the application calls "Create Benefit Plan" — the same
+      // surface, one inserted word apart. Substring matching misses it.
+      return shown.includes(needle) || words.every((w) => shown.includes(w));
+    });
+    if (hit !== undefined) return hit.name || name;
+  }
+  return null;
+}
+

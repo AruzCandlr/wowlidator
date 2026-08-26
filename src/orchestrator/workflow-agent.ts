@@ -23,7 +23,7 @@ import { SELECTOR_SYNTAX_RULES, captureAxNodes } from '../healer/jit-healer.js';
 import { CONSENT_ACCEPT_NAME, CONSENT_GATE_URL_PATTERN, acceptConsentGateAnywhere, consentGateShowing } from '../engine/sign-in.js';
 import { scopeUrl, type CacheManager } from '../cache/cache-manager.js';
 import type { AxNode } from '../healer/jit-healer.js';
-import { decisionKey, focusTree, renderTree, selectorGrounded, selectorName, unscopedDestructiveClick } from './agent-guards.js';
+import { decisionKey, focusTree, goalAlreadyShowing, renderTree, selectorGrounded, selectorName, unscopedDestructiveClick } from './agent-guards.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
 import {
   LlmFactory,
@@ -735,6 +735,27 @@ export class WorkflowAgent {
       }
       history.push(`(the flow's recorded script failed at action ${replayed + 1}; asking the model)`);
     }
+    // **The state the goal describes is already showing.** The cheapest rung
+    // of all: no model call, no action, no turn. Measured (be100,
+    // 2026-08-26) six of ten agent runs in one pass ended after one or two
+    // turns having found the dialog the goal asked for already open — the
+    // authored step before them had opened it. Asking the tree first turns
+    // that whole leg into a lookup.
+    const showing = goalAlreadyShowing(goal, await captureAxNodes(page, Number.MAX_SAFE_INTEGER));
+    if (showing !== null) {
+      history.push(`(the goal's own surface "${showing}" is already showing; nothing to do)`);
+      return this.#result(
+        goal,
+        true,
+        `"${showing}" is already open — the state this goal describes was reached before the leg began, so no model turn was spent`,
+        actions,
+        0,
+        startedMs,
+        0,
+        0,
+      );
+    }
+
     const preflight = await this.#preflight(page, goal, startUrl, destination, allowed, actions, history);
     if (preflight !== null) {
       this.#remember(key, memory, actions);

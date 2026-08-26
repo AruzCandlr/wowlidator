@@ -640,6 +640,27 @@ export interface ProofSummary {
   healLatencyMs: number;
   agentLatencyMs: number;
   inputTokens: number;
+  /**
+   * What THIS run spent on a session-billed provider (the Claude CLI), when
+   * one was used. Absent otherwise, so a run on an API-key provider carries
+   * nothing it cannot substantiate.
+   *
+   * Its own field rather than folded into `inputTokens`, because it answers
+   * a different question: the token counters say how much work the control
+   * plane did, and this says what the person's session was charged for it —
+   * the number they can check against their own account.
+   */
+  session?:
+    | {
+        provider: string;
+        calls: number;
+        costUsd: number;
+        inputTokens: number;
+        cachedInputTokens: number;
+        outputTokens: number;
+        wallMs: number;
+      }
+    | undefined;
   outputTokens: number;
   defects: number;
 }
@@ -1149,8 +1170,29 @@ export class ProofBundleBuilder {
   }
 
   /** Seal the run and compute the summary. */
+  /**
+   * What a session-billed provider charged this run. Recorded by the runner
+   * at the end, as a delta over the whole run — see `claudeCliUsageSince`.
+   * Zero calls records nothing: a run that never asked is not a run that
+   * spent nothing, it is a run the question does not apply to.
+   */
+  noteSessionUsage(provider: string, spent: {
+    calls: number;
+    costUsd: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    wallMs: number;
+  }): void {
+    if (spent.calls <= 0) return;
+    this.#sessionUsage = { provider, ...spent };
+  }
+
+  #sessionUsage: ProofBundle['summary']['session'] = undefined;
+
   finish(): ProofBundle {
     const summary: ProofSummary = {
+      ...(this.#sessionUsage === undefined ? {} : { session: this.#sessionUsage }),
       totalSteps: this.#steps.length,
       passed: 0,
       failed: 0,

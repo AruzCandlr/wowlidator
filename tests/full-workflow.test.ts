@@ -878,6 +878,7 @@ describe('config & llm-factory', () => {
     assert.deepEqual(config.apiKeys, {
       local: [LOCAL_LLM_PLACEHOLDER_KEY],
       'claude-cli': [CLAUDE_CLI_PLACEHOLDER_KEY],
+      'claude-tty': [CLAUDE_CLI_PLACEHOLDER_KEY],
     });
   });
 

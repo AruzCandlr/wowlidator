@@ -19,6 +19,8 @@ import {
   focusTree,
   selectorGrounded,
   selectorName,
+  goalAlreadyShowing,
+  goalSurfaceNames,
   unscopedDestructiveClick,
 } from '../src/orchestrator/agent-guards.js';
 import { AGENT_ACTIONS, AGENT_NO_PROGRESS_TURNS, WorkflowAgent, parseWherePairs, type AgentDecision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
@@ -57,6 +59,51 @@ describe('selectorGrounded', () => {
   it('says nothing about a selector it cannot read', () => {
     assert.equal(selectorGrounded('input[type="password"]', TREE), null);
     assert.equal(selectorGrounded('role=textbox >> nth=1', TREE), null);
+  });
+});
+
+describe('goalAlreadyShowing', () => {
+  const node = (role: string, name: string): AxNode => ({
+    role, name, value: '', description: '', disabled: false, checked: false, url: '',
+  });
+
+  it("reads the surface a goal says should be showing, in the shapes catalogs actually write", () => {
+    // Verbatim from the be100 run of 2026-08-26.
+    assert.deepEqual(
+      goalSurfaceNames('On /en/admin/benefits/plans click the Create Plan button so the Create Plan dialog opens'),
+      ['Create Plan'],
+    );
+    assert.deepEqual(
+      goalSurfaceNames('select one plan and click its Insert action so that the popup titled "Insert New Changes for Benefit" opens'),
+      ['Insert New Changes for Benefit'],
+    );
+    // A placeholder the author left in names nothing.
+    assert.deepEqual(goalSurfaceNames('the popup titled "Insert New Changes for Benefit: <plan name>" opens'), []);
+    // Most goals name no surface at all, and must fall through untouched.
+    assert.deepEqual(goalSurfaceNames('count every plan whose Benefit Type is Reimbursement'), []);
+  });
+
+  it('says the leg is done when that surface is already open', () => {
+    // Six of ten agent runs in one pass ended after one or two turns having
+    // discovered exactly this — the authored step before them had opened it.
+    const nodes = [node('heading', 'Benefit Plan Catalog'), node('dialog', 'Create Benefit Plan')];
+    assert.equal(
+      goalAlreadyShowing('click the Create Plan button so the Create Plan dialog opens', nodes),
+      'Create Benefit Plan',
+    );
+  });
+
+  it('says nothing whenever the evidence is short of unambiguous', () => {
+    // The cost of a false yes is a leg that never ran, which is far worse
+    // than a leg that ran needlessly — so every uncertain case falls through.
+    const noDialog = [node('heading', 'Create Benefit Plan'), node('button', 'Create Plan')];
+    assert.equal(goalAlreadyShowing('click Create Plan so the Create Plan dialog opens', noDialog), null,
+      'a heading is not an open dialog');
+    const otherDialog = [node('dialog', 'Confirm delete plan')];
+    assert.equal(goalAlreadyShowing('click Create Plan so the Create Plan dialog opens', otherDialog), null,
+      'a different dialog is not this one');
+    assert.equal(goalAlreadyShowing('reach the reporting screen', [node('dialog', 'Anything')]), null,
+      'a goal that names no surface never fires');
   });
 });
 

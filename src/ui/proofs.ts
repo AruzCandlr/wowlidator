@@ -71,6 +71,12 @@ export interface ProofCard {
    */
   inputTokens: number;
   outputTokens: number;
+  /**
+   * What a session-billed provider charged for this run, when one ran it —
+   * see `ProofSummary.session`. Absent on an API-key run, where there is no
+   * session to gauge.
+   */
+  session?: ProofBundle['summary']['session'];
   caseRetries: number;
   cacheHits: number;
   dialogsDismissed: number;
@@ -141,6 +147,7 @@ export function toCard(bundle: ProofBundle, path: string): ProofCard {
     jitHeals: bundle.summary.jitHeals,
     inputTokens: bundle.summary.inputTokens,
     outputTokens: bundle.summary.outputTokens,
+    ...(bundle.summary.session === undefined ? {} : { session: bundle.summary.session }),
     caseRetries: bundle.summary.caseRetries,
     cacheHits: bundle.summary.cacheHits,
     dialogsDismissed: bundle.summary.dialogsDismissed,

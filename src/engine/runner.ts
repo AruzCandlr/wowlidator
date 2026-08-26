@@ -81,6 +81,7 @@ import { HealFailedError, HealUnavailableError, JitHealer, captureAxTree } from 
 import type { FlowRepairModel } from '../repair/flow-repair-model.js';
 import { REVEAL_ACTIONS, WorkflowAgent, cacheAgentMemory, type AgentDbProbe, type PlanStep } from '../orchestrator/workflow-agent.js';
 import { nearestRoutes, routeIsDeclared } from '../context/route-match.js';
+import { claudeCliUsage, claudeCliUsageSince } from '../providers/claude-cli.js';
 import { SessionVault, type StoredSession } from './session-vault.js';
 
 /**
@@ -6651,6 +6652,8 @@ function flowPolarity(flow: Flow): { polarity: TestPolarity; source: 'stated' | 
 }
 
 export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Promise<ProofBundle> {
+  // The browser-free path meters the same way — see `runFlow`.
+  const sessionBefore = claudeCliUsage();
   const apiPolarity = flowPolarity(flow);
   const bundle = new ProofBundleBuilder({
     name: flow.name,
@@ -6716,6 +6719,10 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
 
   bundle.setVariables(variables.snapshotForReport());
   if (issues.length > 0) bundle.recordIssueTally(new StepIssuesError(issues).message);
+  // What the person's own Claude session was charged for this run. A delta
+  // over the whole run rather than an absolute, so a suite of cases in one
+  // process each carry their own share and never the accumulated total.
+  bundle.noteSessionUsage('claude-cli', claudeCliUsageSince(sessionBefore));
   const sealed = bundle.finish();
 
   if (options.historyPath !== null) {
@@ -6773,6 +6780,10 @@ export async function runFlow(
   sourceFlow: Flow,
   options: RunFlowOptions = {},
 ): Promise<ProofBundle> {
+  // The session meter as it stands BEFORE this run. Everything the run then
+  // spends is the difference — which is what makes a suite of cases sharing
+  // one process each report their own share rather than the running total.
+  const sessionBefore = claudeCliUsage();
   // Composition is resolved once, here, so every caller — CLI, MCP, the repair
   // loop — gets it without asking, and everything downstream sees an ordinary
   // flow. `flowDir` is what makes a fragment path relative to the flow that
@@ -6901,6 +6912,7 @@ export async function runFlow(
     // history — a launch that failed at attach is a result worth recalling,
     // not a run that never happened.
     bundle.recordRunError(error);
+    bundle.noteSessionUsage('claude-cli', claudeCliUsageSince(sessionBefore));
     return appendToHistory(bundle.finish(), bundle, options, flow.caseContext);
   }
 
@@ -6929,6 +6941,9 @@ export async function runFlow(
     }
   }
 
+  // Recorded before the bundle is sealed by `close()`, so the run's own
+  // share of the session meter travels with its proof.
+  bundle.noteSessionUsage('claude-cli', claudeCliUsageSince(sessionBefore));
   const sealed = await runner.close();
   return appendToHistory(sealed, bundle, options, flow.caseContext);
 }

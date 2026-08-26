@@ -175,6 +175,17 @@ describe('the wowUI page', () => {
     }
   });
 
+  it('gauges what the run charged the session, and never invents one', () => {
+    // A token count says how much work the control plane did; this says what
+    // the account was charged for it. Only shown when a session-billed
+    // provider actually ran the flow — an API-key run has no session to
+    // gauge, and a zero would read as "it was free" rather than "the
+    // question does not apply".
+    for (const marker of ['latest.session', 'session.costUsd.toFixed(2)', "' session'", 'served from cache']) {
+      assert.ok(html.includes(marker), `the page lost "${marker}"`);
+    }
+  });
+
   it('lets a workflow step open in place, showing what the agent did', () => {
     for (const marker of ['agent action', 'agentActionLog', 'The goal the agent was given']) {
       assert.ok(html.includes(marker), `the page lost "${marker}"`);

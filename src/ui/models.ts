@@ -478,6 +478,11 @@ const REQUESTS: Record<ProviderName, (key: string | undefined) => ModelRequest> 
     headers: {},
     parse: () => ['fable', 'opus', 'sonnet', 'haiku'],
   }),
+  'claude-tty': () => ({
+    url: 'about:blank',
+    headers: {},
+    parse: () => ['fable', 'opus', 'sonnet', 'haiku'],
+  }),
 };
 
 

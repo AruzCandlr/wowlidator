@@ -115,6 +115,20 @@ export interface Job {
   title: string;
   commandLine: string;
   argv: string[];
+  /**
+   * The secret environment this job was started with — credentials
+   * (`WOWLIDATOR_AS`), a database URL. Kept so a RESUME can carry them
+   * forward, and kept **in memory only**: never written beside the job,
+   * never in `summariseJob`, never in the command line.
+   *
+   * It exists because of a measured failure (be100, 2026-08-26): a secret
+   * field is carried by env overlay and deliberately never becomes argv, so
+   * a resume that replays the prior job's argv started a run with no
+   * credentials at all. Twenty-five of twenty-six cases then failed on
+   * "prove the sign-in took effect" — one lost variable, reported as
+   * twenty-five findings about the application.
+   */
+  secretEnv?: Record<string, string> | undefined;
   browser: boolean;
   longRunning: boolean;
   status: JobStatus;
@@ -292,6 +306,9 @@ export class JobRunner {
       title: spec.title,
       commandLine: formatCommandLine(argv),
       argv,
+      // In memory only — see the field note. `Object.keys` of this never
+      // reaches the API, and its values never reach a log.
+      secretEnv: Object.keys(env).length > 0 ? { ...env } : undefined,
       browser: spec.browser,
       longRunning: spec.longRunning === true,
       status: 'running',

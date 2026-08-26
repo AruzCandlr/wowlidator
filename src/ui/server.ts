@@ -576,6 +576,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
       const next = ctx.jobs.start(spec, argv, {
         ...ctx.keys.envOverlay(ctx.config),
         ...ctx.models.envOverlay(),
+        // The secrets the interrupted run was given. A secret is carried by
+        // env and never by argv, so replaying argv alone starts a run
+        // without its credentials — measured as 25 sign-in failures reported
+        // as findings about the application (be100, 2026-08-26).
+        ...(priorJobs[priorJobs.length - 1]?.secretEnv ?? {}),
       });
       json(res, { job: summariseJob(next) }, 201);
     } catch (error) {
@@ -1095,7 +1100,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
 }
 
 function summariseJob(job: ReturnType<JobRunner['list']>[number]): Record<string, unknown> {
-  const { lines, cases, ...rest } = job;
+  // `secretEnv` is stripped here, beside `lines` and `cases`, because this
+  // object is spread wholesale into a JSON response: a field added to `Job`
+  // and not named here would be published. Credentials must never leave the
+  // process that was handed them.
+  const { lines, cases, secretEnv: _secret, ...rest } = job;
   return {
     ...rest,
     lineCount: lines.length,

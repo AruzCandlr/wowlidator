@@ -81,6 +81,58 @@ export const DEFAULT_CLAUDE_CLI_EFFORT = 'high';
 export const CLAUDE_CLI_NATIVE_SCHEMA =
   process.env['WOWLIDATOR_CLAUDE_CLI_NATIVE_SCHEMA'] !== '0';
 
+/**
+ * What this process has spent on the CLI.
+ *
+ * Module-level on purpose, and that is also what makes it honest: the meter
+ * counts calls made by THIS process, which for a run is exactly the test
+ * flow's own spend. A supervising session, a judge pass, or anything else
+ * driving the CLI runs in its own process with its own counter, so nobody
+ * else's tokens can land in a run's report.
+ *
+ * The CLI reports `total_cost_usd` per call, which is the real number rather
+ * than an estimate from a price table that would drift the moment pricing
+ * changed. `cachedInputTokens` is tracked apart because it is the bulk of
+ * the input and bills at a fraction — a total that hid it would read as ten
+ * times the spend it is.
+ */
+export interface ClaudeCliUsage {
+  calls: number;
+  costUsd: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  /** Wall time inside the CLI, including the process startup each call pays. */
+  wallMs: number;
+}
+
+const usage: ClaudeCliUsage = {
+  calls: 0,
+  costUsd: 0,
+  inputTokens: 0,
+  cachedInputTokens: 0,
+  outputTokens: 0,
+  wallMs: 0,
+};
+
+/** What this process has spent so far. A copy — the caller cannot edit the meter. */
+export function claudeCliUsage(): ClaudeCliUsage {
+  return { ...usage };
+}
+
+/** `after` minus `before`, for measuring one run's share of the meter. */
+export function claudeCliUsageSince(before: ClaudeCliUsage): ClaudeCliUsage {
+  const now = usage;
+  return {
+    calls: now.calls - before.calls,
+    costUsd: now.costUsd - before.costUsd,
+    inputTokens: now.inputTokens - before.inputTokens,
+    cachedInputTokens: now.cachedInputTokens - before.cachedInputTokens,
+    outputTokens: now.outputTokens - before.outputTokens,
+    wallMs: now.wallMs - before.wallMs,
+  };
+}
+
 /** `$schema` says nothing the CLI needs, and is the leading suspect for its rejection. */
 export function withoutSchemaKeyword(schema: unknown): unknown {
   if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return schema;
@@ -177,6 +229,7 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
     supportedUrls: {},
 
     async doGenerate(call: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
+      const startedMs = Date.now();
       const { system, text } = flattenPrompt(call.prompt);
       // The CLI validates against the schema itself, so it is not restated
       // in the prompt. `$schema` is dropped as a courtesy — it tells the CLI
@@ -228,10 +281,17 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
       }
 
       const answer = String(envelope.result ?? '');
+      usage.calls += 1;
+      usage.costUsd += envelope.total_cost_usd ?? 0;
+      usage.wallMs += Date.now() - startedMs;
       const input = envelope.usage?.input_tokens ?? 0;
       const cacheRead = envelope.usage?.cache_read_input_tokens ?? 0;
       const cacheWrite = envelope.usage?.cache_creation_input_tokens ?? 0;
       const output = envelope.usage?.output_tokens ?? 0;
+
+      usage.inputTokens += input;
+      usage.cachedInputTokens += cacheRead;
+      usage.outputTokens += output;
 
       return {
         content: answer === '' ? [] : [{ type: 'text', text: answer }],
