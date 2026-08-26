@@ -59,6 +59,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { askWarm, closeClaudeSessions } from './claude-cli-session.js';
 import type {
   LanguageModelV4,
   LanguageModelV4CallOptions,
@@ -66,6 +67,18 @@ import type {
 } from '@ai-sdk/provider';
 
 const run = promisify(execFile);
+
+/**
+ * Whether to reuse a warm process instead of spawning one per call.
+ *
+ * On by default: measured, it takes a call from ~6 s to ~1.2 s by paying the
+ * CLI's 3.4-4.3 s startup once per forty calls rather than once per call.
+ * `WOWLIDATOR_CLAUDE_CLI_WARM=0` forces the one-shot path, which is also
+ * where every warm failure falls back to.
+ */
+export const CLAUDE_CLI_WARM = process.env['WOWLIDATOR_CLAUDE_CLI_WARM'] !== '0';
+
+export { closeClaudeSessions };
 
 /** How long one completion may take. An authoring prompt is large and slow. */
 export const CLAUDE_CLI_TIMEOUT_MS = 10 * 60 * 1000;
@@ -257,6 +270,49 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
         ...(schema === null ? [] : ['--json-schema', schema]),
         text,
       ];
+
+      // **The warm path.** A process already running answers in about a fifth
+      // of the time, because the startup was paid by an earlier call. Any
+      // failure here falls through to the one-shot path below rather than
+      // failing the call: a reused process is an optimisation, never a new
+      // way for a run to break.
+      if (CLAUDE_CLI_WARM) {
+        try {
+          const warm = await askWarm(
+            {
+              binary,
+              cwd: neutralCwd(),
+              modelId: options.modelId,
+              effort,
+              system,
+              schema,
+            },
+            text,
+          );
+          usage.calls += 1;
+          usage.costUsd += warm.costUsd;
+          usage.wallMs += Date.now() - startedMs;
+          usage.inputTokens += warm.inputTokens;
+          usage.cachedInputTokens += warm.cachedInputTokens;
+          usage.outputTokens += warm.outputTokens;
+          return {
+            content: warm.text === '' ? [] : [{ type: 'text', text: warm.text }],
+            finishReason: { unified: 'stop', raw: 'stop' },
+            usage: {
+              inputTokens: {
+                total: warm.inputTokens + warm.cachedInputTokens + warm.cacheWriteTokens,
+                noCache: warm.inputTokens,
+                cacheRead: warm.cachedInputTokens,
+                cacheWrite: warm.cacheWriteTokens,
+              },
+              outputTokens: { total: warm.outputTokens, text: warm.outputTokens, reasoning: 0 },
+            },
+            warnings: [],
+          };
+        } catch {
+          // Fall through and ask the cold way.
+        }
+      }
 
       let envelope: CliEnvelope;
       try {
