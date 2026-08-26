@@ -225,6 +225,17 @@ export interface RoleConfig {
    * and a role is the unit a provider is chosen at.
    */
   baseUrl?: string | undefined;
+  /**
+   * Reasoning effort for a provider that has the concept (`claude-cli`), from
+   * `WOWLIDATOR_<ROLE>_EFFORT`.
+   *
+   * Per role, because the roles differ in what they are for: the healer, the
+   * agent and the data model each make one small decision and are called
+   * every few seconds, while authoring is one large call per case. Measured
+   * 2026-08-26 at 15k tokens of prompt: fable at high effort answered in
+   * 6.1 s against sonnet at low effort's 3.0 s, and cost four times as much.
+   */
+  effort?: string | undefined;
 }
 
 export interface WowlidatorConfig {
@@ -286,6 +297,13 @@ const videoSchema = z.enum(['on', 'off']);
 const envSchema = z.object({
   WOWLIDATOR_HEALER_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_HEALER_MODEL: z.string().min(1).optional(),
+  // Reasoning effort per role, for a provider that has the concept. Left
+  // loose on purpose: the set of levels belongs to the provider, and a schema
+  // that pinned it here would reject a level added later.
+  WOWLIDATOR_HEALER_EFFORT: z.string().min(1).optional(),
+  WOWLIDATOR_GENERATOR_EFFORT: z.string().min(1).optional(),
+  WOWLIDATOR_AGENT_EFFORT: z.string().min(1).optional(),
+  WOWLIDATOR_DATA_EFFORT: z.string().min(1).optional(),
   WOWLIDATOR_HEALER_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_GENERATOR_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_GENERATOR_MODEL: z.string().min(1).optional(),
@@ -431,7 +449,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
     provider: ProviderName | undefined,
     modelId: string | undefined,
     baseUrl?: string | undefined,
+    effort?: string | undefined,
   ): RoleConfig => {
+    // Authoring is one large call per case and earns the thinking; the roles
+    // called every few seconds do not. A role that says nothing takes the
+    // default for its kind rather than the most expensive setting.
+    const resolvedEffort =
+      (effort?.trim() || undefined) ?? (name === 'generator' ? 'high' : 'low');
     const resolvedProvider = provider ?? DEFAULT_ROLE_MODELS[name].provider;
     // Only `local` has a server to point at; a base URL on any other provider
     // is ignored rather than sent somewhere the SDK would not honour it.
@@ -449,14 +473,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
     // the server answers with the model it loaded, so the alias is the truth.
     const fixed = fixedModelFor(resolvedProvider);
     if (fixed !== undefined) {
-      return { role: name, provider: resolvedProvider, modelId: fixed, baseUrl: resolvedBase };
+      return { role: name, provider: resolvedProvider, modelId: fixed, baseUrl: resolvedBase, effort: resolvedEffort };
     }
     const resolvedModel =
       modelId ??
       (resolvedProvider === DEFAULT_ROLE_MODELS[name].provider
         ? DEFAULT_ROLE_MODELS[name].modelId
         : DEFAULT_PROVIDER_MODELS[resolvedProvider]);
-    return { role: name, provider: resolvedProvider, modelId: resolvedModel };
+    return { role: name, provider: resolvedProvider, modelId: resolvedModel, effort: resolvedEffort };
   };
 
   const apiKeys: Partial<Record<ProviderName, string[]>> = {};
@@ -484,10 +508,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
 
   return {
     roles: {
-      healer: role('healer', e.WOWLIDATOR_HEALER_PROVIDER, e.WOWLIDATOR_HEALER_MODEL, e.WOWLIDATOR_HEALER_BASE_URL),
-      generator: role('generator', e.WOWLIDATOR_GENERATOR_PROVIDER, e.WOWLIDATOR_GENERATOR_MODEL, e.WOWLIDATOR_GENERATOR_BASE_URL),
-      agent: role('agent', e.WOWLIDATOR_AGENT_PROVIDER, e.WOWLIDATOR_AGENT_MODEL, e.WOWLIDATOR_AGENT_BASE_URL),
-      data: role('data', e.WOWLIDATOR_DATA_PROVIDER, e.WOWLIDATOR_DATA_MODEL, e.WOWLIDATOR_DATA_BASE_URL),
+      healer: role('healer', e.WOWLIDATOR_HEALER_PROVIDER, e.WOWLIDATOR_HEALER_MODEL, e.WOWLIDATOR_HEALER_BASE_URL, e.WOWLIDATOR_HEALER_EFFORT),
+      generator: role('generator', e.WOWLIDATOR_GENERATOR_PROVIDER, e.WOWLIDATOR_GENERATOR_MODEL, e.WOWLIDATOR_GENERATOR_BASE_URL, e.WOWLIDATOR_GENERATOR_EFFORT),
+      agent: role('agent', e.WOWLIDATOR_AGENT_PROVIDER, e.WOWLIDATOR_AGENT_MODEL, e.WOWLIDATOR_AGENT_BASE_URL, e.WOWLIDATOR_AGENT_EFFORT),
+      data: role('data', e.WOWLIDATOR_DATA_PROVIDER, e.WOWLIDATOR_DATA_MODEL, e.WOWLIDATOR_DATA_BASE_URL, e.WOWLIDATOR_DATA_EFFORT),
     },
     apiKeys,
     maxRetries: e.WOWLIDATOR_LLM_MAX_RETRIES ?? DEFAULT_MAX_RETRIES,

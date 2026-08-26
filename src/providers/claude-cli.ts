@@ -30,10 +30,27 @@
  *     `PROVIDER_META` records no env var for it and the role gate treats it
  *     as always available.
  *
- * Structured output is prompt-shaped, not native: `claude-cli` joins
- * `SCHEMA_IN_PROMPT_PROVIDERS`, the schema is stated in the prompt, and the
- * JSON is parsed out of the reply. The CLI has no `response_format`, and
- * pretending otherwise would fail on the first `generateObject`.
+ * Structured output is NATIVE: the CLI takes `--json-schema` and validates
+ * against it, so the schema is not restated in the prompt and a reply that
+ * does not parse never costs a re-ask — which on this provider would mean
+ * another process startup.
+ *
+ * It was briefly disabled on the belief that the CLI had rejected the AI
+ * SDK's schema. That was wrong, and worth recording: the failure was the
+ * usage limit arriving in the same minute, and `Command failed` reads
+ * identically for both. Bisected afterwards against the exact schema that
+ * "failed" — `$schema`, `additionalProperties: false`, nested arrays, all
+ * accepted. The lesson is the ordinary one: a provider error and a quota
+ * error look the same from outside, so neither should be diagnosed from one
+ * observation.
+ *
+ * **What makes it slow is process startup, not the model.** Measured
+ * 2026-08-26 across model and effort combinations: wall-clock minus the API's
+ * own reported duration is a flat 3.4–4.3 s on every call, whatever the model
+ * or the prompt size — Node boot, config load, session setup. At roughly
+ * twenty calls to author and run one case, that is over a minute of pure
+ * startup per case. `--effort` and the model choice move the API half;
+ * nothing but reusing a process moves the other half.
  */
 
 import { execFile } from 'node:child_process';
@@ -54,6 +71,22 @@ const run = promisify(execFile);
 export const CLAUDE_CLI_TIMEOUT_MS = 10 * 60 * 1000;
 /** The reasoning effort every role gets unless its own env var says otherwise. */
 export const DEFAULT_CLAUDE_CLI_EFFORT = 'high';
+
+/**
+ * Whether to hand the CLI the JSON Schema directly (`--json-schema`) rather
+ * than stating it in the prompt. On by default — verified against the AI
+ * SDK's own generated schemas. `WOWLIDATOR_CLAUDE_CLI_NATIVE_SCHEMA=0` falls
+ * back to the prompt-shaped path if a future CLI ever regresses it.
+ */
+export const CLAUDE_CLI_NATIVE_SCHEMA =
+  process.env['WOWLIDATOR_CLAUDE_CLI_NATIVE_SCHEMA'] !== '0';
+
+/** `$schema` says nothing the CLI needs, and is the leading suspect for its rejection. */
+export function withoutSchemaKeyword(schema: unknown): unknown {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return schema;
+  const { $schema: _dropped, ...rest } = schema as Record<string, unknown>;
+  return rest;
+}
 
 /**
  * A directory with no CLAUDE.md, made once per process.
@@ -119,7 +152,13 @@ interface CliEnvelope {
 export interface ClaudeCliOptions {
   /** `fable`, `opus`, `sonnet`, `haiku`, or a full id. */
   modelId: string;
-  /** Reasoning effort. Higher costs more and thinks longer. */
+  /**
+   * Reasoning effort. Higher costs more and thinks longer — measured at 15k
+   * tokens of prompt, fable/high answered in 6.1 s of API time against
+   * sonnet/low's 3.0 s, at four times the price. The roles called most often
+   * (healer, agent, data) make one small decision at a time and want `low`;
+   * authoring is the one that earns `high`.
+   */
   effort?: string | undefined;
   /** Overridable for tests — the binary to run. */
   binary?: string | undefined;
@@ -139,6 +178,15 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
 
     async doGenerate(call: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
       const { system, text } = flattenPrompt(call.prompt);
+      // The CLI validates against the schema itself, so it is not restated
+      // in the prompt. `$schema` is dropped as a courtesy — it tells the CLI
+      // nothing it needs — not because it was ever the problem.
+      const schema =
+        CLAUDE_CLI_NATIVE_SCHEMA &&
+        call.responseFormat?.type === 'json' &&
+        call.responseFormat.schema !== undefined
+          ? JSON.stringify(withoutSchemaKeyword(call.responseFormat.schema))
+          : null;
       const args = [
         '-p',
         '--model',
@@ -153,6 +201,7 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
           ? 'You answer exactly what is asked, with no preamble and no commentary.'
           : system,
         '--strict-mcp-config',
+        ...(schema === null ? [] : ['--json-schema', schema]),
         text,
       ];
 

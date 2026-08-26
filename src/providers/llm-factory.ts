@@ -132,7 +132,15 @@ export function isKeyExhaustedError(error: unknown): boolean {
 export type ModelBuilder = (
   apiKey: string,
   modelId: string,
-  options?: { baseUrl?: string | undefined },
+  options?: {
+    baseUrl?: string | undefined;
+    /**
+     * Reasoning effort, for a provider that has the concept. Per role, so a
+     * run can spend it where authoring happens and keep the roles called
+     * every few seconds cheap and quick.
+     */
+    effort?: string | undefined;
+  },
 ) => LanguageModel;
 
 /**
@@ -143,7 +151,8 @@ const FACTORIES: Record<ProviderName, ModelBuilder> = {
   // No key: the CLI carries the operator's own session. See `claude-cli.ts`
   // for why the system prompt is replaced and the process runs from a
   // neutral directory.
-  'claude-cli': (_apiKey, modelId) => createClaudeCli({ modelId }),
+  'claude-cli': (_apiKey, modelId, options) =>
+    createClaudeCli({ modelId, ...(options?.effort === undefined ? {} : { effort: options.effort }) }),
   google: (apiKey, modelId) => createGoogleGenerativeAI({ apiKey })(modelId),
   groq: (apiKey, modelId) => createGroq({ apiKey })(modelId),
   openrouter: (apiKey, modelId) => createOpenRouter({ apiKey })(modelId),
@@ -231,7 +240,10 @@ export function createModelForRole(
     role,
     provider: entry.provider,
     modelId: entry.modelId,
-    model: builders[entry.provider](apiKey, entry.modelId, { baseUrl: entry.baseUrl }),
+    model: builders[entry.provider](apiKey, entry.modelId, {
+      baseUrl: entry.baseUrl,
+      effort: entry.effort,
+    }),
     id: modelIdFor(entry),
     keyIndex,
     keyCount: keys.length,
@@ -913,9 +925,9 @@ const REASONING_OUTPUT_FLOOR: Partial<Record<ProviderName, number>> = {
 // DeepSeek offers `json_object` mode but no schema-constrained channel the
 // OpenAI-compatible provider can hand a schema to, so it is told the schema in
 // prose like the other two.
-// `claude-cli` joins them: the CLI has no `response_format`, so the schema is
-// stated in the prompt and the JSON parsed out of the reply.
-const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local', 'claude-cli']);
+// `claude-cli` is NOT among them: the CLI takes `--json-schema` and validates
+// against it, so restating the schema in the prompt would only cost tokens.
+const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local']);
 
 /**
  * Silence the one AI SDK warning this codebase makes untrue.
