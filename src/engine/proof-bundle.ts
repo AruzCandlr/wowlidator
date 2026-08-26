@@ -364,6 +364,18 @@ export interface AgentRecord {
   latencyMs: number;
   inputTokens?: number | undefined;
   outputTokens?: number | undefined;
+  /**
+   * The loop ended because every action it took was a look (scroll, wait) —
+   * it never had a page control the goal could name. Set by
+   * `WorkflowAgent#lookedOnly`; consumed in `engine/runner.ts` the same way
+   * as `verificationOnlyGoal`, because it is structural evidence of the same
+   * fact `verificationOnlyGoal` tries to read out of the goal's WORDING in
+   * advance: a goal that is a reading question, which an agent cannot answer
+   * by acting. Runtime evidence catches the shapes the classifier cannot —
+   * an ambiguous goal, or one with no verify verb at all that still turned
+   * out to have nothing to click.
+   */
+  lookedOnly?: boolean | undefined;
 }
 
 export type DefectSeverity = 'high' | 'medium' | 'low';

@@ -227,7 +227,20 @@ export function goalEvidence(goal: string, before: string, after: string): GoalE
  * wants work done, and an agent that could not do it failed at something real.
  */
 const ACTION_VERB =
-  /\b(click|press|open|fill|type|enter|select|choose|submit|save|create|add|insert|delete|remove|edit|update|change|correct|navigate|go to|search|filter|sort|upload|download|sign in|log in|sign out|accept|confirm|apply|toggle|expand|collapse|scroll to)\b/i;
+  /\b(click|press|open|fill|type|enter|select|choose|submit|save|create|insert|delete|remove|edit|update|change|correct|navigate|go to|search|filter|sort|upload|download|sign in|log in|sign out|accept|apply|toggle|expand|collapse|scroll to)\b/i;
+/**
+ * Verbs that are actions on a PAGE only when they take a page-shaped object.
+ *
+ * "add a plan" acts; "add them together" is arithmetic. "confirm the delete"
+ * acts; "confirm that the sum equals" is a check. Live (be100 PL_03_01,
+ * 2026-08-26): a goal reading "read the numbers … add them together, and
+ * confirm that the sum equals the Total Plans number" was classed as an
+ * action goal on the single word `add`, so the verification handoff never
+ * fired, the agent was asked to be a calculator, and — having nothing on the
+ * page it could legitimately click — it scrolled five times and was recorded
+ * as a stall. A stronger model does not fix this; it was never the model.
+ */
+const CONTEXTUAL_ACTION_VERB = /\b(add|confirm)\s+(?:a|an|the|new|this|that\s+\w+)\b(?!\s+(?:sum|total|count|number|value|equals?|matches?|is\b))/i;
 /**
  * Verbs that ask only to LOOK. The Thai verb sits outside the `\b` group on
  * purpose: JavaScript's word boundary is defined over `[A-Za-z0-9_]`, so
@@ -261,7 +274,7 @@ const VERIFY_VERB = /\b(verify|check|confirm that|ensure|assert|observe|read|see
  * looking defers.
  */
 export function verificationOnlyGoal(goal: string): boolean {
-  return VERIFY_VERB.test(goal) && !ACTION_VERB.test(goal);
+  return VERIFY_VERB.test(goal) && !ACTION_VERB.test(goal) && !CONTEXTUAL_ACTION_VERB.test(goal);
 }
 
 export function agentModelUnavailable(summary: string): boolean {

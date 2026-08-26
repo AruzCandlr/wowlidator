@@ -23,7 +23,7 @@ import {
   goalSurfaceNames,
   unscopedDestructiveClick,
 } from '../src/orchestrator/agent-guards.js';
-import { AGENT_ACTIONS, AGENT_NO_PROGRESS_TURNS, WorkflowAgent, parseWherePairs, type AgentDecision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
+import { AGENT_ACTIONS, AGENT_LOOK_ONLY_TURNS, AGENT_NO_PROGRESS_TURNS, WorkflowAgent, parseWherePairs, type AgentDecision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
 import type { AxNode } from '../src/healer/jit-healer.js';
 
@@ -335,7 +335,11 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     // goal's control on screen. Looking again cannot change the app, so it is
     // never the stall the repeat guard exists for (the same fill, four
     // times); it is also never progress, so a loop that only looks still
-    // ends — on the no-progress judge, after AGENT_NO_PROGRESS_TURNS.
+    // ends — on evidence, not on the repeat guard. A goal like this one names
+    // no control at all, so it now ends on the FASTER looked-only handoff
+    // (2026-08-26, AGENT_LOOK_ONLY_TURNS) rather than riding out the full
+    // no-progress judge — the ordinary stall path is covered separately by
+    // "does NOT hand off once a real action has landed".
     const { model, seen } = scripted([{ action: 'scroll' }]);
     const agent = new WorkflowAgent({ model });
     const result = await withPage(CDP_URL, async (page) => {
@@ -344,14 +348,15 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     });
     assert.equal(result.success, false);
     assert.doesNotMatch(result.summary, /repeated/, 'a scroll is not a stall');
-    assert.match(result.summary, /nothing advanced/);
-    assert.equal(result.turns, AGENT_NO_PROGRESS_TURNS);
+    assert.match(result.summary, /looked and found nothing to act on/);
+    assert.equal(result.lookedOnly, true);
+    assert.equal(result.turns, AGENT_LOOK_ONLY_TURNS);
     assert.ok(
       seen.some((o) => /will not reveal more/.test(o.feedback ?? '')),
       'the model was told once, per turn, that looking again changes nothing',
     );
     assert.ok(
-      result.actions.filter((a) => a.action === 'scroll' && a.ok).length >= AGENT_NO_PROGRESS_TURNS,
+      result.actions.filter((a) => a.action === 'scroll' && a.ok).length >= AGENT_LOOK_ONLY_TURNS,
       'the insisted-on scrolls were performed, not refused',
     );
   });
@@ -435,6 +440,89 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     assert.equal(result.actions[0]?.ok, false, 'the public internet is refused');
     assert.match(result.actions[0]?.error ?? '', /off-origin/);
     assert.equal(result.success, true, 'the origin the goal names is allowed, and arriving finishes');
+  });
+});
+
+describe('a stall made only of looking (CDP)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+
+  before(async () => {
+    server = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<h1>Plans</h1><p>Nothing here names a control the goal could press.</p>');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+
+  it('hands off after 3 idle-only turns, never reaching the 5-turn stall', async () => {
+    // be100 PL_03_01 (2026-08-26): a goal read as arithmetic ("add them
+    // together"), the wording classifier missed it, and the agent — with
+    // nothing on the page it could press — scrolled and waited until it hit
+    // the stall judge. This is the runtime backstop: three turns of nothing
+    // but looking end the leg as a handoff, at three turns rather than five,
+    // and the run is never even asked past that point.
+    // Alternating action/selector on every entry, so no two decisions ever
+    // share a `decisionKey` on this unchanged page — that keeps the idle
+    // repeat-guard's informed re-ask out of the trace entirely, and the
+    // turn count exact rather than inflated by a refused repeat.
+    const { model, seen } = scripted([
+      { action: 'scroll', selector: 'role=heading[name="Plans" i]' },
+      { action: 'wait' },
+      { action: 'scroll' },
+    ]);
+    const agent = new WorkflowAgent({ model });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/plans`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'add the numbers shown and confirm the sum matches the total');
+    });
+
+    assert.equal(result.success, false);
+    assert.match(result.summary, /looked and found nothing to act on/);
+    assert.doesNotMatch(result.summary, /stalled: nothing advanced/, 'never falls through to the 5-turn judge');
+    assert.equal(result.lookedOnly, true);
+    assert.equal(result.turns, AGENT_LOOK_ONLY_TURNS, 'ends at 3 turns, not 5');
+    assert.ok(result.turns < AGENT_NO_PROGRESS_TURNS, 'the handoff pre-empts the ordinary stall judge');
+    // Every action taken really was idle — nothing was ever attempted to click.
+    assert.ok(result.actions.every((a) => a.action === 'scroll' || a.action === 'wait'));
+    assert.equal(seen.length, AGENT_LOOK_ONLY_TURNS);
+  });
+
+  it('does NOT hand off once a real action has landed — that stays the ordinary stall', async () => {
+    // A leg that clicked something for real and only got stuck looking
+    // afterward is a different, more ordinary failure: the 5-turn judge,
+    // not the 3-turn handoff. Whole-leg scope is deliberate — see the
+    // comment at the call site in workflow-agent.ts.
+    // Every entry a distinct decisionKey, for the same reason as the test
+    // above — the idle repeat-guard's re-ask must not shift the turn count.
+    const { model } = scripted([
+      { action: 'click', selector: 'role=heading[name="Plans" i]' },
+      { action: 'scroll', selector: 'role=heading[name="Plans" i]' },
+      { action: 'wait' },
+      { action: 'scroll', selector: 'p' },
+      { action: 'wait', url: 'x' },
+      { action: 'scroll' },
+    ]);
+    const agent = new WorkflowAgent({ model });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/plans`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'click the heading, then add the numbers and confirm the total');
+    });
+
+    assert.equal(result.lookedOnly, undefined);
+    // Turn 1's click is a real action and resets the no-progress counter, so
+    // it takes AGENT_NO_PROGRESS_TURNS more turns after it — not instead of
+    // it — to reach the stall.
+    assert.match(result.summary, new RegExp(`stalled: nothing advanced in ${AGENT_NO_PROGRESS_TURNS} consecutive turns`));
+    assert.equal(result.turns, AGENT_NO_PROGRESS_TURNS + 1);
   });
 });
 

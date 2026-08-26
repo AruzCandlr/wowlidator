@@ -83,7 +83,19 @@ export { closeClaudeSessions };
 /** How long one completion may take. An authoring prompt is large and slow. */
 export const CLAUDE_CLI_TIMEOUT_MS = 10 * 60 * 1000;
 /** The reasoning effort every role gets unless its own env var says otherwise. */
-export const DEFAULT_CLAUDE_CLI_EFFORT = 'high';
+export const DEFAULT_CLAUDE_CLI_EFFORT =
+  process.env['WOWLIDATOR_CLAUDE_CLI_EFFORT'] ||
+  process.env['CLAUDE_CLI_EFFORT'] ||
+  'high';
+
+/** Format tool parameter (string or array) into a CLI argument string. */
+export function formatToolArg(val: string | readonly string[] | undefined | null): string | null {
+  if (val === undefined || val === null) return null;
+  if (Array.isArray(val)) {
+    return val.length === 0 ? '' : val.join(',');
+  }
+  return String(val);
+}
 
 /**
  * Whether to hand the CLI the JSON Schema directly (`--json-schema`) rather
@@ -223,8 +235,28 @@ export interface ClaudeCliOptions {
    * sonnet/low's 3.0 s, at four times the price. The roles called most often
    * (healer, agent, data) make one small decision at a time and want `low`;
    * authoring is the one that earns `high`.
+   * Choices: 'low', 'medium', 'high', 'xhigh', 'max'.
    */
   effort?: string | undefined;
+  /**
+   * Tools to make available to the Claude session via `--tools`.
+   * Accepts a string (e.g. `""` to disable all tools, `"default"` for all built-ins,
+   * or a comma/space-separated list like `"Bash,Edit,Read"`) or an array of tool names.
+   * If unset, falls back to `WOWLIDATOR_CLAUDE_CLI_TOOLS` or `CLAUDE_CLI_TOOLS`.
+   */
+  tools?: string | readonly string[] | undefined;
+  /**
+   * Allowed tools via `--allowed-tools`.
+   * Comma or space-separated list or array of tool names/patterns (e.g. `"Bash(git *) Edit"`).
+   * If unset, falls back to `WOWLIDATOR_CLAUDE_CLI_ALLOWED_TOOLS` or `CLAUDE_CLI_ALLOWED_TOOLS`.
+   */
+  allowedTools?: string | readonly string[] | undefined;
+  /**
+   * Disallowed tools via `--disallowed-tools`.
+   * Comma or space-separated list or array of tool names/patterns.
+   * If unset, falls back to `WOWLIDATOR_CLAUDE_CLI_DISALLOWED_TOOLS` or `CLAUDE_CLI_DISALLOWED_TOOLS`.
+   */
+  disallowedTools?: string | readonly string[] | undefined;
   /** Overridable for tests — the binary to run. */
   binary?: string | undefined;
   timeoutMs?: number | undefined;
@@ -232,8 +264,31 @@ export interface ClaudeCliOptions {
 
 export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
   const binary = options.binary ?? 'claude';
-  const effort = options.effort ?? DEFAULT_CLAUDE_CLI_EFFORT;
+  const effort =
+    options.effort ??
+    process.env['WOWLIDATOR_CLAUDE_CLI_EFFORT'] ??
+    process.env['CLAUDE_CLI_EFFORT'] ??
+    DEFAULT_CLAUDE_CLI_EFFORT;
   const timeout = options.timeoutMs ?? CLAUDE_CLI_TIMEOUT_MS;
+
+  const resolvedTools = formatToolArg(
+    options.tools ??
+      process.env['WOWLIDATOR_CLAUDE_CLI_TOOLS'] ??
+      process.env['CLAUDE_CLI_TOOLS'] ??
+      null,
+  );
+  const resolvedAllowedTools = formatToolArg(
+    options.allowedTools ??
+      process.env['WOWLIDATOR_CLAUDE_CLI_ALLOWED_TOOLS'] ??
+      process.env['CLAUDE_CLI_ALLOWED_TOOLS'] ??
+      null,
+  );
+  const resolvedDisallowedTools = formatToolArg(
+    options.disallowedTools ??
+      process.env['WOWLIDATOR_CLAUDE_CLI_DISALLOWED_TOOLS'] ??
+      process.env['CLAUDE_CLI_DISALLOWED_TOOLS'] ??
+      null,
+  );
 
   return {
     specificationVersion: 'v4',
@@ -267,6 +322,9 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
           ? 'You answer exactly what is asked, with no preamble and no commentary.'
           : system,
         '--strict-mcp-config',
+        ...(resolvedTools !== null ? ['--tools', resolvedTools] : []),
+        ...(resolvedAllowedTools !== null ? ['--allowed-tools', resolvedAllowedTools] : []),
+        ...(resolvedDisallowedTools !== null ? ['--disallowed-tools', resolvedDisallowedTools] : []),
         ...(schema === null ? [] : ['--json-schema', schema]),
         text,
       ];
@@ -286,6 +344,9 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
               effort,
               system,
               schema,
+              tools: resolvedTools,
+              allowedTools: resolvedAllowedTools,
+              disallowedTools: resolvedDisallowedTools,
             },
             text,
           );

@@ -3108,6 +3108,19 @@ export class SmartRunner {
     // whatever the flow asserts afterwards is the proof, and a step that
     // asserts nothing afterwards is caught by `unsettledWorkflowClaim` at
     // authoring time, not invented into a defect here.
+    // Two ways to reach the same conclusion: the goal's own WORDING says it
+    // asks only to verify (`verificationOnlyGoal`, judged before a turn is
+    // spent), or the RUNTIME shows the agent never had anything to act on
+    // (`record.lookedOnly` — every action across the whole loop was a look).
+    // The second catches what the first cannot: a goal with no verify verb
+    // at all, or one the wording classifier reads ambiguously, that still
+    // turns out to be a reading question once the page is actually looked
+    // at. Live (be100 PL_03_01, 2026-08-26): "add them together, and confirm
+    // that the sum equals the Total Plans number" was classed as an ACTION
+    // goal on the bare word "add" — arithmetic, not a click — the agent
+    // scrolled five times finding nothing to press, and was recorded
+    // stalled with a high defect. A stronger model does not fix a goal that
+    // was never actionable; only reading the runtime evidence does.
     const deferred = evidence === null && !record.success && verificationOnlyGoal(goal);
     if (deferred) {
       evidence = {
@@ -3116,6 +3129,15 @@ export class SmartRunner {
           'the goal asked only to verify, which is an assertion\'s job and not the agent\'s — ' +
           `the agent's own account (${record.summary}) is not evidence either way, and the ` +
           'checks that follow this step are what settle the claim',
+      };
+    } else if (evidence === null && !record.success && record.lookedOnly === true) {
+      evidence = {
+        rule: 'verification-deferred',
+        reason:
+          'every action the agent took was a look (scroll, wait) — it never had a control on this ' +
+          `page the goal could name, which is what a reading question looks like at runtime even ` +
+          `when the goal's wording did not say so outright. The agent's account (${record.summary}) ` +
+          'is not evidence either way, and the checks that follow this step are what settle the claim',
       };
     }
     // A model that could not answer is not an application that could not
@@ -3169,24 +3191,38 @@ export class SmartRunner {
     if (evidence !== null) {
       // Green, and still a finding — the turns were paid for either way, and
       // a leg that keeps costing them is a fact about the FLOW worth a
-      // reader's attention. The two cases read differently, though: one is an
-      // agent that succeeded and failed to notice; the other is a goal that
-      // was never the agent's to answer.
+      // reader's attention. Three shapes read differently: an agent that
+      // succeeded and failed to notice; a goal phrased as read-only from the
+      // start; and a goal the RUNTIME showed had nothing to act on, which the
+      // wording alone could not have told the author in advance.
+      const cause: 'under-reported' | 'wording' | 'runtime' = deferred
+        ? 'wording'
+        : evidence.rule === 'verification-deferred'
+          ? 'runtime'
+          : 'under-reported';
       this.#recordRuntimeDefect(
         'usability',
         'low',
-        deferred
+        cause === 'wording'
           ? `Workflow goal asks the agent to verify, which is an assertion's job: ${goal}`
-          : `Workflow agent under-reported its own success: ${goal}`,
-        deferred
+          : cause === 'runtime'
+            ? `Workflow goal had nothing on the page for the agent to act on: ${goal}`
+            : `Workflow agent under-reported its own success: ${goal}`,
+        cause === 'wording'
           ? `The agent said "${record.summary}" after ${record.turns} turn(s). ${evidence.reason} ` +
             'A workflow leg prepares the page; it cannot be the oracle, because an agent produces an ' +
             'account of itself and never evidence. Write this leg as the assertion it is ' +
             '(expectText / expectVisible on the value), and keep the agent for the navigation that ' +
             'reaches the page.'
-          : `The agent said "${record.summary}" after ${record.turns} turn(s), but ${evidence.reason}. ` +
-            'The step is judged on that evidence rather than on the agent\'s account of itself. ' +
-            'The turns were still paid for: narrow the goal, or replace this leg with ordinary steps.',
+          : cause === 'runtime'
+            ? `The agent said "${record.summary}" after ${record.turns} turn(s). ${evidence.reason} ` +
+              'Confirm this leg is reachable (the right page, the content finished loading) — if it ' +
+              'is, the goal likely describes reading a value rather than acting, and reads better as ' +
+              'the assertion it is; if it is not, the earlier step that was meant to reach it is ' +
+              'the one to fix.'
+            : `The agent said "${record.summary}" after ${record.turns} turn(s), but ${evidence.reason}. ` +
+              'The step is judged on that evidence rather than on the agent\'s account of itself. ' +
+              'The turns were still paid for: narrow the goal, or replace this leg with ordinary steps.',
         undefined,
       );
     }

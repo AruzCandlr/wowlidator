@@ -252,6 +252,21 @@ export interface RoleConfig {
    * 6.1 s against sonnet at low effort's 3.0 s, and cost four times as much.
    */
   effort?: string | undefined;
+  /**
+   * Available tools for a CLI provider (`claude-cli`), from
+   * `WOWLIDATOR_<ROLE>_TOOLS`.
+   */
+  tools?: string | undefined;
+  /**
+   * Allowed tools for a CLI provider (`claude-cli`), from
+   * `WOWLIDATOR_<ROLE>_ALLOWED_TOOLS`.
+   */
+  allowedTools?: string | undefined;
+  /**
+   * Disallowed tools for a CLI provider (`claude-cli`), from
+   * `WOWLIDATOR_<ROLE>_DISALLOWED_TOOLS`.
+   */
+  disallowedTools?: string | undefined;
 }
 
 export interface WowlidatorConfig {
@@ -320,6 +335,18 @@ const envSchema = z.object({
   WOWLIDATOR_GENERATOR_EFFORT: z.string().min(1).optional(),
   WOWLIDATOR_AGENT_EFFORT: z.string().min(1).optional(),
   WOWLIDATOR_DATA_EFFORT: z.string().min(1).optional(),
+  WOWLIDATOR_HEALER_TOOLS: z.string().optional(),
+  WOWLIDATOR_GENERATOR_TOOLS: z.string().optional(),
+  WOWLIDATOR_AGENT_TOOLS: z.string().optional(),
+  WOWLIDATOR_DATA_TOOLS: z.string().optional(),
+  WOWLIDATOR_HEALER_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_GENERATOR_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_AGENT_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_DATA_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_HEALER_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_GENERATOR_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_AGENT_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_DATA_DISALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_HEALER_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_GENERATOR_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_GENERATOR_MODEL: z.string().min(1).optional(),
@@ -466,12 +493,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
     modelId: string | undefined,
     baseUrl?: string | undefined,
     effort?: string | undefined,
+    tools?: string | undefined,
+    allowedTools?: string | undefined,
+    disallowedTools?: string | undefined,
   ): RoleConfig => {
     // Authoring is one large call per case and earns the thinking; the roles
     // called every few seconds do not. A role that says nothing takes the
     // default for its kind rather than the most expensive setting.
     const resolvedEffort =
       (effort?.trim() || undefined) ?? (name === 'generator' ? 'high' : 'low');
+    const resolvedTools = tools?.trim() || undefined;
+    const resolvedAllowedTools = allowedTools?.trim() || undefined;
+    const resolvedDisallowedTools = disallowedTools?.trim() || undefined;
     const resolvedProvider = provider ?? DEFAULT_ROLE_MODELS[name].provider;
     // Only `local` has a server to point at; a base URL on any other provider
     // is ignored rather than sent somewhere the SDK would not honour it.
@@ -489,14 +522,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
     // the server answers with the model it loaded, so the alias is the truth.
     const fixed = fixedModelFor(resolvedProvider);
     if (fixed !== undefined) {
-      return { role: name, provider: resolvedProvider, modelId: fixed, baseUrl: resolvedBase, effort: resolvedEffort };
+      return {
+        role: name,
+        provider: resolvedProvider,
+        modelId: fixed,
+        baseUrl: resolvedBase,
+        effort: resolvedEffort,
+        tools: resolvedTools,
+        allowedTools: resolvedAllowedTools,
+        disallowedTools: resolvedDisallowedTools,
+      };
     }
     const resolvedModel =
       modelId ??
       (resolvedProvider === DEFAULT_ROLE_MODELS[name].provider
         ? DEFAULT_ROLE_MODELS[name].modelId
         : DEFAULT_PROVIDER_MODELS[resolvedProvider]);
-    return { role: name, provider: resolvedProvider, modelId: resolvedModel, effort: resolvedEffort };
+    return {
+      role: name,
+      provider: resolvedProvider,
+      modelId: resolvedModel,
+      effort: resolvedEffort,
+      tools: resolvedTools,
+      allowedTools: resolvedAllowedTools,
+      disallowedTools: resolvedDisallowedTools,
+    };
   };
 
   const apiKeys: Partial<Record<ProviderName, string[]>> = {};
@@ -525,10 +575,46 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
 
   return {
     roles: {
-      healer: role('healer', e.WOWLIDATOR_HEALER_PROVIDER, e.WOWLIDATOR_HEALER_MODEL, e.WOWLIDATOR_HEALER_BASE_URL, e.WOWLIDATOR_HEALER_EFFORT),
-      generator: role('generator', e.WOWLIDATOR_GENERATOR_PROVIDER, e.WOWLIDATOR_GENERATOR_MODEL, e.WOWLIDATOR_GENERATOR_BASE_URL, e.WOWLIDATOR_GENERATOR_EFFORT),
-      agent: role('agent', e.WOWLIDATOR_AGENT_PROVIDER, e.WOWLIDATOR_AGENT_MODEL, e.WOWLIDATOR_AGENT_BASE_URL, e.WOWLIDATOR_AGENT_EFFORT),
-      data: role('data', e.WOWLIDATOR_DATA_PROVIDER, e.WOWLIDATOR_DATA_MODEL, e.WOWLIDATOR_DATA_BASE_URL, e.WOWLIDATOR_DATA_EFFORT),
+      healer: role(
+        'healer',
+        e.WOWLIDATOR_HEALER_PROVIDER,
+        e.WOWLIDATOR_HEALER_MODEL,
+        e.WOWLIDATOR_HEALER_BASE_URL,
+        e.WOWLIDATOR_HEALER_EFFORT,
+        e.WOWLIDATOR_HEALER_TOOLS,
+        e.WOWLIDATOR_HEALER_ALLOWED_TOOLS,
+        e.WOWLIDATOR_HEALER_DISALLOWED_TOOLS,
+      ),
+      generator: role(
+        'generator',
+        e.WOWLIDATOR_GENERATOR_PROVIDER,
+        e.WOWLIDATOR_GENERATOR_MODEL,
+        e.WOWLIDATOR_GENERATOR_BASE_URL,
+        e.WOWLIDATOR_GENERATOR_EFFORT,
+        e.WOWLIDATOR_GENERATOR_TOOLS,
+        e.WOWLIDATOR_GENERATOR_ALLOWED_TOOLS,
+        e.WOWLIDATOR_GENERATOR_DISALLOWED_TOOLS,
+      ),
+      agent: role(
+        'agent',
+        e.WOWLIDATOR_AGENT_PROVIDER,
+        e.WOWLIDATOR_AGENT_MODEL,
+        e.WOWLIDATOR_AGENT_BASE_URL,
+        e.WOWLIDATOR_AGENT_EFFORT,
+        e.WOWLIDATOR_AGENT_TOOLS,
+        e.WOWLIDATOR_AGENT_ALLOWED_TOOLS,
+        e.WOWLIDATOR_AGENT_DISALLOWED_TOOLS,
+      ),
+      data: role(
+        'data',
+        e.WOWLIDATOR_DATA_PROVIDER,
+        e.WOWLIDATOR_DATA_MODEL,
+        e.WOWLIDATOR_DATA_BASE_URL,
+        e.WOWLIDATOR_DATA_EFFORT,
+        e.WOWLIDATOR_DATA_TOOLS,
+        e.WOWLIDATOR_DATA_ALLOWED_TOOLS,
+        e.WOWLIDATOR_DATA_DISALLOWED_TOOLS,
+      ),
     },
     apiKeys,
     maxRetries: e.WOWLIDATOR_LLM_MAX_RETRIES ?? DEFAULT_MAX_RETRIES,

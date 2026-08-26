@@ -141,6 +141,12 @@ export type ModelBuilder = (
      * every few seconds cheap and quick.
      */
     effort?: string | undefined;
+    /** Tools to make available to the provider session (e.g. for `claude-cli`). */
+    tools?: string | readonly string[] | undefined;
+    /** Allowed tools for the provider session. */
+    allowedTools?: string | readonly string[] | undefined;
+    /** Disallowed tools for the provider session. */
+    disallowedTools?: string | readonly string[] | undefined;
   },
 ) => LanguageModel;
 
@@ -153,7 +159,13 @@ const FACTORIES: Record<ProviderName, ModelBuilder> = {
   // for why the system prompt is replaced and the process runs from a
   // neutral directory.
   'claude-cli': (_apiKey, modelId, options) =>
-    createClaudeCli({ modelId, ...(options?.effort === undefined ? {} : { effort: options.effort }) }),
+    createClaudeCli({
+      modelId,
+      ...(options?.effort === undefined ? {} : { effort: options.effort }),
+      ...(options?.tools === undefined ? {} : { tools: options.tools }),
+      ...(options?.allowedTools === undefined ? {} : { allowedTools: options.allowedTools }),
+      ...(options?.disallowedTools === undefined ? {} : { disallowedTools: options.disallowedTools }),
+    }),
   // Same session, one warm interactive process per (model, effort) — pooled
   // in module state, because this builder runs on EVERY failover call.
   'claude-tty': (_apiKey, modelId, options) =>
@@ -248,6 +260,9 @@ export function createModelForRole(
     model: builders[entry.provider](apiKey, entry.modelId, {
       baseUrl: entry.baseUrl,
       effort: entry.effort,
+      tools: entry.tools,
+      allowedTools: entry.allowedTools,
+      disallowedTools: entry.disallowedTools,
     }),
     id: modelIdFor(entry),
     keyIndex,

@@ -155,6 +155,24 @@ describe('verificationOnlyGoal', () => {
     );
   });
 
+  it('is true for "add" and "confirm" used arithmetically, not as an action verb', () => {
+    // be100 PL_03_01 (2026-08-26): this exact goal was classed as an ACTION
+    // goal on the bare word "add" — arithmetic, not a click — so the
+    // verification handoff never fired. The agent, having nothing on the
+    // page it could legitimately press, scrolled five times and was
+    // recorded stalled with a high defect. A stronger model does not fix a
+    // goal that was never actionable to begin with.
+    assert.equal(
+      verificationOnlyGoal(
+        'read the numbers shown in the Reimbursement by Employee and HR box, the Reimbursement by ' +
+          'HR box, the Info box and the Records box, add them together, and confirm that the sum ' +
+          'equals the Total Plans number',
+      ),
+      true,
+    );
+    assert.equal(verificationOnlyGoal('confirm that the total matches the sum shown'), true);
+  });
+
   it('is false the moment the goal asks for any work', () => {
     // Narrow on purpose: a leg that acts and then checks is a real leg, and
     // its failure is a real failure.
@@ -163,6 +181,9 @@ describe('verificationOnlyGoal', () => {
     assert.equal(verificationOnlyGoal('navigate to the plans page and confirm that it loaded'), false);
     // No verify verb at all is not a verification goal either.
     assert.equal(verificationOnlyGoal('reach the application details page'), false);
+    // "add"/"confirm" used as real actions still count as action verbs.
+    assert.equal(verificationOnlyGoal('add a new plan, then verify it appears in the list'), false);
+    assert.equal(verificationOnlyGoal('confirm the delete dialog, then verify the row is gone'), false);
   });
 });
 

@@ -65,6 +65,12 @@ export const DEFAULT_AGENT_MAX_STEPS = envMaxSteps() ?? Infinity;
  * for an 8 s miss; the fast-fail made it four times stricter than intended.
  */
 export const AGENT_NO_PROGRESS_TURNS = 5;
+/**
+ * Fewer turns than a stall when EVERY action so far has been a look. Three
+ * scrolls that changed nothing say the page has no more to show; two more
+ * would only say it again, at a model call each.
+ */
+export const AGENT_LOOK_ONLY_TURNS = 3;
 
 /**
  * Actions that look again rather than act: they can never change the
@@ -643,6 +649,11 @@ export class WorkflowAgent {
    */
   async run(page: Page, goal: string, runOptions: RunOptions = {}): Promise<WorkflowResult> {
     const startedMs = Date.now();
+    // Reset here, not at declaration: the agent is one instance shared across
+    // every workflow step of a run, and a flag that stuck from a PRIOR step's
+    // goal would mark every step after a looked-only one the same way,
+    // whether or not it was.
+    this.#lookedOnly = false;
     const memory = runOptions.memory ?? this.#memory;
     // What this run may do at all: `readOnly` is the strictest form, an
     // explicit set is the middle ground (the reveal pass), absent is the full
@@ -1053,6 +1064,29 @@ export class WorkflowAgent {
         turnsWithoutProgress = 0;
       } else {
         turnsWithoutProgress += 1;
+        // **A stall made only of looking is a handoff, not a failure.** When
+        // EVERY action across the whole leg — not just this turn — has been
+        // idle (scroll, wait), the model was never handed a real move: no
+        // click, fill or press was ever attempted, ok or not. That is a fact
+        // about the goal, and with a capable model it is the only way this
+        // shape arises — a goal that reads as an action but is actually a
+        // reading question (arithmetic over values on the page, a
+        // cross-check), so the agent has nothing legitimate to press. The
+        // leg ends as inconclusive-not-failed: whatever the flow asserts next
+        // is the proof, exactly as `verification-deferred` treats a goal the
+        // wording classifier caught up front. The whole-leg scope is
+        // deliberate: a leg that landed one real action earlier and only
+        // got stuck looking afterward is a different, more ordinary stall,
+        // and stays on the 5-turn judge above.
+        const lookedOnly = actions.length > 0 && actions.every((a) => IDLE_ACTIONS.has(a.action));
+        if (lookedOnly && turnsWithoutProgress >= AGENT_LOOK_ONLY_TURNS) {
+          summary =
+            `agent looked and found nothing to act on: ${turnsWithoutProgress} turn(s) of scrolling and ` +
+            'waiting with no control the goal could name — this is a reading question, and the ' +
+            "flow's own assertions after this step are what answer it";
+          this.#lookedOnly = true;
+          break;
+        }
         if (turnsWithoutProgress >= AGENT_NO_PROGRESS_TURNS) {
           const lastFailed = [...actions].reverse().find((a) => !a.ok);
           summary =
@@ -1310,6 +1344,7 @@ export class WorkflowAgent {
       latencyMs: Date.now() - startedMs,
       inputTokens,
       outputTokens,
+      ...(this.#lookedOnly ? { lookedOnly: true } : {}),
     };
   }
 
@@ -1533,6 +1568,13 @@ export class WorkflowAgent {
 
   /** Set by `#target` for the history line of the action that follows. */
   #lastTargetNote: string | null = null;
+  /**
+   * Set when the loop ended because every action taken was a look — see the
+   * no-progress judge. Reset at the top of `run()`; read into the RESULT
+   * (`WorkflowResult.lookedOnly`), never off the instance directly, because
+   * one agent instance answers many workflow steps across a run.
+   */
+  #lookedOnly = false;
   /** This run's read-only DB access, when the runner provided one. */
   #dbProbe: AgentDbProbe | null = null;
 
