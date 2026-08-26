@@ -39,11 +39,16 @@ import { createHash } from 'node:crypto';
 /**
  * How many questions one process answers before it is retired.
  *
- * The session accumulates context, so this bounds how large that grows. Forty
- * is roughly two cases' worth of calls: large enough that startup becomes a
- * rounding error, small enough that the context stays modest.
+ * Measured 2026-08-26 on real be100 calls: a session left to run to 40 turns
+ * accumulated 700k-1.7M cached input tokens, and per-call wall time grew from
+ * ~5s early in the session to 26-82s by turn 20-30 — cached tokens are cheap
+ * in dollars but the model still attends over them, so a bloated session gets
+ * slower call by call even though nothing else changed. Ten keeps the
+ * attended context small enough that a call stays well under the 20s target
+ * for the run's whole lifetime, at the cost of paying the ~1.2s warm-restart
+ * more often (still far cheaper than the 3.4-4.3s cold-start it replaces).
  */
-export const MAX_TURNS_PER_SESSION = 40;
+export const MAX_TURNS_PER_SESSION = 10;
 /** A session with nothing to do is closed rather than left holding a process. */
 export const SESSION_IDLE_MS = 90_000;
 /** No single answer may hang the run. */
