@@ -3762,7 +3762,19 @@ export function duplicateCredentialSubmit(
     if (submit !== null && submit.selector === step.selector) {
       return { first: submit.index, repeat: index, selector: step.selector };
     }
-    if (sawCredentialFill) submit = { index, selector: step.selector };
+    if (sawCredentialFill) {
+      submit = { index, selector: step.selector };
+      // **The credential window ends at the submit.** `sawCredentialFill` used
+      // to be cleared only by a `goto`, so after sign-in it stayed true for the
+      // rest of the flow and every later click was a candidate sign-in submit.
+      // Any two clicks on one selector with no other click between them were
+      // then reported as a login retry — which is the ordinary shape of a
+      // wording case: open a popup, read it, close it, open it again. PL_02_03
+      // and PL_02_04 were both lost to it, told by the refusal that their
+      // "Create Plan" button was a sign-in form, and re-asked until the attempt
+      // budget ran out. One submit is all this lint was ever about.
+      sawCredentialFill = false;
+    }
   }
   return null;
 }

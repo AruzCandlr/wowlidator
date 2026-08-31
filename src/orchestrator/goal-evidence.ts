@@ -328,8 +328,25 @@ function firstDefined(groups: readonly (string | undefined)[], from: number, cou
   return '';
 }
 
+/**
+ * A goal's provenance annotation — `(test step 1: เข้าสู่เมนูที่กำหนด)`, which
+ * the authoring prompt attaches to every catalog goal so a reader can trace the
+ * leg back to its sheet row.
+ *
+ * Stripped before the outcome is parsed, because the colon inside it is not a
+ * control/value separator and `OUTCOME_EQ` cannot tell the difference.
+ * Measured (PL_02_07, run a8ae1bb5): the annotation's colon was matched, the
+ * bare-control alternation ran backwards into the sentence, and the agent was
+ * asked to prove a control named `he Benefit Plan Catalog page (test step 1`
+ * shows `เข้าสู่เมนูที่กำหนด`. No page shows that, so a leg that HAD reached
+ * `/en/admin/benefits/plans` — exactly the page the goal named — was recorded
+ * as a claimed finish the page contradicts.
+ */
+const GOAL_ANNOTATION = /\s*\((?:test\s+step|step|case|row)\b[^)]*\)\s*\.?\s*$/i;
+
 export function goalOutcome(goal: string): GoalOutcome | null {
-  const m = OUTCOME_SET.exec(goal) ?? OUTCOME_EQ.exec(goal);
+  const text = goal.replace(GOAL_ANNOTATION, '');
+  const m = OUTCOME_SET.exec(text) ?? OUTCOME_EQ.exec(text);
   if (!m) return null;
   // Groups: 1–3 quoted control, 4 bare control, 5–7 quoted value, 8 bare value.
   // A bare control in the `X = "Y"` form runs back to the sentence start
