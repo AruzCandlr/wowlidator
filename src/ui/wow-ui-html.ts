@@ -1979,6 +1979,15 @@ function taskRow(task) {
         disabled: !caseIdOfName(task.name),
         title: 'Add this case to the work queue — queued cases are re-authored from their sheet rows and run together. Asks before adding.',
         text: 'Queue', onclick: function () { queueAdd(caseIdOfName(task.name)); }
+      }),
+      // **The Runs list is the front page**, so the report belongs on the row
+      // itself, not only behind a click into the detail pane. The evidence a
+      // person opens wowUI to read was reachable in three places and none of
+      // them was this one.
+      latest.reportPath && el('button', {
+        type: 'button', class: 'btn', title: 'Open the rendered report for this run — the readable document, not the raw bundle.',
+        text: 'Report',
+        onclick: function () { window.open('/view?path=' + encodeURIComponent(latest.reportPath), '_blank'); }
       })
     ])
   ]);
