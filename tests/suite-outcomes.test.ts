@@ -193,3 +193,18 @@ describe('the exit code for a list of cases', () => {
     assert.equal(suiteExit(outcomes), EXIT.environment);
   });
 });
+
+describe('vacuous assertion scoring (S5)', () => {
+  it('a passing run whose expectVisible resolved a nameless element is needs-review, never green', async () => {
+    const { ProofBundleBuilder } = await import('../src/engine/proof-bundle.js');
+    const b = new ProofBundleBuilder({ name: 'PL_04_13', cdpUrl: null, cachePath: null, healerModel: null } as never);
+    b.addStep({ ...step('passed'), action: 'goto', index: 0 } as ProofStep);
+    b.addStep({
+      ...step('passed'), action: 'expectVisible', index: 1, selector: 'role=combobox >> nth=0',
+      detail: { expected: 'visible', actual: 'visible', vacuous: 'resolved an element with no accessible name or text — this assertion cannot fail and proves nothing' },
+    } as ProofStep);
+    const bundle = b.finish();
+    assert.equal(bundle.status, 'needs-review');
+    assert.match(bundle.steps[1]?.unsure ?? '', /cannot fail/);
+  });
+});

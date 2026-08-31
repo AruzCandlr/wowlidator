@@ -127,7 +127,7 @@ ${DETERMINISM_RULES}
 ${procedure('HOW TO LIST THE CLAIMS', [
   'Walk the catalog top to bottom, in its own order. Claims come out in DOCUMENT ORDER — never regrouped, never sorted by importance.',
   'For each row, section or paragraph: one claim per assertion it makes. A sentence with "and" between two checkable things is two claims; a numbered "Expected output" list is one claim per number.',
-  'Keep the document\'s identifiers: "source" is the case id / row id / heading exactly as written (PB_01_01, "3.2 Session timeout"), or the first four words of the line when there is none.',
+  'Keep the document\'s identifiers: "source" is the case id / row id / heading exactly as written (TC_01_01, "3.2 Session timeout"), or the first four words of the line when there is none.',
   'Priority: the document\'s own word when it has one (High/Medium/Low → high/medium/low); otherwise medium. Never infer high from tone.',
   'testable=false for a line that only states who is signed in, what data exists, or what environment is running; everything that says what the application must show or do is testable=true.',
 ])}
@@ -387,6 +387,18 @@ export function buildAuthoringPrompt(
   const testable = claims.filter((claim) => claim.testable);
   const setup = claims.filter((claim) => !claim.testable);
   const parts: string[] = [];
+
+  // The mission, first — before the background — so the model (and anyone
+  // reading the request log) sees the task ahead of the documents that serve
+  // it. Constant across every row of a catalog, so the shared prompt prefix
+  // the caching comment below relies on is unchanged: this line + the docs
+  // are byte-identical from row to row.
+  parts.push(
+    'Create a runnable JSON flow that navigates the website exactly as the test steps say, and takes ' +
+      'the expected output in the test case VERBATIM as the expected output — without modification. ' +
+      'If the case alone gives too little context, find what is missing in the SUPPORTING CONTEXT ' +
+      'documents and the repository sections included below. Every test case has something to test.',
+  );
 
   for (const document of options.context ?? []) {
     parts.push(

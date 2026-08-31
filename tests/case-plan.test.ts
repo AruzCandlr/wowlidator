@@ -11,7 +11,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CaseQueue, DEFAULT_AUTHOR_CONCURRENCY, ScenarioGate, authorWorkers, caseWrites, mapPool, planCases, readersFirst, runQueue, runWithConcurrency, withWorkflowScripts } from '../src/cli/case-plan.js';
+import { CaseQueue, DEFAULT_AUTHOR_CONCURRENCY, ScenarioGate, authorWorkers, caseWrites, mapPool, orderScenariosFastestFirst, planCases, readersFirst, runQueue, runWithConcurrency, withWorkflowScripts } from '../src/cli/case-plan.js';
 import { signsInItself, type Flow } from '../src/engine/runner.js';
 
 const flow = (steps: Flow['steps'], setup?: Flow['setup']): Flow =>
@@ -209,6 +209,13 @@ describe('the auth exemption reads the page, not the field name', () => {
 });
 
 describe('authorWorkers', () => {
+  it('reads the Machinery dial when no flag is given; the flag and a serial provider still win', () => {
+    assert.equal(authorWorkers(undefined, 'groq', { WOWLIDATOR_AUTHOR_CONCURRENCY: '5' }), 5);
+    assert.equal(authorWorkers(2, 'groq', { WOWLIDATOR_AUTHOR_CONCURRENCY: '5' }), 2, 'the flag wins');
+    assert.equal(authorWorkers(undefined, 'local', { WOWLIDATOR_AUTHOR_CONCURRENCY: '5' }), 1, 'serial provider stays 1');
+    assert.equal(authorWorkers(undefined, 'groq', { WOWLIDATOR_AUTHOR_CONCURRENCY: '99' }), DEFAULT_AUTHOR_CONCURRENCY, 'out of range falls back');
+  });
+
   it('authors one row at a time on a provider that answers one call at a time', () => {
     assert.equal(authorWorkers(undefined, 'local'), 1);
     assert.equal(authorWorkers(undefined, 'groq'), DEFAULT_AUTHOR_CONCURRENCY);
@@ -664,5 +671,51 @@ describe('withWorkflowScripts', () => {
     const branchStep = (out!.steps[0] as { then: { script?: unknown[] }[] }).then[0]!;
     assert.equal(setupStep.script!.length, 1);
     assert.equal(branchStep.script!.length, 1);
+  });
+});
+
+describe('orderScenariosFastestFirst', () => {
+  const row = (caseId: string, scenarioId: string, steps: string, extra: Partial<{ testCase: string; expected: string }> = {}) =>
+    ({ caseId, scenarioId, steps, ...extra });
+
+  it('queues the statically cheaper scenario first, rows contiguous and in sheet order', () => {
+    const rows = [
+      row('A_01', 'A', '1. a\n2. b\n3. c\n4. d\n5. e'),
+      row('A_02', 'A', '1. a\n2. b\n3. c'),
+      row('B_01', 'B', '1. a'),
+    ];
+    const { rows: ordered, order } = orderScenariosFastestFirst(rows);
+    assert.deepEqual(ordered.map((r) => r.caseId), ['B_01', 'A_01', 'A_02']);
+    assert.deepEqual(order.map((o) => o.scenario), ['B', 'A']);
+    assert.equal(order[0]!.rows, 1);
+  });
+
+  it('a recorded duration outranks the static estimate', () => {
+    const rows = [
+      row('A_01', 'A', '1. a'),                 // static: tiny
+      row('B_01', 'B', '1. a\n2. b\n3. c\n4. d'), // static: bigger
+    ];
+    // History says A was actually the slow one (an agent leg, say).
+    const prior = new Map([['A_01', 300_000], ['B_01', 5_000]]);
+    const { rows: ordered } = orderScenariosFastestFirst(rows, prior);
+    assert.deepEqual(ordered.map((r) => r.caseId), ['B_01', 'A_01']);
+  });
+
+  it('a writer is priced above its line count — it will run alone', () => {
+    const reader = row('R_01', 'R', '1. open the list\n2. read the count');
+    const writer = row('W_01', 'W', '1. open the list\n2. delete the row');
+    const { order } = orderScenariosFastestFirst([writer, reader]);
+    assert.deepEqual(order.map((o) => o.scenario), ['R', 'W']);
+  });
+
+  it('ties break to sheet order, and every row survives', () => {
+    const rows = [
+      row('B_01', 'B', '1. a'),
+      row('A_01', 'A', '1. a'),
+      row('C_01', '', '1. a'),
+    ];
+    const { rows: ordered, order } = orderScenariosFastestFirst(rows);
+    assert.equal(ordered.length, 3);
+    assert.deepEqual(order.map((o) => o.scenario), ['B', 'A', 'ungrouped']);
   });
 });

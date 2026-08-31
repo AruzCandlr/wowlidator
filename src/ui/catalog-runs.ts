@@ -52,6 +52,8 @@ export interface CatalogRunEntry {
   /** What started the run, when the ledger recorded it. Without it a resume
    *  can only reuse a same-session job's argv. */
   launch: SuiteLedger['launch'] | null;
+  /** Every planned case id, in plan order — what maps a case row to its run. */
+  planned: readonly string[];
 }
 
 const LEDGER_SUFFIX = '.progress.json';
@@ -79,6 +81,7 @@ function toEntry(ledgerPath: string, ledger: SuiteLedger): CatalogRunEntry {
     ended: ledger.ended,
     resumable: left > 0,
     launch: ledger.launch ?? null,
+    planned: ledger.planned,
   };
 }
 

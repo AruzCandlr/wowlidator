@@ -23,8 +23,29 @@
 
 import { REDACTED } from './redact.js';
 
-/** Matches `{{name}}`, allowing surrounding whitespace inside the braces. */
-const PLACEHOLDER = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+/**
+ * Matches `{{name}}`, allowing surrounding whitespace inside the braces.
+ *
+ * **Hyphens are part of a name.** The authoring prompt's own worked example is
+ * `saveCount as "rows-before"` … `expectCount "{{rows-before}}"`, and a pattern
+ * that stopped at `[A-Za-z0-9_]` could not match it: `replace` found nothing,
+ * returned the string untouched, and the flow went on to assert the literal
+ * text `{{rows-before}}` against the page. Worse, the unknown-name guard below
+ * lives inside the replace callback, so a name that never matched was never
+ * reported either — the one case that most needed an error produced silence.
+ * Measured on PL_02: 11 of 18 authoring refusals were hyphenated placeholders,
+ * and three rows died renaming the placeholder because nothing said that was
+ * the problem.
+ */
+const PLACEHOLDER = /\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}/g;
+
+/**
+ * Any `{{…}}` at all — what `interpolate` scans for AFTER substituting, so a
+ * brace pair that `PLACEHOLDER` could not read is a loud failure rather than
+ * literal text in an assertion. Deliberately laxer than `PLACEHOLDER`: its job
+ * is to catch exactly what that one rejects.
+ */
+const ANY_PLACEHOLDER = /\{\{[^}]*\}\}/;
 
 /**
  * Variable names whose value is treated as a credential in the report.
@@ -69,13 +90,22 @@ export class VariableStore {
     return [...this.#values.keys()];
   }
 
-  /** Replace every `{{name}}` in `text`. Throws on an unknown name. */
+  /**
+   * Replace every `{{name}}` in `text`. Throws on an unknown name — and on a
+   * brace pair `PLACEHOLDER` could not read at all, which is the same mistake
+   * wearing a different hat and used to pass through as literal text.
+   */
   interpolate(text: string): string {
-    return text.replace(PLACEHOLDER, (_match, name: string) => {
+    const out = text.replace(PLACEHOLDER, (_match, name: string) => {
       const value = this.#values.get(name);
       if (value === undefined) throw new UnknownVariableError(name, this.names());
       return value;
     });
+    const stray = ANY_PLACEHOLDER.exec(out);
+    if (stray !== null) {
+      throw new UnknownVariableError(stray[0].slice(2, -2).trim(), this.names());
+    }
+    return out;
   }
 
   /**

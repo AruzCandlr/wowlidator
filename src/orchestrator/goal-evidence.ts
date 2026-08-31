@@ -280,3 +280,93 @@ export function verificationOnlyGoal(goal: string): boolean {
 export function agentModelUnavailable(summary: string): boolean {
   return /^agent model failed:/i.test(summary);
 }
+
+/**
+ * The checkable END STATE a goal describes, or null when it names none.
+ *
+ * Audit 2026-08-28 (be100): 20 of 22 agent legs on PASSED cases were settled
+ * by the agent's own `finish` text — "shows 1–75 of 75, *meaning* 100 was
+ * selected", "picked, *as confirmed by* the successful clicks" — inference
+ * presented as observation, never checked against the page. The rule "what
+ * the agent claims is never the evidence" was enforced for failures only.
+ * This is the success half: a goal that says what the page should hold when
+ * it is done is turned into a predicate the harness evaluates on the live
+ * tree, and a `finish` is accepted on the tree's word, not the model's.
+ *
+ * Two shapes, both from the way catalog goals are actually written:
+ *  - `set/select/choose/change <control> to <value>` → `{ control, value }`:
+ *    some node whose name or value carries the control's words must show the
+ *    value (a filter button reading "Type: Info", a combobox value, a readout).
+ *  - `<control> = <value>` / `<control> to "<value>"` → the same.
+ * Deliberately narrow — a goal it cannot read falls through to today's
+ * behaviour, and the record says so (`settledBy: 'agent-claim'`), so an
+ * all-claim run is visible as one rather than passing silently.
+ */
+export interface GoalOutcome {
+  control: string;
+  value: string;
+}
+
+// Two spellings each of the control and the value: quoted (any quote style)
+// or bare. Written as alternations rather than optional quotes so a quoted
+// control followed by a bare value ("set the "Rows per page" control to 25")
+// cannot be mis-split across the quote characters.
+const Q = String.raw`(?:"([^"]{1,60})"|“([^”]{1,60})”|'([^']{1,60})')`;
+const BARE_CONTROL = String.raw`([A-Za-z][^"“'=:,]{1,40}?)`;
+const BARE_VALUE = String.raw`([^\s"“',.;)]{1,40})`;
+const OUTCOME_SET = new RegExp(
+  String.raw`\b(?:set|select|choose|change|switch)\s+(?:the\s+)?(?:${Q}|${BARE_CONTROL})\s+(?:control\s+|dropdown\s+|filter\s+|field\s+)?(?:to|=|as)\s+(?:${Q}|${BARE_VALUE})`,
+  'i',
+);
+const OUTCOME_EQ = new RegExp(String.raw`(?:${Q}|${BARE_CONTROL})\s*(?:=|:)\s*(?:${Q}|${BARE_VALUE})`);
+
+function firstDefined(groups: readonly (string | undefined)[], from: number, count: number): string {
+  for (let i = from; i < from + count; i += 1) {
+    const g = groups[i];
+    if (g !== undefined && g !== '') return g;
+  }
+  return '';
+}
+
+export function goalOutcome(goal: string): GoalOutcome | null {
+  const m = OUTCOME_SET.exec(goal) ?? OUTCOME_EQ.exec(goal);
+  if (!m) return null;
+  // Groups: 1–3 quoted control, 4 bare control, 5–7 quoted value, 8 bare value.
+  // A bare control in the `X = "Y"` form runs back to the sentence start
+  // and picks up the verb ("Fill Country"); the verb is not the control.
+  const control = firstDefined(m, 1, 4)
+    .trim()
+    .replace(/^(?:fill|set|select|choose|change|switch|enter|type|pick)\s+(?:the\s+)?/i, '')
+    .replace(/\s+(?:control|dropdown|filter|field|selector|box|button)$/i, '');
+  const value = firstDefined(m, 5, 4).trim();
+  if (control === '' || value === '' || /^\d+$/.test(control) || control.length < 2) return null;
+  return { control, value };
+}
+
+/**
+ * Does the rendered tree show the outcome? A node is evidence when its
+ * name+value carries BOTH the control's words and the value (a filter button
+ * "Type: Info"), or when a node carrying the control's words is followed
+ * within a few lines by one carrying the value (a label and its readout as
+ * siblings — the same shape `focusTree` keeps neighbours for). Returns the
+ * evidencing line, or null. Case-folded; a truncated tree declines (null),
+ * absence of evidence is not evidence of absence.
+ */
+export function outcomeShown(outcome: GoalOutcome, axTree: string): string | null {
+  if (axTree.includes('TREE TRUNCATED')) return null;
+  const lines = axTree.split('\n');
+  const ctl = outcome.control.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
+  const val = outcome.value.toLowerCase();
+  const hasCtl = (l: string): boolean => ctl.every((w) => l.toLowerCase().includes(w));
+  const hasVal = (l: string): boolean => l.toLowerCase().includes(val);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] as string;
+    if (hasCtl(line) && hasVal(line)) return line.trim();
+    if (hasCtl(line)) {
+      for (let j = i + 1; j <= Math.min(i + 3, lines.length - 1); j += 1) {
+        if (hasVal(lines[j] as string)) return `${line.trim()} → ${(lines[j] as string).trim()}`;
+      }
+    }
+  }
+  return null;
+}

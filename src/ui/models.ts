@@ -483,6 +483,12 @@ const REQUESTS: Record<ProviderName, (key: string | undefined) => ModelRequest> 
     headers: {},
     parse: () => ['fable', 'opus', 'sonnet', 'haiku'],
   }),
+  // Same aliases: a cloud session takes the same `--model` the local CLI does.
+  'claude-cloud': () => ({
+    url: 'about:blank',
+    headers: {},
+    parse: () => ['fable', 'opus', 'sonnet', 'haiku'],
+  }),
 };
 
 

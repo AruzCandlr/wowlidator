@@ -26,7 +26,7 @@
  * `isAllowed` in `server.ts`, applied by making the question not arise.
  */
 
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { open, readFile, readdir, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import type { ProofBundle, RunStatus, TierSummary } from '../engine/proof-bundle.js';
@@ -93,6 +93,10 @@ export interface ProofCard {
   /** 'positive' | 'negative' | null — what the test means to prove. */
   polarity: string | null;
   polaritySource: string | null;
+  /** The pre-run dead-end risk, when one was judged — `fail-fast` ran once with retries off. */
+  risk: { likelihood: number; failLikelihood?: number | undefined; verdict: 'run' | 'fail-fast'; reason: string | null } | null;
+  /** The system-error diagnosis, when one ran: which layer broke, and the fix if any. */
+  diagnosis: { origin: string; confidence: number; fix: string | null; reasoning: string } | null;
   /** 0–1, or null when the page had no controls to measure against. */
   coverage: number | null;
   trend: string | null;
@@ -115,10 +119,30 @@ export interface ProofCard {
      *  every resume of the same run. Null for pre-key bundles. */
     runKey: string | null;
   } | null;
+  /**
+   * The run's open question is the SHEET's wording vs the page's rendering —
+   * a deliberate-design-vs-spec call for BA triage, not a machine verdict.
+   * EN-2 audit: 29 of 31 real QA fails were this class.
+   */
+  specQuestion: boolean;
   /** Whether opening this run will show any pictures. */
   hasEvidence: boolean;
   error: string | null;
   path: string;
+  /**
+   * The rendered HTML report for this run, when one is on disk.
+   *
+   * `path` is the proof BUNDLE — raw JSON, which is what every "open" button in
+   * wowUI used to serve. Opening a run therefore showed the machine's record
+   * and never the document written for a person to read. The two files are
+   * written side by side (`writeProofBundle` then `writeHtmlReport`) but
+   * nothing linked them: the bundle carries no report path, and the report's
+   * name is slugged from the case, so neither can be derived from the other.
+   * Resolved instead by `indexReports`, which reads each report's own header.
+   * Null when no report was written (a `--json` run) or the file has since
+   * moved.
+   */
+  reportPath: string | null;
 }
 
 export interface ProofIndex {
@@ -130,16 +154,20 @@ export interface ProofIndex {
   skipped: number;
 }
 
-export function toCard(bundle: ProofBundle, path: string): ProofCard {
+export function toCard(bundle: ProofBundle, path: string, reportPath: string | null = null): ProofCard {
   return {
     runId: bundle.runId,
+    reportPath,
     name: bundle.name,
     renamedFrom: bundle.renamedFrom ?? null,
     status: bundle.status,
     quarantined: bundle.quarantined === true,
-    startedAt: bundle.startedAt,
+    startedAt: bundle.caseStartedAt ?? bundle.startedAt,
     finishedAt: bundle.finishedAt,
-    durationMs: bundle.durationMs,
+    // The case span when the suite loop stamped one — pickup through every
+    // repair attempt — else the single flow attempt. The card must show the
+    // time a person actually waited, not the shortest attempt.
+    durationMs: bundle.caseDurationMs ?? bundle.durationMs,
     totalSteps: bundle.summary.totalSteps,
     passed: bundle.summary.passed,
     failed: bundle.summary.failed,
@@ -162,6 +190,8 @@ export function toCard(bundle: ProofBundle, path: string): ProofCard {
     unsureSteps: bundle.steps.filter((s) => s.unsure !== undefined && !s.superseded).length,
     polarity: bundle.polarity ?? null,
     polaritySource: bundle.polaritySource ?? null,
+    risk: bundle.risk === undefined ? null : { likelihood: bundle.risk.likelihood, ...(bundle.risk.failLikelihood === undefined ? {} : { failLikelihood: bundle.risk.failLikelihood }), verdict: bundle.risk.verdict, reason: bundle.risk.reasons[0] ?? bundle.risk.missing[0] ?? null },
+    diagnosis: bundle.diagnosis === undefined ? null : { origin: bundle.diagnosis.origin, confidence: bundle.diagnosis.confidence, fix: bundle.diagnosis.fix, reasoning: bundle.diagnosis.reasoning },
     coverage: bundle.coverage?.ratio ?? null,
     trend: bundle.trend?.verdict ?? null,
     trendMessage: bundle.trend?.message ?? null,
@@ -185,6 +215,7 @@ export function toCard(bundle: ProofBundle, path: string): ProofCard {
     // richest runs as having none.
     hasEvidence:
       bundle.video?.data !== undefined || bundle.steps.some((s) => s.screenshot !== undefined),
+    specQuestion: bundle.specQuestion === true,
     error: bundle.error ?? null,
     path,
   };
@@ -238,8 +269,84 @@ async function readBundle(path: string, signature: string): Promise<ProofBundle 
  * land in it directly, and a deep tree there means someone has pointed the
  * config at a directory that is not one.
  */
-export async function readProofIndex(dir: string, limit = DEFAULT_LIMIT): Promise<ProofIndex> {
+/**
+ * How much of a report to read when looking for its run id.
+ *
+ * The id sits in the header block — `run <code>…</code>` under the title —
+ * which lands about 25 KB in on a real report, after the inlined CSS. The rest
+ * of the file is screenshots as data URIs and runs to megabytes, so reading
+ * whole reports to build this map would be hundreds of MB for a link. 96 KB is
+ * a wide margin over the observed offset and still cheap.
+ */
+const REPORT_HEAD_BYTES = 96 * 1024;
+
+/** `run <code>76dbb6cb-…</code>` — the report naming the run it renders. */
+const REPORT_RUN_ID = /run <code>([A-Za-z0-9._-]+)<\/code>/;
+
+/**
+ * Map every rendered report under `dir` to the run it belongs to.
+ *
+ * Matched on the report's OWN statement of its run id, never on its file name:
+ * the name is slugged from the case title, so two runs of one case collide and
+ * a renamed run stops matching entirely. Reading the header is the only
+ * reliable link between the two files.
+ *
+ * Best-effort throughout — an unreadable or oddly-shaped report is skipped, and
+ * a run simply has no report link. A broken link would be worse than none.
+ */
+export async function indexReports(dir: string): Promise<Map<string, string>> {
+  const byRunId = new Map<string, string>();
   const root = resolve(dir);
+
+  async function walk(current: string, depth: number): Promise<void> {
+    if (depth > 3 || byRunId.size > 2000) return;
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full, depth + 1);
+        continue;
+      }
+      if (!entry.name.endsWith('.html')) continue;
+      let head = '';
+      try {
+        const handle = await open(full, 'r');
+        try {
+          const buffer = Buffer.alloc(REPORT_HEAD_BYTES);
+          const { bytesRead } = await handle.read(buffer, 0, REPORT_HEAD_BYTES, 0);
+          head = buffer.subarray(0, bytesRead).toString('utf8');
+        } finally {
+          await handle.close();
+        }
+      } catch {
+        continue;
+      }
+      const runId = REPORT_RUN_ID.exec(head)?.[1];
+      // First writer wins: reports are walked newest-directory-first only by
+      // accident, so a duplicate would otherwise flip between refreshes. A
+      // suite index (`index.html`) names no run and is skipped by the regex.
+      if (runId !== undefined && !byRunId.has(runId)) byRunId.set(runId, full);
+    }
+  }
+
+  await walk(root, 0);
+  return byRunId;
+}
+
+export async function readProofIndex(
+  dir: string,
+  limit = DEFAULT_LIMIT,
+  reportDir?: string,
+): Promise<ProofIndex> {
+  const root = resolve(dir);
+  // One walk for the whole index, not one per card: the map is built before the
+  // bundles are read and every card looks its own report up by run id.
+  const reports = reportDir === undefined ? new Map<string, string>() : await indexReports(reportDir);
   const files: { path: string; signature: string; mtimeMs: number }[] = [];
 
   async function walk(current: string, depth: number): Promise<void> {
@@ -283,7 +390,7 @@ export async function readProofIndex(dir: string, limit = DEFAULT_LIMIT): Promis
       skipped += 1;
       continue;
     }
-    cards.push(toCard(bundle, file.path));
+    cards.push(toCard(bundle, file.path, reports.get(bundle.runId) ?? null));
     paths.set(bundle.runId, file.path);
   }
 
@@ -410,7 +517,15 @@ export interface AccuracyScore {
   percent: number;
 }
 
-export type VerdictKind = 'passed' | 'failed' | 'deadEnd' | 'error' | 'needsReview';
+/**
+ * Two families, not five words (2026-08-27): `testFailed` is the subject
+ * missing the case's expectation — a contradicted assertion OR a dead-ended
+ * control the flow needed (`dead-end` was a separate red word that read as a
+ * third kind of outcome and never was); `systemError` is the harness breaking
+ * internally, no verdict delivered. Machine statuses are unchanged
+ * underneath — see `verdictFamily` in engine/proof-bundle.ts, the one rule.
+ */
+export type VerdictKind = 'passed' | 'testFailed' | 'systemError' | 'needsReview';
 
 export type VerdictTally = Record<VerdictKind, { count: number; percent: number }>;
 
@@ -431,15 +546,15 @@ export function verdictKind(card: ProofCard): VerdictKind | null {
     review: card.review === null ? undefined : { verdict: card.review.verdict as 'proved' | 'failed', at: card.review.at },
   });
   if (isPassing(status)) return 'passed';
-  if (status === 'dead-end') return 'deadEnd';
-  if (status === 'error') return 'error';
+  if (status === 'error') return 'systemError';
   if (status === 'needs-review') return 'needsReview';
-  return 'failed';
+  // failed, dead-end: the subject missed the case's expectation.
+  return 'testFailed';
 }
 
 /** Counts and percentages over `cards`. Percentages are of the whole list, rounded. */
 export function tallyVerdicts(cards: readonly ProofCard[]): VerdictTally {
-  const counts: Record<VerdictKind, number> = { passed: 0, failed: 0, deadEnd: 0, error: 0, needsReview: 0 };
+  const counts: Record<VerdictKind, number> = { passed: 0, testFailed: 0, systemError: 0, needsReview: 0 };
   for (const card of cards) {
     const kind = verdictKind(card);
     if (kind !== null) counts[kind] += 1;
@@ -448,9 +563,8 @@ export function tallyVerdicts(cards: readonly ProofCard[]): VerdictTally {
   const pct = (n: number): number => (total === 0 ? 0 : Math.round((n / total) * 100));
   return {
     passed: { count: counts.passed, percent: pct(counts.passed) },
-    failed: { count: counts.failed, percent: pct(counts.failed) },
-    deadEnd: { count: counts.deadEnd, percent: pct(counts.deadEnd) },
-    error: { count: counts.error, percent: pct(counts.error) },
+    testFailed: { count: counts.testFailed, percent: pct(counts.testFailed) },
+    systemError: { count: counts.systemError, percent: pct(counts.systemError) },
     needsReview: { count: counts.needsReview, percent: pct(counts.needsReview) },
   };
 }
@@ -489,7 +603,11 @@ export function groupAccuracy(cards: readonly ProofCard[]): AccuracyScore {
     }
     scored += 1;
     const verdict = verdictKind(card);
-    if ((verdict === 'passed' && known === 'passed') || (verdict === 'failed' && known === 'failed')) {
+    // Family semantics (2026-08-27): a dead-end is the subject missing the
+    // case's expectation, so it agrees with a human-recorded Failed exactly
+    // as a contradicted assertion does. Only a systemError still agrees with
+    // nothing — the harness broke and no verdict was delivered.
+    if ((verdict === 'passed' && known === 'passed') || (verdict === 'testFailed' && known === 'failed')) {
       agreed += 1;
     }
   }

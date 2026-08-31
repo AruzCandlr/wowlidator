@@ -72,6 +72,14 @@ export interface JobProgress {
   /** `elapsedMs` when `done` last advanced — the anchor the next step's dt is measured from. */
   lastStepMs: number;
   /**
+   * `elapsedMs` when this unit's own work began — a case picked up mid-suite
+   * starts its clock at its `started` line, not at the job's. Without it the
+   * first observed step's dt spans the whole queue wait (30 minutes of other
+   * cases), the EMA is seeded from that, and the ETA reads hours for a
+   * ten-second case. Null for job-level progress (the job's clock IS its own).
+   */
+  startedMs: number | null;
+  /**
    * How far along, 0-100, for a command that has no steps to count.
    *
    * Reading a catalog is one model call and a file read — there is no step
@@ -318,7 +326,7 @@ export class JobRunner {
       lines: [],
       artifacts: [],
       ended: null,
-      progress: { done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0 },
+      progress: { done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0, startedMs: null },
       cases: [],
     };
     this.#jobs.set(id, job);
@@ -403,7 +411,14 @@ export class JobRunner {
     const at = job.argv.indexOf('--claims');
     const claims = at >= 0 ? job.argv[at + 1] : undefined;
     if (claims !== undefined) {
-      void writeFile(`${resolvePath(claims)}.progress.json.pause`, `pause requested ${new Date().toISOString()}\n`, 'utf8').catch(() => undefined);
+      // The ledger's real name strips the claims file's own `.json` first
+      // (`be100.claims.json` → `be100.claims.progress.json` — see
+      // `suite-progress.ts`). Appending to the full path wrote the pause
+      // marker under a name no suite polls, so the file route silently did
+      // nothing whenever the signal was absorbed by the tsx wrapper (live,
+      // 2026-08-28: job-12 ran on for minutes after "pausing instantly").
+      const ledger = resolvePath(claims).replace(/\.json$/i, '') + '.progress.json';
+      void writeFile(`${ledger}.pause`, `pause requested ${new Date().toISOString()}\n`, 'utf8').catch(() => undefined);
     }
     child.kill('SIGUSR2');
     return true;
@@ -491,6 +506,10 @@ export class JobRunner {
       if (started) {
         entry.name = started[1]!;
         entry.status = 'running';
+        // Anchor the case's own clock here: its pace and ETA measure from the
+        // moment it was picked up, never from the job's start.
+        entry.progress.startedMs ??= elapsed;
+        entry.progress.lastStepMs = Math.max(entry.progress.lastStepMs, elapsed);
       }
       const ended = CASE_ENDED.exec(body);
       if (ended) {
@@ -624,6 +643,7 @@ function emptyCase(number: number, name: string, exclusive: boolean): JobCase {
       phase: null,
       rateMsPerStep: null,
       lastStepMs: 0,
+      startedMs: null,
     },
   };
 }
@@ -677,8 +697,16 @@ export function applyProgressLine(
   if (total !== null && done < total) {
     // ETA = remaining / rate, expressed as remaining × ms-per-step so a
     // zero-pace burst (two step lines in the same millisecond) rounds to an
-    // honest 0 instead of dividing into Infinity.
-    progress.etaMs = Math.round(progress.rateMsPerStep * (total - done));
+    // honest 0 instead of dividing into Infinity. When the unit's own start
+    // is known (a case's `started` line), the EMA is blended half-and-half
+    // with the unit's overall average pace: steps here are heterogeneous — a
+    // 5ms assert beside a 90s workflow leg — and a pure EMA whipsaws the
+    // estimate on every fast step while the average alone drags the first
+    // slow step to the end. The blend tracks both without trusting either.
+    const anchored = progress.startedMs;
+    const avg = anchored !== null && elapsedMs > anchored && done > 0 ? (elapsedMs - anchored) / done : null;
+    const rate = avg === null ? progress.rateMsPerStep : (progress.rateMsPerStep + avg) / 2;
+    progress.etaMs = Math.round(rate * (total - done));
   } else if (total !== null) {
     // Every planned step is accounted for; what remains is the report and the
     // disconnect, which this cannot time and must not pretend to.

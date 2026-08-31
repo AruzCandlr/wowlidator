@@ -12,7 +12,7 @@ import { DEFAULT_REPORT_DIR, REPORT_PLACEHOLDERS } from '../reporter/html-report
 export const USAGE = `wowlidator — decoupled UI testing engine with JIT self-healing
 
 Usage:
-  wowlidator ui [--port 4600] [--no-open] [--wow]              everything below, in a browser
+  wowlidator ui [--port 4600] [--no-open] [--wow]        everything below, in a browser
   wowlidator go <flow.json | url | "what to test"> [options]   one command, start to report
   wowlidator run <flow.json>... [--repair] [options]        several files run as one suite
   wowlidator generate <url> [--run] [--context] [options]
@@ -48,10 +48,12 @@ Options:
   --report-dir <dir>   Directory for reports when --report has no path
   --no-report          Skip HTML report generation
   --video <mode>       on | always | off  (default on)
-                       'always' keeps the WHOLE recording whatever the
-                       outcome — the film of the mock user performing the
-                       task end to end, untrimmed. This is what "view
-                       actual flow" records for a run that passed.
+                       Every run keeps its film — "View actual flow" plays
+                       it in the report and the panel, pass or fail. Under
+                       'on' a failing run's film is cut at the failure when
+                       nothing was filmed after it; 'always' keeps it
+                       untrimmed whatever happened, and paces steps for a
+                       viewer (--step-delay defaults to 1500 there).
                        Films the run, with a pointer drawn into the page so
                        clicks are visible — a still cannot show a click, only
                        the page on either side of one. The recording is
@@ -95,6 +97,12 @@ Options:
                        reconstruction record, a medium drift defect), and
                        an assertion always keeps its claim: only
                        preparation may be inserted before it.
+  --no-agent-early-stop
+                       Disable the workflow agent's early give-up. By default
+                       a leg concedes after 3 turns of finding nothing to act
+                       on, or 5 with no progress; off raises both to 25, so
+                       the agent keeps trying far longer before conceding —
+                       slower and more thorough. Env: WOWLIDATOR_AGENT_EARLY_STOP=off.
   --no-heal            Disable the JIT healer
   --no-agent           Disable multi-page agentic navigation
   --no-backend         Author no HTTP or database step: every claim is proved
@@ -115,10 +123,15 @@ run options:
   also writes truth-table.html beside the suite index on finish — every case
   graded TP/TN/FP/FN against the sheet, accuracy/precision/recall on top.
   Pure arithmetic over the verdicts already earned: zero model tokens.
-  --sheet-order        Keep the suite's own case order. By default readers run
-                       before writers: a read-assertion is authored against the
-                       data as it stood, and a suite that creates or deletes
-                       records mid-run invalidates its own remaining reads.
+  --sheet-order        Keep the suite's own case order. Two defaults it
+                       disables: readers run before writers (a read-assertion
+                       is authored against the data as it stood, and a suite
+                       that creates or deletes records mid-run invalidates its
+                       own remaining reads), and a multi-scenario catalog
+                       queues its FASTEST scenario first — estimated from the
+                       catalog's own prior run durations where they exist, the
+                       sheet's Steps/Expected lines otherwise — so verdicts
+                       arrive soonest and cheap scenarios fail fast.
                        Use this when the sequence itself is what the suite
                        tests.
   --repair             Autoheal: on a failed / error / dead-end result, ask AI
@@ -185,6 +198,8 @@ catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mm
                        its claim (only the sign-in proof and a URL); implies --resume
   --rerun-errors       Re-run every recorded case the harness ended in error; implies --resume
   --rerun-failed       Re-run every failed / dead-end case with autoheal; implies --resume --repair
+  --rerun-case <id>    Re-author the named case from its sheet row and re-run it, whatever its
+                       verdict; repeatable; implies --resume
   --claims-out <path>  Where --claims-only writes
                        (default: <report-dir>/catalogs/<name>.claims.json)
   --context-doc <path> A supporting document — background for the model, never
@@ -245,6 +260,8 @@ Browser lifecycle (wowlidator starts and checks Chrome itself — no wrapper scr
                        them one after another, and is the A/B test for a
                        parallel result that looks wrong.
   --author-concurrency <n>
+  --author-attempts <n>  Authoring asks per row including the first (default 3, or the
+                       Machinery dial); 1 = no re-ask budget
                        (catalog --claims) How many rows of a test-case table
                        are authored at once (default 3). Each worker reads the
                        start page in its own tab and makes its own model call;

@@ -120,6 +120,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'max-heal': { type: 'string' },
       concurrency: { type: 'string' },
       'author-concurrency': { type: 'string' },
+      'author-attempts': { type: 'string' },
       'author-lookahead': { type: 'string' },
       'follow-buttons': { type: 'boolean', default: false },
       'no-ensure-chrome': { type: 'boolean', default: false },
@@ -150,6 +151,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'no-agent-capture': { type: 'boolean', default: false },
       'no-author-review': { type: 'boolean', default: false },
       'no-reconstruct': { type: 'boolean', default: false },
+      'no-agent-early-stop': { type: 'boolean', default: false },
       json: { type: 'boolean', default: false },
       all: { type: 'boolean', default: false },
       focus: { type: 'string' },
@@ -185,6 +187,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'rerun-errors': { type: 'boolean', default: false },
       'resume-from': { type: 'string' },
       'rerun-failed': { type: 'boolean', default: false },
+      'rerun-case': { type: 'string', multiple: true },
       'claims-out': { type: 'string' },
       'catalog-out': { type: 'string' },
       'max-cases-drafted': { type: 'string' },
@@ -331,7 +334,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     agentAssist: values['agent-assist'] === true || config.agentAssist,
     agentCapture: values['no-agent-capture'] !== true,
     authorReview: values['no-author-review'] !== true,
-    reconstruct: values['no-reconstruct'] !== true,
+    // Three retry rules, each toggleable by flag AND by env (so a run started
+    // from a terminal or the panel obeys the same `.env` line):
+    //  - reconstruction (retry a failed step up to 3×): --no-reconstruct, or
+    //    WOWLIDATOR_RECONSTRUCT=off.
+    reconstruct:
+      values['no-reconstruct'] !== true &&
+      process.env['WOWLIDATOR_RECONSTRUCT']?.trim().toLowerCase() !== 'off',
+    //  - the agent's early give-up (look-only 3 / no-progress 5): the flag
+    //    forces off; otherwise the agent reads WOWLIDATOR_AGENT_EARLY_STOP.
+    agentEarlyStop: values['no-agent-early-stop'] === true ? false : undefined,
     captureDelayMs,
     stepDelayMs,
     heal: values['no-heal'] !== true,
@@ -359,6 +371,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       values['author-concurrency'] === undefined
         ? undefined
         : Number(values['author-concurrency']),
+    authorAttempts:
+      values['author-attempts'] === undefined ? undefined : Number(values['author-attempts']),
     authorLookahead:
       values['author-lookahead'] === undefined
         ? undefined
@@ -391,15 +405,20 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       values['rerun-vacuous'] === true ||
       values['rerun-errors'] === true ||
       values['rerun-failed'] === true ||
+      (Array.isArray(values['rerun-case']) && values['rerun-case'].length > 0) ||
       typeof values['resume-from'] === 'string',
     resumeFrom: typeof values['resume-from'] === 'string' ? values['resume-from'] : undefined,
     rerunVacuous: values['rerun-vacuous'] === true,
     rerunErrors: values['rerun-errors'] === true,
     rerunFailed: values['rerun-failed'] === true,
+    rerunCases: Array.isArray(values['rerun-case']) && values['rerun-case'].length > 0 ? values['rerun-case'] : undefined,
     sheetOrder: values['sheet-order'] === true,
+    //  - whole-flow repair (rerun a failed case up to N attempts): --repair,
+    //    the rerun/investigate/regenerate flags, or WOWLIDATOR_REPAIR=on.
     repair:
       values.repair ||
-      values['rerun-failed'] === true || values['repair-investigate'] === true || values['repair-regenerate'] === true,
+      values['rerun-failed'] === true || values['repair-investigate'] === true || values['repair-regenerate'] === true ||
+      process.env['WOWLIDATOR_REPAIR']?.trim().toLowerCase() === 'on',
     repairAttempts,
     repairInvestigate: values['repair-investigate'] === true,
     repairRegenerate: values['repair-regenerate'] === true,

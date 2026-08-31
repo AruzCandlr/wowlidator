@@ -49,6 +49,54 @@ import { createHash } from 'node:crypto';
  * more often (still far cheaper than the 3.4-4.3s cold-start it replaces).
  */
 export const MAX_TURNS_PER_SESSION = 10;
+
+/**
+ * How many questions a **generator** session answers: one.
+ *
+ * Measured on be100-rip (2026-08-31): 143 of 190 generator asks did no tool
+ * use at all (`turns: 0`) and still read **126,616 cached input tokens each**
+ * — nine earlier rows' 26.5k prompts and answers, sitting in the session. Over
+ * the run that was 21.7M cached-read tokens against ~5M of actual prompts, and
+ * per-call wall sat at 42–57 s against the ~5 s this comment's own measurement
+ * records for a fresh session.
+ *
+ * The difference from the healer and the agent is what a session is FOR. Those
+ * roles hold a conversation about one page, and the earlier turns are the
+ * context that makes the next answer good. Catalog authoring is the opposite:
+ * every row is an independent question, and the nine rows before it are pure
+ * cost and pure latency — the model still attends over them.
+ *
+ * One means a fresh process per row: the ~1.2 s warm restart, not the
+ * 3.4–4.3 s cold start of the one-shot vector, because this is still the
+ * stream-json path. `WOWLIDATOR_GENERATOR_SESSION_TURNS` dials it back up if
+ * that restart ever costs more than the context it avoids.
+ */
+export const AUTHORING_TURNS_PER_SESSION = 1;
+
+function envTurns(raw: string | undefined): number | null {
+  const value = Number((raw ?? '').trim());
+  return Number.isInteger(value) && value >= 1 && value <= 40 ? value : null;
+}
+
+/**
+ * How many questions one process answers, for this role.
+ *
+ * Per-role because the roles want opposite things — see
+ * `AUTHORING_TURNS_PER_SESSION`. `WOWLIDATOR_<ROLE>_SESSION_TURNS` overrides
+ * one role, `WOWLIDATOR_SESSION_TURNS` overrides them all, and neither may
+ * push a session past 40 turns (the bloat this whole mechanism exists to
+ * bound).
+ */
+export function sessionTurnBudget(
+  role: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const named = role === undefined ? null : envTurns(env[`WOWLIDATOR_${role.toUpperCase()}_SESSION_TURNS`]);
+  if (named !== null) return named;
+  const all = envTurns(env['WOWLIDATOR_SESSION_TURNS']);
+  if (all !== null) return all;
+  return role === 'generator' ? AUTHORING_TURNS_PER_SESSION : MAX_TURNS_PER_SESSION;
+}
 /** A session with nothing to do is closed rather than left holding a process. */
 export const SESSION_IDLE_MS = 90_000;
 /** No single answer may hang the run. */
@@ -56,11 +104,26 @@ export const SESSION_ANSWER_TIMEOUT_MS = 5 * 60_000;
 
 export interface SessionAnswer {
   text: string;
+  /**
+   * This call's OWN cost. The stream-json `result` event reports
+   * `total_cost_usd` CUMULATIVELY for the session (measured 2026-08-27:
+   * three identical questions reported 0.000754 / 0.001351 / 0.002015 —
+   * constant deltas, climbing totals — while token usage stayed per-call),
+   * so the session tracks the last total and reports the difference.
+   * Before this, a 10-turn session's summed ledger rows over-reported spend
+   * ~5×, and cost-guard.sh kills runs against exactly that number.
+   */
   costUsd: number;
   inputTokens: number;
   cachedInputTokens: number;
   cacheWriteTokens: number;
   outputTokens: number;
+  /**
+   * Model turns this answer took (delta of the event's cumulative
+   * `num_turns`). More than 1 means tool use happened — the only signal
+   * that the BM25 `search_context` tool was actually consulted.
+   */
+  turns: number;
 }
 
 export interface SessionKey {
@@ -75,6 +138,8 @@ export interface SessionKey {
   tools?: string | null;
   allowedTools?: string | null;
   disallowedTools?: string | null;
+  /** Inline `--mcp-config` JSON (the BM25 retrieval server), or null for none. */
+  mcpConfig?: string | null;
 }
 
 /** Stable identity for a session's launch flags — the same flags reuse a process. */
@@ -91,6 +156,7 @@ export function sessionKeyOf(key: SessionKey): string {
         key.tools ?? '',
         key.allowedTools ?? '',
         key.disallowedTools ?? '',
+        key.mcpConfig ?? '',
       ].join(' '),
     )
     .digest('hex');
@@ -101,6 +167,10 @@ class ClaudeSession {
   #buffer = '';
   #turns = 0;
   #closed = false;
+  /** Last cumulative `total_cost_usd` seen — see `SessionAnswer.costUsd`. */
+  #lastCostUsd = 0;
+  /** Last cumulative `num_turns` seen, same delta rule as the cost. */
+  #lastNumTurns = 0;
   #idleTimer: NodeJS.Timeout | null = null;
   /** The question in flight, if any. Serial by construction — see the header. */
   #pending: {
@@ -127,12 +197,27 @@ class ClaudeSession {
         ? 'You answer exactly what is asked, with no preamble and no commentary.'
         : key.system,
       '--strict-mcp-config',
-      ...(key.tools !== undefined && key.tools !== null ? ['--tools', key.tools] : []),
-      ...(key.allowedTools !== undefined && key.allowedTools !== null ? ['--allowed-tools', key.allowedTools] : []),
-      ...(key.disallowedTools !== undefined && key.disallowedTools !== null ? ['--disallowed-tools', key.disallowedTools] : []),
+      // In step with the one-shot vector in `claude-cli.ts` (see the note
+      // there): no settings/hooks/skills at boot, no transcript on disk.
+      '--setting-sources',
+      '',
+      '--disable-slash-commands',
+      '--no-session-persistence',
+      // `=` form: variadic flags with an empty space-separated value would
+      // swallow whatever follows — same rule as the one-shot vector.
+      ...(key.tools !== undefined && key.tools !== null ? [`--tools=${key.tools}`] : []),
+      ...(key.allowedTools !== undefined && key.allowedTools !== null ? [`--allowed-tools=${key.allowedTools}`] : []),
+      ...(key.disallowedTools !== undefined && key.disallowedTools !== null ? [`--disallowed-tools=${key.disallowedTools}`] : []),
+      ...(key.mcpConfig !== undefined && key.mcpConfig !== null ? [`--mcp-config=${key.mcpConfig}`] : []),
       ...(key.schema === null ? [] : ['--json-schema', key.schema]),
     ];
-    this.#child = spawn(key.binary, args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: key.cwd });
+    this.#child = spawn(key.binary, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: key.cwd,
+      // Startup network (version check, telemetry) is the enemy this warm
+      // process exists to amortise — turn it off outright.
+      env: { ...process.env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+    });
     this.#child.stdout?.on('data', (chunk: Buffer) => this.#onData(chunk.toString()));
     // A dead process must fail the question it was holding, not hang it.
     this.#child.on('exit', () => this.#die(new Error('the claude session exited')));
@@ -143,9 +228,31 @@ class ClaudeSession {
     this.#child.stderr?.on('data', () => undefined);
   }
 
-  /** True while this process can still take another question. */
-  get usable(): boolean {
-    return !this.#closed && this.#turns < MAX_TURNS_PER_SESSION && this.#pending === null;
+  /** Questions this process has already been asked. */
+  get turnsTaken(): number {
+    return this.#turns;
+  }
+
+  /**
+   * True while this process can still take another question under the
+   * CALLER's turn budget. The budget belongs to the ask, not to the process:
+   * it is a policy about what kind of question this is (see
+   * `sessionTurnBudget`), and a process spawned for one role is only ever
+   * reused by that role, because the role's system prompt is part of the
+   * session key.
+   */
+  usableFor(maxTurns: number): boolean {
+    return !this.#closed && this.#turns < maxTurns && this.#pending === null;
+  }
+
+  /** True while this process could still take a question under ANY budget — for pruning. */
+  get spent(): boolean {
+    return this.#closed || this.#turns >= MAX_TURNS_PER_SESSION;
+  }
+
+  /** True while a question is in flight — a busy session must never be closed. */
+  get busy(): boolean {
+    return this.#pending !== null;
   }
 
   ask(text: string): Promise<SessionAnswer> {
@@ -197,13 +304,22 @@ class ClaudeSession {
         continue;
       }
       const usage = (event['usage'] ?? {}) as Record<string, number>;
+      // Cumulative-to-delta for the session-scoped counters; usage is
+      // already per-call. See `SessionAnswer.costUsd`.
+      const totalCost = Number(event['total_cost_usd'] ?? 0);
+      const costUsd = Math.max(0, totalCost - this.#lastCostUsd);
+      this.#lastCostUsd = totalCost;
+      const totalTurns = Number(event['num_turns'] ?? 0);
+      const turns = Math.max(0, totalTurns - this.#lastNumTurns);
+      this.#lastNumTurns = totalTurns;
       held.resolve({
         text: String(event['result'] ?? ''),
-        costUsd: Number(event['total_cost_usd'] ?? 0),
+        costUsd,
         inputTokens: Number(usage['input_tokens'] ?? 0),
         cachedInputTokens: Number(usage['cache_read_input_tokens'] ?? 0),
         cacheWriteTokens: Number(usage['cache_creation_input_tokens'] ?? 0),
         outputTokens: Number(usage['output_tokens'] ?? 0),
+        turns,
       });
     }
   }
@@ -243,41 +359,106 @@ class ClaudeSession {
   }
 }
 
-/** Live sessions by launch-flag identity. At most one process per role in practice. */
-const sessions = new Map<string, ClaudeSession>();
+/**
+ * How many warm processes one launch-flag identity may hold at once.
+ *
+ * One is not enough: catalog authoring runs `DEFAULT_AUTHOR_CONCURRENCY` (3)
+ * rows in parallel, all on the generator's one key, and the old single-slot
+ * map CLOSED the busy session to make room — killing another worker's
+ * in-flight question, which then fell back to a cold one-shot re-paying the
+ * whole prompt (measured live 2026-08-27: a 217 s cold authoring call in the
+ * middle of two overlapping warm ones). Sized to the author concurrency plus
+ * one for a heal arriving mid-authoring; past the cap the caller gets a
+ * rejection and takes the one-shot path, which is the honest overflow.
+ */
+export const MAX_SESSIONS_PER_KEY = 4;
 
 /**
- * Ask a warm process, starting one if there is none.
+ * The live cap — the constant is the floor, and a suite that runs more lanes
+ * raises it to `concurrency + 1` (docs/parallel-run-spec.md, defect #5): the
+ * fifth concurrent ask used to fall to a cold one-shot at 217 s, which is the
+ * exact bill parallelism exists to avoid. Never lowered below the default —
+ * shrinking under live sessions would re-create the closed-busy-session bug.
+ */
+let sessionCap = MAX_SESSIONS_PER_KEY;
+
+export function raiseSessionCapFor(concurrency: number): void {
+  sessionCap = Math.max(MAX_SESSIONS_PER_KEY, Math.floor(concurrency) + 1);
+}
+
+export function currentSessionCap(): number {
+  return sessionCap;
+}
+
+/** Live session pools by launch-flag identity. */
+const sessions = new Map<string, ClaudeSession[]>();
+
+/**
+ * Ask a warm process, starting one if none is free.
+ *
+ * A busy session is NEVER closed here — it is answering someone else. A
+ * retired or dead idle session is pruned; a free one is reused; a new one is
+ * spawned while the pool is under `MAX_SESSIONS_PER_KEY`.
  *
  * Rejects on any transport failure so the caller can fall back to a one-shot
  * call — the warm path is an optimisation and must never be the reason a run
  * fails.
  */
-export async function askWarm(key: SessionKey, text: string): Promise<SessionAnswer> {
+export async function askWarm(
+  key: SessionKey,
+  text: string,
+  /**
+   * How many questions this process may answer, from `sessionTurnBudget`.
+   * Defaults to the old global bound so an unattributed caller is unchanged.
+   */
+  maxTurns: number = MAX_TURNS_PER_SESSION,
+): Promise<SessionAnswer> {
   const id = sessionKeyOf(key);
-  let session = sessions.get(id);
-  if (session !== undefined && !session.usable) {
-    // Retired (turn budget) or busy: close and replace rather than queue —
-    // the caller already serialises its own calls per role.
-    session.close();
-    sessions.delete(id);
-    session = undefined;
+  let pool = sessions.get(id);
+  if (pool === undefined) {
+    pool = [];
+    sessions.set(id, pool);
   }
+  // Prune sessions that are done for (retired at the turn budget, or dead)
+  // and idle. Busy ones stay whatever their state — their caller is owed an
+  // answer, and `usableFor` already keeps new questions off them.
+  //
+  // Pruning uses `spent` (the global bound), not this ask's budget: a session
+  // this ask may not reuse is not necessarily rubbish. Under a budget of one
+  // that distinction is academic, but it keeps a mixed pool honest — killing
+  // another role's still-good process to satisfy this one's policy is the
+  // closed-busy-session bug in a new hat.
+  for (let at = pool.length - 1; at >= 0; at -= 1) {
+    const held = pool[at] as ClaudeSession;
+    if (held.spent && !held.busy) {
+      held.close();
+      pool.splice(at, 1);
+    }
+  }
+  let session = pool.find((candidate) => candidate.usableFor(maxTurns));
   if (session === undefined) {
+    if (pool.length >= currentSessionCap()) {
+      throw new Error(
+        `all ${currentSessionCap()} warm claude sessions for this key are busy`,
+      );
+    }
     session = new ClaudeSession(key);
-    sessions.set(id, session);
+    pool.push(session);
   }
   try {
     return await session.ask(text);
   } catch (error) {
     session.close();
-    sessions.delete(id);
+    const at = pool.indexOf(session);
+    if (at >= 0) pool.splice(at, 1);
     throw error instanceof Error ? error : new Error(String(error));
   }
 }
 
 /** Close every warm process. Safe to call twice. */
 export function closeClaudeSessions(): void {
-  for (const session of sessions.values()) session.close();
+  for (const pool of sessions.values()) {
+    for (const session of pool) session.close();
+  }
   sessions.clear();
 }

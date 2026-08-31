@@ -48,6 +48,11 @@ export const GOOGLE_FREE_TIER_LIMITS: Readonly<Record<string, RateLimits>> = {
   'gemini-2.5-flash': { rpm: 10, tpm: 250_000, rpd: 250 },
   'gemini-2.5-flash-lite': { rpm: 15, tpm: 250_000, rpd: 1000 },
   'gemini-3-flash-preview': { rpm: 10, tpm: 250_000, rpd: 250 },
+  // Stated by the operator (2026-08-31): the 3.5 lite tier allows 500/day.
+  // Without this row the id fell to the 250-RPD default — exactly the
+  // wrong-guess failure the WOWLIDATOR_GOOGLE_RPD escape hatch exists for,
+  // now fixed at the table.
+  'gemini-3.5-flash-lite': { rpm: 10, tpm: 250_000, rpd: 500 },
   'gemini-3.1-flash-lite': { rpm: 15, tpm: 250_000, rpd: 1000 },
 };
 export const GOOGLE_FREE_TIER_DEFAULT: RateLimits = { rpm: 10, tpm: 250_000, rpd: 250 };

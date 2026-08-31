@@ -28,9 +28,13 @@ cache alone: the script survives a cleared cache and travels with the flow.
 
 **Every workflow step is self-evidencing.** The step's `detail` carries `urlBefore`/`urlAfter`, the page's headings before and after (and `appeared`, the diff), and the requests the page made while the agent held it land on `network` — so a leg nothing asserts on afterwards is still auditable from the report. That is why `unsettledWorkflowClaim` (and the e2e `agent-journey` verdict of `notEndToEnd`) are `weak` refusals **accepted at once with a note**, never re-asked: measured, the re-ask came back with the same leg — the model could not see the page the leg ends on — and the weak result was taken anyway once the budget was spent, two calls later. Fatal violations still refuse. The agent's history lines now carry the value typed (a password masked to its length) and `moved A → B` / `still at`, and its prompt has a per-turn procedure whose second step is "an action marked ok is DONE — never repeat it".
 
+## A control clicked past its limit is circling (`repeatedToggleClick`)
+
+Live (PL_03_02, 2026-08-27): a filter button whose listbox options never appeared in the truncated tree was clicked EIGHT times across 38 turns and 310 s — each toggle changed the tree (open ↔ closed) so the repeated-on-unchanged-page guard never fired, and a mid-thrash URL change reset the per-URL done-set too. `repeatedToggleClick` (`agent-guards.ts`, pure) counts ok clicks per selector for the WHOLE run: past `TOGGLE_CLICK_LIMIT` (3 — a multi-select legitimately re-opens once per pick, PL_03_17 needed three) the next click on that selector is refused with the count and alternatives (key into it, another control, or fail). Second insistence is `circling:` — recorded REFUSED like the destructive guard, never acted on, counts as no progress, and the no-progress counter ends a model that keeps insisting.
+
 ## The agent's read-only database access (`dbCount`)
 
-`AGENT_ACTIONS` includes `dbCount`: count the rows of a table (in `selector`) matching equality pairs (in `value`, `"column=value, column2=value2"`), through `RunOptions.dbProbe` — which the runner wires to its own `DbActions.probeCount`, so the agent gets the same table/column grounding and the same read-only session as every `expectDbRow`, and nothing else. The observed count rides the history line as the action's note ("dbCount benefit_management.benefit_plan — ok (observed 3 row(s))"), so the model reasons from what the database actually said and the record shows the evidence — the same "what the agent claims is never the evidence" rule, satisfied by making the observation itself the record. It cannot write, which keeps the vocabulary's safety argument intact. When no database is configured the probe is simply absent and the action fails with advice ("verify through the page instead"), never a connection error. Born from PL_03_03 (2026-08-25): a claim of the form "the count in the box matches the database" was authored as a hardcoded `count: 0` because nothing could read both sides; an agent goal can now hold the box and the table together.
+`AGENT_ACTIONS` includes `dbCount`: count the rows of a table (in `selector`) matching equality pairs (in `value`, `"column=value, column2=value2"`), through `RunOptions.dbProbe` — which the runner wires to its own `DbActions.probeCount`, so the agent gets the same table/column grounding and the same read-only session as every `expectDbRow`, and nothing else. The observed count rides the history line as the action's note ("dbCount benefit_management.benefit_plan — ok (observed 3 row(s))"), so the model reasons from what the database actually said and the record shows the evidence — the same "what the agent claims is never the evidence" rule, satisfied by making the observation itself the record. It cannot write, which keeps the vocabulary's safety argument intact. When no database is configured the probe is simply absent and the action fails with advice ("verify through the page instead"), never a connection error. **`--no-backend` withdraws the probe too** (2026-08-27): a run that declared backend-off had its agent settle a UI-reading goal with three `dbCount` calls (PL_03_02) — a pass whose evidence the run's own limits said not to touch, on a replica whose counts drift. The gate lives in `SmartRunner.#agentDbProbe`. Born from PL_03_03 (2026-08-25): a claim of the form "the count in the box matches the database" was authored as a hardcoded `count: 0` because nothing could read both sides; an agent goal can now hold the box and the table together.
 
 ## Looking again is not a stall, and three turns was not evidence
 
@@ -41,6 +45,21 @@ Measured the day after the turn ceiling went (be100, 2026-08-25, 22 error runs w
 - **A `wait` on a page whose network is already quiet pays `WAIT_SETTLE_MS`.** The idle wait returns at once there, and a wait that does nothing costs a model turn to do nothing. Paid only when the idle wait had nothing to wait on, so settled pages are not taxed on every wait (the 2026-08-24 concern).
 - **`scroll` goes through `#target` and the grounding refusal.** A row a virtualised table has not rendered is "no element matches" in 1.5 s, with the reason, not a 5 s `scrollIntoViewIfNeeded` timeout the next turn cannot read.
 - **The consent-gate rung runs on every turn, not only in the preflight.** A goto redirected to `/en/consent` (the session had not accepted; the preflight's 5 s poll had found no accept control on a page still hydrating under an eight-way run) is cleared without a model turn, and the agent is returned to `intendedUrl` — the page its last goto asked for, else the step's own page — never left on the app's home. The model is never asked to decide from the gate.
+
+## A leg that never engages a control ends fast, and a reload is not progress
+
+Live (PL_07_03, 2026-08-27): three workflow legs told to "locate the row for PL_07_… and click its Make Correction icon" on a 76-row table whose **filter and search controls are absent from the AX tree** — every `role=combobox`, `role=textbox`, `role=button[name="Category"]` a 1.5 s miss, while buttons that ARE exposed resolve. Two harness faults made a hopeless leg slow instead of quick: the looked-only handoff (`AGENT_LOOK_ONLY_TURNS`) fired only when EVERY action was a scroll/wait, so a leg that *tried* clicks and missed was disqualified and rode the full 5-turn stall at 1.5 s a miss (77 s on one leg); and a `goto` reload of the same page counted as progress and reset the no-progress judge, so the agent reloaded "to get a clean tree" and bought five fresh turns each time.
+
+Two fixes in the loop's progress judge (both keyed on new `INTERACTION_ACTIONS` — the acts that engage a control; `goto` is not one):
+
+- **A leg that never once lands a control-engaging action hands off at `AGENT_LOOK_ONLY_TURNS`**, softly — the same reading/unreachable outcome as the pure-scroll case, extended to "attempted a click and every one missed" (`missedEveryInteraction`). The handoff is soft (`lookedOnly`, inconclusive-not-failed), so a goal the agent truly could not fulfil still fails — at the flow's next assertion in 2 s, not after 77 s. A leg of failed **gotos** is excluded (navigation that did not arrive is an ordinary stall), and a leg that DID engage a control earlier (`interactedEver`) stays on the 5-turn judge.
+- **A `goto` to a URL already visited this leg is not progress** (`visitedUrls`): a reload no longer resets the no-progress counter, so a leg that keeps reloading the same page is bounded instead of running indefinitely.
+
+The still-open half is the target app's own: those filter/search controls render without `combobox`/`textbox`/`searchbox` roles, so nothing — agent or authored selector — can drive them. Until they carry ARIA roles (or authoring learns to locate the row another way, e.g. a URL search param the app honours), the correct outcome for these legs is the fast soft handoff above, with the assertion carrying the verdict.
+
+## The early give-up is a toggle
+
+The agent's two early-stop judges — the look-only soft handoff at `AGENT_LOOK_ONLY_TURNS` (3) and the no-progress stall at `AGENT_NO_PROGRESS_TURNS` (5) — are on by default and can be turned off per run (`--no-agent-early-stop`, the panel's "Disable the agent's early give-up") or process-wide (`WOWLIDATOR_AGENT_EARLY_STOP=off`). Off raises BOTH ceilings to `AGENT_NO_PROGRESS_OFF_TURNS` (25) rather than to `maxSteps` (unbounded by default): "off" must mean "try much harder before conceding," never "loop forever spending model calls on a control that will never appear." The ceilings live as instance fields (`#noProgressTurns`/`#lookOnlyTurns`, resolved in the constructor from `WorkflowAgentOptions.earlyStop ?? agentEarlyStopDefault()`), so the toggle is one decision applied everywhere the two judges fire. This is one of three retry rules the operator can switch off — the others are in-run step reconstruction (`WOWLIDATOR_RECONSTRUCT`/`--no-reconstruct`, `src/engine/`) and whole-flow repair (`WOWLIDATOR_REPAIR`/`--repair`, `src/repair/`).
 
 ## A destructive click must name its row
 
@@ -59,3 +78,44 @@ Both halves were the harness's own:
 
 **And the goal was never the agent's to answer.** `verificationOnlyGoal` (`goal-evidence.ts`): a goal carrying a verify verb and no action verb asks the agent to be the oracle, which it structurally cannot be — an agent produces an account of itself, never evidence, which is this module's whole premise. Such a leg now **hands off**: `goalEvidence` returns `verification-deferred`, the step passes, and whatever the flow asserts next is the proof (a leg with nothing after it is caught at authoring time by `unsettledWorkflowClaim`, never invented into a defect at runtime). It still files the `low` usability finding, worded for this case: write the leg as the assertion it is, and keep the agent for the navigation that reaches the page. Deliberately narrow — any action verb anywhere disqualifies it, so "open the dialog and verify the title" stays a real leg whose failure is real.
 
+## The queue governor (`queue-governor.ts`, 2026-08-28)
+
+One agent per suite run governing parallel queuing (docs/parallel-run-spec.md
+§2.4): role `governor` (default groq; point at claude-cli opus via
+`WOWLIDATOR_GOVERNOR_*` — the TURN BUDGET bounds the spend, not the model).
+Event-driven (`suite-start`, `case-ended` on a non-pass, `queue-blocked` after
+~25 refused dispatch polls), hard-budgeted (`WOWLIDATOR_GOVERNOR_TURNS`, 12),
+compact observation, one structured action per turn. It may NARROW on its own
+authority (hold, shrink pool, note); the deterministic section rules are the
+floor. `db-read` = one SELECT; `db-write` = one INSERT/UPDATE on a declared
+table, only with `WOWLIDATOR_DB_ADMIN_URL`, logged BEFORE execution, DELETE
+refused outright. Absent/off/erroring/out-of-budget → the deterministic
+scheduler runs exactly as it would alone (the capture-pilot containment rule).
+`WOWLIDATOR_GOVERNOR=off` disables. Tests: `tests/queue-governor.test.ts`.
+
+## A finish is accepted on the page's word (S1 of the 2026-08-28 agent-flaw audit)
+
+Audit of be100's latest run: 20 of 22 agent legs on PASSED cases were settled by the agent's own `finish` text — "shows 1–75 of 75, *meaning* 100 was selected"; "picked, *as confirmed by* the successful clicks" — inference presented as observation, never checked. The "what the agent claims is never the evidence" rule had been enforced on failures only. Now: `goalOutcome` (`goal-evidence.ts`, pure) reads the checkable end state a goal names (`set X to Y`, `X = "Y"`); on `finish` the loop re-reads the live tree and `outcomeShown` must find it — on one line (`button "Status: Inactive"`) or as a label→value neighbour within three lines. A miss is refused ONCE with what the tree shows; a second insistence records `claimed finish, but the page does not show X = Y` and `success: false`. A goal naming no state falls through, and the record says so: `AgentRecord.settledBy` is `observed-state` (with the evidencing line) or `agent-claim` (with the bare reasoning), so an all-claim run is visible as one in the report. New action **`read`** (idle, never progress): the harness reports a control's text/value/checked/expanded/disabled into the history at $0, so the agent learns whether a choice took instead of clicking again to find out — the repeat-guard stalls on Country and Rows-per-page were exactly that.
+
+## The judge may not overrule a human record (S2)
+
+`runFlow`'s auto-review: when the sheet's own Actual Result (`generation.knownResult`) exists and the judge's ruling contradicts it, the ruling is withheld with the disagreement on `notes` and the run stays `needs-review` for a person. PL_04_08: a human passed the case by hand; the judge ruled "failed" at 0.9 on "still visible contradicts hidden" without asking whether "not shown" meant hidden, disabled or inert. A machine's confident reading of two strings does not outrank a tester's hands.
+
+Since 2026-08-31 the DEFAULT governor is deterministic (`RuleGovernorModel`,
+same `GovernorModel` seam, effectively unbudgeted): measured across two live
+suites, every LLM turn concluded `idle` while restating a set-intersection the
+scheduler had already computed. The rules: name a fully-conflicting blocked
+queue as a real conflict (once per distinct blockage), call out a compatible
+case that is not dispatching, and shrink the pool one step after 3
+timeout-shaped failures in 5 minutes (never below 2). `WOWLIDATOR_GOVERNOR=
+model` restores the LLM governor — its remaining unique power is judging and
+seeding a starved fixture (`db-write`); `off` disables both.
+
+## A readOnly run's finish is the answer, never a claim to refuse (2026-08-31)
+
+The observed-state finish settlement (`goalOutcome`/`outcomeShown`) is skipped
+when the run is `readOnly`: such a run cannot act, so refusing its finish to
+make it "set" the state burns a turn by construction — and the triage look's
+verdict travels IN its finish. Found live: the look's goal text parses as an
+outcome, the settlement refused the verdict once, and every `fail` verdict
+cost two model calls instead of one (tests/smoke.test.ts pins one call).

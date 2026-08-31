@@ -4,6 +4,8 @@
  */
 
 import { FlowReviewer, LlmFlowReviewModel } from '../generator/flow-review.js';
+import { LlmRiskModel, riskEnabled, type RiskModel } from '../generator/dead-end-risk.js';
+import { LlmDiagnosisModel, diagnosisEnabled, type DiagnosisModel } from '../generator/error-diagnosis.js';
 import type { CacheManager } from '../cache/cache-manager.js';
 import { describeRouting } from '../config.js';
 import { LlmDataModel } from '../data/data-model.js';
@@ -93,6 +95,7 @@ export function buildAgent(options: CliOptions, tag?: string | undefined): Workf
   if (!options.agent) return null;
   return new WorkflowAgent({
     model: new LlmAgentModel({ factory: options.factory }),
+    earlyStop: options.agentEarlyStop,
     // Per-turn live progress — a `workflow` step can run for several seconds
     // across multiple model calls, and this is the only visibility into it
     // before the step as a whole finishes. Suppressed under --json: the
@@ -127,6 +130,28 @@ export function buildInvestigationAgent(options: CliOptions): WorkflowAgent {
  * degradation as the capture pilot: without a generator key, runs behave
  * exactly as they did before reconstruction existed.
  */
+/**
+ * The pre-run dead-end risk judge (`generator/dead-end-risk.ts`): on unless
+ * `WOWLIDATOR_RISK=off`, and only when the generator role resolves — it is the
+ * model that read the same evidence the case was written from.
+ */
+export function buildRiskModel(options: CliOptions): RiskModel | null {
+  if (!riskEnabled()) return null;
+  if (!options.factory.canResolve('generator')) return null;
+  return new LlmRiskModel({ factory: options.factory });
+}
+
+/**
+ * The post-run system-error judge (`generator/error-diagnosis.ts`): on unless
+ * `WOWLIDATOR_DIAGNOSE=off`, through the healer role — the small, fast
+ * diagnostic model. Only ever called on a run whose status is `error`.
+ */
+export function buildDiagnosisModel(options: CliOptions): DiagnosisModel | null {
+  if (!diagnosisEnabled()) return null;
+  if (!options.factory.canResolve('healer')) return null;
+  return new LlmDiagnosisModel({ factory: options.factory });
+}
+
 export function buildStepRepair(options: CliOptions): FlowRepairModel | null {
   if (!options.reconstruct) return null;
   if (!options.factory.canResolve('generator')) return null;

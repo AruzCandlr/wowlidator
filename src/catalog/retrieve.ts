@@ -484,10 +484,15 @@ export function selectRelevantContext(
     };
 
     // The floor: one chunk each, best first, before anyone gets a second.
-    // Only ever a chunk that actually scored — a document nothing matched
-    // keeps its outline and quotes nothing, rather than being padded.
+    // Drawn from ALL scores, not the floor-filtered list — a document whose
+    // best section scores under RELATIVE_SCORE_FLOOR of the GLOBAL best used
+    // to quote nothing at all (seen live: two catalog documents, one lexically
+    // dominant, the other reduced to a bare outline — "the AI only used one
+    // document"). Every document that scored at all now quotes its own best
+    // section; only a document nothing matched keeps its outline unquoted,
+    // rather than being padded with noise.
     for (const doc of large) {
-      const best = ranked.find((entry) => entry.chunk.doc === doc.name);
+      const best = allScores.find((entry) => entry.chunk.doc === doc.name && entry.score > 0);
       if (best) take(best.chunk, true);
     }
     for (const entry of ranked) take(entry.chunk);

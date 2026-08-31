@@ -211,14 +211,105 @@ import { SERIAL_PROVIDERS } from '../config.js';
 export { SERIAL_PROVIDERS };
 
 /**
+ * Fastest scenario first (2026-08-28).
+ *
+ * A catalog's scenarios run in sheet order, and the ScenarioGate holds
+ * authoring to the scenario the runner is in — so a slow scenario at the top
+ * of the sheet delays every verdict behind it. Nothing orders the sheet by
+ * cost: PL_01 goes first because someone typed it first. Queuing the fastest
+ * scenario first gets the most verdicts on screen soonest and fails fast on
+ * cheap scenarios before the expensive ones spend their budget.
+ *
+ * Cost is ESTIMATED, and only the ordering matters, never the number:
+ *  - A row this catalog has run before is priced at its recorded wall clock
+ *    (the prior progress ledger's proof bundles — `caseDurationMs`).
+ *  - A row never run is priced statically from the sheet itself: its Steps
+ *    lines (each step is browser work), half-weighted Expected lines (each
+ *    is an assertion), plus a writer penalty — a case that creates or
+ *    deletes runs ALONE under the scheduler, so it serializes the pool and
+ *    costs more than its lines say.
+ * Rows keep their sheet order inside a scenario; scenarios tie-break to
+ * sheet order, so the result is deterministic for identical inputs.
+ */
+export interface SpeedOrderRow {
+  caseId: string;
+  scenarioId: string;
+  testCase?: string;
+  steps?: string;
+  expected?: string;
+}
+
+/** A static unit ≈ one browser step. Only relative cost matters. */
+const SPEED_UNIT_MS = 6_000;
+const SPEED_WRITE_VERB =
+  /\b(create|insert|delete|remove|update|edit|submit|approve|reject|save)\b|สร้าง|เพิ่ม|ลบ|แก้ไข|บันทึก|อนุมัติ/i;
+
+export function estimateRowUnits(row: SpeedOrderRow): number {
+  const lines = (text: string | undefined): number =>
+    (text ?? '').split('\n').filter((line) => line.trim() !== '').length;
+  const units = Math.max(1, lines(row.steps)) + 0.5 * lines(row.expected);
+  const writes = SPEED_WRITE_VERB.test(`${row.testCase ?? ''}\n${row.steps ?? ''}`);
+  return units + (writes ? 3 : 0);
+}
+
+/**
+ * Reorder scenario BLOCKS by ascending estimated cost. `priorMs` maps a
+ * caseId to a recorded duration from an earlier run of this same catalog —
+ * measured beats estimated wherever it exists. Pure and total: rows of one
+ * scenario stay contiguous and in their given order, every row survives.
+ */
+export function orderScenariosFastestFirst<T extends SpeedOrderRow>(
+  rows: readonly T[],
+  priorMs: ReadonlyMap<string, number> = new Map(),
+): { rows: T[]; order: { scenario: string; estimateMs: number; rows: number }[] } {
+  const blocks = new Map<string, T[]>();
+  const sheetOrder: string[] = [];
+  for (const row of rows) {
+    const key = row.scenarioId || 'ungrouped';
+    if (!blocks.has(key)) {
+      blocks.set(key, []);
+      sheetOrder.push(key);
+    }
+    blocks.get(key)!.push(row);
+  }
+  const costOf = (block: readonly T[]): number =>
+    block.reduce(
+      (sum, row) => sum + (priorMs.get(row.caseId) ?? SPEED_UNIT_MS * estimateRowUnits(row)),
+      0,
+    );
+  const order = sheetOrder
+    .map((scenario, at) => ({ scenario, at, estimateMs: Math.round(costOf(blocks.get(scenario)!)) }))
+    .sort((a, b) => a.estimateMs - b.estimateMs || a.at - b.at);
+  return {
+    rows: order.flatMap((entry) => blocks.get(entry.scenario)!),
+    order: order.map(({ scenario, estimateMs }) => ({
+      scenario,
+      estimateMs,
+      rows: blocks.get(scenario)!.length,
+    })),
+  };
+}
+
+/**
  * How many rows to author at once: what was asked for, else the default —
  * unless the generator role sits on a provider that answers one call at a
  * time, where the only honest default is 1. An explicit `--author-concurrency`
  * always wins: the person may be running a server configured otherwise.
  */
-export function authorWorkers(requested: number | undefined, generatorProvider: string): number {
+export function authorWorkers(
+  requested: number | undefined,
+  generatorProvider: string,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
   if (requested !== undefined) return Math.max(1, requested);
-  return SERIAL_PROVIDERS.has(generatorProvider) ? 1 : DEFAULT_AUTHOR_CONCURRENCY;
+  // The Machinery dial (`WOWLIDATOR_AUTHOR_CONCURRENCY`) sets the default;
+  // an explicit --author-concurrency still wins, and a serial provider still
+  // forces 1 unless the person overrode it by flag — a dial must not talk a
+  // one-lane server into three concurrent calls.
+  const dial = Number((env['WOWLIDATOR_AUTHOR_CONCURRENCY'] ?? '').trim());
+  if (SERIAL_PROVIDERS.has(generatorProvider)) return 1;
+  if (Number.isInteger(dial) && dial >= 1 && dial <= 12) return dial;
+  return DEFAULT_AUTHOR_CONCURRENCY;
 }
 
 /**
@@ -347,18 +438,41 @@ export async function runQueue<T>(
    * ledger's `remaining()` reads as "still to run".
    */
   shouldPause?: () => boolean,
+  /**
+   * Section-aware sharing (docs/parallel-run-spec.md §2.2). Consulted for a
+   * NON-exclusive item against everything currently in flight: false holds
+   * the dispatch until a lane finishes and the answer is asked again. Absent
+   * = the old rule (any two non-exclusive items share).
+   */
+  canRunWith?: (item: T, index: number, inflight: readonly { item: T; index: number }[]) => boolean,
+  /**
+   * A soft hold: while true, nothing new is dispatched but in-flight lanes
+   * finish normally and the loop resumes when it clears. What the
+   * interference re-run and the governor's `hold` use — unlike `shouldPause`,
+   * which ends the loop for good.
+   */
+  waitWhile?: () => boolean,
 ): Promise<void> {
   const limitOf =
     typeof concurrency === 'function'
       ? (): number => Math.max(1, Math.floor(concurrency()))
       : (): number => Math.max(1, Math.floor(concurrency));
   const inFlight = new Set<Promise<void>>();
+  const inFlightItems = new Map<Promise<void>, { item: T; index: number }>();
 
   const start = (item: T, index: number): void => {
     const promise = run(item, index).finally(() => {
       inFlight.delete(promise);
+      inFlightItems.delete(promise);
     });
     inFlight.add(promise);
+    inFlightItems.set(promise, { item, index });
+  };
+
+  const drainOne = async (): Promise<void> => {
+    if (inFlight.size > 0) await Promise.race([...inFlight]);
+    // A held loop with an empty pool must not spin hot.
+    else await new Promise((resolve) => setTimeout(resolve, 200));
   };
 
   for (let index = 0; ; index += 1) {
@@ -370,14 +484,34 @@ export async function runQueue<T>(
     // must not start the case that finally arrives. The un-run item simply
     // earns no outcome, which is exactly what a resume reads as still-to-run.
     if (shouldPause?.()) break;
+    while (waitWhile?.() === true) {
+      if (shouldPause?.()) break;
+      await drainOne();
+    }
+    if (shouldPause?.()) break;
     if (isExclusive(item, index) || limitOf() === 1) {
       if (inFlight.size > 0) await Promise.all([...inFlight]);
+      while (waitWhile?.() === true && !shouldPause?.()) await drainOne();
+      if (shouldPause?.()) break;
       await run(item, index);
       continue;
     }
     // Re-read after every completion, not once: the limit may have grown
-    // while this dispatch waited for a slot.
-    while (inFlight.size >= limitOf()) await Promise.race([...inFlight]);
+    // while this dispatch waited for a slot — and the section check is asked
+    // again too, because the conflicting lane may be the one that finished.
+    for (;;) {
+      if (inFlight.size >= limitOf()) {
+        await Promise.race([...inFlight]);
+        continue;
+      }
+      if (canRunWith !== undefined && !canRunWith(item, index, [...inFlightItems.values()])) {
+        if (shouldPause?.()) break;
+        await drainOne();
+        continue;
+      }
+      break;
+    }
+    if (shouldPause?.()) break;
     start(item, index);
   }
 

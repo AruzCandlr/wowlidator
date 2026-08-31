@@ -25,10 +25,10 @@ import { DEFAULT_REPORT_DIR as REPORTER_DEFAULT_DIR } from './reporter/html-repo
 import { DEFAULT_CAPTURE_DELAY_MS } from './engine/evidence.js';
 import type { ScreenshotMode, VideoMode } from './engine/runner.js';
 
-export const LLM_ROLES = ['healer', 'generator', 'agent', 'data'] as const;
+export const LLM_ROLES = ['healer', 'generator', 'agent', 'data', 'governor'] as const;
 export type LlmRole = (typeof LLM_ROLES)[number];
 
-export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli', 'claude-tty'] as const;
+export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli', 'claude-tty', 'claude-cloud'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 /** Which env var carries each provider's key, and where to get one. */
@@ -55,6 +55,18 @@ export const PROVIDER_META: Record<
     label: 'Claude Code TTY (this machine\'s session, one warm process)',
     consoleUrl: 'https://claude.com/claude-code',
     freeTier: 'billed to the session already signed in here — no key to configure',
+  },
+  // The same signed-in account, but the model runs in a Claude Code CLOUD
+  // session (`claude --cloud`) rather than on this machine. The CLI refuses
+  // `--cloud` without a TTY, so this rides the same warm interactive terminal
+  // as `claude-tty` — see `createClaudeCloud` in `providers/claude-tty.ts`.
+  // `WOWLIDATOR_CLAUDE_CLOUD_SESSION` attaches to an existing session by id or
+  // claude.ai/code URL; unset, a fresh cloud session is created per worker.
+  'claude-cloud': {
+    envKey: '',
+    label: 'Claude Code Cloud (a cloud session on this account)',
+    consoleUrl: 'https://claude.ai/code',
+    freeTier: 'billed to the signed-in account\'s cloud sessions — no key to configure',
   },
   google: {
     envKey: 'GOOGLE_GENERATIVE_AI_API_KEY',
@@ -121,7 +133,9 @@ export const PROVIDER_META: Record<
 // `claude-tty` is one terminal answering one request at a time — the same
 // shape, so it takes the same admission control (and authors one row at a
 // time). `WOWLIDATOR_CLAUDE_TTY_WORKERS` widens the terminal pool behind it.
-export const SERIAL_PROVIDERS: ReadonlySet<string> = new Set(['local', 'claude-tty']);
+// `claude-cloud` is that same terminal with the work happening in a cloud
+// session behind it — still one request at a time per terminal.
+export const SERIAL_PROVIDERS: ReadonlySet<string> = new Set(['local', 'claude-tty', 'claude-cloud']);
 
 /** Where the `local` provider's server listens. */
 export const DEFAULT_LOCAL_LLM_BASE_URL = 'http://localhost:8080/v1';
@@ -175,6 +189,11 @@ export const DEFAULT_ROLE_MODELS: Record<LlmRole, { provider: ProviderName; mode
   // Same job shape as healer — small, latency-sensitive, rarely called (most
   // data generation is deterministic and never reaches a model at all).
   data: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
+  // The queue governor: a handful of event-driven turns per SUITE, each a
+  // compact observation and one structured decision. Cheap by default; the
+  // person may point it at an expensive model (claude-cli opus) precisely
+  // because the turn budget, not the model, bounds the spend.
+  governor: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
 };
 
 /**
@@ -227,6 +246,9 @@ export const DEFAULT_PROVIDER_MODELS: Record<ProviderName, string> = {
   // The warm terminal is for the roles called every few seconds — healer,
   // agent, data — where the cheap fast model at low effort measured best.
   'claude-tty': 'sonnet',
+  // A cloud session pays network latency on every exchange anyway, so the
+  // default leans on capability — the natural home for the agent role.
+  'claude-cloud': 'sonnet',
 };
 
 
@@ -339,14 +361,17 @@ const envSchema = z.object({
   WOWLIDATOR_GENERATOR_TOOLS: z.string().optional(),
   WOWLIDATOR_AGENT_TOOLS: z.string().optional(),
   WOWLIDATOR_DATA_TOOLS: z.string().optional(),
+  WOWLIDATOR_GOVERNOR_TOOLS: z.string().optional(),
   WOWLIDATOR_HEALER_ALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_GENERATOR_ALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_AGENT_ALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_DATA_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_GOVERNOR_ALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_HEALER_DISALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_GENERATOR_DISALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_AGENT_DISALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_DATA_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_GOVERNOR_DISALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_HEALER_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_GENERATOR_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_GENERATOR_MODEL: z.string().min(1).optional(),
@@ -357,6 +382,10 @@ const envSchema = z.object({
   WOWLIDATOR_DATA_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_DATA_MODEL: z.string().min(1).optional(),
   WOWLIDATOR_DATA_BASE_URL: z.string().url().optional(),
+  WOWLIDATOR_GOVERNOR_PROVIDER: providerSchema.optional(),
+  WOWLIDATOR_GOVERNOR_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_GOVERNOR_BASE_URL: z.string().url().optional(),
+  WOWLIDATOR_GOVERNOR_EFFORT: z.string().optional(),
 
   GOOGLE_GENERATIVE_AI_API_KEY: z.string().min(1).optional(),
   GROQ_API_KEY: z.string().min(1).optional(),
@@ -572,6 +601,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
   // a provider whose credential is absent.
   apiKeys['claude-cli'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
   apiKeys['claude-tty'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
+  apiKeys['claude-cloud'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
 
   return {
     roles: {
@@ -614,6 +644,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
         e.WOWLIDATOR_DATA_TOOLS,
         e.WOWLIDATOR_DATA_ALLOWED_TOOLS,
         e.WOWLIDATOR_DATA_DISALLOWED_TOOLS,
+      ),
+      governor: role(
+        'governor',
+        e.WOWLIDATOR_GOVERNOR_PROVIDER,
+        e.WOWLIDATOR_GOVERNOR_MODEL,
+        e.WOWLIDATOR_GOVERNOR_BASE_URL,
+        e.WOWLIDATOR_GOVERNOR_EFFORT,
+        e.WOWLIDATOR_GOVERNOR_TOOLS,
+        e.WOWLIDATOR_GOVERNOR_ALLOWED_TOOLS,
+        e.WOWLIDATOR_GOVERNOR_DISALLOWED_TOOLS,
       ),
     },
     apiKeys,

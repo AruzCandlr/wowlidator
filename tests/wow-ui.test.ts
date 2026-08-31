@@ -814,6 +814,7 @@ describe('which model each role runs on', () => {
       generator: { provider: 'google', modelId: 'gemini-2.5-flash' },
       agent: { provider: 'openrouter', modelId: 'some/model' },
       data: { provider: 'groq', modelId: 'llama-3.1-8b-instant' },
+      governor: { provider: 'groq', modelId: 'llama-3.1-8b-instant' },
     },
     apiKeys: { groq: ['gsk_x'], google: [], openrouter: [] },
   } as never;
@@ -1017,10 +1018,11 @@ describe('grouping runs by the pass that authored them', () => {
   });
 
   // A catalog's roll-up is asked for as a share, not a count: "proved 60%,
-  // dead-end 20%, error 20%" of a five-case sheet. Every kind is its own
-  // bucket — dead-end and error are not "failed" here — and the percentages
-  // are of the whole group.
-  it('tallies each verdict kind as a count and a percentage of the group', () => {
+  // test-failed 20%, system error 20%" of a five-case sheet. Two families
+  // (2026-08-27): a dead-end joins failed as testFailed — the subject missed
+  // the case's expectation either way — and error stands alone as
+  // systemError, the harness breaking with no verdict delivered.
+  it('tallies each verdict family as a count and a percentage of the group', () => {
     const groups = groupRuns([
       card('a', '2026-08-19T03:40:00.000Z', { generatedAt: 'T1' }, 'passed'),
       card('b', '2026-08-19T03:41:00.000Z', { generatedAt: 'T1' }, 'passed'),
@@ -1030,9 +1032,8 @@ describe('grouping runs by the pass that authored them', () => {
     ]);
     const tally = groups[0]!.tally;
     assert.deepEqual(tally.passed, { count: 3, percent: 60 });
-    assert.deepEqual(tally.deadEnd, { count: 1, percent: 20 });
-    assert.deepEqual(tally.error, { count: 1, percent: 20 });
-    assert.deepEqual(tally.failed, { count: 0, percent: 0 });
+    assert.deepEqual(tally.testFailed, { count: 1, percent: 20 }, 'the dead-end reads as the subject failing the case');
+    assert.deepEqual(tally.systemError, { count: 1, percent: 20 });
     assert.deepEqual(tally.needsReview, { count: 0, percent: 0 });
     assert.deepEqual(tallyVerdicts([]).passed, { count: 0, percent: 0 }, 'an empty list divides by nothing');
   });
@@ -1111,7 +1112,7 @@ describe('grouping runs by the pass that authored them', () => {
     assert.deepEqual(scenarios.map((s) => s.title), ['S2 Leave approval', 'S1 Login', 'ungrouped']);
     assert.equal(scenarios[1]!.runs.length, 2);
     assert.deepEqual(scenarios[1]!.tally.passed, { count: 2, percent: 100 });
-    assert.deepEqual(scenarios[0]!.tally.failed, { count: 1, percent: 100 });
+    assert.deepEqual(scenarios[0]!.tally.testFailed, { count: 1, percent: 100 });
     assert.equal(scenarios[1]!.runs[0]!.generatedBy?.caseTitle, 'Wrong password');
     assert.equal(scenarios[0]!.id, `${groups[0]!.id}|S2 Leave approval`, 'stable across polls');
     assert.equal(groupScenarios('g', []).length, 0);

@@ -51,6 +51,9 @@ import { JobRunner } from './jobs.js';
 import { FAILED_RUNS_FILE, FailedRunLog } from './failed-runs.js';
 import { DbStatus } from './db-status.js';
 import { KeySelection, KeySelectionError } from './keys.js';
+import { ClaudeSettingsError, describeClaudeSettings, persistClaudeRunScript } from './claude-settings.js';
+import { UsageCapGuard, persistUsageCap } from './usage-cap.js';
+import { describeDials, describeGates, persistDial, persistGate } from './gates.js';
 import { ModelSelection, ModelSelectionError, persistRoleModel } from './models.js';
 import { RoleCheckError, RoleChecks } from './checks.js';
 import {
@@ -82,6 +85,8 @@ interface ServerContext {
   checks: RoleChecks;
   /** Jobs that ended without a proof — see `ui/failed-runs.ts`. */
   failedRuns: FailedRunLog;
+  /** The session usage cap: stops every job and holds new ones — see `ui/usage-cap.ts`. */
+  usageCap: UsageCapGuard;
   /** The database's configuration, last probe, and repo-derived hints. See `ui/db-status.ts`. */
   db: DbStatus;
 }
@@ -310,6 +315,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
     return;
   }
 
+  // newUI: both surfaces as one page — docs/one-page-ui-spec.md. Same
+  // server, same whitelist, same API; only the document differs.
+
+
   // ---- what this install can do ------------------------------------------
   if (path === '/api/meta' && req.method === 'GET') {
     json(res, {
@@ -338,6 +347,17 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   // ---- jobs ---------------------------------------------------------------
   if (path === '/api/jobs' && req.method === 'GET') {
     json(res, { jobs: ctx.jobs.list().map(summariseJob) });
+    return;
+  }
+
+  // Under a tripped usage cap nothing starts — not a new job, not a resume —
+  // until a person resets it. Stopping a job is always allowed.
+  if (
+    req.method === 'POST' &&
+    ctx.usageCap.held &&
+    (path === '/api/jobs' || path === '/api/catalog-runs/resume' || /^\/api\/jobs\/[^/]+\/resume$/.test(path))
+  ) {
+    json(res, { error: ctx.usageCap.holdMessage(), usageCap: ctx.usageCap.describe() }, 409);
     return;
   }
 
@@ -405,7 +425,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
     // declares the flag can be resumed, so the whitelist still says what runs.
     if (tail === '/resume' && req.method === 'POST') {
       const spec = commandById(job.commandId);
-      let body: { mode?: string; caseId?: string } = {};
+      let body: { mode?: string; caseId?: string; caseIds?: string[] } = {};
       try {
         body = ((await readBody(req)) as typeof body) ?? {};
       } catch {
@@ -424,7 +444,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
         json(res, { error: 'mode "from" needs a caseId of plan-id shape' }, 400);
         return;
       }
-      const flag = mode === 'from' ? '--resume-from' : RESUME_MODES[mode];
+      // mode "cases": re-author exactly the named cases from their sheet
+      // rows and re-run them — the panel's "Re-author & run" button and its
+      // work queue. The CLI validates the ids against the ledger's plan, so
+      // an id matching nothing fails loudly rather than running everything.
+      const caseIds =
+        mode === 'cases'
+          ? (Array.isArray(body.caseIds) ? body.caseIds : []).map((id) => String(id).trim())
+          : [];
+      if (mode === 'cases' && (caseIds.length === 0 || caseIds.some((id) => !/^[A-Za-z0-9._-]{1,80}$/.test(id)))) {
+        json(res, { error: 'mode "cases" needs caseIds, each of plan-id shape' }, 400);
+        return;
+      }
+      const flag = mode === 'from' ? '--resume-from' : mode === 'cases' ? '--rerun-case' : RESUME_MODES[mode];
       const field = flag?.replace(/^--/, '');
       const allowed =
         spec !== undefined && flag !== undefined && spec.fields.some((f) => f.name === field) && job.ended !== null &&
@@ -441,7 +473,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
       }
       try {
         const base = stripResumeFlags(job.argv);
-        const argv = mode === 'from' ? [...base, flag, caseId] : [...base, flag];
+        const argv =
+          mode === 'from'
+            ? [...base, flag, caseId]
+            : mode === 'cases'
+              ? [...base, ...caseIds.flatMap((id) => [flag, id])]
+              : [...base, flag];
         const next = ctx.jobs.start(spec, argv, {
           ...ctx.keys.envOverlay(ctx.config),
           ...ctx.models.envOverlay(),
@@ -514,7 +551,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   // flag the person chose), else it is rebuilt from the ledger's own `launch`
   // record through the command whitelist.
   if (path === '/api/catalog-runs/resume' && req.method === 'POST') {
-    let body: { ledgerPath?: string; mode?: string; caseId?: string };
+    let body: { ledgerPath?: string; mode?: string; caseId?: string; caseIds?: string[] };
     try {
       body = ((await readBody(req)) as typeof body) ?? {};
     } catch (error) {
@@ -527,7 +564,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
       json(res, { error: 'mode "from" needs a caseId of plan-id shape' }, 400);
       return;
     }
-    const flag = mode === 'from' ? '--resume-from' : RESUME_MODES[mode];
+    const caseIds =
+      mode === 'cases'
+        ? (Array.isArray(body.caseIds) ? body.caseIds : []).map((id) => String(id).trim())
+        : [];
+    if (mode === 'cases' && (caseIds.length === 0 || caseIds.some((id) => !/^[A-Za-z0-9._-]{1,80}$/.test(id)))) {
+      json(res, { error: 'mode "cases" needs caseIds, each of plan-id shape' }, 400);
+      return;
+    }
+    const flag = mode === 'from' ? '--resume-from' : mode === 'cases' ? '--rerun-case' : RESUME_MODES[mode];
     const spec = commandById('catalog-run');
     const field = flag?.replace(/^--/, '');
     if (spec === undefined || flag === undefined || !spec.fields.some((f) => f.name === field)) {
@@ -572,7 +617,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
         );
         return;
       }
-      const argv = mode === 'from' ? [...base, flag, caseId] : [...base, flag];
+      const argv =
+        mode === 'from'
+          ? [...base, flag, caseId]
+          : mode === 'cases'
+            ? [...base, ...caseIds.flatMap((id) => [flag, id])]
+            : [...base, flag];
       const next = ctx.jobs.start(spec, argv, {
         ...ctx.keys.envOverlay(ctx.config),
         ...ctx.models.envOverlay(),
@@ -786,6 +836,111 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
     return;
   }
 
+  // ---- the claude-* providers: run script and live quota -------------------
+  //
+  // GET is cheap and pollable: the quota fetch is TTL-cached in
+  // `providers/claude-quota.ts`, so a polling page costs one credentialed
+  // request every thirty seconds, and the OAuth token itself never appears in
+  // the answer. Editing the run script persists to `.env` immediately — see
+  // `ui/claude-settings.ts` for why that is the opposite of the key rule.
+  if (path === '/api/claude' && req.method === 'GET') {
+    json(res, { ...(await describeClaudeSettings(ctx.config)), usageCap: ctx.usageCap.describe() });
+    return;
+  }
+
+  // The usage cap on its own: cheap enough for every page to poll for the
+  // popup (the quota behind it is TTL-cached) without the settings payload.
+  if (path === '/api/usage-cap' && req.method === 'GET') {
+    json(res, ctx.usageCap.describe());
+    return;
+  }
+
+  if (path === '/api/usage-cap' && req.method === 'POST') {
+    let body: { enabled?: unknown; capPercent?: unknown };
+    try {
+      body = (await readBody(req)) as typeof body;
+    } catch (error) {
+      json(res, { error: error instanceof Error ? error.message : String(error) }, 400);
+      return;
+    }
+    try {
+      await persistUsageCap({
+        enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
+        capPercent: body.capPercent,
+      });
+      json(res, await ctx.usageCap.tick());
+    } catch (error) {
+      const status = error instanceof ClaudeSettingsError ? 400 : 500;
+      json(res, { error: error instanceof Error ? error.message : String(error) }, status);
+    }
+    return;
+  }
+
+  if (path === '/api/usage-cap/reset' && req.method === 'POST') {
+    json(res, await ctx.usageCap.reset());
+    return;
+  }
+
+  // ---- the machinery gates: every on/off that shapes a run ----------------
+  // Same contract as the usage cap: a flip writes `.env` AND this process's
+  // env, so the NEXT spawned job inherits it; a run in flight keeps the
+  // gates it started with. The allowlist lives in `gates.ts` — the endpoint
+  // edits those vars and no others.
+  if (path === '/api/gates' && req.method === 'GET') {
+    json(res, { gates: describeGates(), dials: describeDials() });
+    return;
+  }
+
+  if (path === '/api/gates' && req.method === 'POST') {
+    let body: { env?: unknown; on?: unknown };
+    try {
+      body = (await readBody(req)) as typeof body;
+    } catch (error) {
+      json(res, { error: error instanceof Error ? error.message : String(error) }, 400);
+      return;
+    }
+    const asDial = (body as { value?: unknown }).value;
+    if (typeof body.env !== 'string' || (typeof body.on !== 'boolean' && asDial === undefined)) {
+      json(res, { error: 'a gate edit is { env, on } for a toggle or { env, value } for a dial' }, 400);
+      return;
+    }
+    try {
+      if (typeof body.on === 'boolean') {
+        const gate = await persistGate(body.env, body.on);
+        json(res, { gate, gates: describeGates(), dials: describeDials() });
+      } else {
+        const dial = await persistDial(body.env, asDial);
+        json(res, { dial, gates: describeGates(), dials: describeDials() });
+      }
+    } catch (error) {
+      const status = error instanceof ClaudeSettingsError ? 400 : 500;
+      json(res, { error: error instanceof Error ? error.message : String(error) }, status);
+    }
+    return;
+  }
+
+  if (path === '/api/claude/run-script' && req.method === 'POST') {
+    let body: { provider?: string; binary?: string; args?: string; extraArgs?: string };
+    try {
+      body = (await readBody(req)) as typeof body;
+    } catch (error) {
+      json(res, { error: error instanceof Error ? error.message : String(error) }, 400);
+      return;
+    }
+    try {
+      await persistClaudeRunScript(String(body.provider), {
+        binary: typeof body.binary === 'string' ? body.binary : undefined,
+        args: typeof body.args === 'string' ? body.args : undefined,
+        extraArgs: typeof body.extraArgs === 'string' ? body.extraArgs : undefined,
+      });
+      json(res, await describeClaudeSettings(ctx.config));
+    } catch (error) {
+      const status = error instanceof ClaudeSettingsError ? 400 : 500;
+      json(res, { error: error instanceof Error ? error.message : String(error) }, status);
+    }
+    return;
+  }
+
   // Saved repositories — read-only: saving one goes through the ordinary job
   // machinery (`context add` via the whitelist), never a bespoke write here.
   if (path === '/api/repos' && req.method === 'GET') {
@@ -841,7 +996,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   }
 
   if (path === '/api/proofs' && req.method === 'GET') {
-    const index = await readProofIndex(resolve(ctx.config.proofDir));
+    // The report directory too, so every card carries a link to the document
+    // written for a person — not only to its own raw JSON.
+    const index = await readProofIndex(
+      resolve(ctx.config.proofDir),
+      undefined,
+      resolve(ctx.config.reportDir),
+    );
     // Grouped server-side rather than in the page: the rule for what belongs
     // together is a fact about provenance, and a second implementation in
     // browser JS would be a second place for it to drift.
@@ -1149,7 +1310,12 @@ export async function startUi(options: StartUiOptions = {}): Promise<{ url: stri
     checks: new RoleChecks(),
     failedRuns,
     db: new DbStatus(),
+    usageCap: new UsageCapGuard(jobs),
   };
+  // A hold left by an earlier panel process stands until reset; then the
+  // guard polls on the quota's own TTL for the life of the server.
+  await ctx.usageCap.load();
+  ctx.usageCap.start();
   const server = createServer((req, res) => {
     handle(req, res, ctx).catch((error: unknown) => {
       if (!res.headersSent) {
@@ -1194,20 +1360,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 2;
   }
 
-  // One server, two surfaces. `--wow` only decides which one the browser is
-  // pointed at; both are served either way, and each links to the other.
-  const wow = argv.includes('--wow');
+  // One server, three surfaces. `--wow` only decides which one the
+  // browser is pointed at; all are served either way.
+  const openPath = argv.includes('--wow') ? 'wow' : '';
 
   try {
     const { url } = await startUi({
       ...(port === undefined ? {} : { port }),
       open: !argv.includes('--no-open'),
-      openPath: wow ? 'wow' : '',
+      openPath,
     });
     process.stdout.write(
       `\n  wowlidator control panel\n\n` +
         `    ${url}                every command, with a manual on the last tab\n` +
-        `    ${url}wow             wowUI — runs, verdicts and the evidence behind them\n\n` +
+        `    ${url}wow             wowUI — runs, verdicts and the evidence behind them\n` +
+        `    ${url}new             newUI — everything above, on one page\n\n` +
         `  Ctrl-C to stop.\n\n`,
     );
     // Hold the process open; the server is the point of it.

@@ -25,6 +25,8 @@ import { HEAL_REPO_HINTS_MAX_LINES, healHintsFrom } from '../src/context/heal-hi
 import { detectDbHint } from '../src/context/db-hint.js';
 import { ManifestIngester } from '../src/context/ingesters/manifest-ingester.js';
 import { ComponentIngester } from '../src/context/ingesters/component-ingester.js';
+import { MessageIngester, isMessageFile } from '../src/context/ingesters/message-ingester.js';
+import { toPromptContext } from '../src/context/query.js';
 import { RouteIngester } from '../src/context/ingesters/route-ingester.js';
 import { nearestRoutes, routeIsDeclared } from '../src/context/route-match.js';
 import { TestIngester } from '../src/context/ingesters/test-ingester.js';
@@ -76,6 +78,40 @@ const NEXT_APP_FIXTURE = {
   'app/(marketing)/about/page.tsx': `
     export default function About() {
       return <div>About</div>;
+    }
+  `,
+  // An i18n catalog (next-intl shape) and a page whose screen binds one of
+  // its namespaces — the application's words, indexed and linked.
+  'messages/en.json': JSON.stringify({
+    plans: { title: 'Benefit Plan Catalog', createPlan: 'Create Plan', intro: 'x'.repeat(200) },
+    common: { save: 'Save' },
+  }),
+  'messages/th.json': JSON.stringify({ plans: { title: 'แคตตาล็อกแผนสวัสดิการ', createPlan: 'สร้างแผน' } }),
+  'src/components/PlanHeader.tsx': `
+    import { useTranslations } from 'next-intl';
+    export function PlanHeader({ isTh }: { isTh: boolean }) {
+      const t = useTranslations('plans');
+      return (
+        <div>
+          <h1>{t('title')}</h1>
+          <button title={isTh ? 'สร้างแผนสวัสดิการใหม่' : 'Create Benefit Plan'}>Create</button>
+          <span>42</span>
+        </div>
+      );
+    }
+  `,
+  'app/plans/page.tsx': `
+    import { PlanHeader } from '../../src/components/PlanHeader';
+    export default function PlansPage() {
+      return <PlanHeader />;
+    }
+  `,
+  // An App Router page that awaits its data — the shape 21 of the indexed
+  // app's 212 pages have, and the one the renders-edge guess used to miss.
+  'app/reports/page.tsx': `
+    export default async function ReportsPage() {
+      const rows = await Promise.resolve([]);
+      return <div>{rows.length}</div>;
     }
   `,
   'app/api/employees/route.ts': `
@@ -311,6 +347,20 @@ describe('context engine', () => {
         ),
       );
     });
+
+    it('guesses the renders edge for an ASYNC default export too (2026-08-28: 23 orphan routes)', async () => {
+      // `export default async function ReportsPage` used to fall through to
+      // the filename guess ("Page"), dangle, be pruned — and the generator's
+      // repository slice for that page walked to nothing.
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+      const reports = result.nodes.find((n) => n.file === 'app/reports/page.tsx');
+      assert.ok(reports, 'the async page is a route');
+      assert.ok(
+        result.edges.some((e) => e.kind === 'renders' && e.from === reports?.id && e.to.endsWith('#ReportsPage')),
+        'the edge names the async default export, not the filename',
+      );
+    });
   });
 
   describe('TestIngester', () => {
@@ -330,6 +380,62 @@ describe('context engine', () => {
       const node = result.nodes.find((n) => n.file === 'employee.flow.json');
       assert.equal(node?.meta?.hasAssertion, 'true');
       assert.equal(node?.meta?.urls, '/employees/42');
+    });
+  });
+
+  describe('MessageIngester', () => {
+    it('recognises i18n catalogs by convention, and nothing else', () => {
+      assert.equal(isMessageFile('messages/en.json'), true);
+      assert.equal(isMessageFile('public/locales/th/common.json'), true);
+      assert.equal(isMessageFile('src/i18n/en-US.json'), true);
+      assert.equal(isMessageFile('package.json'), false);
+      assert.equal(isMessageFile('messages/README.json'), false, 'a stem that is not a locale');
+      assert.equal(isMessageFile('src/data/en.json'), false, 'not under an i18n directory');
+    });
+
+    it('indexes one node per namespace and locale, with the strings as its detail', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new MessageIngester().ingest(ctx);
+      const en = result.nodes.find((n) => n.file === 'messages/en.json' && n.name === 'plans');
+      const th = result.nodes.find((n) => n.file === 'messages/th.json' && n.name === 'plans');
+      assert.ok(en && th, 'a node per locale');
+      assert.equal(en?.kind, 'message');
+      assert.equal(en?.meta?.locale, 'en');
+      assert.equal(en?.meta?.keys, '3');
+      assert.match(en?.detail ?? '', /title: "Benefit Plan Catalog"/);
+      // Short labels come first; a paragraph is quoted cut, never whole.
+      assert.ok((en?.detail ?? '').indexOf('createPlan') < (en?.detail ?? '').indexOf('intro'));
+      assert.doesNotMatch(en?.detail ?? '', /x{150}/);
+      assert.ok(result.nodes.some((n) => n.name === 'common'), 'every namespace, bound or not');
+    });
+
+    it('links a component to the namespaces its file binds, and the prompt slice prints the words', async () => {
+      const engine = new ContextEngine({ rootDir: dir, cacheFile: join(dir, '.wowlidator/context-graph.json') });
+      const graph = await engine.build({ force: true });
+      const header = graph.nodes.find((n) => n.name === 'PlanHeader');
+      const en = graph.nodes.find((n) => n.kind === 'message' && n.file === 'messages/en.json' && n.name === 'plans');
+      assert.ok(header && en);
+      assert.ok(graph.edges.some((e) => e.kind === 'uses' && e.from === header?.id && e.to === en?.id), 'PlanHeader uses en plans');
+      assert.ok(graph.edges.some((e) => e.kind === 'uses' && e.from === header?.id && e.to.endsWith('th.json#plans')), 'and th');
+      // The route-centred slice the generator reads now carries the rendering.
+      const slice = toPromptContext(graph, { url: 'http://x.test/plans' });
+      assert.match(slice, /renders the plans strings \[en, messages\/en\.json\]: .*Benefit Plan Catalog/);
+      assert.match(slice, /แคตตาล็อกแผนสวัสดิการ/, 'the other locale too — the bilingual anyOf needs both');
+    });
+
+    it('captures the words a component renders from its own source — both branches of a locale ternary', async () => {
+      // The modal title a wording case asked about was a hardcoded JSX
+      // attribute (`title={isTh ? 'สร้าง…' : 'Create Benefit Plan'}`) in no
+      // catalog — invisible to the index until the component carried it.
+      const engine = new ContextEngine({ rootDir: dir, cacheFile: join(dir, '.wowlidator/context-graph.json') });
+      const graph = await engine.build({ force: true });
+      const header = graph.nodes.find((n) => n.name === 'PlanHeader');
+      assert.match(header?.detail ?? '', /"Create Benefit Plan"/);
+      assert.match(header?.detail ?? '', /"สร้างแผนสวัสดิการใหม่"/);
+      assert.match(header?.detail ?? '', /"Create"/, 'JSX text too');
+      assert.doesNotMatch(header?.detail ?? '', /"42"/, 'a number is not a word');
+      const slice = toPromptContext(graph, { url: 'http://x.test/plans' });
+      assert.match(slice, /PlanHeader .*— says: .*"Create Benefit Plan"/);
     });
   });
 

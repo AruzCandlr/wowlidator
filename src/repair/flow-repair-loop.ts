@@ -88,7 +88,7 @@ export interface RepairAttempt {
 }
 
 export interface FlowRepairOutcome {
-  status: 'passed' | 'dead-end';
+  status: 'passed' | 'dead-end' | 'needs-review';
   attempts: RepairAttempt[];
   /** The flow that finally passed, or the last one attempted if dead-ended. */
   finalFlow: Flow;
@@ -296,6 +296,27 @@ export class FlowRepairLoop {
       if (isPassing(bundle.status)) {
         this.#onLog?.(`✓ passed`);
         return { status: 'passed', attempts, finalFlow: current };
+      }
+
+      // A wording near-miss is a VERDICT question, not a breakage: the page
+      // answered, and the judge (which runs inside each attempt when built)
+      // or a human decides whether the answer satisfies the claim. Ruled
+      // proved → the run passed. Ruled failed at the bar → a genuine failure,
+      // and the repair gets its turn (regeneration may rewrite a stale
+      // claim). Unruled → stop and leave it for a human: re-running the flow
+      // can only arrive at the same pair of strings, and a repair must never
+      // overwrite a question nobody has answered.
+      if (bundle.status === 'needs-review') {
+        const ruling = bundle.review?.verdict;
+        if (ruling === 'proved') {
+          this.#onLog?.(`✓ passed — the judge ruled the wording satisfies the claim`);
+          return { status: 'passed', attempts, finalFlow: current };
+        }
+        if (ruling === undefined) {
+          this.#onLog?.(`? needs review — a wording question for the judge or a human, not a breakage to repair`);
+          return { status: 'needs-review', attempts, finalFlow: current };
+        }
+        // ruled failed: fall through to the repair below.
       }
 
       if (attempt === this.#maxAttempts) {

@@ -62,7 +62,10 @@ export const VERDICT_COPY = {
     'neither a pass nor a product failure.',
   failedHeadline: (name: string) => `FAILED — ${name}`,
   errorHeadline: (name: string) => `ERROR — ${name} (the run hit errors; this is not an assertion failure)`,
-  deadEndHeadline: (name: string) => `DEAD END — ${name} (a control could not be found by any means; nothing left to try)`,
+  // Family wording (2026-08-27): a dead end IS the test failing — the page
+  // never offered what the case needed — so the headline leads with that and
+  // keeps the mechanism in the parenthesis.
+  deadEndHeadline: (name: string) => `TEST FAILED — ${name} (dead end: a control the case needed could not be found by any means; nothing left to try)`,
   passedAll: (steps: number) =>
     `All ${steps} step${steps === 1 ? '' : 's'} did what the test said they should.`,
   runError: 'The run could not complete. Nothing below was verified.',

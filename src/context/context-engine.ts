@@ -21,6 +21,7 @@ import { RouteIngester } from './ingesters/route-ingester.js';
 import { TestIngester } from './ingesters/test-ingester.js';
 import { OpenApiIngester } from './ingesters/openapi-ingester.js';
 import { SchemaIngester } from './ingesters/schema-ingester.js';
+import { MessageIngester } from './ingesters/message-ingester.js';
 import {
   PROJECT_GRAPH_VERSION,
   type IngestContext,
@@ -257,6 +258,9 @@ export class ContextEngine {
       new ComponentIngester(),
       new RouteIngester(),
       new TestIngester(),
+      // The application's own words (i18n catalogs) — the one kind of fact
+      // the structural ingesters never carried. See message-ingester.ts.
+      new MessageIngester(),
       new OpenApiIngester(options.openApiSpec === undefined ? {} : { source: options.openApiSpec }),
       new SchemaIngester({
         source: options.dbSchema,

@@ -81,7 +81,8 @@ import { HealFailedError, HealUnavailableError, JitHealer, captureAxTree } from 
 import type { FlowRepairModel } from '../repair/flow-repair-model.js';
 import { REVEAL_ACTIONS, WorkflowAgent, cacheAgentMemory, type AgentDbProbe, type PlanStep } from '../orchestrator/workflow-agent.js';
 import { nearestRoutes, routeIsDeclared } from '../context/route-match.js';
-import { claudeCliUsage, claudeCliUsageSince } from '../providers/claude-cli.js';
+import { claudeCliUsage, claudeCliUsageSince, type ClaudeCliUsage } from '../providers/claude-cli.js';
+import { sessionQuotaPoint, type SessionQuotaPoint } from '../providers/claude-quota.js';
 import { SessionVault, type StoredSession } from './session-vault.js';
 
 /**
@@ -133,8 +134,10 @@ import {
   type ProofStep,
   type RejectedHeal,
   type ResolutionSource,
+  nearMiss,
 } from './proof-bundle.js';
 import { inferPolarity, type TestPolarity } from './polarity.js';
+import type { DataGate } from '../cli/data-locks.js';
 
 export const DEFAULT_CDP_URL = 'http://localhost:9222';
 /** Fast-path timeout. Short by design — see the module comment. */
@@ -264,6 +267,14 @@ export interface SmartRunnerOptions {
    * preparation may be inserted before it). Null/absent disables.
    */
   stepRepair?: FlowRepairModel | null | undefined;
+  /**
+   * The suite's step-level data lock for this run, or null. Consulted around
+   * every step: a run takes a data section when it reaches the step that
+   * changes it and gives it back at the last step that still needs that
+   * change to hold, so lanes overlap everywhere except the change-and-verify
+   * span. See `cli/data-locks.ts` for why this replaced flagging whole flows.
+   */
+  dataGate?: DataGate | null | undefined;
   /**
    * Pause before each step, in ms. Zero (the default) keeps the hot path
    * hot. Under `video: 'always'` the default becomes
@@ -511,7 +522,12 @@ export class StepResolutionError extends Error {
     // live: `expectText role=main` resolved instantly on every rung, failed
     // on text, and the report said the control was never found.
     const contentOnly =
-      attempts.length > 0 && attempts.every((line) => /expected text to contain/i.test(line));
+      attempts.length > 0 &&
+      attempts.some((line) => /expected text to contain/i.test(line)) &&
+      attempts.every(
+        (line) =>
+          /expected text to contain/i.test(line) || line.startsWith('known content mismatch:'),
+      );
     super(
       contentOnly
         ? `"${selector}" resolved, but its content did not hold after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`
@@ -874,6 +890,102 @@ function excerptAround(actual: string, matched: string): string {
   return `${start > 0 ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}`;
 }
 
+/**
+ * How an expected string was found in the actual text, when it was not found
+ * verbatim.
+ *
+ * Three relaxations, in the order they are tried. Each is a case the
+ * deterministic comparison used to lose to and hand — via `nearMiss` — to the
+ * review judge and then to a human, at a model call and a queue entry apiece,
+ * for a difference nothing about the application had caused.
+ *
+ * - `case` — the rendered text differs only in capitalisation. Case on screen
+ *   is frequently CSS, not content: `text-transform` restyles a heading without
+ *   touching the DOM, so the same markup reads "Insert new changes" to
+ *   `innerText` and "INSERT NEW CHANGES" to a person. This engine already
+ *   concedes the point for accessible names — `relaxRoleName` re-writes every
+ *   authored `[name="…"]` to `[name="…" i]` because Chrome and Playwright
+ *   disagree about it outright (`tests/selector-case.test.ts`). An assertion
+ *   over `innerText` has no better claim to the distinction than the AX tree
+ *   does.
+ * - `template` — the expected string is a SPEC with a placeholder in it:
+ *   "Insert New Changes for Benefit: {Plan name}". The braces are the sheet
+ *   author saying "whatever the plan is called", and every literal segment
+ *   around them still has to appear, in order. Matching it literally asserts
+ *   that the page renders the word "{Plan name}", which no page does.
+ * - `template-case` — both at once, which is the shape that actually turned up.
+ *
+ * Never a silent pass: the relaxation used is recorded on the step and shown in
+ * the report, so a reader sees that the page's wording differed and how. A
+ * claim that genuinely rides on capitalisation is not provable through
+ * `innerText` in the first place and belongs in a visual check.
+ */
+export type TextMatchRelaxation = 'case' | 'template' | 'template-case';
+
+/** `{Plan name}`, `{{plan}}`, `<name>` — a sheet author's stand-in for a value. */
+const EXPECTED_PLACEHOLDER = /\{\{?[^{}]*\}?\}|<[^<>]+>/g;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * A regex for an expected string carrying placeholders, or null when it carries
+ * none. The literal segments must appear in order; what stands between them is
+ * the page's business.
+ *
+ * Two limits, stated because they bound what a `template` match proves:
+ * a placeholder BETWEEN two literals matches at least one character, but
+ * whitespace counts — "Benefit: {Plan} Effective" is satisfied by
+ * "Benefit:  Effective" — and a placeholder at either END imposes nothing at
+ * all, since there is no second literal to anchor it against. So a template
+ * match proves the page's fixed wording, never that the variable part was
+ * filled in. Asserting the value itself needs the value: quote it from the
+ * case, or save it (`saveText`) and compare.
+ */
+export function templateToRegExp(expected: string, flags: string): RegExp | null {
+  EXPECTED_PLACEHOLDER.lastIndex = 0;
+  if (!EXPECTED_PLACEHOLDER.test(expected)) return null;
+  const source = expected
+    .split(EXPECTED_PLACEHOLDER)
+    .map((literal) => escapeRegExp(literal.trim()))
+    .filter((literal) => literal !== '')
+    // Whitespace between literals is the page's to decide: a heading may wrap,
+    // and `innerText` then reports a newline where the sheet wrote a space.
+    .join('[\\s\\S]+?');
+  if (source === '') return null;
+  return new RegExp(source, flags);
+}
+
+/**
+ * Find `expected` inside `actual`, conceding case and placeholders in that
+ * order. Returns the substring of `actual` that satisfied it — so the report's
+ * "actual" quotes the page's own wording, not the spec's — with the relaxation
+ * that was needed, or null when the text is genuinely absent.
+ */
+export function relaxedTextMatch(
+  expected: string,
+  actual: string,
+): { found: string; relaxation: TextMatchRelaxation } | null {
+  const needle = expected.trim();
+  if (needle === '') return null;
+
+  const at = actual.toLowerCase().indexOf(needle.toLowerCase());
+  if (at !== -1) return { found: actual.slice(at, at + needle.length), relaxation: 'case' };
+
+  // Case-sensitive first, so a template that matches exactly is not reported as
+  // a case difference it never had.
+  const exactTemplate = templateToRegExp(needle, '');
+  const exactHit = exactTemplate?.exec(actual);
+  if (exactHit?.[0]) return { found: exactHit[0], relaxation: 'template' };
+
+  const looseTemplate = templateToRegExp(needle, 'i');
+  const looseHit = looseTemplate?.exec(actual);
+  if (looseHit?.[0]) return { found: looseHit[0], relaxation: 'template-case' };
+
+  return null;
+}
+
 export function scriptMismatchNote(expected: string, actual: string): string {
   const expectedLatin = LATIN_LETTER.test(expected) && !NON_LATIN_LETTER.test(expected);
   const expectedOther = NON_LATIN_LETTER.test(expected) && !LATIN_LETTER.test(expected);
@@ -982,7 +1094,7 @@ export class SmartRunner {
    * `url :: selector`, valued with the step index that established it. Never
    * persisted — a negative result belongs to this run's page state only.
    */
-  readonly #deadResolutions = new Map<string, number>();
+  readonly #deadResolutions = new Map<string, { step: number; contentMiss: boolean }>();
   /** Pages this runner drove and then navigated away from, via popup adoption. */
   readonly #pagesLeftBehind: Page[] = [];
   /**
@@ -991,6 +1103,8 @@ export class SmartRunner {
    * retry loop and needs to consult it.
    */
   readonly stepRepair: FlowRepairModel | null;
+  /** The suite's step-level data lock, or null — see `SmartRunnerOptions.dataGate`. */
+  readonly dataGate: DataGate | null;
   /** Where the previous step's network mark sat — see `#takeNetMark`. */
   #previousNetMark: number | undefined;
   /** Lower bound of the current step's evidence window. */
@@ -1066,6 +1180,7 @@ export class SmartRunner {
     this.#backend = options.backend ?? true;
     this.#declaredRoutes = options.declaredRoutes ?? [];
     this.stepRepair = options.stepRepair ?? null;
+    this.dataGate = options.dataGate ?? null;
     this.#stepDelayMs =
       options.stepDelayMs ?? ((options.video ?? 'on') === 'always' ? DEMONSTRATION_STEP_DELAY_MS : 0);
     this.#coverage = options.coverage ?? true;
@@ -2458,14 +2573,47 @@ export class SmartRunner {
             detail['actual'] = excerptAround(actual, matched);
             return;
           }
+          // Verbatim failed. Before spending another poll — and ultimately a
+          // judge call and a human's queue slot — concede the two differences
+          // that are not the application's doing: rendered case, and a
+          // placeholder the sheet author wrote as a stand-in. See
+          // `relaxedTextMatch`. Only on the LAST look, so a page still
+          // rendering gets every chance to satisfy the strict comparison first
+          // and a relaxation is never recorded for text that was merely late.
+          if (Date.now() >= deadline) {
+            for (const candidate of accepted) {
+              const relaxed = relaxedTextMatch(candidate, actual);
+              if (relaxed === null) continue;
+              if (candidate !== expected) detail['matchedRendering'] = candidate;
+              // The page's own words, not the spec's — the whole point of
+              // quoting an actual.
+              detail['matchedText'] = relaxed.found;
+              detail['relaxation'] = relaxed.relaxation;
+              detail['actual'] = excerptAround(actual, relaxed.found);
+              this.bundle.note(
+                `expectText ${selector}: the page reads ${JSON.stringify(relaxed.found)} where the claim ` +
+                  `says ${JSON.stringify(candidate)} — accepted as a ${relaxed.relaxation} difference; ` +
+                  'confirm the wording if the claim rides on it',
+              );
+              return;
+            }
+          }
           if (Date.now() >= deadline) break;
           await this.page.waitForTimeout(Math.min(150, Math.max(1, deadline - Date.now())));
         }
-        detail['actual'] = actual.trim().slice(0, 400);
+        // First reading wins: the authored selector's own text is the honest
+        // "actual". Later rungs read wider elements (kin climbs to the card,
+        // a heal may land on a container), and letting the last write win put
+        // a whole page of innerText where the report's Actual column should
+        // have shown a breadcrumb (be100 PL_02_07, live). The thrown message
+        // is capped the same way — each attempt line lands in the bundle and
+        // the report verbatim.
+        if (detail['actual'] === undefined) detail['actual'] = actual.trim().slice(0, 400);
+        const shown = actual.trim();
         throw new Error(
           `expected text to contain ${JSON.stringify(expected)}` +
             (anyOf?.length ? ` (or an accepted rendering: ${anyOf.map((a) => JSON.stringify(a)).join(', ')})` : '') +
-            `, got ${JSON.stringify(actual.trim())}` +
+            `, got ${JSON.stringify(shown.length > 200 ? `${shown.slice(0, 200)}…` : shown)}` +
             scriptMismatchNote(expected, actual),
         );
       },
@@ -2483,6 +2631,36 @@ export class SmartRunner {
         try {
           await locator.waitFor({ state: 'visible', timeout });
           detail['actual'] = 'visible';
+          // **A "visible" that resolved on nothing the author named proves
+          // nothing** (S5 of the 2026-08-28 audit). PL_04_13: three
+          // `expectVisible role=combobox >> nth=0` passed on a page with
+          // zero comboboxes — the positional fallback resolved SOMETHING
+          // and the human had recorded the case Failed. A positional or
+          // nameless selector whose element has no accessible name and no
+          // text is recorded vacuous; the case is scored needs-review, never
+          // green on it.
+          if (/>>\s*nth=|^role=[a-z]+\s*$|^role=[a-z]+\s*>>/i.test(selector)) {
+            const named = await locator
+              .evaluate((el) => {
+                // Structural cast, not HTMLElement: tsconfig pins types to
+                // ["node"], so DOM lib names do not exist at compile time —
+                // the callback runs in the browser, where the shape is real.
+                const e = el as unknown as {
+                  getAttribute(name: string): string | null;
+                  innerText?: string;
+                };
+                return Boolean(
+                  (e.getAttribute('aria-label') || e.getAttribute('aria-labelledby') || e.innerText || '').trim(),
+                );
+              })
+              .catch(() => true);
+            if (!named) {
+              detail['vacuous'] = 'resolved an element with no accessible name or text — this assertion cannot fail and proves nothing';
+              this.bundle.note(
+                `vacuous assertion: expectVisible ${selector} resolved an element with no name or text; the claim it serves is unproved — review it`,
+              );
+            }
+          }
         } catch (error) {
           detail['actual'] = 'not visible (hidden or absent)';
           throw error;
@@ -2578,6 +2756,49 @@ export class SmartRunner {
         if (actual !== expected) {
           throw new Error(`expected ${expected} matches, found ${actual}`);
         }
+      },
+      detail,
+    );
+  }
+
+  /**
+   * Read how many elements match, into the variable store — the first half
+   * of a reconciliation claim ("the tile matches the table", "no change
+   * after Insert"). Goes through the ladder like any selector, and waits
+   * for at least one match: a save that silently recorded 0 off a bogus
+   * selector would make the later compare a fight between two mistakes.
+   * A legitimately-empty result is saved via `saveText` of the readout
+   * ("0 of 0") instead — the page's own words for emptiness.
+   */
+  async saveCount(selector: string, as: string, intent?: string): Promise<void> {
+    const detail: Record<string, unknown> = { as };
+    await this.#step(
+      'saveCount',
+      selector,
+      intent,
+      async (locator, timeout) => {
+        await locator.first().waitFor({ state: 'attached', timeout });
+        const count = await locator.count();
+        detail['saved'] = count;
+        this.variables.set(as, String(count));
+      },
+      detail,
+    );
+  }
+
+  /** Read an element's visible text into the variable store — see `saveCount`. */
+  async saveText(selector: string, as: string, intent?: string): Promise<void> {
+    const detail: Record<string, unknown> = { as };
+    await this.#step(
+      'saveText',
+      selector,
+      intent,
+      async (locator, timeout) => {
+        const first = locator.first();
+        await first.waitFor({ state: 'visible', timeout });
+        const text = ((await first.innerText()) ?? '').trim();
+        detail['saved'] = text.slice(0, 200);
+        this.variables.set(as, text);
       },
       detail,
     );
@@ -2776,6 +2997,11 @@ export class SmartRunner {
    * cannot honour. Spread into `RunOptions` at the `agent.run` call sites.
    */
   #agentDbProbe(): { dbProbe: AgentDbProbe } | null {
+    // `--no-backend` withdraws the probe too, not only the flow's own DB
+    // steps. Seen live (PL_03_02, 2026-08-27): a run declared backend-off,
+    // and the agent still settled a UI-reading goal with three `dbCount`
+    // calls — a pass whose evidence the run's own limits said not to touch.
+    if (!this.#backend) return null;
     if (!this.#db.configured) return null;
     return { dbProbe: (table, where) => this.#db.probeCount(table, where) };
   }
@@ -3164,7 +3390,11 @@ export class SmartRunner {
       selector: null,
       resolvedSelector: null,
       resolution: null,
-      status: failed ? 'failed' : 'passed',
+      // A provider that could not be asked is a harness fact — `error`, the
+      // system-error family — never `failed`, which files the subject.
+      // Live (be100 PL_02_08/09, 2026-08-28): an open circuit breaker was
+      // scored as two red test failures.
+      status: failed ? (providerFailed ? 'error' : 'failed') : 'passed',
       startedAt,
       durationMs: Date.now() - started,
       url: urlAfter,
@@ -3172,6 +3402,12 @@ export class SmartRunner {
         goal,
         turns: record.turns,
         ...(evidence === null ? {} : { settledBy: evidence.rule, evidence: evidence.reason }),
+        // A success settled by the agent itself says how (S1): the live
+        // tree's line for `observed-state`, or the bare claim — so a reader
+        // can tell a proved leg from a trusted one in the report.
+        ...(evidence === null && record.success && record.settledBy !== undefined
+          ? { settledBy: record.settledBy, evidence: record.settledEvidence ?? '' }
+          : {}),
         // The before/after the agent produced, as data. Headings are what a
         // person reads to know which screen they are on; the diff of them is
         // "what appeared". Capped, like every other evidence list.
@@ -3477,6 +3713,60 @@ export class SmartRunner {
           };
         }
       }
+      // **A near-NAME on the right role is the same wording question** (EN-2
+      // audit, false alarms): `role=button[name="Save"]` dead-ended while the
+      // page's footer button is "Proceed"; `role=textbox[name="Benefit Plan
+      // ID"]` while the field is named a word apart. When an assertion's
+      // named-role selector resolved nothing but the live tree holds a
+      // same-role control whose name is a near-miss of the asserted one, the
+      // step carries both names and qualifies for proved-? — the judge (or a
+      // person) rules whether the page's name satisfies the sheet's, instead
+      // of a bare "could not resolve" filing a false alarm.
+      if (
+        resolution !== undefined &&
+        (detail === undefined || detail['foundInPageText'] === undefined) &&
+        (ASSERTION_ACTIONS as readonly string[]).includes(action)
+      ) {
+        const named = /^role=([a-z]+)\s*\[name="((?:[^"\\]|\\.)*)"/i.exec(selector.trim());
+        if (named) {
+          const role = (named[1] as string).toLowerCase();
+          const wantedName = (named[2] as string).replace(/\\(.)/g, '$1');
+          try {
+            const tree = await captureAxTree(this.page, 200);
+            const lineRe = new RegExp(`^\\s*${role}\\s+"((?:[^"\\\\]|\\\\.)*)"`, 'i');
+            for (const line of tree.split('\n')) {
+              const m = lineRe.exec(line);
+              const candidate = m?.[1]?.replace(/\\(.)/g, '$1');
+              // `nearMiss` alone is deliberately lenient (any non-numeric
+              // wording mismatch is "worth judging") — here it would stamp
+              // every same-role node as near. Require the names to actually
+              // share a word (3+ chars) or contain one another first.
+              const sharesWord = (x: string, y: string): boolean => {
+                const xs = x.toLowerCase(); const ys = y.toLowerCase();
+                if (xs.includes(ys) || ys.includes(xs)) return true;
+                const words = xs.split(/[^\p{L}\p{N}]+/u).filter((w) => w.length >= 3);
+                return words.some((w) => new RegExp(`(^|[^\\p{L}\\p{N}])${w.replace(/[.*+?^$()|[\]{}\\]/g, '\\$&')}([^\\p{L}\\p{N}]|$)`, 'iu').test(y));
+              };
+              if (
+                candidate !== undefined &&
+                candidate !== '' &&
+                sharesWord(wantedName, candidate) &&
+                nearMiss(wantedName, candidate)
+              ) {
+                detail = {
+                  ...(detail ?? {}),
+                  expected: wantedName,
+                  actual: `the page's ${role} is named ${JSON.stringify(candidate)}`,
+                  foundInPageText: true,
+                };
+                break;
+              }
+            }
+          } catch {
+            // Evidence-gathering only — a failed capture changes nothing.
+          }
+        }
+      }
       this.bundle.addStep({
         action,
         intent,
@@ -3515,10 +3805,10 @@ export class SmartRunner {
           (line) => line.startsWith('backend:') || line.startsWith('declined to heal:'),
         );
         if (!transient) {
-          this.#deadResolutions.set(
-            CacheManager.key(this.page.url(), selector),
-            this.bundle.steps.length - 1,
-          );
+          this.#deadResolutions.set(CacheManager.key(this.page.url(), selector), {
+            step: this.bundle.steps.length - 1,
+            contentMiss: resolution.contentOnly,
+          });
         }
       }
       this.#recordStepFailureDefect(action, selector, describe(error), evidence.failures);
@@ -3844,12 +4134,15 @@ export class SmartRunner {
   /**
    * Where the recording should stop, or `null` to keep none of it.
    *
-   * The rule: **a recording is evidence of a failure.** It runs from the start
-   * of the flow — the state leading up to a failure is most of what makes it
-   * diagnosable — and ends at the step that broke. A run where nothing broke
-   * produces no video at all, which is what keeps this affordable as a
-   * default: the reports that carry a recording are exactly the ones somebody
-   * is going to open.
+   * The rule (2026-08-31): **every run keeps its film.** A recording used to
+   * be evidence of a failure only — a clean pass discarded its film, and the
+   * report's "View actual flow" button existed for a minority of runs. Asked
+   * for universally: the film of the mock user performing the task IS the
+   * evidence a reviewer opens first, pass or fail, so a clean pass now keeps
+   * the whole recording. The cut rules below still apply when something
+   * broke — the film runs from the start (the state leading up to a failure
+   * is most of what makes it diagnosable) and is trimmed only when the
+   * failure was the last filmed moment.
    *
    * The *first* failure, not the last. Once a step has failed the run
    * continues, and everything after it is happening in a state the test no
@@ -3880,10 +4173,12 @@ export class SmartRunner {
       break;
     }
     if (firstBroken === undefined) {
-      // A run rescued mid-flight keeps its WHOLE film: the break and the
-      // rescue are exactly the footage the drift defect asks someone to look
-      // at. A run that passed cleanly still keeps nothing.
-      return sawSuperseded ? 'full' : null;
+      // Nothing broke (or every break was rescued): the whole film is the
+      // record of the task being performed, and it is what "View actual
+      // flow" plays. `sawSuperseded` no longer changes the answer — it is
+      // kept readable above for the cut rules that still need it.
+      void sawSuperseded;
+      return 'full';
     }
     // **The run carried on past the failure, so the film does too.** The
     // "cut at the first broken step" rule was written when a failure ended
@@ -4378,9 +4673,20 @@ export class SmartRunner {
     const deadKey = CacheManager.key(this.page.url(), selector);
     const priorDeadEnd = this.#deadResolutions.get(deadKey);
     if (priorDeadEnd !== undefined) {
+      // A repeated CONTENT mismatch is not a dead end: the element resolves
+      // and the fresh fast attempt above just re-read it. The ladder is still
+      // not repaid — the answer cannot change — but the failure keeps its
+      // content-only classification, so the run stays a VERDICT (`failed` →
+      // the near-miss gate → the judge) instead of a dead-end that buries a
+      // wording question (be100 PL_02_07, live: "Benefit Plans" against a
+      // breadcrumb reading "Benefit Plan Catalog" was retried once, memoed,
+      // and the dead-end status then hid the mismatch from the judge).
       attempts.push(
-        `known dead end: identical failure at step ${priorDeadEnd} on this same page — ` +
-          'not repaid; the page has not changed its answer, fix the flow',
+        priorDeadEnd.contentMiss
+          ? `known content mismatch: step ${priorDeadEnd.step} already read this element on this ` +
+              "same page — not repaid; the text has not changed, and the wording is the judge's to rule on"
+          : `known dead end: identical failure at step ${priorDeadEnd.step} on this same page — ` +
+              'not repaid; the page has not changed its answer, fix the flow',
       );
       throw new StepResolutionError(selector, attempts);
     }
@@ -5417,7 +5723,12 @@ export type FlowStep =
   | { action: 'expectHidden'; selector: string; intent?: string | undefined }
   | { action: 'expectEnabled'; selector: string; intent?: string | undefined }
   | { action: 'expectDisabled'; selector: string; intent?: string | undefined }
-  | { action: 'expectCount'; selector: string; count: number; intent?: string | undefined }
+  | { action: 'expectCount'; selector: string; count: number | string; intent?: string | undefined }
+  // --- cross-surface reconciliation (EN-2 audit): read one surface, compare
+  // on another. `saveCount`/`saveText` write into the run's variable store;
+  // a later expectCount/expectText carries `{{name}}`.
+  | { action: 'saveCount'; selector: string; as: string; intent?: string | undefined }
+  | { action: 'saveText'; selector: string; as: string; intent?: string | undefined }
   | { action: 'expectUrl'; value: string; intent?: string | undefined }
   | { action: 'expectValue'; selector: string; value: string; intent?: string | undefined }
   | {
@@ -5588,8 +5899,15 @@ export interface StepIssue {
  * calling it a test failure would blame the app for the harness's problem.
  */
 function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] {
-  if (error instanceof StepResolutionError) return 'dead-end';
-  if (error instanceof Error && error.cause instanceof StepResolutionError) return 'dead-end';
+  // A content-only resolution failure is a verdict, not a lost control:
+  // every rung resolved the element and only its text missed. `failed` keeps
+  // it eligible for the near-miss gate (proved-? → the judge); `dead-end`
+  // buried wording questions behind a status that reads "the control was
+  // absent" (be100 PL_02_07).
+  if (error instanceof StepResolutionError) return error.contentOnly ? 'failed' : 'dead-end';
+  if (error instanceof Error && error.cause instanceof StepResolutionError) {
+    return error.cause.contentOnly ? 'failed' : 'dead-end';
+  }
   // Harness and grounding facts are errors even under an `expect` name: an
   // unreachable database, an unattached observer, a table the schema does not
   // declare, an unknown {{variable}} nothing saved, an assertion with no
@@ -5706,6 +6024,11 @@ function reconstructionFutile(error: unknown): boolean {
     return true;
   }
   if (!(error instanceof StepResolutionError)) return false;
+  // A content-only miss stays ELIGIBLE for reconstruction on purpose: the
+  // claim survives verbatim, but inserted preparation can make it true (the
+  // canonical rescue — a missing click before an expectText). Only when the
+  // retries run dry does the failure classify `failed` and reach the
+  // near-miss gate and the judge.
   return error.attempts.some(
     (line) =>
       line.startsWith('backend:') ||
@@ -5930,6 +6253,13 @@ async function executeSteps(
   let urlBeforeFills: string | null = null;
   let hydrationReplayed = false;
   for (const raw of steps) {
+    // **The data lock, taken and given back by the steps themselves.** A run
+    // in a parallel suite holds a data section only from the step that
+    // changes it to the last step that still needs the change to hold — see
+    // `cli/data-locks.ts`. This is the only place that blocks, and it blocks
+    // before the step is narrated, so a lane waiting on a section reads as
+    // waiting rather than as a slow step.
+    await runner.dataGate?.before(raw);
     // A step that does not pass no longer aborts the run: it is recorded and
     // classified (fail / error / dead end), and the next step gets its turn.
     // The run reports everything it saw at the end instead of stopping at the
@@ -5961,6 +6291,7 @@ async function executeSteps(
         kind,
         message: error instanceof Error ? error.message : String(error),
       });
+      runner.dataGate?.after(raw);
       continue;
     }
     let plan: FlowStep[] = [original];
@@ -6162,6 +6493,7 @@ async function executeSteps(
       }
       break;
     }
+    runner.dataGate?.after(raw);
   }
 }
 
@@ -6319,8 +6651,24 @@ async function executeStep(
       case 'expectDisabled':
         await runner.expectDisabled(step.selector, step.intent);
         break;
-      case 'expectCount':
-        await runner.expectCount(step.selector, step.count, step.intent);
+      case 'expectCount': {
+        // A string count is a `{{variable}}` already interpolated above — the
+        // saved half of a reconciliation claim. Non-numeric after
+        // interpolation is the flow's fault, said loudly.
+        const n = typeof step.count === 'string' ? Number(step.count.trim()) : step.count;
+        if (!Number.isInteger(n) || n < 0) {
+          throw new Error(
+            `expectCount was given ${JSON.stringify(step.count)}, which is not a whole number after interpolation`,
+          );
+        }
+        await runner.expectCount(step.selector, n, step.intent);
+        break;
+      }
+      case 'saveCount':
+        await runner.saveCount(step.selector, step.as, step.intent);
+        break;
+      case 'saveText':
+        await runner.saveText(step.selector, step.as, step.intent);
         break;
       case 'expectUrl':
         await runner.expectUrl(step.value, step.intent);
@@ -6512,6 +6860,17 @@ export interface RunFlowOptions {
    */
   stepRepair?: FlowRepairModel | null | undefined;
   /**
+   * The suite's step-level data lock for this run — see `data-locks.ts`.
+   *
+   * A **function**, not a gate, because the flow that finally runs is not
+   * always the flow the suite handed over: `--repair` re-authors it between
+   * attempts, and a gate's windows are step identities in one flow's own
+   * objects. Resolving it here, against the flow actually about to run, is
+   * what keeps a repaired attempt locked instead of silently unlocked. A lone
+   * run passes nothing and holds no lock.
+   */
+  dataGate?: ((flow: Flow) => DataGate | null) | null | undefined;
+  /**
    * The auto-review judge: one small `agent`-role call when a run lands on
    * proved-?, ruling it `proved` at `AUTO_PROVE_CONFIDENCE` or better — see
    * `src/engine/review-judge.ts`. Null/absent leaves every proved-? for a
@@ -6606,8 +6965,12 @@ async function executeApiSteps(
   baseUrl: string | undefined,
   issues: StepIssue[],
   bundle?: ProofBundleBuilder,
+  dataGate?: DataGate | null,
 ): Promise<void> {
   for (const step of steps) {
+    // The same step-level data lock the browser path takes — a browser-free
+    // flow writes to the same database as everything else.
+    await dataGate?.before(step);
     // Same run-to-the-end rule as the browser path: a miss is classified and
     // collected, and the next step still runs.
     try {
@@ -6659,6 +7022,8 @@ async function executeApiSteps(
         kind,
         message: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      dataGate?.after(step);
     }
   }
 }
@@ -6690,6 +7055,7 @@ function flowPolarity(flow: Flow): { polarity: TestPolarity; source: 'stated' | 
 export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Promise<ProofBundle> {
   // The browser-free path meters the same way — see `runFlow`.
   const sessionBefore = claudeCliUsage();
+  const quotaBefore = await sessionQuotaPoint();
   const apiPolarity = flowPolarity(flow);
   const bundle = new ProofBundleBuilder({
     name: flow.name,
@@ -6739,17 +7105,21 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
   });
 
   const issues: StepIssue[] = [];
+  // Same per-flow resolution as the browser path: a browser-free flow writes
+  // to the same database and takes the same locks.
+  const gate = options.dataGate?.(flow) ?? null;
   try {
     if (flow.setup?.length) {
-      await executeApiSteps(api, db, flow.setup, flow.baseUrl, issues, bundle);
+      await executeApiSteps(api, db, flow.setup, flow.baseUrl, issues, bundle, gate);
     }
-    await executeApiSteps(api, db, flow.steps, flow.baseUrl, issues, bundle);
+    await executeApiSteps(api, db, flow.steps, flow.baseUrl, issues, bundle, gate);
     // Teardown still always runs — its job is to clean up regardless of how
     // the body went, and that reasoning has nothing to do with browsers.
     if (flow.teardown?.length) {
-      await executeApiSteps(api, db, flow.teardown, flow.baseUrl, issues, bundle);
+      await executeApiSteps(api, db, flow.teardown, flow.baseUrl, issues, bundle, gate);
     }
   } finally {
+    gate?.releaseAll();
     await db.close().catch(() => undefined);
   }
 
@@ -6758,7 +7128,7 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
   // What the person's own Claude session was charged for this run. A delta
   // over the whole run rather than an absolute, so a suite of cases in one
   // process each carry their own share and never the accumulated total.
-  bundle.noteSessionUsage('claude-cli', claudeCliUsageSince(sessionBefore));
+  await noteSessionSpend(bundle, sessionBefore, quotaBefore);
   const sealed = bundle.finish();
 
   if (options.historyPath !== null) {
@@ -6819,7 +7189,11 @@ export async function runFlow(
   // The session meter as it stands BEFORE this run. Everything the run then
   // spends is the difference — which is what makes a suite of cases sharing
   // one process each report their own share rather than the running total.
+  // The quota point beside it, so a cost can be reported WITH how much of
+  // the 5-hour session window the run moved (cached 30 s; null when the
+  // account's quota is unreadable, and then simply absent from the proof).
   const sessionBefore = claudeCliUsage();
+  const quotaBefore = await sessionQuotaPoint();
   // Composition is resolved once, here, so every caller — CLI, MCP, the repair
   // loop — gets it without asking, and everything downstream sees an ordinary
   // flow. `flowDir` is what makes a fragment path relative to the flow that
@@ -6873,6 +7247,9 @@ export async function runFlow(
 
   const healer =
     options.healer !== undefined ? options.healer : (options.makeHealer?.(cache) ?? null);
+
+  // Resolved once, against the flow this run will actually execute.
+  const gate = options.dataGate?.(flow) ?? null;
 
   const polarity = flowPolarity(flow);
   const bundle = new ProofBundleBuilder({
@@ -6930,6 +7307,7 @@ export async function runFlow(
       backend: options.backend,
       declaredRoutes: options.declaredRoutes,
       stepRepair: options.stepRepair,
+      dataGate: gate,
       stepDelayMs: options.stepDelayMs,
       coverage: options.coverage,
       baselineDir: options.baselineDir,
@@ -6948,7 +7326,7 @@ export async function runFlow(
     // history — a launch that failed at attach is a result worth recalling,
     // not a run that never happened.
     bundle.recordRunError(error);
-    bundle.noteSessionUsage('claude-cli', claudeCliUsageSince(sessionBefore));
+    await noteSessionSpend(bundle, sessionBefore, quotaBefore);
     return appendToHistory(bundle.finish(), bundle, options, flow.caseContext);
   }
 
@@ -6959,6 +7337,10 @@ export async function runFlow(
     // A tally of step issues is kept apart from a fatal — see StepIssuesError.
     if (error instanceof StepIssuesError) bundle.recordIssueTally(error.message);
     else bundle.recordRunError(error);
+  } finally {
+    // A run that died mid-window must not take the section down with it: the
+    // lanes waiting on it are other people's verdicts.
+    gate?.releaseAll();
   }
 
   // Bank the session for the suite's later cases — observation-gated: only a
@@ -6979,9 +7361,37 @@ export async function runFlow(
 
   // Recorded before the bundle is sealed by `close()`, so the run's own
   // share of the session meter travels with its proof.
-  bundle.noteSessionUsage('claude-cli', claudeCliUsageSince(sessionBefore));
+  await noteSessionSpend(bundle, sessionBefore, quotaBefore);
   const sealed = await runner.close();
   return appendToHistory(sealed, bundle, options, flow.caseContext);
+}
+
+/**
+ * Record what this run charged the operator's Claude session, WITH where the
+ * 5-hour window stood — a cost figure should never travel without its "and
+ * how much of my session was that" half. The end reading bypasses the quota
+ * cache (a short run would otherwise reread its own start snapshot and
+ * report a 0% move); a run that made no claude calls fetches nothing.
+ */
+async function noteSessionSpend(
+  bundle: ProofBundleBuilder,
+  sessionBefore: ClaudeCliUsage,
+  quotaBefore: SessionQuotaPoint | null,
+): Promise<void> {
+  const spent = claudeCliUsageSince(sessionBefore);
+  if (spent.calls <= 0) return;
+  let quota: { beforePercent: number; afterPercent: number; resetsAt: string | null } | undefined;
+  if (quotaBefore !== null) {
+    const after = await sessionQuotaPoint(process.env, true);
+    if (after !== null) {
+      quota = {
+        beforePercent: quotaBefore.percent,
+        afterPercent: after.percent,
+        resetsAt: after.resetsAt,
+      };
+    }
+  }
+  bundle.noteSessionUsage('claude-cli', spent, quota);
 }
 
 /** The origin a flow tests against — its baseUrl, else its first goto. */
@@ -7017,6 +7427,27 @@ async function appendToHistory(
   // or failed everywhere, both ways at the bar since the gate widened to
   // every wording mismatch — and anything short of the bar leaves the
   // human's queue exactly as it was, with the judge's opinion on `notes`.
+  // **A wording dispute whose expected words are the SHEET's own is a spec
+  // question** (EN-2 audit: 29 of 31 genuine QA fails were deliberate design
+  // vs the sheet, and a binary verdict hid every one). Stamped before the
+  // judge so both surfaces can show it to BA triage whatever the ruling.
+  if (sealed.status === 'needs-review' && typeof caseContext === 'string' && caseContext !== '') {
+    const disputed = sealed.steps.filter((s) => s.unsure !== undefined && !s.superseded);
+    const fromSheet =
+      disputed.length > 0 &&
+      disputed.every((s) => {
+        const expected = s.detail?.['expected'];
+        return typeof expected === 'string' && expected !== '' && caseContext.includes(expected);
+      });
+    if (fromSheet) {
+      sealed.specQuestion = true;
+      sealed.notes = [
+        ...(sealed.notes ?? []),
+        'spec question: every disputed expectation quotes the sheet\'s own wording and the page renders it differently — ' +
+          'deliberate design vs the spec is a BA call, not a machine verdict',
+      ];
+    }
+  }
   if (sealed.status === 'needs-review' && options.reviewJudge) {
     try {
       const pairs = reviewPairs(sealed);
@@ -7027,7 +7458,23 @@ async function appendToHistory(
           caseContext,
           pairs,
         });
-        const ruling = autoReviewRuling(judgement, judge.id);
+        let ruling = autoReviewRuling(judgement, judge.id);
+        // **The judge may not overrule a human record without a person**
+        // (S2 of the 2026-08-28 audit). PL_04_08: the sheet's Actual Result
+        // is Passed — a tester ran it by hand — and the judge ruled "failed"
+        // at 0.9 on "still visible contradicts hidden", never asking whether
+        // "not shown" meant hidden, disabled or inert. A machine ruling that
+        // contradicts a human one is downgraded to the human's queue with
+        // the disagreement named; agreement, and rows with no record, stand.
+        const humanSaid = sealed.generatedBy?.knownResult;
+        if (ruling !== null && humanSaid !== undefined && ruling.verdict !== (humanSaid === 'passed' ? 'proved' : 'failed')) {
+          sealed.notes = [
+            ...(sealed.notes ?? []),
+            `auto-review: ${judge.id} would rule ${ruling.verdict} (confidence ${judgement.confidence.toFixed(2)}) but the sheet's own Actual Result ` +
+              `is ${humanSaid} — a machine may not overrule a human record; left for a person. ${judgement.reasoning.split('\n')[0] ?? ''}`,
+          ];
+          ruling = null;
+        }
         if (ruling !== null) {
           sealed.review = ruling;
           sealed.notes = [

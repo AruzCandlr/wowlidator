@@ -135,7 +135,12 @@ const flowStepSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('expectHidden'), selector: sel, intent }),
   z.object({ action: z.literal('expectEnabled'), selector: sel, intent }),
   z.object({ action: z.literal('expectDisabled'), selector: sel, intent }),
-  z.object({ action: z.literal('expectCount'), selector: sel, count: z.number().int().min(0), intent }),
+  z.object({ action: z.literal('expectCount'), selector: sel, count: z.union([z.number().int().min(0), z.string()]), intent }),
+  // Read a count / an element's text into the run's variable store, for a
+  // later `expectCount`/`expectText` carrying `{{name}}` — how "A matches B"
+  // and "no change after the action" claims are proved (EN-2 audit).
+  z.object({ action: z.literal('saveCount'), selector: sel, as: z.string().min(1), intent }),
+  z.object({ action: z.literal('saveText'), selector: sel, as: z.string().min(1), intent }),
   z.object({ action: z.literal('expectUrl'), value: z.string(), intent }),
   z.object({ action: z.literal('expectValue'), selector: sel, value: z.string(), intent }),
   z.object({

@@ -87,6 +87,14 @@ export interface SuiteLedger {
         claims: string;
         url?: string | undefined;
         repo?: string | undefined;
+        /**
+         * Whether the original pass had the multi-page agent (S8 of the
+         * 2026-08-28 audit). A resume whose config lacks a role the pass
+         * was authored with refuses at the boundary — nine be100 cases
+         * errored one step at a time with "needs the multi-page agent, but
+         * none is configured" on a resume that had silently dropped it.
+         */
+        agent?: boolean | undefined;
       }
     | undefined;
   outcomes: Record<string, LedgerOutcome>;

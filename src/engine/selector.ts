@@ -133,6 +133,16 @@ export function exactTextSelector(selector: string): string | null {
  * skip a redundant retry instead of paying the fast-path timeout twice.
  */
 export function relaxTextSelector(selector: string): string | null {
+  // A chained selector (`text="X" >> nth=0`, the shape a model writes for a
+  // label that appears twice) is relaxed on its HEAD and the chain kept —
+  // 2026-08-28: every `text="…" >> nth=0` used to skip this rung entirely,
+  // because the `>>` refusal below read the chain operator as part of the
+  // text. The refusal still guards text that itself contains `>>`.
+  const chainAt = selector.indexOf('>>');
+  if (chainAt >= 0) {
+    const head = relaxTextSelector(selector.slice(0, chainAt));
+    return head === null ? null : `${head} ${selector.slice(chainAt)}`;
+  }
   const match = /^(\s*text=)(.*)$/s.exec(selector);
   if (!match) return null;
   const body = match[2]!.trim();

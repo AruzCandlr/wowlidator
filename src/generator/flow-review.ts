@@ -264,6 +264,68 @@ export function auditGrounding(
   return findings;
 }
 
+/**
+ * Which findings are worth a model call, and which nothing could settle.
+ *
+ * Measured on be100-rip (2026-08-31): the run's authoring log is a wall of
+ * `the review could not ground it either — No tree captured for this page
+ * state`. Every one of those cost a share of an `agent` call and returned
+ * `unsure`, which changes nothing. They were not the model being unhelpful —
+ * they were unanswerable, and the audit already knows it.
+ *
+ * A **selector** finding is unanswerable when all three hold:
+ *  1. it sits after a `workflow` leg, so no captured tree covers its page;
+ *  2. the evidence carries no repository slice, so there is no source index to
+ *     name the control from either;
+ *  3. the control's own accessible name appears nowhere in the evidence text.
+ *
+ * Under those three, `applyReview` would reject any `replace` (nothing backs
+ * the selector) and any `keep` (the audit already proved nothing backs it),
+ * and the only verdict left is `unsure`. Asking is spending a call to be told
+ * what the audit computed for free.
+ *
+ * **Path findings are always asked**, even after a workflow leg: a route is
+ * settled by the repository's declared patterns or a document sentence, and
+ * needs no tree at all. And a finding stays askable the moment ANY of the
+ * three fails — a repository slice in the evidence, or the name appearing in a
+ * document, is exactly the case where the review earns its keep.
+ */
+export function settleableFindings(
+  findings: readonly ReviewFinding[],
+  evidence: ReviewEvidence,
+): { askable: ReviewFinding[]; unanswerable: ReviewFinding[] } {
+  const hasProjectContext = (evidence.projectContext ?? '').trim() !== '';
+  const text = evidenceText(evidence);
+  const askable: ReviewFinding[] = [];
+  const unanswerable: ReviewFinding[] = [];
+  for (const finding of findings) {
+    const step = finding.step as { selector?: unknown };
+    const isSelector = typeof step.selector === 'string' && step.selector !== '';
+    if (!isSelector || !finding.afterWorkflow || hasProjectContext) {
+      askable.push(finding);
+      continue;
+    }
+    const name = selectorName(step.selector as string);
+    const needle = (name ?? '').trim().toLowerCase();
+    if (needle !== '' && text.includes(needle)) {
+      askable.push(finding);
+      continue;
+    }
+    unanswerable.push(finding);
+  }
+  return { askable, unanswerable };
+}
+
+/** The note an unanswerable finding earns instead of a model call. */
+export function unanswerableNote(finding: ReviewFinding): string {
+  return (
+    `${finding.section}[${finding.index}] ${finding.step.action}: no evidence could settle this — ` +
+    'the step follows a workflow leg so no tree covers its page, the repository index is absent, ' +
+    'and its control is named in no document. A capture of that page, or indexing the repository ' +
+    `(--repo), is what would answer it — not another model call. (${finding.reason})`
+  );
+}
+
 // --- 2. the model -----------------------------------------------------------
 
 const INSERTABLE = new Set(['click', 'waitFor', 'goto', 'press', 'scrollTo', 'clickIfVisible']);
@@ -619,13 +681,42 @@ export class FlowReviewer {
     cases?: readonly { steps: FlowStep[] }[],
   ): Promise<ReviewOutcome> {
     const startedMs = Date.now();
-    const findings = auditGrounding(setup, steps, evidence);
-    if (findings.length === 0) {
+    const audited = auditGrounding(setup, steps, evidence);
+    if (audited.length === 0) {
       this.#onLog?.('review: every step is grounded in the evidence — nothing to ask');
       return { setup, steps, record: null };
     }
+    // Only what some evidence could actually settle is worth a call — see
+    // `settleableFindings`. The rest are reported as what they are: a missing
+    // capture or a missing repository index, which no model call can supply.
+    const { askable: findings, unanswerable } = settleableFindings(audited, evidence);
+    const unanswerableNotes = unanswerable.map(unanswerableNote);
+    for (const line of unanswerableNotes) this.#onLog?.(`  · ${line}`);
+    if (findings.length === 0) {
+      this.#onLog?.(
+        `review: ${unanswerable.length} ungrounded step(s), none of them settleable by any evidence — not asking`,
+      );
+      return {
+        setup,
+        steps,
+        record: {
+          model: this.model.id,
+          flagged: audited.length,
+          replaced: 0,
+          inserted: 0,
+          kept: 0,
+          unsure: unanswerable.length,
+          rejected: [],
+          notes: unanswerableNotes,
+          inputTokens: 0,
+          outputTokens: 0,
+          latencyMs: Date.now() - startedMs,
+        },
+      };
+    }
     this.#onLog?.(
-      `review: ${findings.length} step(s) with nothing behind them — asking the agent role to check them against the codebase and documents…`,
+      `review: ${findings.length} step(s) with nothing behind them — asking the agent role to check them against the codebase and documents…` +
+        (unanswerable.length > 0 ? ` (${unanswerable.length} more no evidence could settle, not asked)` : ''),
     );
     for (const f of findings) this.#onLog?.(`  · ${f.section}[${f.index}] ${f.step.action}: ${f.reason}`);
 
@@ -640,13 +731,16 @@ export class FlowReviewer {
         steps,
         record: {
           model: this.model.id,
-          flagged: findings.length,
+          flagged: audited.length,
           replaced: 0,
           inserted: 0,
           kept: 0,
-          unsure: findings.length,
+          unsure: audited.length,
           rejected: [],
-          notes: [`the authoring review could not run (${why}); ${findings.length} ungrounded step(s) left as authored`],
+          notes: [
+            `the authoring review could not run (${why}); ${findings.length} ungrounded step(s) left as authored`,
+            ...unanswerableNotes,
+          ],
           inputTokens: 0,
           outputTokens: 0,
           latencyMs: Date.now() - startedMs,
@@ -657,6 +751,12 @@ export class FlowReviewer {
     const record: ReviewRecord = {
       model: this.model.id,
       ...applied,
+      // The tally a reader needs is what the AUDIT flagged, and the unsettleable
+      // ones are unsure by construction — reporting only what was asked would
+      // quietly shrink the problem.
+      flagged: audited.length,
+      unsure: applied.unsure + unanswerable.length,
+      notes: [...applied.notes, ...unanswerableNotes],
       inputTokens: response.inputTokens ?? 0,
       outputTokens: response.outputTokens ?? 0,
       latencyMs: Date.now() - startedMs,

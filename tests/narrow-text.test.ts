@@ -345,3 +345,14 @@ describe('narrow-text resolution (CDP)', { skip: skipBrowser }, () => {
     assert.equal(step?.pageContext, undefined);
   });
 });
+
+describe('relaxTextSelector on a chained selector', () => {
+  it('relaxes the head and keeps the chain — `text="X" >> nth=0` used to skip the rung', () => {
+    assert.equal(relaxTextSelector('text="Benefit Plans" >> nth=0'), 'text=Benefit Plans >> nth=0');
+    assert.equal(relaxTextSelector('text="Records" >> visible=true >> nth=0'), 'text=Records >> visible=true >> nth=0');
+    // Text that itself contains the operator stays refused.
+    assert.equal(relaxTextSelector('text="a >> b"'), null);
+    // An unquoted head has nothing to relax, chain or not.
+    assert.equal(relaxTextSelector('text=Records >> nth=0'), null);
+  });
+});

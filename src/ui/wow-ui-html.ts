@@ -60,7 +60,7 @@ import { GRIM_BASE, GRIM_TOKENS } from '../reporter/theme.js';
  * `.drawer` — so the two surfaces can be diffed against each other by anyone
  * who knows either one.
  */
-const WOW_STYLE = `
+export const WOW_STYLE = `
 ${GRIM_TOKENS}
 ${GRIM_BASE}
 
@@ -441,9 +441,9 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 
 /* Live progress. The bar is a run in flight, so it is only ever on screen while
    something is actually moving — there is no finished state to style. */
-.prog { display: flex; align-items: center; gap: var(--s2); min-width: 200px; }
+.prog { display: flex; align-items: center; gap: var(--s3); min-width: 260px; }
 .prog .pbar {
-  position: relative; flex: 1; height: 5px; border-radius: 999px;
+  position: relative; flex: 1; height: 12px; border-radius: 999px;
   background: var(--line); overflow: hidden;
 }
 .prog .pbar i {
@@ -463,14 +463,14 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
   100% { transform: translateX(285%); }
 }
 .prog .eta {
-  display: inline-flex; align-items: center; gap: 4px; white-space: nowrap;
-  font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums;
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-size: var(--fs-md); font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums;
 }
 .prog .eta svg {
-  width: 13px; height: 13px; flex: 0 0 auto; fill: none; stroke: currentColor;
+  width: 16px; height: 16px; flex: 0 0 auto; fill: none; stroke: currentColor;
   stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round;
 }
-.prog .steps { font-size: var(--fs-xs); color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.prog .steps { font-size: var(--fs-sm); color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
 @media (prefers-reduced-motion: reduce) {
   .prog .pbar i { transition: none; }
   .prog .pbar.wait i { animation: none; }
@@ -518,6 +518,15 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .warn-banner b { font-size: var(--fs-sm); color: var(--warn); }
 .warn-banner .fix { display: block; font-size: var(--fs-xs); color: var(--muted); margin-top: var(--s1); line-height: 1.6; }
 .warn-banner .acts { margin-top: var(--s3); display: flex; gap: var(--s2); }
+
+/* The work queue box: a warn-banner whose accent is the ordinary line, not a
+   warning — a queue is a plan, not a problem. */
+.warn-banner.wq { background: var(--panel); border-color: var(--line-strong); }
+.warn-banner.wq b { color: var(--fg); }
+.wq-rows { margin-top: var(--s2); display: flex; flex-direction: column; gap: var(--s1); }
+.wq-row { display: flex; align-items: center; gap: var(--s3); font-size: var(--fs-sm); }
+.wq-id { font-family: var(--mono); }
+.wq-where { color: var(--muted); font-size: var(--fs-xs); flex: 1; }
 
 .filters { display: flex; gap: var(--s2); margin-bottom: var(--s4); flex-wrap: wrap; }
 .f-pill {
@@ -648,9 +657,25 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
 @media (max-width: 900px) {
-  .app { grid-template-columns: 1fr; }
-  .side { display: none; }
+  /* The sidebar becomes a sticky top bar instead of disappearing — hiding it
+     removed ALL navigation on a phone. Labels, footer and the sub-line go;
+     the nav items themselves scroll horizontally. */
+  .app { display: block; }
+  .side {
+    flex-direction: row; align-items: center; overflow-x: auto;
+    min-height: 0; height: auto; z-index: 30;
+    border-right: 0; border-bottom: 1px solid var(--line);
+    padding: var(--s2) var(--s3); gap: var(--s1);
+  }
+  .side .brand { padding: 0 var(--s2) 0 0; flex: 0 0 auto; }
+  .side .brand-sub, .side .nav-label, .side .side-footer { display: none; }
+  .side .nav-item { width: auto; flex: 0 0 auto; height: 30px; white-space: nowrap; }
+  .side .nav-item.active { box-shadow: inset 0 -2px 0 var(--accent); }
   .main { padding: var(--s5) var(--s4) 48px; }
+  /* Wide content scrolls inside its own container; the page never scrolls
+     sideways. display:block on a table keeps its internal layout intact. */
+  .tbl { display: block; overflow-x: auto; }
+  .drawer { width: 100vw; }
   .stats { grid-template-columns: repeat(2, 1fr); }
   .row { grid-template-columns: 54px minmax(0, 1fr); row-gap: 6px; }
   /* Statistics must never be the thing a narrow window cuts: counts and
@@ -670,7 +695,7 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 }
 `;
 
-const WOW_SCRIPT = String.raw`
+export const WOW_SCRIPT = String.raw`
 'use strict';
 
 /* ------------------------------------------------------------------ state */
@@ -698,14 +723,17 @@ function verdictKindOf(x) {
   if (!x || x.quarantined) return null;
   var st = effStatus(x);
   if (isPassing(st)) return 'passed';
-  if (st === 'dead-end') return 'deadEnd';
-  if (st === 'error') return 'error';
+  if (st === 'error') return 'systemError';
   if (st === 'needs-review') return 'needsReview';
-  return 'failed';
+  /* failed and dead-end are ONE family: the subject missed the case's
+     expectation — by contradicting an assertion or by never offering the
+     control/content the flow needed. Mirrors verdictFamily in
+     engine/proof-bundle.ts. */
+  return 'testFailed';
 }
 
 function tallyOf(items) {
-  var counts = { passed: 0, failed: 0, deadEnd: 0, error: 0, needsReview: 0 };
+  var counts = { passed: 0, testFailed: 0, systemError: 0, needsReview: 0 };
   items.forEach(function (x) { var k = verdictKindOf(x); if (k) counts[k] += 1; });
   var total = items.length;
   var out = {};
@@ -715,11 +743,13 @@ function tallyOf(items) {
   return out;
 }
 
-/* "proved 67% (4) · failed 17% (1) · dead-end 17% (1)". Zero buckets are left
-   out except proved, so a clean group reads "proved 100%" and nothing else. */
+/* "proved 67% (4) · test-failed 17% (1) · system error 17% (1)". Zero buckets
+   are left out except proved, so a clean group reads "proved 100%" and
+   nothing else. Red = the subject failed the case; amber = the harness broke
+   and delivered no verdict. */
 var TALLY_LABELS = [
-  ['passed', 'proved', 'ok'], ['failed', 'failed', 'bad'], ['deadEnd', 'dead-end', 'bad'],
-  ['error', 'error', 'warn'], ['needsReview', 'proved-?', 'info']
+  ['passed', 'proved', 'ok'], ['testFailed', 'test-failed', 'bad'],
+  ['systemError', 'system error', 'warn'], ['needsReview', 'proved-?', 'info']
 ];
 function tallyLine(tally, total) {
   var node = el('span', { class: 'pct', title: 'share of the ' + total + ' run(s) in this group' });
@@ -773,7 +803,7 @@ function accuracyLine(items) {
   if (a.scored === 0) return null;
   var node = el('span', {
     class: 'pct',
-    title: 'agreement with the sheet’s recorded Actual Result: verdicts matching what a person found running the same case by hand (' + a.agreed + ' of ' + a.scored + ' recorded case(s); dead-end/error runs deliver no verdict and agree with nothing' + (a.unscored > 0 ? '; ' + a.unscored + ' case(s) have no recorded result and are not scored' : '') + ')'
+    title: 'agreement with the sheet’s recorded Actual Result: verdicts matching what a person found running the same case by hand (' + a.agreed + ' of ' + a.scored + ' recorded case(s); system-error runs deliver no verdict and agree with nothing' + (a.unscored > 0 ? '; ' + a.unscored + ' case(s) have no recorded result and are not scored' : '') + ')'
   });
   var span = el('span', { class: a.percent === 100 ? 'ok' : '' });
   span.appendChild(document.createTextNode('accuracy '));
@@ -865,11 +895,13 @@ var S = {
   openCase: {},      /* 'case:<job>:<n>' -> its output pane is expanded */
   keys: { providers: [], roles: [] },
   models: { providers: [], roles: [], checks: [], checking: [] },  /* the model catalogue, each role's pick, and its last readiness check */
+  claude: null,      /* the claude-* run scripts and the signed-in session's live quota */
   contextDocs: [],   /* stored background documents — see the launcher */
   repos: [],         /* saved repositories (context add) — see Machinery › Repositories */
   bundles: {},       /* runId -> the full bundle, fetched when a run is opened */
   verdicts: {},      /* runId -> the server-computed verdict (same pure function the report leads with) */
   openTask: null,    /* which flow's detail is expanded */
+  openStep: null,    /* 'agent:<runId>:<step>' — a workflow step unfolded in place; its own slot, so opening one never collapses the task around it */
   cycleOf: {},       /* flow name -> the run being shown in its detail */
   filter: 'all',
   runningFor: {},    /* flow name -> job id, for runs started from this page */
@@ -937,6 +969,35 @@ function toast(message) {
   setTimeout(function () { node.remove(); }, 2600);
 }
 
+/* The usage-cap popup, on every view: shown once per trip (keyed on the
+   trip's own timestamp, so a reset-and-retrip pops again), and once as a
+   warning when a window is approaching the cap. Never auto-dismissed — a
+   stop that killed the runs is not a toast. */
+function usageCapPopup() {
+  var cap = S.claude && S.claude.usageCap;
+  if (!cap) return;
+  if (cap.tripped && S.capPopupFor !== cap.tripped.at) {
+    S.capPopupFor = cap.tripped.at;
+    var t = cap.tripped;
+    var overlay = el('div', { class: 'overlay-backdrop' });
+    overlay.appendChild(el('div', { class: 'modal', role: 'alertdialog', 'aria-label': 'Usage cap reached', onclick: function (e) { e.stopPropagation(); } }, [
+      el('h2', { text: 'Usage cap reached' }),
+      el('p', { text: t.reason + ' — every running job was stopped' + (t.stoppedJobs.length ? ' (' + t.stoppedJobs.join(', ') + ')' : '') + ', and new runs are held until the cap is reset.' }),
+      el('p', { class: 'meta', text: (t.resetsAt ? 'The window resets ' + untilTime(t.resetsAt) + '. ' : '') + 'Reset the hold, raise the cap, or turn it off on the Models & keys page.' }),
+      el('div', { style: 'display:flex; gap:8px; justify-content:flex-end; margin-top:12px' }, [
+        el('button', { type: 'button', class: 'btn', text: 'Open Models & keys', onclick: function () { overlay.remove(); S.view = 'keys'; renderSidebar(); render(); } }),
+        el('button', { type: 'button', class: 'btn', text: 'Dismiss', onclick: function () { overlay.remove(); } })
+      ])
+    ]));
+    document.body.appendChild(overlay);
+  } else if (!cap.tripped && cap.nearing && cap.worst && !S.capNearingToastFor) {
+    S.capNearingToastFor = cap.worst.label;
+    toast('approaching the usage cap: ' + cap.worst.label + ' ' + Math.round(cap.worst.percent) + '% of ' + cap.capPercent + '%');
+  } else if (!cap.nearing && !cap.tripped) {
+    S.capNearingToastFor = null;
+  }
+}
+
 function copy(value, what) {
   navigator.clipboard.writeText(value).then(
     function () { toast('copied the ' + what); },
@@ -978,6 +1039,38 @@ function tail(path) {
    opposite: "the application refused it, as required". Rendered for both
    readings — a reader scanning a mixed catalog needs the positives labelled
    too, or absence is ambiguous. */
+/* A case that ran once because the pre-run judge put its dead-end risk above
+   the line: the verdict is real, the retries were withheld, and the row says
+   so rather than looking like every other run. */
+/* The sheet's wording vs the page's rendering — a BA call, not a machine
+   verdict (EN-2: 29 of 31 real QA fails were this class). Rendered wherever
+   the run is listed, so triage can filter for it. */
+function specTag(specQuestion) {
+  if (!specQuestion) return null;
+  return el('span', {
+    class: 'chip doubt', style: 'margin-left:6px',
+    title: 'spec question: every disputed expectation quotes the sheet’s own wording and the page renders it differently — deliberate design vs the spec; BA triage decides',
+    text: 'spec?'
+  });
+}
+
+function riskTag(risk) {
+  if (!risk || risk.verdict !== 'fail-fast') return null;
+  var de = Math.round(risk.likelihood * 100);
+  var fl = Math.round((risk.failLikelihood || 0) * 100);
+  // Name the dimension that tripped: a near-certain dead-end and a
+  // near-certain genuine fail are different facts with the same consequence.
+  var byFail = fl > de;
+  return el('span', {
+    class: 'tag', style: 'margin-left:6px;color:var(--warn)',
+    title: (byFail
+      ? 'pre-run expected-fail risk ' + fl + '% (the evidence says the app does not satisfy this claim — a fail retries only re-prove)'
+      : 'pre-run dead-end risk ' + de + '%')
+      + ' — ran once with no healer, no agent, no reconstruction, no repair' + (risk.reason ? ': ' + risk.reason : ''),
+    text: (byFail ? 'fail-fast (expected fail) ' + fl : 'fail-fast ' + de) + '%'
+  });
+}
+
 function polarityTag(polarity, source) {
   if (!polarity) return null;
   var negative = polarity === 'negative';
@@ -1252,9 +1345,11 @@ function paintProgress(live, job, age) {
     var pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
     live.bar.classList.remove('wait');
     live.fill.style.width = pct + '%';
-    // tqdm's readout, ticking locally between polls: elapsed from the job's
-    // own start time, remaining counted down by "age" like the eta text.
-    var elapsedMs = Math.max(0, Date.now() - new Date(job.startedAt).getTime());
+    // tqdm's readout, ticking locally between polls: elapsed from this unit's
+    // OWN start (a case's "started" line, carried as progress.startedMs) —
+    // falling back to the job's — and remaining counted down by "age".
+    var baseMs = (progress && typeof progress.startedMs === 'number') ? progress.startedMs : 0;
+    var elapsedMs = Math.max(0, Date.now() - new Date(job.startedAt).getTime() - baseMs);
     var leftNow = progress.etaMs === null || progress.etaMs === undefined ? null : Math.max(0, progress.etaMs - age);
     var readout = done > 0 ? tqdmReadout(done, total, elapsedMs, leftNow, progress.rateMsPerStep) : null;
     live.steps.textContent = readout !== null ? readout : pct + '% · ' + done + ' / ' + total + ' steps';
@@ -1473,6 +1568,12 @@ function renderRuns(main) {
   }
 
   main.appendChild(statsStrip());
+
+  // The work queue, when anything is in it: cases waiting to be re-authored
+  // from their sheet rows. Rendered above the catalog banners so what is
+  // ABOUT to run sits beside what already ran.
+  var wq = workQueueBox();
+  if (wq) main.appendChild(wq);
 
   // A catalog run that ended before every case had a verdict — stopped,
   // killed, paused, or blocked on the machinery — says why and offers to
@@ -1735,7 +1836,7 @@ function taskRow(task) {
   else if (latest.status === 'needs-review' && latest.review) chip = verdictChip(latestEff === 'passed' ? 'verified' : 'feedback', latestEff === 'passed' ? 'proved (human-confirmed)' : 'failed (human-confirmed)');
   else if (escalated) chip = verdictChip('escalated', 'needs a human');
   else if (latest.status === 'passed-with-issues') chip = verdictChip('doubt', 'pass**');
-  else if (!isPassing(latest.status)) chip = verdictChip('feedback', latest.status);
+  else if (!isPassing(latest.status)) chip = familyChip(latest.status);
   else if (latest.quarantined) chip = verdictChip('blocked', 'quarantined');
   else {
     chip = verdictChip('verified', latest.coverage === null
@@ -1786,15 +1887,46 @@ function taskRow(task) {
        control plane did; this says what it cost the account they can go and
        check. Only ever this run share — the meter is read as a delta. */
     if (latest.session && latest.session.calls > 0) {
+      /* The cost never travels alone: when the run recorded where the 5-hour
+         session window stood, the chip says what the run moved it by and
+         where it stands now — the "% of my session" half of every dollar. */
+      var q = latest.session.quota;
+      var quotaText = '';
+      var quotaTitle = '';
+      if (q) {
+        var moved = Math.max(0, Math.round(q.afterPercent - q.beforePercent));
+        quotaText = ' · 5h ' + Math.round(q.afterPercent) + '%' + (moved > 0 ? ' (+' + moved + '%)' : '');
+        quotaTitle = ' — session window ' + Math.round(q.beforePercent) + '% → ' + Math.round(q.afterPercent)
+          + '% used' + (moved > 0 ? ' (+' + moved + '% by this run)' : ' (no visible move)');
+      }
       counts.appendChild(document.createTextNode(' · '));
       counts.appendChild(el('b', {
         style: 'color:var(--accent)',
         title: latest.session.calls + ' ' + latest.session.provider + ' call(s) for this run — '
           + fmtTok(latest.session.inputTokens) + ' in (' + fmtTok(latest.session.cachedInputTokens)
           + ' of it served from cache, billed at a fraction) / ' + fmtTok(latest.session.outputTokens)
-          + ' out, ' + fmtMs(latest.session.wallMs) + ' spent inside the provider',
-        text: '$' + latest.session.costUsd.toFixed(2) + ' session'
+          + ' out, ' + fmtMs(latest.session.wallMs) + ' spent inside the provider' + quotaTitle,
+        text: '$' + latest.session.costUsd.toFixed(2) + ' session' + quotaText
       }));
+      /* Who spent it: authoring vs repair vs the agent, per flow. Only roles
+         that actually called appear; bundles from before the split have none. */
+      if (latest.session.byRole) {
+        var roleLabels = { generator: 'author', healer: 'heal', agent: 'agent', data: 'data' };
+        var parts = [];
+        for (var roleName in latest.session.byRole) {
+          var spend = latest.session.byRole[roleName];
+          if (!spend || !(spend.calls > 0)) continue;
+          parts.push((roleLabels[roleName] || roleName) + ' $' + spend.costUsd.toFixed(2)
+            + ' (' + spend.calls + ')');
+        }
+        if (parts.length > 0) {
+          counts.appendChild(el('span', {
+            class: 'dim',
+            title: 'this flow\'s claude spend by role — calls in parentheses',
+            text: ' — ' + parts.join(' · ')
+          }));
+        }
+      }
     }
   }
 
@@ -1814,7 +1946,9 @@ function taskRow(task) {
     el('div', { class: 'task-cell' }, [
       el('div', { class: 'task-name' }, [
         document.createTextNode(task.name),
-        polarityTag(latest.polarity, latest.polaritySource)
+        polarityTag(latest.polarity, latest.polaritySource),
+        riskTag(latest.risk),
+        specTag(latest.specQuestion)
       ]),
       sub
     ]),
@@ -1831,6 +1965,20 @@ function taskRow(task) {
         disabled: isRunning || !flowPath || latest.status !== 'failed',
         title: latest.status !== 'failed' ? 'nothing failed — there is nothing to repair' : runAgainTitle,
         text: 'Repair', onclick: function () { startRun(task.key, { flow: flowPath, repair: true }); }
+      }),
+      el('button', {
+        type: 'button', class: 'btn',
+        disabled: isRunning || !caseIdOfName(task.name) || !ledgerForCase(caseIdOfName(task.name)),
+        title: !caseIdOfName(task.name) || !ledgerForCase(caseIdOfName(task.name))
+          ? 'only a case a catalog run plans can be re-authored from its sheet row'
+          : 'Clear this case\'s verdict and re-author it from its sheet row — a FRESH flow on the current code — then run it. Asks before doing anything.',
+        text: 'Re-author', onclick: function () { reauthorCase(caseIdOfName(task.name)); }
+      }),
+      el('button', {
+        type: 'button', class: 'btn',
+        disabled: !caseIdOfName(task.name),
+        title: 'Add this case to the work queue — queued cases are re-authored from their sheet rows and run together. Asks before adding.',
+        text: 'Queue', onclick: function () { queueAdd(caseIdOfName(task.name)); }
       })
     ])
   ]);
@@ -1913,6 +2061,8 @@ function taskDetail(task) {
     if (review) detail.appendChild(review);
     var why = whyBlock(bundle);
     if (why) detail.appendChild(why);
+    var noteBox = notesBlock(bundle);
+    if (noteBox) detail.appendChild(noteBox);
   }
 
   // The console output of the job that produced this run, collapsed under the
@@ -1938,8 +2088,15 @@ function taskDetail(task) {
             : 'the .flow.json for this run is not visible from here',
           onclick: function () { startRun(task.key, { flow: flowPath, video: 'always' }); }
         }),
+    // The report BEFORE the bundle, and accented: the rendered document is what
+    // a person came to read, and every one of these buttons used to open raw
+    // JSON instead. Absent only when no report was written for the run.
+    card.reportPath && el('button', {
+      type: 'button', class: 'btn accent', text: 'Open the report',
+      onclick: function () { window.open('/view?path=' + encodeURIComponent(card.reportPath), '_blank'); }
+    }),
     el('button', {
-      type: 'button', class: 'btn accent', text: 'Open the raw proof',
+      type: 'button', class: card.reportPath ? 'btn' : 'btn accent', text: 'Open the raw proof',
       onclick: function () { window.open('/view?path=' + encodeURIComponent(card.path), '_blank'); }
     }),
     el('button', {
@@ -2028,12 +2185,33 @@ function caseSections(job) {
   return wrap;
 }
 
+/* The two verdict families, as a chip (src/ui/CLAUDE.md, "Two verdict
+   families"): TEST FAILED, red — the subject missed the case's expectation,
+   covering "failed" and "dead-end"; SYSTEM ERROR, amber — the harness broke
+   with no verdict delivered. The mechanism stays in the parenthesis and the
+   title carries the machine status, so nothing is lost, only un-perplexed. */
+function familyLabel(status) {
+  if (status === 'error') return 'system error';
+  if (status === 'dead-end') return 'test failed (dead-end)';
+  if (status === 'failed') return 'test failed';
+  return status;
+}
+function familyChip(status) {
+  var chip = verdictChip(status === 'error' ? 'feedback' : 'escalated', familyLabel(status));
+  chip.title = status === 'error'
+    ? 'status: error — the harness or its models broke; no verdict about the application'
+    : 'status: ' + status + ' — ' + (status === 'dead-end' ? 'a control or content the case needed never resolved' : 'a claim was false in the application');
+  return chip;
+}
+
 /* What a status is called on screen. 'passed-with-issues' IS a pass; the
    asterisks point at the broken action step, and nothing about validation
    changes. 'error' is the machinery, never a verdict about the application. */
 function caseLabel(status) {
   if (status === 'passed-with-issues') return 'pass**';
-  if (status === 'error') return 'runtime error';
+  if (status === 'error') return 'system error';
+  if (status === 'failed') return 'test failed';
+  if (status === 'dead-end') return 'test failed (dead-end)';
   return status;
 }
 
@@ -2346,11 +2524,29 @@ function claimsSummary(bundle) {
    leads with, served alongside the bundle so the two surfaces cannot disagree
    about the same run. Rendered only for failed / error / dead-end: a green
    run's why is the table itself. */
+/* Everything the run wrote onto bundle.notes, verbatim: the pre-run risk
+   line, the system-error diagnosis, an auto-review ruling, the session note,
+   an authoring coverage warning ("Expected line(s) … have no assertion").
+   These were reachable only in the run log before; the card is where a
+   person actually reads a run. */
+function notesBlock(bundle) {
+  var notes = bundle.notes || [];
+  if (notes.length === 0) return null;
+  var box = el('div', { class: 'why-block notes-block' });
+  box.appendChild(el('div', { class: 'cap', text: 'Run notes (' + notes.length + ')' }));
+  notes.forEach(function (line) {
+    box.appendChild(el('div', { class: 'why-line muted2', text: line }));
+  });
+  return box;
+}
+
 function whyBlock(bundle) {
   if (bundle.status !== 'failed' && bundle.status !== 'error' && bundle.status !== 'dead-end') return null;
   var verdict = S.verdicts[bundle.runId];
   var box = el('div', { class: 'why-block' });
-  box.appendChild(el('div', { class: 'cap', text: 'Why it ' + (bundle.status === 'failed' ? 'failed' : bundle.status === 'dead-end' ? 'dead-ended' : 'errored') }));
+  box.appendChild(el('div', { class: 'cap', text: bundle.status === 'error'
+    ? 'Why the system errored (no verdict on the application)'
+    : 'Why the test failed' + (bundle.status === 'dead-end' ? ' (a control the case needed never resolved)' : '') }));
   if (verdict) {
     box.appendChild(el('div', { class: 'why-headline', text: verdict.headline }));
     if (verdict.what) box.appendChild(el('div', { class: 'why-line', text: verdict.what }));
@@ -2364,6 +2560,13 @@ function whyBlock(bundle) {
     // build (or a fetch that failed) still gets the honest floor.
     var step = (bundle.steps || []).filter(function (s) { return s.status !== 'passed' && !s.superseded; })[0];
     box.appendChild(el('div', { class: 'why-line', text: bundle.error || (step ? stepClaim(step) + ' \u2014 ' + ((step.error || '').split('\n')[0] || 'did not hold') : 'the run did not complete') }));
+  }
+  /* The system-error diagnosis, when the judge ran: which layer broke and the
+     fix, so "system error" stops meaning "re-run it and see". */
+  if (bundle.diagnosis) {
+    var dg = bundle.diagnosis;
+    box.appendChild(el('div', { class: 'why-line', text: 'Diagnosed: ' + dg.origin + ' (' + Math.round(dg.confidence * 100) + '%) — ' + dg.reasoning }));
+    box.appendChild(el('div', { class: 'why-line' + (dg.fix ? '' : ' muted2'), text: dg.fix ? 'Suggested fix: ' + dg.fix : 'No fix available from the evidence.' }));
   }
   return box;
 }
@@ -2511,14 +2714,14 @@ function checksTable(bundle) {
        the same evidence the drawer's Trace tab holds. */
     var acts = (step.agent && step.agent.actions) || [];
     var expandKey = 'agent:' + bundle.runId + ':' + step.index;
-    var expanded = S.openTask === expandKey;
+    var expanded = S.openStep === expandKey;
     var lastCell = el('td', { class: 'col-r' }, [
       step.agent
         ? el('button', {
             type: 'button', class: 'link',
             title: 'the agent drove the browser here — see every action it took',
             text: (expanded ? '▾ ' : '▸ ') + acts.length + ' agent action' + (acts.length === 1 ? '' : 's'),
-            onclick: function () { S.openTask = expanded ? null : expandKey; render(); }
+            onclick: function () { S.openStep = expanded ? null : expandKey; render(); }
           })
         : null,
       el('button', { type: 'button', class: 'link', text: 'See evidence', onclick: function () { openEvidence(bundle, step, null); } })
@@ -3100,13 +3303,17 @@ function appendHistoryRow(rows, card) {
           ? verdictChip('verified', card.quarantined ? 'quarantined' : 'proved')
           : card.status === 'passed-with-issues'
             ? verdictChip('doubt', 'pass**')
-            : verdictChip('feedback', 'failed'),
+            : familyChip(card.status),
       el('span', { class: 'counts' }, [
         el('b', { text: String(card.passed) }),
         document.createTextNode(' / ' + card.totalSteps + ' steps')
       ]),
       el('span', { class: 'when', text: timeAgo(card.finishedAt) }),
       el('div', { class: 'actions', onclick: function (e) { e.stopPropagation(); } }, [
+        card.reportPath && el('button', {
+          type: 'button', class: 'btn', text: 'Report',
+          onclick: function () { window.open('/view?path=' + encodeURIComponent(card.reportPath), '_blank'); }
+        }),
         el('button', {
           type: 'button', class: 'btn', text: 'Raw proof',
           onclick: function () { window.open('/view?path=' + encodeURIComponent(card.path), '_blank'); }
@@ -3116,7 +3323,7 @@ function appendHistoryRow(rows, card) {
     if (open) {
       var bundle = S.bundles[card.runId];
       rows.appendChild(el('div', { class: 'detail' }, bundle
-        ? [claimsSummary(bundle), checksTable(bundle), reviewBlock(bundle), whyBlock(bundle)].filter(Boolean)
+        ? [claimsSummary(bundle), checksTable(bundle), reviewBlock(bundle), whyBlock(bundle), notesBlock(bundle)].filter(Boolean)
         : [el('div', { class: 'mono', style: 'padding:12px', text: 'reading the proof bundle…' })]));
     }
   }
@@ -3288,6 +3495,12 @@ function renderAttention(main) {
         onclick: function () { S.openTask = item.task.key; show('runs'); loadBundle(item.task.latest.runId).then(render); }
       }));
     } else {
+      if (item.card.reportPath) {
+        acts.appendChild(el('button', {
+          type: 'button', class: 'btn', text: 'Open the report',
+          onclick: function () { window.open('/view?path=' + encodeURIComponent(item.card.reportPath), '_blank'); }
+        }));
+      }
       acts.appendChild(el('button', {
         type: 'button', class: 'btn', text: 'Open the raw proof',
         onclick: function () { window.open('/view?path=' + encodeURIComponent(item.card.path), '_blank'); }
@@ -3722,6 +3935,7 @@ function renderKeys(main) {
     main.appendChild(section);
   });
 
+  renderClaudeSection(main);
   renderDbSection(main);
 
   main.appendChild(el('div', { class: 'box', style: 'text-align:left;margin-top:8px' }, [
@@ -3734,6 +3948,324 @@ function renderKeys(main) {
       document.createTextNode('When a call comes back unauthorised, out of quota or rate-limited, wowlidator moves to the next key for that provider and carries on — for every role sharing it, so a dead key is only discovered once. It stays there; it never goes back to re-probe a key it already knows is dead. Each move is printed into the run’s output, so the run drawer is where you see one happen. A failure that is not about the key — a model that cannot emit JSON, a malformed prompt — never rotates, because spending a second key on a call that was never going to work would only hide which model failed.')
     ])
   ]));
+}
+
+/** How long until an ISO time, for a quota reset — '2h 10m', 'in the past'. */
+function untilTime(iso) {
+  if (!iso) return '';
+  var ms = new Date(iso).getTime() - Date.now();
+  if (!isFinite(ms)) return '';
+  if (ms <= 0) return 'resetting now';
+  var minutes = Math.round(ms / 60000);
+  if (minutes < 60) return 'resets in ' + minutes + 'm';
+  if (minutes < 48 * 60) return 'resets in ' + Math.floor(minutes / 60) + 'h ' + (minutes % 60) + 'm';
+  return 'resets in ' + Math.round(minutes / (24 * 60)) + 'd';
+}
+
+/**
+ * The Claude session card: the signed-in account's live quota — per limit
+ * window, including the rows scoped to one model type — and the run script
+ * behind each claude-* provider, editable. Quota is read from the same
+ * endpoint Claude Code's own /usage reads; the credential never reaches this
+ * page in any form. Run-script edits persist to .env at once (a binary path
+ * that evaporates on restart is not a setting) and apply from the next run.
+ */
+/* The machinery gates: every on/off that shapes a run — the scenario gate,
+   data sections, the governor, the risk judge, diagnosis, the auto-review
+   judge. A flip persists to .env and the panel's own env, so the NEXT run
+   inherits it; the run already in flight keeps the gates it started with,
+   and the card says so. The allowlist is the server's (ui/gates.ts). */
+function renderGatesBlock(card) {
+  card.appendChild(el('div', { style: 'font-weight:600; margin:14px 0 8px', text: 'Run gates' }));
+  var host = el('div', {});
+  card.appendChild(host);
+  host.appendChild(el('div', { class: 'mono', text: 'reading…' }));
+  api('/api/gates').then(function (b) {
+    while (host.firstChild) host.removeChild(host.firstChild);
+    (b.gates || []).forEach(function (gate) {
+      var toggle = el('input', { type: 'checkbox', id: 'gate-' + gate.env });
+      toggle.checked = !!gate.on;
+      toggle.onchange = function () {
+        api('/api/gates', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ env: gate.env, on: toggle.checked })
+        }).then(function () {
+          toast(gate.label + (toggle.checked ? ' on' : ' off') + ' — applies from the next run');
+        })['catch'](function (e) { toast(e.message); toggle.checked = !toggle.checked; });
+      };
+      host.appendChild(el('div', { style: 'display:flex; align-items:flex-start; gap:8px; margin:6px 0' }, [
+        toggle,
+        el('label', { for: 'gate-' + gate.env }, [
+          el('span', { text: gate.label + ' ' }),
+          el('span', { class: 'mono', style: 'color:var(--muted); font-size:var(--fs-xs)', text: '(' + gate.env + ')' }),
+          el('div', { class: 'picker-note', text: gate.help })
+        ])
+      ]));
+    });
+    (b.dials || []).forEach(function (dial) {
+      var num = el('input', {
+        type: 'number', min: String(dial.min), max: String(dial.max), step: '1', class: 'mono',
+        style: 'width:4.5em', value: String(dial.value), 'aria-label': dial.label
+      });
+      host.appendChild(el('div', { style: 'display:flex; align-items:flex-start; gap:8px; margin:10px 0 6px' }, [
+        num,
+        el('label', {}, [
+          el('span', { text: dial.label + ' ' }),
+          el('span', { class: 'mono', style: 'color:var(--muted); font-size:var(--fs-xs)', text: '(' + dial.env + ')' }),
+          el('div', { class: 'picker-note', text: dial.help })
+        ]),
+        el('button', {
+          type: 'button', class: 'btn', text: 'Save',
+          onclick: function () {
+            api('/api/gates', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ env: dial.env, value: Number(num.value) })
+            }).then(function () { toast(dial.label + ' = ' + num.value + ' — applies from the next run'); })
+              ['catch'](function (e) { toast(e.message); });
+          }
+        })
+      ]));
+    });
+    host.appendChild(el('div', { class: 'picker-note', text: 'A change applies from the next run the panel starts — a suite already in flight keeps the gates it launched with.' }));
+  })['catch'](function (e) {
+    while (host.firstChild) host.removeChild(host.firstChild);
+    host.appendChild(el('div', { class: 'mono', text: 'gates unavailable: ' + e.message }));
+  });
+}
+
+/* The usage cap controls: on/off, the percent, what stands where against it,
+   and — while tripped — the hold with its Reset. The rule is the server's
+   (providers/usage-cap.ts); this only shows and edits it. */
+function renderUsageCapBlock(card, cap) {
+  card.appendChild(el('div', { style: 'font-weight:600; margin:14px 0 8px', text: 'Usage cap' }));
+  if (!cap) {
+    card.appendChild(el('div', { class: 'mono', text: 'reading…' }));
+    return;
+  }
+  var save = function (edit, done) {
+    api('/api/usage-cap', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(edit)
+    }).then(function () { toast(done); refresh(); })['catch'](function (e) { toast(e.message); });
+  };
+  var toggle = el('input', { type: 'checkbox', id: 'usage-cap-on' });
+  toggle.checked = !!cap.enabled;
+  toggle.onchange = function () { save({ enabled: toggle.checked }, toggle.checked ? 'usage cap on' : 'usage cap off'); };
+  var pct = el('input', {
+    type: 'number', min: '1', max: '100', step: '1', class: 'mono',
+    style: 'width:5em', value: String(cap.capPercent), 'aria-label': 'cap percent'
+  });
+  card.appendChild(el('div', { style: 'display:flex; align-items:center; gap:10px; flex-wrap:wrap' }, [
+    el('label', { for: 'usage-cap-on', style: 'display:flex; align-items:center; gap:6px' }, [toggle, el('span', { text: 'stop everything when any window reaches' })]),
+    pct,
+    el('span', { text: '%' }),
+    el('button', { type: 'button', class: 'btn', text: 'Save cap', onclick: function () { save({ capPercent: pct.value }, 'cap saved at ' + pct.value + '%'); } })
+  ]));
+  var standing = cap.worst
+    ? 'highest window now: ' + cap.worst.label + ' ' + Math.round(cap.worst.percent) + '% of ' + cap.capPercent + '%'
+      + (cap.worst.resetsAt ? ' · resets ' + untilTime(cap.worst.resetsAt) : '')
+    : (cap.note || 'no window reported yet');
+  card.appendChild(el('div', {
+    class: 'mono',
+    style: cap.tripped ? 'color:var(--red, #c0392b)' : cap.nearing ? 'color:var(--amber, #b8860b)' : '',
+    text: (cap.enabled ? (cap.tripped ? 'TRIPPED — ' : cap.nearing ? 'approaching — ' : 'armed — ') : 'off — ') + standing
+  }));
+  if (cap.tripped) {
+    var t = cap.tripped;
+    card.appendChild(el('div', { class: 'card', style: 'padding:10px 14px; margin-top:8px; border-color:var(--red, #c0392b)' }, [
+      el('div', { style: 'font-weight:600', text: 'Usage cap reached: ' + t.reason }),
+      el('div', { class: 'meta', text: 'at ' + timeAgo(t.at) + ' — stopped ' + t.stoppedJobs.length + ' job(s)' + (t.stoppedJobs.length ? ': ' + t.stoppedJobs.join(', ') : '') + '. New runs are held until you reset.' + (t.resetsAt ? ' The window resets ' + untilTime(t.resetsAt) + '.' : '') }),
+      el('div', { style: 'margin-top:8px; display:flex; gap:8px' }, [
+        el('button', { type: 'button', class: 'btn', text: 'Reset hold', onclick: function () {
+          api('/api/usage-cap/reset', { method: 'POST' }).then(function (b) {
+            toast(b.tripped ? 'still over the cap — raise it, turn it off, or wait for the reset' : 'hold lifted');
+            refresh();
+          })['catch'](function (e) { toast(e.message); });
+        } })
+      ])
+    ]));
+  }
+  card.appendChild(el('div', {
+    class: 'picker-note',
+    text: 'Compared against every window above (session, week, week per model). When one reaches the cap, every job this panel is running is stopped, new runs are refused, and a run started from a terminal refuses its next claude call. Saved to .env as ' + cap.envVars.enabled + ' / ' + cap.envVars.percent + '.'
+  }));
+}
+
+function renderClaudeSection(main) {
+  var claude = S.claude;
+  var section = el('section', { class: 'group' });
+  section.appendChild(el('div', { class: 'group-head' }, [
+    el('span', { class: 'avatar', text: 'C' }),
+    el('b', { text: 'Claude session' }),
+    el('span', { class: 'mono', text: 'claude-cli · claude-tty · claude-cloud' }),
+    el('span', { class: 'meta', style: 'margin-left:auto', text: 'billed to the session signed in on this machine — quota and run script' })
+  ]));
+
+  var card = el('div', { class: 'card', style: 'padding:16px 20px' });
+  if (!claude) {
+    card.appendChild(el('div', { class: 'mono', text: 'reading…' }));
+    section.appendChild(card);
+    main.appendChild(section);
+    return;
+  }
+
+  /* --- live quota, one row per limit window (session, week, week-per-model) --- */
+  var quota = claude.quota || { limits: [], note: '' };
+  card.appendChild(el('div', { style: 'font-weight:600; margin-bottom:8px', text: 'Quota right now' }));
+  if ((quota.limits || []).length === 0) {
+    card.appendChild(el('div', { class: 'mono', text: quota.note || 'no quota information available' }));
+  } else {
+    quota.limits.forEach(function (limit) {
+      var pct = Math.max(0, Math.min(100, Math.round(limit.percent)));
+      var tone = limit.severity !== 'normal' || pct >= 90 ? 'var(--red, #c0392b)'
+        : pct >= 70 ? 'var(--amber, #b8860b)' : 'var(--accent)';
+      card.appendChild(el('div', { style: 'display:flex; align-items:center; gap:10px; margin:4px 0' }, [
+        el('span', { class: 'mono', style: 'flex:0 0 11em', text: limit.label }),
+        el('div', { style: 'flex:1 1 auto; height:6px; border-radius:3px; background:color-mix(in srgb, currentColor 12%, transparent); overflow:hidden' }, [
+          el('div', { style: 'height:100%; width:' + pct + '%; background:' + tone })
+        ]),
+        el('span', { class: 'mono', style: 'flex:0 0 4em; text-align:right', text: pct + '%' + (limit.severity !== 'normal' ? ' !' : '') }),
+        el('span', { class: 'meta', style: 'flex:0 0 10em', text: untilTime(limit.resetsAt) })
+      ]));
+    });
+    card.appendChild(el('div', {
+      class: 'picker-note',
+      text: 'used, per window — the rows named after a model are that model type’s own weekly limit. Read while claude-cli / claude-tty / claude-cloud runs spend from it; refreshed about every 30s, and printed into the run’s output beside each claude call.'
+    }));
+  }
+
+  /* --- the usage cap: a hard stop at N% of any window ---------------------- */
+  renderUsageCapBlock(card, claude.usageCap);
+
+  /* --- the run gates: scenario gate, sections, governor, judges ------------ */
+  renderGatesBlock(card);
+
+  /* --- the claude -p ledger: every claude-cli call, across processes ------- */
+  var cli = claude.cliUsage;
+  card.appendChild(el('div', { style: 'font-weight:600; margin:14px 0 8px', text: 'claude -p usage' }));
+  if (cli && !cli.enabled) {
+    card.appendChild(el('div', { class: 'mono', text: 'tracking is off (WOWLIDATOR_CLAUDE_CLI_USAGE=off)' }));
+  } else if (!cli || !cli.total || cli.total.calls === 0) {
+    card.appendChild(el('div', { class: 'mono', text: 'no claude -p calls recorded yet — rows appear as claude-cli runs spend' }));
+  } else {
+    var fmtUsd = function (v) { return '$' + (v >= 1 ? v.toFixed(2) : v.toFixed(3)); };
+    var usageLine = function (label, u) {
+      return el('div', { style: 'display:flex; gap:14px; margin:3px 0' }, [
+        el('span', { class: 'mono', style: 'flex:0 0 11em', text: label }),
+        el('span', { class: 'mono', text: fmtInt(u.calls) + ' call(s)' + (u.warmCalls > 0 ? ' (' + fmtInt(u.warmCalls) + ' warm)' : '') }),
+        el('span', { class: 'mono', text: fmtInt(u.inputTokens + u.cachedInputTokens) + ' in / ' + fmtInt(u.outputTokens) + ' out tok' }),
+        el('span', { class: 'mono', text: fmtUsd(u.costUsd) })
+      ]);
+    };
+    card.appendChild(usageLine('today (UTC)', cli.today));
+    card.appendChild(usageLine('all-time', cli.total));
+    (cli.byModel || []).forEach(function (m) {
+      card.appendChild(usageLine('· ' + m.modelId, m));
+    });
+    card.appendChild(el('div', {
+      class: 'picker-note',
+      text: 'one row per claude -p call, from every process run in this directory — the ledger at ' + cli.path + (cli.lastCallAt ? ' · last call ' + timeAgo(cli.lastCallAt) : '')
+    }));
+  }
+  section.appendChild(card);
+
+  /* --- the run script behind each claude provider, editable ---------------- */
+  (claude.runScripts || []).forEach(function (script) {
+    var row = el('div', { class: 'card', style: 'padding:16px 20px; margin-top:10px' });
+    row.appendChild(el('div', { style: 'display:flex; align-items:baseline; gap:10px' }, [
+      el('span', { style: 'font-weight:600', text: script.provider }),
+      el('span', {
+        class: 'meta',
+        text: script.roles.length > 0 ? 'used by ' + script.roles.join(', ') : 'no role points here'
+      })
+    ]));
+    row.appendChild(el('div', {
+      class: 'mono',
+      style: 'margin:8px 0; overflow-x:auto; white-space:nowrap',
+      title: 'the command this provider launches — <model>, <effort> and friends are filled per role and per call',
+      text: script.commandLine
+    }));
+    if (script.error) {
+      row.appendChild(el('div', { class: 'mono', style: 'color:var(--red, #c0392b)', text: script.error }));
+    }
+
+    /* claude-cli's command is hardcoded in the source, by request — the row
+       shows what runs and where to change it, and offers no fields that
+       would pretend otherwise. */
+    if (script.hardcoded) {
+      row.appendChild(el('div', {
+        class: 'picker-note',
+        text: 'this command is hardcoded — edit the args array in src/providers/claude-cli.ts (one-shot) and src/providers/claude-cli-session.ts (warm session), then restart runs. WOWLIDATOR_CLAUDE_CLI_WARM=0 keeps only the one-shot vector in play.'
+      }));
+      section.appendChild(row);
+      return;
+    }
+
+    var binary = el('input', {
+      class: 'inp mono', type: 'text', value: script.binaryOverridden ? script.binary : '',
+      placeholder: 'claude', spellcheck: 'false', autocomplete: 'off',
+      'aria-label': script.provider + ' binary',
+      title: 'the binary to launch (' + script.binaryEnvVar + ') — a path, a wrapper script, a pinned install. Empty = claude from PATH.',
+      style: 'flex:1 1 auto'
+    });
+    /* The WHOLE argument line, editable — delete a flag and it is gone,
+       reorder and it reorders. {placeholders} expand per call; clearing the
+       field (or retyping the default) goes back to the built-in line. */
+    var argsLine = el('input', {
+      class: 'inp mono', type: 'text', value: script.argsTemplate,
+      placeholder: script.argsTemplateDefault, spellcheck: 'false', autocomplete: 'off',
+      'aria-label': script.provider + ' arguments',
+      title: 'the full argument line (' + script.argsTemplateEnvVar + '). Placeholders this provider knows: ' +
+        (script.placeholders || []).map(function (p) { return '{' + p + '}'; }).join(' ') +
+        '. Shell-style quoting, never run through a shell. Empty = the default line. ' +
+        'The model cannot be set here — it always comes from the role’s model selector above; ' +
+        '{model-args} is required and a literal --model is refused.',
+      style: 'flex:1 1 auto'
+    });
+    var extra = el('input', {
+      class: 'inp mono', type: 'text', value: script.extraArgsRaw,
+      placeholder: 'e.g. --permission-mode plan', spellcheck: 'false', autocomplete: 'off',
+      'aria-label': script.provider + ' extra arguments',
+      title: 'appended where {extra-args} sits (' + script.extraArgsEnvVar + '). Last wins, so a flag here overrides an earlier one. For quick additions; the args line above is for real edits. --model is refused — the model is picked in the role row.',
+      style: 'flex:1 1 auto'
+    });
+    var fieldRow = function (label, input, extraNode) {
+      return el('div', { style: 'display:flex; gap:8px; margin-top:6px; align-items:center' },
+        [el('span', { class: 'mono', style: 'flex:0 0 5em', text: label }), input].concat(extraNode ? [extraNode] : []));
+    };
+    row.appendChild(fieldRow('binary', binary));
+    row.appendChild(fieldRow('args', argsLine));
+    row.appendChild(fieldRow('extra', extra, el('button', {
+      type: 'button', class: 'btn accent', text: 'Save',
+      title: 'written to .env now; runs pick it up from the next one they start',
+      onclick: function () {
+        api('/api/claude/run-script', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            provider: script.provider, binary: binary.value,
+            args: argsLine.value, extraArgs: extra.value
+          })
+        }).then(function (body) {
+          S.claude = body;
+          toast(script.provider + ' run script saved to .env (next run)');
+          render();
+        })['catch'](function (error) { toast(error.message); });
+      }
+    })));
+    var notes = [];
+    if (script.argsTemplateCustom) {
+      notes.push('custom args line — clear the field and Save to go back to the default' +
+        (script.provider === 'claude-cli' ? '; a custom line runs one process per call (warm reuse off)' : ''));
+    }
+    if (script.sharedExtraArgsRaw) {
+      notes.push('WOWLIDATOR_CLAUDE_EXTRA_ARGS adds first, for every claude provider: ' + script.sharedExtraArgsRaw);
+    }
+    notes.forEach(function (text) {
+      row.appendChild(el('div', { class: 'picker-note', text: text }));
+    });
+    section.appendChild(row);
+  });
+
+  main.appendChild(section);
 }
 
 /**
@@ -4809,7 +5341,7 @@ function suiteRunButtons(items) {
     if (!path) { missing += 1; return; }
     all.push(path);
     var k = verdictKindOf(p);
-    if (k === 'failed' || k === 'deadEnd' || k === 'error') broken.push(path);
+    if (k === 'testFailed' || k === 'systemError') broken.push(path);
   });
   var left = missing > 0 ? ' — ' + missing + ' flow file(s) are not visible from here and are left out' : '';
   var node = el('span', { class: 'suite-acts' });
@@ -4834,13 +5366,89 @@ function suiteRunButtons(items) {
    restart too, because the ledger (not the in-memory job) is the record.
    The resumed run keeps the catalog's unique run key, so cases already
    tested under it are pulled into the resumed roll-up as finished tests. */
-function resumeCatalog(ledgerPath, mode, caseId) {
+function resumeCatalog(ledgerPath, mode, caseId, caseIds) {
+  var body = { ledgerPath: ledgerPath, mode: mode || 'continue' };
+  if (caseId) body.caseId = caseId;
+  if (caseIds && caseIds.length) body.caseIds = caseIds;
   api('/api/catalog-runs/resume', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(caseId ? { ledgerPath: ledgerPath, mode: mode, caseId: caseId } : { ledgerPath: ledgerPath, mode: mode || 'continue' })
+    body: JSON.stringify(body)
   })
-    .then(function () { toast(mode === 'failed' ? 'healing failed cases' : mode === 'errors' ? 'rerunning errored cases' : mode === 'vacuous' ? 're-authoring vacuous cases' : mode === 'from' ? 'rerunning from ' + caseId + ' on current config' : 'continuing where it stopped'); refresh(); })
+    .then(function () { toast(mode === 'failed' ? 'healing failed cases' : mode === 'errors' ? 'rerunning errored cases' : mode === 'vacuous' ? 're-authoring vacuous cases' : mode === 'from' ? 'rerunning from ' + caseId + ' on current config' : mode === 'cases' ? 're-authoring ' + caseIds.length + ' case(s) from their sheet rows' : 'continuing where it stopped'); refresh(); })
     ['catch'](function (error) { toast(error.message); });
+}
+
+/* ---- Re-authoring one case, and the work queue of cases to re-author. ----
+   Re-author = the case's verdict is cleared and the resumed run authors a
+   FRESH flow from the sheet row on the current code, then runs it — the
+   \'--rerun-case\' flag. Every add/remove/run asks first: a queue mutation
+   is a decision about spend, and the confirm is where it is made. */
+function caseIdOfName(name) {
+  var m = /^([A-Za-z0-9._-]+)[\s]/.exec(name || '');
+  return m ? m[1] : null;
+}
+/* The newest catalog run whose plan includes this case — the list arrives
+   newest-first, so the first hit is the run a re-author should join. */
+function ledgerForCase(caseId) {
+  var runs = (S.catalogRuns || []).filter(function (r) { return (r.planned || []).indexOf(caseId) >= 0; });
+  return runs.length ? runs[0].ledgerPath : null;
+}
+function reauthorCase(caseId) {
+  var ledger = ledgerForCase(caseId);
+  if (!ledger) { toast('no catalog run plans ' + caseId + ' — re-authoring needs its ledger'); return; }
+  if (!window.confirm('Re-author ' + caseId + ' from its sheet row and run it again now?\nIts recorded verdict is replaced by the new run\'s.')) return;
+  resumeCatalog(ledger, 'cases', null, [caseId]);
+}
+function queueLoad() { try { return JSON.parse(localStorage.getItem('wow-work-queue') || '[]'); } catch (e) { return []; } }
+function queueSave(q) { try { localStorage.setItem('wow-work-queue', JSON.stringify(q)); } catch (e) { /* storage may be unavailable; the queue is a convenience */ } }
+function queueAdd(caseId) {
+  var q = queueLoad();
+  if (q.indexOf(caseId) >= 0) { toast(caseId + ' is already in the work queue'); return; }
+  if (!window.confirm('Add ' + caseId + ' to the work queue?\nQueued cases are re-authored from their sheet rows and run together when you press Run queue.')) return;
+  q.push(caseId); queueSave(q);
+  toast(caseId + ' queued — ' + q.length + ' in the work queue');
+  render();
+}
+function queueRemove(caseId) {
+  if (!window.confirm('Remove ' + caseId + ' from the work queue?')) return;
+  queueSave(queueLoad().filter(function (id) { return id !== caseId; }));
+  render();
+}
+function queueRun() {
+  var q = queueLoad();
+  if (q.length === 0) return;
+  if (!window.confirm('Re-author and run ' + q.length + ' queued case(s) now?\n' + q.join(', ') + '\nEach is re-authored from its sheet row; recorded verdicts are replaced.')) return;
+  var byLedger = {}, missing = [];
+  q.forEach(function (id) {
+    var l = ledgerForCase(id);
+    if (!l) { missing.push(id); return; }
+    (byLedger[l] = byLedger[l] || []).push(id);
+  });
+  Object.keys(byLedger).forEach(function (l) { resumeCatalog(l, 'cases', null, byLedger[l]); });
+  queueSave(missing);
+  if (missing.length) toast(missing.length + ' case(s) stay queued — no catalog run plans them');
+  render();
+}
+/* The queue box: what will run, one Remove per entry, Run/empty controls. */
+function workQueueBox() {
+  var q = queueLoad();
+  if (q.length === 0) return null;
+  var rows = q.map(function (id) {
+    return el('div', { class: 'wq-row' }, [
+      el('span', { class: 'wq-id', text: id }),
+      el('span', { class: 'wq-where', text: ledgerForCase(id) ? '' : 'no catalog run plans this id' }),
+      el('button', { type: 'button', class: 'btn', text: 'Remove', onclick: function () { queueRemove(id); } })
+    ]);
+  });
+  return el('div', { class: 'warn-banner wq', role: 'status' }, [
+    el('div', {}, [
+      el('b', { text: 'Work queue — ' + q.length + ' case(s) to re-author from their sheet rows' }),
+      el('div', { class: 'wq-rows' }, rows),
+      el('div', { class: 'acts' }, [
+        el('button', { type: 'button', class: 'btn md accent', text: 'Run queue (' + q.length + ')', onclick: function () { queueRun(); } })
+      ])
+    ])
+  ]);
 }
 
 function stopJob(id) {
@@ -4996,7 +5604,12 @@ function dataSignature() {
     S.models.roles && S.models.roles.map(function (r) { return r.role + r.provider + r.modelId; }),
     S.models.providers && S.models.providers.map(function (p) { return p.provider + p.models.length + p.note; }),
     S.models.checks && S.models.checks.map(function (c) { return c.role + c.status + c.checkedAt + c.running; }),
-    S.models.checking
+    S.models.checking,
+    S.claude && (S.claude.quota.limits || []).map(function (l) { return l.label + l.percent + l.severity; }),
+    S.claude && (S.claude.quota.note || ''),
+    S.claude && S.claude.usageCap && [S.claude.usageCap.enabled, S.claude.usageCap.capPercent, S.claude.usageCap.maxPercent, S.claude.usageCap.nearing, S.claude.usageCap.tripped && S.claude.usageCap.tripped.at],
+    S.claude && (S.claude.runScripts || []).map(function (r) { return r.provider + r.commandLine + r.argsTemplate + r.roles.join(); }),
+    S.claude && S.claude.cliUsage && [S.claude.cliUsage.total.calls, S.claude.cliUsage.today.calls, S.claude.cliUsage.lastCallAt]
   ]);
 }
 
@@ -5012,10 +5625,14 @@ function refresh() {
     api('/api/keys').then(function (b) { S.keys = b; })['catch'](function () {}),
     api('/api/models').then(function (b) { S.models = b; })['catch'](function () {}),
     api('/api/repos').then(function (b) { S.repos = b.repos || []; })['catch'](function () {}),
-    api('/api/db').then(function (b) { S.db = b; })['catch'](function () {})
+    api('/api/db').then(function (b) { S.db = b; })['catch'](function () {}),
+    /* quota is TTL-cached on the server, so polling this costs one real
+       request every thirty seconds however often the page asks */
+    api('/api/claude').then(function (b) { S.claude = b; })['catch'](function () {})
   ]).then(function () {
     var wasOffline = !S.online;
     S.online = true;
+    usageCapPopup();
     var signature = dataSignature();
     if (signature === S.signature && !wasOffline) {
       // Progress is deliberately not in the fingerprint — it changes every step

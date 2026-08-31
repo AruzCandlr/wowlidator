@@ -104,6 +104,8 @@ export const GENERATOR_ACTIONS = [
   'expectUrl',
   'expectValue',
   'expectScrollable',
+  'saveCount',
+  'saveText',
 ] as const;
 
 /**
@@ -250,10 +252,17 @@ Actions available:
 - expectText  element's text contains "value".
 - expectVisible / expectHidden        element is / is not visible.
 - expectEnabled / expectDisabled      control is / is not interactive.
-- expectCount element matches exactly "value" elements (a number as a string).
+- expectCount element matches exactly "value" elements (a number as a string,
+              or a {{variable}} saved earlier by saveCount/saveText).
+- saveCount   read HOW MANY elements match into a variable named "value"; a later
+              expectCount/expectText carrying {{that-name}} compares it. Use it for
+              any claim that two readings agree or that a number did not change —
+              asserting one side exists proves no agreement.
+- saveText    read the element's visible text into a variable named "value".
 - expectUrl   current URL contains "value". When asserting where a link goes, take
               the path from that link's url= in the tree — never from its visible
-              label. A card labelled "E-Patient" can point at /benefits-hub/referral,
+              label. A card's label and its destination often differ — "Reports"
+              can point at /analytics/overview —
               and a guessed path is a test that fails for the wrong reason.
 - expectValue an input's current value equals "value".
 - expectScrollable  the page, or a container if you give a selector, can really be
@@ -480,6 +489,8 @@ const ASSERTION_GENERATOR_ACTIONS = [
   'expectUrl',
   'expectValue',
   'expectScrollable',
+  'saveCount',
+  'saveText',
 ] as const;
 
 /** Narrow the flat generated shape back into the runner's step union. Exported — see `GeneratedStepSchema`. */
@@ -525,13 +536,25 @@ export function toFlowStep(raw: z.infer<typeof GeneratedStepSchema>): FlowStep |
     case 'expectDisabled':
       return selector === '' ? null : { action: 'expectDisabled', selector, intent };
     case 'expectCount': {
-      // The schema carries every field as a string; a non-numeric count is
-      // unusable rather than something to guess at.
+      // The schema carries every field as a string; digits or a {{variable}}
+      // saved by saveCount/saveText — anything else is unusable rather than
+      // something to guess at.
+      if (/^\{\{[\w.-]+\}\}$/.test(raw.value.trim())) {
+        return selector === '' ? null : { action: 'expectCount', selector, count: raw.value.trim(), intent };
+      }
       const count = Number(raw.value);
       return selector === '' || !Number.isInteger(count) || count < 0
         ? null
         : { action: 'expectCount', selector, count, intent };
     }
+    case 'saveCount':
+      return selector === '' || raw.value.trim() === ''
+        ? null
+        : { action: 'saveCount', selector, as: raw.value.trim(), intent };
+    case 'saveText':
+      return selector === '' || raw.value.trim() === ''
+        ? null
+        : { action: 'saveText', selector, as: raw.value.trim(), intent };
     case 'expectUrl':
       return raw.value === '' ? null : { action: 'expectUrl', value: raw.value, intent };
     case 'expectValue':

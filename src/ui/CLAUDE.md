@@ -95,6 +95,14 @@ Two capabilities in `commands.ts` exist for this and are worth knowing about bef
 
 Uploaded documents land in `.wowlidator/catalogs/` and `.wowlidator/context-docs/` (`ui/uploads.ts`). **The file name is rebuilt, never used** — only the extension survives, and only if the extractor can read it. Deletion has the narrowest rule in the server: a name, in one known directory, with a readable extension, rather than the general roots check, because it is the one operation here that destroys something.
 
+## Two verdict families, one machine taxonomy (2026-08-27)
+
+Every human-facing verdict tag now reads as one of TWO families — the machine statuses underneath are unchanged (exit codes, resume ledgers, quarantine, `--repair` all key off `RunStatus`, and rewriting stored bundles would orphan history): **test-failed** (red) — the subject missed the case's expectation, covering `failed` (a contradicted assertion) and `dead-end` (a control/content the case needed never resolved; surveyed, every dead-end in this workspace was "could not resolve <selector>", which is the page not offering what was expected, not a harness fact); and **system error** (amber) — `error`, the harness or its models breaking internally with no verdict about the application delivered. `verdictFamily`/`familyLabel` in `engine/proof-bundle.ts` are the single rule; `ui/proofs.ts`'s `VerdictKind` collapsed to `passed | testFailed | systemError | needsReview`, wowUI's tallies/labels/drawer captions and the report's status pill + CSS follow it (the report used to paint `error` red — now amber, matching wowUI). `needs-review` (proved-?) deliberately joins NEITHER family: it is a pending pass-shaped result awaiting a human, and painting it amber would misfile it. The mechanism stays visible in the parenthesis — `test-failed (dead-end)` — and the pill's `title` carries the machine status, so nothing is lost, only un-perplexed.
+
+## The usage cap (`src/ui/usage-cap.ts`, `src/providers/usage-cap.ts`, `/api/usage-cap`)
+
+A hard stop at N% of the signed-in session's own windows (2026-08-27). `cost-guard.sh` capped dollars the repo recorded; this caps what the account meters — the session and weekly percentages `claude-quota.ts` reads — so the number on the card is the number Anthropic enforces. The rule is one pure function (`evaluateUsageCap`: the highest reported window against the cap, named), and it is enforced twice: `UsageCapGuard` in the panel polls on the quota TTL, **stops every running job and holds new ones** (`POST /api/jobs` and both resumes answer 409 with the reason) until a person resets it from the Claude session card; and `assertUnderUsageCap` at the top of every claude-cli `doGenerate` refuses the next call in ANY process, worded as a provider refusal so the exit contract files environment, never an app defect. The hold is persisted (`.wowlidator/usage-cap.json`) so a panel restart keeps holding; a reset does not change the settings, so a still-exceeded window trips again on the next tick — the way out is raise, disable, or wait, all named in the popup. Settings live in `.env` (`WOWLIDATOR_USAGE_CAP`, `WOWLIDATOR_USAGE_CAP_PERCENT`; off by default — a cap is a decision) via the same `upsertEnv` the run-script edits use, so a terminal `wow` reads the cap the panel shows. Both surfaces pop an alert dialog once per trip (keyed on the trip's timestamp) — wowUI on every view through `refresh()`, the classic panel on its own 30 s poll — and wowUI toasts once when a window passes 90% of the cap. Honest about reach: the panel kills its own jobs; a terminal run is stopped at its next model call, not mid-step; non-claude providers do not spend the windows and are untouched.
+
 ## The Database card (`src/ui/db-status.ts`, `/api/db`)
 
 The fourth sibling of `keys.ts`/`models.ts`/`checks.ts`, asking about the backend runs verify against instead of a model role. Three kinds of knowledge, kept separate on the card (Models & keys page): **configured** — what `WOWLIDATOR_DB_URL` resolves to, masked (`maskDsn`; the password characters never reach the page, same rule as API keys — the page gets host/port/database/user and a `passwordSet` boolean); **probed** — whether it answers, on a click and never on a poll (`GET /api/db` is cheap and pollable, the probe runs only on `POST /api/db/check`: connect read-only, introspect, count tables, close — `doctor`'s db line in-process, and a probe result about a DSN that has since changed is dropped, the same never-show-a-stale-verdict rule as `RoleChecks.describe`); **hinted** — what registered repositories' own files say their database is (`RepoEntry.dbHint`), shown whether or not a DSN is set so a configured DSN pointing somewhere the repo does not name is visible too, with a ready-to-edit suggestion that never includes a password ("add the password yourself; wowlidator never reads one out of a repo").
@@ -108,3 +116,70 @@ The fourth sibling of `keys.ts`/`models.ts`/`checks.ts`, asking about the backen
 
 **A workflow step expands in place.** It is the one step whose work is invisible from its row — the agent took the browser for N turns and the row can only say "workflow" — so the step list carries a `▸ N agent actions` button that unfolds the goal, what the agent reported, its cost, the `settledBy` evidence when a rule settled the step, and the turn-by-turn log, without leaving for the drawer. `agentActionLog` is shared with the drawer's Trace tab so the two cannot drift, and a password-shaped fill shows its length and never its characters. The emailable report folds the same trace into a `<details>`, open by default when the goal was not reached — the case a reader came for.
 
+
+## newUI (`src/ui/new-ui-html.ts`, `/new`, `wowlidator ui --new`) — 2026-08-27
+
+The two surfaces as **one page**, built to `docs/one-page-ui-spec.md`. Six anchored sections — Now, Start, Runs and proof, Library, Machinery, Help — a sticky header with the status a person checks before pressing Start (connection, browser free/in use, CDP, roles keyed, the usage-cap gauge; repainted every poll), a search box that filters everything on the page, and no router: `location.hash` is an anchor, and every hash the older surfaces ever wrote still lands (`#history` → Runs in the every-run density, `#keys` → Machinery, `#doctor` → that command's form).
+
+**It composes wowUI, it does not fork it.** `WOW_SCRIPT` ships verbatim as a library — task rows, the checks table, the evidence drawer, the launcher gate, the Models & keys internals — and the functions that decide *where things go* (`render`, `show`, `boot`, `renderSidebar`, `pageHead`) are declared again after it; a later top-level function declaration replaces an earlier one for the whole script. Four base functions are *wrapped* instead (`openLauncher`, `launcherBox`, `post`, `dataSignature`): `baseScript()` renames them with an exact-match replace that throws on the first `GET /new` if the anchor has moved, so a wowUI refactor cannot silently strip the page's behaviour. wowUI's own trailing `boot()` is removed the same way. The tests in `tests/new-ui.test.ts` pin all of this by page string, the way `wow-ui.test.ts` pins wowUI.
+
+What the page adds on top of the base, each traceable to the spec:
+
+- **A fourth launcher segment, More commands** — every `CommandSpec` the three modes do not cover, as a form rendered *from the spec* (`cmdForm`). The 21 shared browser flags sit in four named drawers (Recording / Behaviour / Chrome / Output — `ADV_GROUPS`, with a test that none falls through to "Other options"); a `no-*` boolean renders as a positively worded switch that is ON by default (`POSITIVE`) and sends `{ 'no-heal': true }` only when switched off — the CLI's own absent-means-not-stated semantics, the checkbox the right way up; a `requiredWhen` field is visible and disabled with its gate named, never hidden; a repeatable field is a chip list submitted as an array (the classic panel's one text box was refused by `buildArgv`); `go`'s three-way `target` is three radios. A 400 naming a field in quotes lands on that field; a 409 is a banner with the action it needs. **`run` is not in the list** — it is `Run…` on a flow row or a task row (`openRunForm`, path locked), which keeps the no-flow-selector rule and the feature both.
+- **Vocabulary** (`VOCAB`, `verdictChip`, `caseLabel`): the chip shows the plain word (proved after a repair, needs your ruling, stuck, could not run), the tooltip and the Help glossary carry the exact term (`pass**`, `proved-?`, `dead-end`, `error`). The data is never rewritten, only the label.
+- **Numbers with denominators**: "3 of the last 7", "55 of 55 on disk", "1 streak(s) · 0 ruling(s) waiting"; the resumable banners are not capped at three (`and N more — show all`); Needs a human scans every proof, not the first twelve.
+- **One destructive idiom**: `post()` gates `cache-forget` and `history-clear` through `confirmModal` (`DESTRUCTIVE`), so every button that reaches them gets the same dialog without knowing; rename and resume-from-case use `promptModal` (validated, with a datalist of known case ids) instead of `window.prompt`; Escape closes whatever is topmost, and modals trap focus.
+- **History folded into Runs**: filter pills, Latest/Name sort (the one `src/ui/CLAUDE.md` claimed and wowUI never had), and a By flow / Every run density; Failed runs — no proof was produced stays its own list. **Library** is Reports, Flows (the classic editor inline under the row, with an unsaved badge and a discard confirm) and Healed selectors as collapsible cards; **Machinery** is `renderKeys` and `renderRepos` as cards with their page actions lifted into the card head.
+- **The manual is data.** `parseManualHtml` turns `manual.ts` into a node tree on the server (tags and `class` only; everything else dropped) and the page builds it through `el()` — so the one `innerHTML` the classic panel needed is absent here, and the no-`innerHTML` test holds for this surface too.
+
+The base file gained one fix while this was built: a workflow step's `▸ N agent actions` used the same `S.openTask` slot as the task around it, so unfolding a step collapsed the task. It is `S.openStep` now, on both wowUI and here.
+
+## Re-authoring and the work queue (wowUI, 2026-08-28)
+
+Each catalog-planned task row carries **Re-author** (clear this case's verdict,
+re-author it from its sheet row on the current code, run it — one
+`--rerun-case` resume job) and **Queue** (add it to the work queue). The queue
+is per-browser (`localStorage` `wow-work-queue`), rendered as a box above the
+catalog banners, and **every add, remove and run asks for confirmation
+first** — a queue mutation is a spend decision, and the confirm is where it is
+made (`window.confirm`, wowUI's existing `window.prompt` idiom). Run queue
+groups queued ids by the newest catalog run that plans them (`CatalogRunEntry.
+planned`, added for this) and posts one `mode: "cases"` resume per ledger; ids
+no run plans stay queued with a toast. Server side: both resume routes accept
+`mode: "cases"` + `caseIds` (plan-id shape enforced), mapping to the
+repeatable `--rerun-case` flag the catalog-run spec declares.
+
+## The Machinery run gates (`src/ui/gates.ts`, 2026-08-28)
+
+The Machinery card carries a **Run gates** block: scenario gate
+(`WOWLIDATOR_SCENARIO_GATE`, new — off lets every row author as fast as the
+pool allows), data sections, queue governor, pre-run risk judge, system-error
+diagnosis, auto-review judge. One mechanism, the `persistUsageCap` pattern: a
+flip writes `.env` AND `process.env`, so the NEXT spawned job inherits it — a
+suite in flight keeps the gates it launched with, and the card says so. The
+allowlist in `gates.ts` is the boundary: `/api/gates` edits those vars and no
+others. Tests: `tests/gates.test.ts`. Beside the toggles sit the **dials**
+(numeric settings, same contract): rows authored at a time
+(`WOWLIDATOR_AUTHOR_CONCURRENCY`, the `authorWorkers` default — an explicit
+`--author-concurrency` still wins and a serial provider stays at 1) and
+authoring attempts per row (`WOWLIDATOR_AUTHOR_ATTEMPTS`, the
+`FlowAuthorOptions.attempts` fallback — also a per-run field on the catalog
+form, `--author-attempts`).
+
+## The spec? chip (2026-08-31)
+
+`ProofCard.specQuestion` mirrors `bundle.specQuestion`: a needs-review whose
+disputed expectations all quote the sheet's own wording while the page renders
+it differently. wowUI's task row shows a dashed `spec?` chip (`specTag`) with
+the explanation in its tooltip; newUI inherits it through `WOW_SCRIPT`. It is
+a triage marker for the BA, never a verdict — the run stays needs-review.
+
+## newUI unwired; /wow is the responsive surface (2026-08-31)
+
+The `/new` route and `ui --new` flag were removed at the user's request —
+`new-ui-html.ts` and its tests remain (they render the module directly), but
+no server route serves it; `/wow` is the surface to improve. wowUI's ≤900px
+media query now keeps navigation: the sidebar becomes a sticky, horizontally
+scrolling top bar (labels/footer hidden) instead of `display: none`, tables
+get `display: block; overflow-x: auto` so the page never scrolls sideways,
+and the evidence drawer takes the full viewport width.

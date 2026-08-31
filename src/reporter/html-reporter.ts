@@ -17,6 +17,7 @@ import type { RequestRecord } from '../api/api-client.js';
 import type { DbCheckRecord } from '../db/db-actions.js';
 import { classifyCall, isBlockingFailure, type NetworkCall } from '../api/network-observer.js';
 import { BACKEND_TIER_ACTIONS,
+  familyLabel,
   meaningfulCoverage,
 } from '../engine/proof-bundle.js';
 import { buildVerdict, escalationTrace, type Verdict } from './verdict.js';
@@ -1097,7 +1098,8 @@ h1{font-size:21px;margin:0;font-weight:650;letter-spacing:-.01em}
 .status.needs-review{color:var(--warn);background:var(--warn-bg);border:1px dashed var(--warn)}
 .verdict-card.needs-review{border-left-color:var(--warn)}
 .callout.unsure{border-left:3px solid var(--warn)}
-.status.failed,.status.error,.status.dead-end{color:var(--bad);background:var(--bad-bg)}
+.status.failed,.status.dead-end{color:var(--bad);background:var(--bad-bg)}
+.status.error{color:var(--warn);background:var(--warn-bg,var(--bad-bg))}
 .status-group{display:flex;align-items:center;gap:8px}
 .polarity{font-weight:600;font-size:11px;letter-spacing:.06em;text-transform:uppercase;
   padding:4px 10px;border-radius:999px;border:1px dashed var(--line);color:var(--muted);cursor:help}
@@ -1114,12 +1116,14 @@ h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--mute
   margin:34px 0 12px;font-weight:600}
 ol.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
 .step{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
-.step.failed,.step.error,.step.dead-end{border-color:var(--bad)}
+.step.failed,.step.dead-end{border-color:var(--bad)}
+.step.error{border-color:var(--warn)}
 .step-head{width:100%;display:flex;align-items:center;gap:11px;padding:11px 14px;background:none;
   border:0;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .step-head:hover{background:color-mix(in srgb,var(--ink) 4%,transparent)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}
-.step.failed .dot,.step.error .dot,.step.dead-end .dot{background:var(--bad)}
+.step.failed .dot,.step.dead-end .dot{background:var(--bad)}
+.step.error .dot{background:var(--warn)}
 .idx{color:var(--muted);font-size:12px;min-width:20px;font-family:ui-monospace,monospace}
 .action{font-weight:600;min-width:88px}
 .target{flex:1;color:var(--muted);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1249,11 +1253,13 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 /* --- Layer 1: the verdict ------------------------------------------------ */
 .verdict{background:var(--panel);border:1px solid var(--line);border-left:5px solid var(--fast);
   border-radius:var(--radius);padding:18px 20px;margin-bottom:18px}
-.verdict.failed,.verdict.error,.verdict.dead-end{border-left-color:var(--bad)}
+.verdict.failed,.verdict.dead-end{border-left-color:var(--bad)}
+.verdict.error{border-left-color:var(--warn)}
 .verdict.passed{border-left-color:var(--ok)}
 .verdict.needs-review, .verdict.passed-with-issues{border-left-color:var(--warn)}
 .verdict-headline{margin:0 0 10px;font-size:19px;letter-spacing:-.01em}
-.verdict.failed .verdict-headline,.verdict.error .verdict-headline,.verdict.dead-end .verdict-headline{color:var(--bad)}
+.verdict.failed .verdict-headline,.verdict.dead-end .verdict-headline{color:var(--bad)}
+.verdict.error .verdict-headline{color:var(--warn)}
 .verdict.passed .verdict-headline{color:var(--ok)}
 .verdict.passed-with-issues .verdict-headline{color:var(--warn)}
 .verdict-line{margin:0 0 7px;font-size:14.5px;line-height:1.55;max-width:78ch}
@@ -1657,7 +1663,7 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
         ${bundle.cdpUrl ? ` &middot; ${esc(bundle.cdpUrl)}` : ''}
       </div>
     </div>
-    <div class="status-group">${polarityPill(bundle)}<span class="status ${esc(bundle.status)}">${esc(bundle.status)}</span></div>
+    <div class="status-group">${polarityPill(bundle)}<span class="status ${esc(bundle.status)}" title="machine status: ${esc(bundle.status)}">${esc(familyLabel(bundle.status))}</span></div>
   </header>
 
   ${verdictBlock(verdict)}

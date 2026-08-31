@@ -59,7 +59,13 @@ async function guessDefaultComponentName(rootDir: string, file: string): Promise
   } catch {
     return undefined;
   }
-  const named = /export\s+default\s+function\s+([A-Z]\w*)/.exec(text);
+  // `async` is optional: an App Router page that awaits its data is
+  // `export default async function BenefitPlansPage()`, and without this the
+  // guess fell through to the filename ("Page"), the edge dangled and was
+  // pruned, and the route walked to NOTHING — the generator's repository
+  // slice for that page was empty (measured 2026-08-28: every async page
+  // route in the indexed app had zero edges).
+  const named = /export\s+default\s+(?:async\s+)?function\s+([A-Z]\w*)/.exec(text);
   if (named?.[1]) return named[1];
   const reference = /export\s+default\s+([A-Z]\w*)\s*;/.exec(text);
   if (reference?.[1]) return reference[1];

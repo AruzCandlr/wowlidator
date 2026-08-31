@@ -53,6 +53,14 @@ export interface CliOptions {
    * silently when the generator role has no key.
    */
   reconstruct: boolean;
+  /**
+   * The workflow agent's early-give-up judges (look-only at 3 turns,
+   * no-progress at 5). On by default (`--no-agent-early-stop` /
+   * `WOWLIDATOR_AGENT_EARLY_STOP=off` turns them off, raising both ceilings to
+   * AGENT_NO_PROGRESS_OFF_TURNS — the agent tries much longer before conceding
+   * a leg). `undefined` lets the env default decide.
+   */
+  agentEarlyStop: boolean | undefined;
   captureDelayMs: number;
   /**
    * Pause before each step, ms. Undefined lets the runner decide: 1.5s while
@@ -126,6 +134,8 @@ export interface CliOptions {
    * another, the A/B for a batched result that looks wrong.
    */
   authorConcurrency: number | undefined;
+  /** Total authoring asks per row including the first (`--author-attempts`). */
+  authorAttempts: number | undefined;
   /**
    * How far authoring may run ahead of the runs on a pipelined catalog
    * (`--author-lookahead`): the number of scenarios beyond the one currently
@@ -180,6 +190,8 @@ export interface CliOptions {
   resumeFrom?: string | undefined;
   /** Re-run every recorded failed / dead-end case, with autoheal on. Implies `--resume` and `--repair`. */
   rerunFailed: boolean;
+  /** Re-author (from the sheet row) and re-run exactly these case ids, whatever their verdicts. Implies `--resume`. */
+  rerunCases?: readonly string[] | undefined;
   /** Where `--claims-only` writes the claims it found. */
   claimsOut: string | undefined;
   /** Where `draft` writes the catalog it constructs. */

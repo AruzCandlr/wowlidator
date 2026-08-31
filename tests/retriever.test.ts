@@ -18,7 +18,7 @@ import {
   buildUserPrompt as healPrompt,
 } from '../src/healer/jit-healer.js';
 import { buildUserPrompt as agentPrompt } from '../src/orchestrator/workflow-agent.js';
-import { caseCard } from '../src/cli/commands/authoring.js';
+import { caseCard, expectedLacksAnchors, sheetGate } from '../src/cli/commands/authoring.js';
 
 describe('Bm25Retriever', () => {
   const items = [
@@ -183,5 +183,38 @@ describe('caseCard', () => {
       steps: '', expected: '', actual: '', testDate: '', testBy: '', bugTicket: '', note: '',
     };
     assert.equal(caseCard(empty), undefined);
+  });
+});
+
+describe('expectedLacksAnchors — is the sheet contextual enough to assert?', () => {
+  it('an expected with a number, an = pair, or a quoted span is contextual', () => {
+    assert.equal(expectedLacksAnchors('6.1 +1 in Total Plans', '', ''), false);
+    assert.equal(expectedLacksAnchors('shows the default', 'Status = Active', ''), false);
+    assert.equal(expectedLacksAnchors('shows "Pending" badge', '', ''), false);
+  });
+
+  it('vague across all three columns trips it — the author would have to invent', () => {
+    assert.equal(expectedLacksAnchors('displays correctly', 'confirmed', 'N/A'), true);
+  });
+
+  it('an empty expected is another lint\'s problem, never vague here', () => {
+    assert.equal(expectedLacksAnchors('', 'no values anywhere', ''), false);
+  });
+});
+
+describe('sheetGate (S7 — the Note/Actual columns are a gate)', () => {
+  const row = (actual: string, note: string) => ({ actual, note, caseId: 'X', testCase: '', expected: '', testData: '', persona: '', steps: '', menu: '', preconditions: '', no: '', scenarioId: '', scenario: '', polarity: '', priority: '', testDate: '', testBy: '', bugTicket: '' }) as never;
+  it('refuses a Cancelled row before any model is asked', () => {
+    assert.match(sheetGate(row('Cancelled', '')) ?? '', /Cancelled/);
+    assert.match(sheetGate(row('', "P'Eng 6 Jul// Start Date filter cancelled")) ?? '', /cancelled/);
+  });
+  it('authors Passed / TBC / Failed rows (the feature exists), and a re-tested row despite an old cancel note', () => {
+    assert.equal(sheetGate(row('Passed', 'TBC wording Plan ID')), null);
+    assert.equal(sheetGate(row('Failed', '14-Aug Failed Company error')), null);
+    assert.equal(sheetGate(row('Re-Test Passed', 'was cancelled, then reinstated')), null);
+  });
+  it('the card carries a requirement-change note as its own line, ahead of the persona', () => {
+    const card = caseCard({ ...row('Passed', '4-Aug New req. update pop-up to page'), caseId: 'PL_06_01', testCase: 'Create plan', expected: '2.1 dialog opens' } as never) ?? '';
+    assert.match(card, /Requirement note .*pop-up to page/);
   });
 });

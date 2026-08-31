@@ -227,6 +227,30 @@ describe('selection', () => {
     }
   });
 
+  it('a lexically weaker document still quotes its best section — never outline-only', () => {
+    // The query's vocabulary saturates spec.md, so every api.md chunk scores
+    // under RELATIVE_SCORE_FLOOR of the global best. The old floor drew from
+    // the filtered list and left api.md quoting NOTHING — "the AI only used
+    // one document". Any document that scored at all must quote something.
+    const other = padded('api.md', [
+      ['Endpoints', 'POST /api/reviews creates a review record.'],
+      ['Errors', 'A 401 is returned when authentication fails.'],
+      ['Rate limits', 'A client may make sixty requests a minute.'],
+      ['Versioning', 'The version is carried in the Accept header.'],
+    ]);
+    const result = selectRelevantContext(
+      [spec, other],
+      'session expires after thirty minutes signed out session expires review',
+      { budgetChars: 3_000 },
+    );
+    const api = result.documents.find((d) => d.name === 'api.md');
+    assert.match(
+      api?.note ?? '',
+      /relevance-selected: [1-9]/,
+      'the weaker document was reduced to an outline with nothing quoted',
+    );
+  });
+
   it('sends the document whole rather than quoting sections that matched nothing', () => {
     const result = selectRelevantContext([spec], 'quarterly warehouse logistics', {
       budgetChars: 4_000,

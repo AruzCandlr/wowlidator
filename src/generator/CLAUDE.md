@@ -11,7 +11,21 @@ The commonest way an authored case ends in `dead-end` is not a broken applicatio
 - **One `agent`-role call, only when there are findings** (`LlmFlowReviewModel`, flat schema via `lenientObject`). The model sees the flagged steps, the whole flow, the trees, the declared routes, the repository's context slice and the request as the author saw it — the documents — and says per step `keep` / `replace` / `insertBefore` / `unsure`, quoting the evidence line. It may change **what a step points at** (selector, url, goal), never what it does: action, typed value and asserted text are the claim, and the claim is the author's. `insertBefore` admits preparation only (click, waitFor, goto, press, scrollTo, clickIfVisible→`when`).
 - **Every proposal is verified before it is applied** (`applyReview`). A selector's name must be in a tree or in the evidence text (source index, documents); a path must match a declared route or appear in the evidence; a decision with no evidence quoted is dropped; a decision about a step the model was not asked about is ignored; a flagged step it says nothing about is `unsure` by omission. Rejections are recorded with the reason. Replacements mutate the step object in place so the case list sees them; insertions are spliced into the section **and** the case holding the step.
 
+**Only findings some evidence could settle are asked about** (`settleableFindings`, 2026-08-31). Measured on be100-rip: the run's log is a wall of `the review could not ground it either — No tree captured for this page state`, every one of them an `unsure` the audit had already computed for free. A **selector** finding is unanswerable when all three hold — it follows a `workflow` leg so no tree covers its page, the evidence carries no repository slice, and its control's name appears nowhere in the evidence text; under those, `applyReview` would reject any `replace` and the audit already disproved `keep`. Such findings become a note naming the actual remedy (a capture of that page, or `--repo`), and when *every* finding is one the call is not made at all. **Path findings are always asked** — a route is settled by a declared pattern or a document sentence and needs no tree. The record still counts what the AUDIT found, so a skipped call never shrinks the reported problem. The reviewer is handed the **row's own** context slice, not the project-wide one: it judges by the evidence the author saw, and the row's slice is what that is.
+
 The record (`AuthoredFlow.review`) is printed by the CLI (`review  N ungrounded step(s): …` plus one line per change and per rejection) and summarised on the flow's `notes`. A model fault never throws: the flow is as authored, the record says the review could not run. `tests/flow-review.test.ts` is entirely unit-tier.
+
+## The suite's refusal memory (`flow-author.ts`)
+
+The informed re-ask teaches one row at a time, and the teaching dies with the row. Measured on be100-rip (2026-08-31): the same two or three lints fired across the whole catalog — an `expectDbRows` on the case's own test data, a `workflow` goal naming controls the repository declares — and each cost a fresh authoring attempt (57 s, ~$0.44 on opus) to re-learn a rule the row before had already been taught.
+
+One `FlowAuthor` writes a whole catalog, so the memory is suite-scoped by construction. Three rules, each with its reason:
+
+- **Keyed by SHAPE, not by message** (`refusalShape`): quoted names, step indexes and numbers are stripped, so six variants of one lint collapse to one entry instead of filling the budget.
+- **A rule travels only once it has been seen twice.** One row's accident is not the suite's pattern, and pre-loading it onto unrelated rows is how a memory turns into a bias.
+- **It is a separate prompt field** (`AuthorRequest.commonRefusals`), rendered under its own heading before the row's own `feedback` and never merged into it. `feedback` says "your previous answer to THIS question was wrong", which is a fact; this says "the suite keeps making this mistake", which is a warning — wording the second as the first on a first attempt would be a lie the model would then try to fix.
+
+Bounded at `SUITE_REFUSAL_MEMORY` (6), most frequent first: a lint that fired twenty times is the one worth pre-empting, and a long list would crowd the request itself out of the model's attention.
 
 ## Authoring rails from a hand-authored comparison (`flow-author.ts`)
 
@@ -72,3 +86,135 @@ Three tiers on `TestGenerator`, default `forms` (`DEFAULT_MUTATION_POLICY` in `t
 One field, several values, an assertion after each. **Every case runs even after one fails** — a partial boundary table is far less useful than the whole one when you are trying to find where behaviour changes.
 
 `submit` is the load-bearing option: validation usually fires on submit, not on input, so without it every case asserts against a form that never ran. That was found by running it, not by reading it.
+
+## The tree's rendering, never the sheet's wording — the guarantee (2026-08-28)
+
+The same case authored by two models, both flows run today with no model in the loop: gemini-3.5-flash-lite asserted `role=heading[name="Benefit Plan Catalog…"]` and passed; claude asserted `text="Benefit Plans"` / `role=heading[name="Benefit Plans" i]` — the requirement's phrase — and dead-ended three times on a page that renders the heading. The LANGUAGE rule in the prompt was a request; `ungroundedTextExpectation` (pure, beside `ungroundedCountRole`) is the guarantee, provider-independent: a presence assertion (`expectVisible`/`expectText`, `text=` or `role=…[name=…]`) whose text is a contiguous case-insensitive substring of NO rendered node name is refused with the nearest real renderings named ("The page renders: "Benefit Plan Catalog" — quote one of those, with its role"), and the ordinary feedback re-ask does the rest. Grounding strips `url="…"` first — word-wise matching would ground "Benefit Plans" on `/benefits/plans`. Exempt after a `workflow` leg and on a truncated tree, the `ungroundedUrlExpectation` rules. Companion in the engine: `relaxTextSelector` now relaxes the HEAD of a chained `text="X" >> nth=0` (every such selector used to skip the rung), so a rendering that differs only in case or surrounding text still resolves at $0.
+
+## No selector may assert a control's implementation (`inventedControlInternals`, 2026-08-28)
+
+A selector like `main select:has(option:text-is("Medical"))` or
+`… >> option:checked` is refused at authoring: no accessibility tree ever
+shows `<select>`, `<option>` or `:checked` — the tree speaks roles — so an
+internals selector is invented by construction, and it dead-ends on any
+custom widget. Live driver: PL_04_04 pinned thirty-one steps to a native
+`<select>` on a page whose category filter is a custom combobox; every one
+failed identically. The refusal steers to the two legal shapes: the control's
+role and visible label from a tree it appears in (`role=combobox[name="…" i]`
+— `selectOption` drives native and custom dropdowns alike through it), or a
+workflow goal in user terms when NO tree shows the control. It also carries
+the semantic rule the case's wording needs: a default written "All" / "No
+filter" is a state the user can see (the control's visible value, an
+unfiltered listing), never an `option:checked` internal. `role=option[name]`
+stays legal (tree notation); quoted strings are stripped before matching so
+`text="Select all"` never trips it. Tests: `tests/flow-author.test.ts`.
+
+## Code-grounded authoring — deterministic first, agent on error only (2026-08-28)
+
+Asked for in so many words: if a part of the journey can be proved by reading
+the codebase, the author writes it as deterministic Playwright steps; the
+agent's job shrinks to the part an error actually reaches. Three layers:
+
+- **Prompt**: grounding order is tree → repository → workflow. When a control
+  is in no tree but WHAT THE REPOSITORY DECLARES names its rendered string (a
+  component's words, a message catalog's values — both already in the graph),
+  the step is written against that string (`role=button[name="Create Plan" i]`);
+  a workflow leg is legal only where neither a tree nor the repository declares
+  the control. The tree still outranks the code where they disagree.
+- **Lints**: `declaredControlStrings` extracts the repo section's quoted
+  strings (one extractor, so "declared by the code" cannot mean two things);
+  `ungroundedTextExpectation` accepts them as evidence (else every
+  code-grounded assertion the prompt invites would be refused);
+  `workflowOverDeclaredControls` refuses a workflow goal that names a declared
+  control, steering to explicit steps and telling the model to keep the goal
+  to what is genuinely undeclared. (PL_07 spent 108 model calls on an agent
+  leg whose "Make Correction" control `messages/en.json` declares verbatim.)
+- **Runtime**: suite runs arm the agent-assist rung whenever an agent was
+  built at all (`run-cases.ts`) — so the agent is consulted only at the step
+  that actually failed, after the $0 ladder and the healer. `--no-agent`
+  disables both; fail-fast still strips assist.
+
+## Expected results are quoted, never invented (2026-08-28)
+
+Driven by PL_03_07: the sheet asked "+1 in Total Plans / +1 in Reimbursement
+by Employee and HR" and the authored flow proved a DB delta and a visible row
+name — real checks of a different claim, with intents citing "6.1/6.2" over
+assertions that never read the counter boxes. Three rails:
+
+- **Prompt**: every NUMBERED Expected line gets its own assertion in the page
+  terms that line names, intent citing the line number; a backend check may
+  corroborate, never substitute. Every asserted value is quoted from the case
+  (Expected / Test data / Note), a document, or the repository — in that
+  order — and when none holds one, the flow says so in notes and asserts the
+  observable shape instead of inventing.
+- **Coverage lint** (`expectedItemsIn` / `unassertedExpectedItems`): numbered
+  ids with no asserting carrier (assert step or workflow goal citing the id)
+  are refused WEAK — the re-ask drives the rewrite, and an uncovered flow at
+  budget end is still handed over with the note, never left flowless.
+- **Contextual-sufficiency check** (`expectedLacksAnchors`, authoring loop):
+  an Expected with no number, no `field = value` pair and no quoted span
+  across Expected+Note+Test data boosts the expected text in the BM25 query
+  (the citation-boost lever) and stamps a one-line instruction into the
+  described case: anchors come from the documents/repository, never invention.
+  Also: the runtime card's Test data cut went 120 → 420 chars — PL_03_07's
+  card ended mid-value, so every runtime role saw truncated test data.
+
+## Pre-run dead-end risk (`src/generator/dead-end-risk.ts`, 2026-08-28)
+
+A case whose flow needs a page the application lacks, or a label the spec words differently, cannot be healed into passing — and the machinery used to try anyway: the ladder's heal and agent rungs, in-run reconstruction, then `--repair`'s three attempts, each a model call and a minute of browser. Measured on be100 (2026-08-28, 27 cases in): 3 dead-ends and 3 errors, each paid for up to four times. So, **right after a catalog row is authored** (`authorEachRow`, on the same evidence the author just read — the ranked documents, the repository slice, the declared routes), one small `generator`-role call judges how likely the run is to end as a dead-end or error rather than a verdict. **Above the threshold (default 50%, `WOWLIDATOR_RISK_THRESHOLD`; strictly above) the case runs ONCE with every RERUN path off** — `failFastRunOptions` in `run-cases.ts`: no healer, no step reconstruction, and the `FlowRepairLoop` is skipped. The AGENT stays, once per step (refined 2026-08-28): a workflow leg has exactly one executor, the assist rung is one consult at the step that failed, and once-per-step holds by construction because with reconstruction off a step fails at most once and the dead-end memo blocks identical retries. The verdict is recorded exactly as any other run's; only the retries are withheld. `WOWLIDATOR_RISK=off` disables it; a generator role that does not resolve disables it with one printed line.
+
+Rules worth keeping:
+
+- **Signals first, model second** (`riskSignals`, $0): a `goto` path the repository declares no page route for (`routeIsDeclared`), a selector name (`name="…"`, `text=…`, `:has-text(…)`) that no document, the case, or the repository mentions, a backend step with the backend off, an agent `workflow` step, and "no evidence at all". They ride in the prompt as facts and on the record as `signals`, so a reader sees what the model was told, not only what it concluded.
+- **Two dimensions since 2026-08-28: dead-end risk AND expected-fail risk.** `likelihood` still rises only when the run cannot reach the point where the expectation is checked — a claim the page can answer, even by contradicting it, is a verdict, so a negative case is never fail-fast for being negative. `failLikelihood` is the separate estimate that the run, having reached its assertions, ends in a GENUINE FAIL (the sheet's own Actual Result recorded Failed — passed in as `knownResult` and stated as a signal — a note citing a defect number, documents contradicting the expected output). Either dimension above the threshold fail-fasts (`riskVerdict(likelihood, threshold, failLikelihood)`): a near-certain fail is a fact the first run proves, and retries only re-prove it at full price. `describeRisk` and wowUI's tag name which dimension tripped.
+- **Never throws.** A judge that fails (rate limit, breaker) is a case that runs the ordinary way, logged once — the retries exist for exactly the runs nobody could judge in advance.
+- **Recorded, visibly.** `SuiteCase.risk` → `bundle.risk` (`DeadEndRisk`: likelihood, threshold, verdict, reasons, missing, signals, model, tokens) plus a line on `bundle.notes`; the proof card carries `risk`, wowUI's task row shows a `fail-fast N%` tag with the reason in its tooltip, and the run log prints `risk  fail-fast: …` at pickup. A person who disagrees has the evidence to say so.
+- **Catalog rows only, for now.** `go`/`generate` suites do not carry the per-row retrieved evidence the judge needs; a hand-written flow has no `risk` and runs as it always did.
+
+`tests/dead-end-risk.test.ts` is entirely unit-tier: the threshold and env, each signal, the prompt's budget, the model through `MockLanguageModelV4`, and the fail-fast option rule as one function.
+
+## Post-run system-error diagnosis (`src/generator/error-diagnosis.ts`, 2026-08-28)
+
+The companion of the pre-run risk judge, on the other side of the run: **a case that ends as a SYSTEM ERROR — `status: 'error'`, no verdict delivered — gets one `healer`-role call naming which layer broke** and the fix when one exists. Born from PL_07: all ten cases errored because the seeded plan the whole scenario asserts against (`PL_07_01_02_03_04_05_06`, "QA-Make correction") is not in the replica at all — the agent hunted a row that cannot exist, stalled, and the run read "system error" with nothing saying *seed the data*; PL_07_01 alone spent 108 model calls and $3.24 rediscovering it, and a person's next move was to re-run it.
+
+Five origins, each implying its own fix: `test-catalog` (the case or its TEST DATA — a record never seeded, a precondition that never holds; fix the data, not the flow), `generator` (an invented selector/route — re-author), `agent` (a target the evidence DOES describe that the agent still missed — retry, better capture), `environment` (unconfigured DB, provider refusal, lost browser — ops), `application` (a genuine 500/crash). Rules worth keeping:
+
+- **Only `status === 'error'` is diagnosed** (`diagnoseError` returns null otherwise). A test-failure is a verdict; a diagnosis of it would be second-guessing evidence a person can already read.
+- **Signals first** (`diagnosisSignals`, $0): the PL_07 signature is load-bearing — a stalled agent whose hunted-for values (from its own failed-action errors) appear in NO evidence (case text, routes, repo hints, background docs via the suite's `HealHintsProvider`) points at test-catalog; the same stall over values the evidence DOES describe points at the agent; provider/quota wording in the run error, or a "never configured" note, points at environment; a cascade (an expect that errored because an earlier step never opened its dialog) is attributed to the first error.
+- **It never repairs and never reclassifies.** The verdict stays `error`; the diagnosis lands on `bundle.diagnosis` (origin, confidence, reasoning, `fix: string | null` — null is the honest empty — signals, model, tokens), a `notes` line, a `diagnosis` line in the run log, the proof card, and the panel's why-block ("Diagnosed: … / Suggested fix: …"). Explaining is the feature; acting stays a person's click (`--repair`, a seed script, an env var).
+- **Never throws; off by env.** `WOWLIDATOR_DIAGNOSE=off`, or a healer role that does not resolve, and the run reports its error exactly as before.
+
+`tests/error-diagnosis.test.ts` is entirely unit-tier, `MockLanguageModelV4` for the model.
+
+## Three more guarantees from the 2026-08-28 audit (S3, S4, S6, S7)
+
+- **Roles are read from the tree, for every action** (`ungroundedSelectorRole`, S4): the generalisation of `ungroundedCountRole`. Sixteen dead-ends on one page came from `role=combobox`, `role=textbox`, native `select` written for filters the tree exposes as `button "Type:"` and `searchbox "Search benefit name"` — the roles a filter USUALLY has. A role no tree line starts with is refused with the tree's own line for that name; and a `fill`/`click`/`type`/`selectOption` on a line the tree marks `disabled` is refused too (the search box "starts disabled until a filter is chosen" — six flows filled it first). `expectHidden` and `expectCount 0` are exempt; after a `workflow` leg or on a truncated tree it declines.
+- **Test data is not an application fact** (`fixtureFacts` / `ungroundedFixtureAssertion`, S3): identifier-shaped values from the Test Data / Expected columns (`PL_07_01_02_03_04_05_06`, `BP-DENTAL-01`, `TH_MED_005`) may be TYPED freely but may be asserted to pre-exist — a DB where-clause, a row click scoped by them, an exact count — only after a step of the same flow typed them into a form (or an agent leg whose goal creates them). Thirteen be100 cases asserted fixtures the database never held and filed the misses against the app.
+- **The risk judge's evidence feeds the author** (S6): a `fail-fast` verdict with concrete reasons triggers ONE immediate re-ask with those reasons as `priorFeedback`; the re-authored flow replaces the first only when its re-judged likelihood is lower — feedback must never make the result worse. "The search box starts disabled" (0.78) and "no Start-date filter exists" (0.88) were each right and each spent on a full dead-ended run.
+- **The Note column is a gate** (`sheetGate` in `commands/authoring.ts`, S7): a row whose Actual Result is Cancelled, or whose Note says cancelled/dropped, is refused before any model call — four be100 rows were authored against filters the requirement dropped on 6 Jul. A dated requirement change ("pop-up → page 4 Aug", "TBC wording") is prepended to the case card as its own line, so the author reads it before writing `role=dialog` for a page.
+
+## Reconciliation claims and sheet-verbatim wording (EN-2 audit, 2026-08-31)
+
+- **`unreconciledMatchClaim`** refuses a flow whose case claims two readings
+  agree ("tile matches the table", "เท่ากับ", "ตรงกับ") or that a number does
+  not change ("no change", "ไม่เปลี่ยน") while no step saves a reading and
+  compares it (`saveCount`/`saveText` → an expect carrying `{{var}}`; a
+  `dbSnapshot` + `expectDbDelta`/`expectDbUnchanged` pair also satisfies).
+  Presence assertions pass whether or not the readings agree — ten such bugs
+  shipped green. The prompt's companion rule: a number printed in Expected
+  ("1-15 of 43") is the sheet-writer's illustration, never a value to assert;
+  the saved reading is the value.
+- **`ungroundedTextExpectation` exempts the sheet's own words** (new `prompt`
+  param): when the asserted text appears verbatim in the case, the sheet's
+  wording IS the claim — refusing it rewrote real wording bugs into
+  assertions about whatever the page renders, which then passed. The claim
+  runs; an exact-miss over text the page holds becomes a near-miss
+  needs-review, the right verdict for a wording dispute.
+- **A workflow goal carries an Expected item only when a later step asserts
+  something** (`unassertedExpectedItems`): an agent leg's claim must be
+  settled by evidence independent of the agent — behavioral lines "covered"
+  solely by a goal's mention shipped unproved, and their bugs with them.
+- **`specQuestion`** (stamped in `runFlow`, engine side): a needs-review whose
+  every disputed expected value quotes the case's own wording is marked a
+  spec question — deliberate design vs the sheet, a BA call. 29 of 31 genuine
+  QA fails in the EN-2 audit were this class; wowUI shows a `spec?` chip.

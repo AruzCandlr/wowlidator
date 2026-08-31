@@ -102,12 +102,24 @@ export function findRouteForUrl(graph: ProjectGraph, url: string): ProjectNode |
   return graph.nodes.find((node) => node.kind === 'route' && matchesRoutePattern(path, node.name));
 }
 
+/** A component's own rendered words, when the index captured any. */
+function says(node: ProjectNode): string {
+  return node.kind === 'component' && node.detail ? ` — says: ${node.detail}` : '';
+}
+
 function describeEdge(from: ProjectNode, kind: ProjectEdgeKind, to: ProjectNode): string {
   switch (kind) {
     case 'renders':
-      return `  renders ${to.name} (${to.file})`;
+      return `  renders ${to.name} (${to.file})${says(to)}`;
     case 'uses':
-      return `  ${from.name} uses ${to.name} (${to.file})`;
+      // A message node IS its strings: print them, so the author can quote
+      // the application's rendering ("Benefit Plan Catalog") instead of the
+      // requirement's phrasing of it. The locale rides along for the
+      // bilingual `anyOf`.
+      if (to.kind === 'message') {
+        return `  ${from.name} renders the ${to.name} strings [${to.meta?.['locale'] ?? '?'}, ${to.file}]: ${to.detail ?? ''}`;
+      }
+      return `  ${from.name} uses ${to.name} (${to.file})${says(to)}`;
     case 'covers':
       return `  covered by "${from.name}" (${from.file})`;
     case 'references':

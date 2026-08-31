@@ -1,0 +1,380 @@
+/**
+ * The catalog report (`src/reporter/catalog-report.ts`).
+ *
+ * Mostly unit-tier: the render is a pure function over ledger-shaped cases,
+ * and every claim the page makes (grouping, embedding, the two panes, export)
+ * is a string here.
+ *
+ * One tier above it, gated on CDP: **that the embedded recording actually
+ * plays.** No string check can prove that. Chrome refuses a `data:` video
+ * silently — the element sits at `readyState 0` with no error, which reads
+ * exactly like a corrupt file — and the whole Blob indirection exists because
+ * of it. A test that asserted only the markup would pass on a report whose
+ * every player spins forever, which is the bug this feature was written to
+ * fix. It runs against the real `tests/fixtures/recording.webm`, on the same
+ * "a reader tested only against its own writer proves nothing" rule as the
+ * `.xlsx` and `.pdf` there.
+ */
+
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
+import {
+  SCREENSHOT_BUDGET_BYTES,
+  VIDEO_BUDGET_BYTES,
+  catalogReportPath,
+  chooseEmbeddedVideos,
+  renderCatalogReport,
+  verdictChipOf,
+  type CatalogReportCase,
+} from '../src/reporter/catalog-report.js';
+
+function step(over: Partial<ProofStep>): ProofStep {
+  return {
+    index: 0, action: 'goto', intent: undefined, selector: null, resolvedSelector: null,
+    resolution: null, status: 'passed', startedAt: '2026-08-31T04:00:00.000Z', durationMs: 350,
+    url: 'http://localhost:3000/en/login',
+    ...over,
+  } as ProofStep;
+}
+
+function bundle(steps: ProofStep[], over: Partial<ProofBundle> = {}): ProofBundle {
+  return {
+    runId: 'r1', name: 'PL_02_01 first', status: 'passed',
+    startedAt: '2026-08-31T04:00:00.000Z', finishedAt: '2026-08-31T04:01:00.000Z',
+    durationMs: 60_000, caseDurationMs: 61_000, cdpUrl: null, cachePath: null, healerModel: null,
+    summary: { totalSteps: steps.length, passed: steps.length, failed: 0 } as ProofBundle['summary'],
+    defects: [], steps,
+    ...over,
+  } as ProofBundle;
+}
+
+function kase(over: Partial<CatalogReportCase>): CatalogReportCase {
+  return {
+    id: 'PL_02_01', name: 'PL_02_01 first', scenario: 'PL_02', verdict: 'passed',
+    status: 'passed', reason: null, bundle: bundle([step({})]), history: [],
+    ...over,
+  };
+}
+
+describe('grouping and coverage', () => {
+  it('groups by scenario with a passed-count, and a never-ran case is a row too', () => {
+    const html = renderCatalogReport({
+      title: 'be100', runKey: 'be100-csv@2026', generatedAt: null,
+      cases: [
+        kase({}),
+        kase({ id: 'PL_02_02', name: 'PL_02_02 second', verdict: 'never-ran', status: null, bundle: null }),
+        kase({ id: 'PL_06_01', name: 'PL_06_01 other', scenario: 'PL_06' }),
+      ],
+    });
+    assert.match(html, /<section class="scenario"><div class="shead">PL_02/);
+    assert.match(html, /PL_06/);
+    assert.match(html, /1 of 2 passed/);
+    assert.match(html, />never ran</);
+    assert.match(html, /No steps were recorded/);
+  });
+
+  it('the chip follows the two-family taxonomy', () => {
+    assert.equal(verdictChipOf(kase({ verdict: 'failed', status: 'dead-end' })).label, 'test failed (dead-end)');
+    assert.equal(verdictChipOf(kase({ verdict: 'failed', status: 'error' })).label, 'system error');
+    assert.equal(verdictChipOf(kase({ verdict: 'passed', status: 'passed-with-issues' })).label, 'pass**');
+    assert.equal(verdictChipOf(kase({ verdict: 'review', status: 'needs-review' })).label, 'needs review');
+  });
+});
+
+describe('the two panes', () => {
+  it('left holds expandable steps with detail; right holds the time record with the slow budget named', () => {
+    const html = renderCatalogReport({
+      title: 't', runKey: null, generatedAt: null,
+      cases: [kase({
+        history: ['newly broken — passed until yesterday'],
+        bundle: bundle([
+          step({ index: 0, intent: 'open the page' }),
+          step({ index: 1, action: 'click', selector: 'role=button[name="Save" i]', status: 'failed', durationMs: 2500, error: 'no element matches' }),
+        ], { status: 'failed', notes: ['pre-run dead-end risk 20%'] }),
+        verdict: 'failed', status: 'failed',
+      })],
+    });
+    assert.match(html, /class="steps-pane"/);
+    assert.match(html, /class="time-pane"/);
+    assert.match(html, /<details class="step no"/);
+    assert.match(html, /no element matches/);
+    assert.match(html, /Time record — /);
+    assert.match(html, /tbar slow broke/);
+    assert.match(html, /2s fast-path budget/);
+    assert.match(html, /From the run history/);
+    assert.match(html, /newly broken — passed until yesterday/);
+    assert.match(html, /Run notes/);
+  });
+});
+
+describe('embedded evidence and the budget', () => {
+  it('embeds screenshots as data URIs; a failure still is embedded past the budget, a routine one is omitted with a note', () => {
+    const big = 'A'.repeat(SCREENSHOT_BUDGET_BYTES + 10);
+    const html = renderCatalogReport({
+      title: 't', runKey: null, generatedAt: null,
+      cases: [
+        kase({ bundle: bundle([step({ screenshot: big })]) }), // routine, over budget alone
+        kase({
+          id: 'PL_02_03', name: 'PL_02_03 f', verdict: 'failed', status: 'failed',
+          bundle: bundle([step({ status: 'failed', screenshot: 'FAILSHOT' })], { status: 'failed' }),
+        }),
+      ],
+    });
+    assert.match(html, /data:image\/jpeg;base64,FAILSHOT/, 'failure stills always embed');
+    assert.ok(!html.includes(big), 'the over-budget routine still is not embedded');
+    assert.match(html, /omitted for size — it stays in the proof bundle/);
+    assert.match(html, /routine screenshot\(s\) omitted/);
+  });
+});
+
+describe('export', () => {
+  it('ships the client-side export for one case and for the catalog', () => {
+    const html = renderCatalogReport({ title: 't', runKey: null, generatedAt: null, cases: [kase({})] });
+    assert.match(html, /function exportCase\(/);
+    assert.match(html, /function exportCatalog\(/);
+    assert.match(html, /onclick="exportCase\(event,'case-pl-02-01'\)"/);
+    assert.match(html, /Export catalog/);
+  });
+});
+
+describe('safety and paths', () => {
+  it('escapes case names — application text cannot become markup', () => {
+    const html = renderCatalogReport({
+      title: '<script>x</script>', runKey: null, generatedAt: null,
+      cases: [kase({ name: 'PL_02_01 <img src=x onerror=alert(1)>' })],
+    });
+    assert.ok(!html.includes('<img src=x'));
+    assert.ok(!html.includes('<script>x</script>'));
+  });
+
+  it('the path is reports/<runKey slug>.html, stable per run key', () => {
+    const p = catalogReportPath('be100-csv@2026-08-31T03:33:23.997Z', 'be100', '/tmp/x');
+    assert.match(p, /^\/tmp\/x\/reports\/be100-csv-2026-08-31t03-33-23-997z\.html$/);
+    assert.equal(catalogReportPath(null, 'My Catalog', '/tmp/x'), '/tmp/x/reports/my-catalog.html');
+  });
+});
+
+/* --------------------------------------------------------- the recording */
+
+/**
+ * The film, and why it has to be here (2026-08-31). The runner's screenshot
+ * default is video-aware: while it is filming, stills are taken only at
+ * failures, because the film covers the rest. Measured on be100-rip's bundles,
+ * that is exactly what they hold — all 13 non-passing cases carry stills and
+ * 18 of 19 passing ones carry none. A report that dropped the recording
+ * therefore left a reader with no evidence at all for every case that worked.
+ */
+const withVideo = (over: Partial<CatalogReportCase>, data: string, over2: Partial<ProofBundle> = {}): CatalogReportCase =>
+  kase({
+    ...over,
+    bundle: bundle([step({}), step({ index: 1, action: 'click', videoOffsetMs: 2110 })], {
+      video: { data, width: 960, height: 540 },
+      ...over2,
+    } as Partial<ProofBundle>),
+  });
+
+describe('chooseEmbeddedVideos', () => {
+  it('serves cases that did NOT pass first — a catalog is mostly passes', () => {
+    // Two of these three fit. Document order would spend the budget on the
+    // pass and leave the failure, the case a reader actually opens, with none.
+    const keep = chooseEmbeddedVideos(
+      [
+        withVideo({ id: 'A', verdict: 'passed' }, 'x'.repeat(60)),
+        withVideo({ id: 'B', verdict: 'failed' }, 'x'.repeat(60)),
+        withVideo({ id: 'C', verdict: 'review' }, 'x'.repeat(60)),
+      ],
+      130,
+    );
+    assert.deepEqual([...keep].sort(), ['B', 'C']);
+  });
+
+  it('within a group takes the smallest first, so the budget buys the most cases', () => {
+    const keep = chooseEmbeddedVideos(
+      [
+        withVideo({ id: 'BIG', verdict: 'failed' }, 'x'.repeat(100)),
+        withVideo({ id: 'S1', verdict: 'failed' }, 'x'.repeat(40)),
+        withVideo({ id: 'S2', verdict: 'failed' }, 'x'.repeat(40)),
+      ],
+      90,
+    );
+    assert.deepEqual([...keep].sort(), ['S1', 'S2']);
+  });
+
+  it('ignores a case with no recording at all rather than counting it', () => {
+    assert.equal(chooseEmbeddedVideos([kase({ id: 'A' })]).size, 0);
+    assert.equal(chooseEmbeddedVideos([withVideo({ id: 'B' }, '')]).size, 0);
+  });
+
+  it('has a budget at all — a 75MB catalog is not a report anyone opens', () => {
+    assert.equal(VIDEO_BUDGET_BYTES, 25_000_000);
+  });
+});
+
+describe('the recording in the page', () => {
+  const render = (cases: CatalogReportCase[]): string =>
+    renderCatalogReport({ title: 't', runKey: null, generatedAt: null, cases });
+
+  it('carries the bytes on an attribute, never as a data: URI', () => {
+    const html = render([withVideo({ id: 'A' }, 'QUJD')]);
+    // Chrome will not load a `data:` video — the element sits at readyState 0
+    // forever with no error, which reads exactly like a corrupt recording.
+    assert.match(html, /<video[^>]*data-webm="QUJD"/);
+    assert.doesNotMatch(html, /src="data:video/);
+    assert.match(html, /wowHydrateVideo/, 'and the page carries what turns it into a Blob');
+  });
+
+  it('does not decode until the case is opened', () => {
+    const html = render([withVideo({ id: 'A' }, 'QUJD')]);
+    assert.match(html, /preload="none"/);
+    assert.match(html, /addEventListener\('toggle'/);
+  });
+
+  it('gives every filmed step a cue into the same file, on the summary where it can be seen', () => {
+    const html = render([withVideo({ id: 'A' }, 'QUJD')]);
+    assert.match(html, /data-seek="2\.11"/);
+    // In the collapsed body a reader has to expand each step to discover that
+    // seeking exists at all; a control nobody can see is not a control.
+    const summary = /<summary>(?:(?!<\/summary>).)*data-seek/s;
+    assert.match(html, summary);
+  });
+
+  it('opens a broken case ON the failure — the frame the recording was kept for', () => {
+    const html = render([
+      kase({
+        id: 'A', verdict: 'failed',
+        bundle: bundle([step({ index: 0, status: 'failed', videoOffsetMs: 4500 })], {
+          video: { data: 'QUJD', width: 960, height: 540 },
+        } as Partial<ProofBundle>),
+      }),
+    ]);
+    assert.match(html, /data-failure-offset="4\.50"/);
+  });
+
+  it('names what it left out instead of dropping it in silence', () => {
+    const html = renderCatalogReport({
+      title: 't', runKey: null, generatedAt: null,
+      cases: [withVideo({ id: 'A' }, 'x'.repeat(30_000_000))],
+    });
+    assert.match(html, /left out to keep this file portable/);
+    assert.doesNotMatch(html, /data-webm="x/);
+    // …and gives no seek control into a film that is not there.
+    assert.doesNotMatch(html, /data-seek=/);
+  });
+
+  it('says a recording FAILED differently from one that was never made', () => {
+    const html = render([
+      kase({
+        id: 'A',
+        bundle: bundle([step({})], {
+          video: { data: '', width: 0, height: 0, omitted: 'the recording was 90MB' },
+        } as Partial<ProofBundle>),
+      }),
+    ]);
+    assert.match(html, /the recording was 90MB/);
+  });
+
+  it('an exported case takes the player and the bytes with it', () => {
+    const html = render([withVideo({ id: 'A' }, 'QUJD')]);
+    // The export writes this variable into the file it downloads; without it
+    // an exported case is a dead player in a file said to hold the evidence.
+    assert.match(html, /var WOW_PLAYER = /);
+    assert.match(html, /WOW_PLAYER \+ '<\/scr'/);
+    // A Blob URL means nothing in another document, so it must be stripped…
+    assert.match(html, /function wowStripBlobs/);
+    // …while the base64 stays put, which is what makes the export playable.
+    assert.match(html, /data-webm deliberately STAYS/);
+  });
+});
+
+/* ------------------------------------------------- does it actually play */
+
+const CDP_URL = process.env['WOWLIDATOR_CDP_URL'] ?? 'http://localhost:9222';
+
+async function cdpAvailable(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${url}/json/version`, { signal: AbortSignal.timeout(1500) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+const browserReady = await cdpAvailable(CDP_URL);
+const skipBrowser = browserReady
+  ? false
+  : `no CDP endpoint at ${CDP_URL} — start Chrome with --remote-debugging-port=9222 (npm run chrome)`;
+
+describe('the recording plays (CDP)', { skip: skipBrowser }, () => {
+  it('decodes on open, seeks from a step, and never toggles that step doing it', async () => {
+    const { chromium } = await import('playwright');
+    const webm = readFileSync(join(import.meta.dirname, 'fixtures', 'recording.webm')).toString('base64');
+    const html = renderCatalogReport({
+      title: 'plays', runKey: null, generatedAt: null,
+      cases: [
+        kase({
+          id: 'A', verdict: 'failed',
+          bundle: bundle(
+            [step({ index: 0, videoOffsetMs: 0 }), step({ index: 1, action: 'click', videoOffsetMs: 500 })],
+            { video: { data: webm, width: 960, height: 540 } } as Partial<ProofBundle>,
+          ),
+        }),
+      ],
+    });
+    const file = join(mkdtempSync(join(tmpdir(), 'wow-catalog-')), 'report.html');
+    writeFileSync(file, html, 'utf8');
+
+    const browser = await chromium.connectOverCDP(CDP_URL);
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(String(error)));
+    try {
+      await page.goto(`file://${file}`);
+      // Nothing is decoded at load: a catalog holds dozens of these, and
+      // building every Blob on first paint would stall the page to make
+      // players nobody opened.
+      assert.equal(await page.locator('video[data-wow-ready]').count(), 0);
+
+      const kase1 = page.locator('details.case').first();
+      await kase1.locator('> summary').click();
+      await page.waitForFunction(
+        () => (document.querySelector('video') as HTMLVideoElement | null)?.readyState >= 2,
+        undefined,
+        { timeout: 15_000 },
+      );
+      const video = kase1.locator('video').first();
+      const state = await video.evaluate((el: HTMLVideoElement) => ({
+        blob: el.src.startsWith('blob:'),
+        duration: el.duration,
+        kept: (el.getAttribute('data-webm') ?? '').length,
+      }));
+      assert.equal(state.blob, true, 'a Blob URL, because Chrome will not load a data: video');
+      assert.ok(state.duration > 0, `the recording has a duration (${state.duration})`);
+      assert.ok(state.kept > 0, 'and the base64 stays put, so an export of this case is playable');
+
+      const seek = kase1.locator('button.seek').nth(1);
+      assert.equal(await seek.isVisible(), true, 'the cue is on the summary, where a reader can see it');
+      await seek.click();
+      await page.waitForTimeout(500);
+      assert.ok(
+        (await video.evaluate((el: HTMLVideoElement) => el.currentTime)) > 0,
+        'clicking a step cue moves the film',
+      );
+      assert.equal(
+        await kase1.locator('details.step').nth(1).evaluate((el: HTMLDetailsElement) => el.open),
+        false,
+        'and playing the film does not expand the step as a side effect',
+      );
+      assert.deepEqual(errors, []);
+    } finally {
+      await page.close().catch(() => undefined);
+      await context.close().catch(() => undefined);
+      await browser.close().catch(() => undefined);
+    }
+  });
+});

@@ -348,10 +348,11 @@ describe('recording a run (CDP)', { skip: skipBrowser }, () => {
     ],
   });
 
-  it('keeps no recording at all when nothing went wrong', async () => {
-    // The rule: a recording is evidence *of a failure*. Filming every passing
-    // run is weight in every report and proof bundle for a question nobody
-    // asked, and it is what makes recording affordable as a default.
+  it('keeps the whole recording when nothing went wrong — every run has a film', async () => {
+    // The rule flipped 2026-08-31, on request: the film of the mock user
+    // performing the task is the evidence a reviewer opens first, pass or
+    // fail, so "View actual flow" must work on every run — a clean pass
+    // keeps its whole recording instead of discarding it.
     const bundle = await runFlow(flow(), {
       cdpUrl: CDP_URL,
       historyPath: null,
@@ -359,8 +360,8 @@ describe('recording a run (CDP)', { skip: skipBrowser }, () => {
     });
 
     assert.equal(bundle.status, 'passed');
-    assert.equal(bundle.video, undefined, 'a passing run must not carry a recording');
-    // Offsets are still stamped: the run *was* filmed, the film was discarded.
+    assert.ok(bundle.video, 'a passing run keeps its recording');
+    assert.ok((bundle.video?.durationMs ?? 0) > 0, 'the film has length');
     for (const step of bundle.steps) {
       assert.equal(typeof step.videoOffsetMs, 'number', `step ${step.index} has no offset`);
     }

@@ -79,6 +79,47 @@ function isAssertionAction(action: string): boolean {
   );
 }
 
+/**
+ * The two families every non-pass verdict is SHOWN as (2026-08-27).
+ *
+ * The machine statuses stay — exit codes, resume ledgers, quarantine and the
+ * repair loop all key off them — but three words for two meanings confused
+ * every reader: `failed` (an assertion contradicted), `dead-end` (a selector
+ * exhausted the ladder) and `error` (a harness fault) wore three tags where
+ * the question a person asks has two answers. Surveyed over this
+ * workspace's 51 bundles: every `dead-end` was "could not resolve <control>"
+ * — the page not offering what the case expected, which is the SUBJECT
+ * failing the expectation, same family as a contradicted assertion; every
+ * run-level `error` traced to a harness fact (a provider refusing the call,
+ * an agent stall, a grounding refusal) — `classifyStepFailure` already
+ * draws exactly this line per step.
+ *
+ * - `test-failed` (red): the test subject did not meet the case's
+ *   expectation — a contradicted assertion, a dead-ended control or content
+ *   the flow needed, a review resolved as failed.
+ * - `system-error` (amber): the harness or its models broke internally —
+ *   no verdict about the application was delivered.
+ * - `review`: proved-? awaiting a human; deliberately NEITHER family — it is
+ *   a pending pass-shaped result, and painting it amber would misfile it.
+ */
+export type VerdictFamily = 'passed' | 'test-failed' | 'system-error' | 'review';
+
+export function verdictFamily(status: RunStatus | string): VerdictFamily {
+  if (isPassing(status)) return 'passed';
+  if (status === 'needs-review') return 'review';
+  if (status === 'error') return 'system-error';
+  // failed, dead-end — and any future subject-side status — read red.
+  return 'test-failed';
+}
+
+/** The tag a person sees, with the machine status kept for the parenthesis. */
+export function familyLabel(status: RunStatus | string): string {
+  const family = verdictFamily(status);
+  if (family === 'test-failed') return status === 'failed' ? 'test-failed' : `test-failed (${status})`;
+  if (family === 'system-error') return 'system error';
+  return status === 'passed-with-issues' ? 'passed**' : String(status);
+}
+
 export function isPassing(status: RunStatus | string): boolean {
   return status === 'passed' || status === 'passed-with-issues';
 }
@@ -376,6 +417,17 @@ export interface AgentRecord {
    * out to have nothing to click.
    */
   lookedOnly?: boolean | undefined;
+  /**
+   * How a SUCCESSFUL finish was settled (2026-08-28, S1 of the agent-flaw
+   * audit): `observed-state` — the harness re-read the goal's end state off
+   * the live tree and `settledEvidence` is the line that showed it;
+   * `agent-claim` — the goal named no checkable state and the model's word
+   * stands, with its reasoning as the evidence. Absent on a failure or a
+   * zero-call rung. Audit finding: 20 of 22 agent legs on passed cases were
+   * settled by the claim alone, invisibly; now the record says which.
+   */
+  settledBy?: 'observed-state' | 'agent-claim' | undefined;
+  settledEvidence?: string | undefined;
 }
 
 export type DefectSeverity = 'high' | 'medium' | 'low';
@@ -671,6 +723,36 @@ export interface ProofSummary {
         cachedInputTokens: number;
         outputTokens: number;
         wallMs: number;
+        /**
+         * The same spend split by the role that asked — authoring
+         * (`generator`), repair (`healer`), the agent, data. Only roles that
+         * actually called appear; absent on bundles from before 2026-08-27.
+         */
+        byRole?:
+          | Record<
+              string,
+              {
+                calls: number;
+                costUsd: number;
+                inputTokens: number;
+                cachedInputTokens: number;
+                outputTokens: number;
+              }
+            >
+          | undefined;
+        /**
+         * Where the account's 5-hour session window stood around this run,
+         * when the quota endpoint answered: the percent used at start and at
+         * end, so a cost figure is never read without its "and how much of
+         * my session was that" half. Absent when quota was unreadable.
+         */
+        quota?:
+          | {
+              beforePercent: number;
+              afterPercent: number;
+              resetsAt: string | null;
+            }
+          | undefined;
       }
     | undefined;
   outputTokens: number;
@@ -730,6 +812,52 @@ export interface GenerationProvenance {
   runKey?: string | undefined;
 }
 
+/** What `error-diagnosis.ts` concluded about a SYSTEM ERROR after the run — see there. */
+export interface ErrorDiagnosis {
+  /** Which layer broke: test-catalog | generator | agent | environment | application. */
+  origin: string;
+  /** 0–1. */
+  confidence: number;
+  reasoning: string;
+  /** A concrete fix when one is available; null is the honest empty. */
+  fix: string | null;
+  /** True when a person can act on the fix now. */
+  actionable: boolean;
+  /** Facts computed from the run and handed to the model as evidence. */
+  signals: string[];
+  model: string;
+  at: string;
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+}
+
+/** What `dead-end-risk.ts` decided about a case before it ran — see there. */
+export interface DeadEndRisk {
+  /** 0–1: how likely the run ends dead-end / error rather than a verdict. */
+  likelihood: number;
+  /**
+   * 0–1: how likely the run ends in a GENUINE FAIL — the application
+   * contradicting the claim (a sheet row recorded Failed, a note citing a
+   * defect, documents that say the app does not satisfy it). A near-certain
+   * fail is a fact retries only re-prove, so past the threshold it fail-fasts
+   * exactly like a dead-end (asked for 2026-08-28). Absent on records from
+   * before the second dimension existed.
+   */
+  failLikelihood?: number | undefined;
+  /** The line it was judged against (0–1). */
+  threshold: number;
+  verdict: 'run' | 'fail-fast';
+  reasons: string[];
+  /** What the flow needs that no evidence shows exists. */
+  missing: string[];
+  /** Facts computed from the code and handed to the model as evidence. */
+  signals: string[];
+  model: string;
+  at: string;
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+}
+
 export interface ProofBundle {
   /**
    * Marked known-flaky by `--quarantine-flaky`: the result is reported in full
@@ -747,10 +875,30 @@ export interface ProofBundle {
    * first rename, and never overwritten by later renames.
    */
   renamedFrom?: string | undefined;
+  /**
+   * A needs-review whose every disputed expected value comes verbatim from
+   * the case's own sheet wording — the page renders the same fact under
+   * different words or design. This is a SPEC QUESTION for BA triage
+   * (deliberate design vs the sheet), not a machine-decidable defect.
+   * Stamped by `runFlow`; EN-2 audit: 29 of 31 genuine QA fails were this
+   * class, and a binary pass/fail hid every one.
+   */
+  specQuestion?: boolean | undefined;
   status: RunStatus;
   startedAt: string;
   finishedAt: string;
   durationMs: number;
+  /**
+   * When the CASE's work began — set by the suite loop at case pickup, so it
+   * covers what `durationMs` (this one flow attempt) cannot: the session
+   * bootstrap, every earlier repair attempt, the investigation between them.
+   * Absent on a standalone `runFlow` (there, `startedAt` is the whole story).
+   * Added 2026-08-27: a repaired case's displayed time was the LAST attempt
+   * only, reading far shorter than the wall clock a person watched.
+   */
+  caseStartedAt?: string | undefined;
+  /** `caseStartedAt` → this bundle's finish. The number a stopwatch agrees with. */
+  caseDurationMs?: number | undefined;
   cdpUrl: string | null;
   cachePath: string | null;
   healerModel: string | null;
@@ -816,6 +964,22 @@ export interface ProofBundle {
       }
     | undefined;
   error?: string | undefined;
+  /**
+   * The pre-run dead-end risk the suite loop judged this case at, when it did
+   * (`src/generator/dead-end-risk.ts`). `fail-fast` means the run happened ONCE
+   * with no healer, no agent, no reconstruction and no repair loop — the
+   * verdict is real, only the retries were withheld. Absent when the
+   * assessment is off, the model could not be resolved, or the flow was
+   * hand-written.
+   */
+  risk?: DeadEndRisk | undefined;
+  /**
+   * Filled only when `status` is `error` and the diagnosis judge ran: which
+   * layer the SYSTEM ERROR came from and the fix, when one exists. Never a
+   * verdict and never a repair — an explanation, so a person stops re-running
+   * a case whose data was never seeded. See `src/generator/error-diagnosis.ts`.
+   */
+  diagnosis?: ErrorDiagnosis | undefined;
 }
 
 export interface ProofBundleBuilderOptions {
@@ -1188,16 +1352,21 @@ export class ProofBundleBuilder {
    * Zero calls records nothing: a run that never asked is not a run that
    * spent nothing, it is a run the question does not apply to.
    */
-  noteSessionUsage(provider: string, spent: {
-    calls: number;
-    costUsd: number;
-    inputTokens: number;
-    cachedInputTokens: number;
-    outputTokens: number;
-    wallMs: number;
-  }): void {
+  noteSessionUsage(
+    provider: string,
+    spent: {
+      calls: number;
+      costUsd: number;
+      inputTokens: number;
+      cachedInputTokens: number;
+      outputTokens: number;
+      wallMs: number;
+      byRole?: NonNullable<ProofBundle['summary']['session']>['byRole'];
+    },
+    quota?: { beforePercent: number; afterPercent: number; resetsAt: string | null },
+  ): void {
     if (spent.calls <= 0) return;
-    this.#sessionUsage = { provider, ...spent };
+    this.#sessionUsage = { provider, ...spent, ...(quota === undefined ? {} : { quota }) };
   }
 
   #sessionUsage: ProofBundle['summary']['session'] = undefined;
@@ -1359,6 +1528,18 @@ export class ProofBundleBuilder {
       const claimsHeld =
         assertions.length > 0 && assertions.every((s) => s.status === 'passed');
       if (claimsHeld) status = 'passed-with-issues';
+    }
+    // **A pass whose assertions include a vacuous one is unproved** (S5 of
+    // the 2026-08-28 audit). PL_04_13: three `expectVisible role=combobox >>
+    // nth=0` resolved a nameless element on a page with zero comboboxes and
+    // passed — while the human had recorded the case Failed. A green built
+    // on an assertion that cannot fail is not a verdict; it goes to a person.
+    if (isPassing(status) && counted.some((s) => s.detail?.['vacuous'] !== undefined && !s.superseded)) {
+      for (const s of counted) {
+        if (s.detail?.['vacuous'] === undefined || s.superseded) continue;
+        s.unsure = `${s.detail['vacuous']} — confirm the claim against the page, or re-author the selector to name the control`;
+      }
+      status = 'needs-review';
     }
     // **proved-? — every broken step is a failed assertion whose actual is a
     // near-miss of its expected.** The page produced the right SHAPE of thing

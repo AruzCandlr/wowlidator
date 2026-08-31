@@ -856,6 +856,32 @@ function boot() {
   });
 }
 
+/* The usage-cap popup — the same one wowUI shows, on this surface too: once
+   per trip, never auto-dismissed. Polled on the quota's own cadence; the
+   server answer is cached, so this is cheap. */
+var capPopupFor = null;
+function pollUsageCap() {
+  api('/api/usage-cap').then(function (cap) {
+    if (!cap || !cap.tripped || capPopupFor === cap.tripped.at) return;
+    capPopupFor = cap.tripped.at;
+    var t = cap.tripped;
+    var overlay = el('div', { style: 'position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; z-index:1000' });
+    var box = el('div', { role: 'alertdialog', 'aria-label': 'Usage cap reached', style: 'background:var(--bg, #fff); color:inherit; max-width:520px; padding:20px 24px; border-radius:8px; box-shadow:0 8px 32px rgba(0,0,0,.3)' }, [
+      el('h2', { text: 'Usage cap reached', style: 'margin:0 0 8px' }),
+      el('p', { text: t.reason + ' — every running job was stopped' + (t.stoppedJobs.length ? ' (' + t.stoppedJobs.join(', ') + ')' : '') + ', and new runs are held until the cap is reset.' }),
+      el('p', { text: (t.resetsAt ? 'The window resets at ' + new Date(t.resetsAt).toLocaleString() + '. ' : '') + 'Reset the hold, raise the cap, or turn it off on wowUI’s Models & keys page (/wow).' }),
+      el('div', { style: 'display:flex; gap:8px; justify-content:flex-end; margin-top:12px' }, [
+        el('a', { href: '/wow', text: 'Open wowUI' }),
+        el('button', { type: 'button', text: 'Dismiss', onclick: function () { overlay.remove(); } })
+      ])
+    ]);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  })['catch'](function () {});
+}
+pollUsageCap();
+setInterval(pollUsageCap, 30000);
+
 boot();
 `;
 

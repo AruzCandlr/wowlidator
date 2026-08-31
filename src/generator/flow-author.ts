@@ -79,6 +79,43 @@ export const JOURNEY_TREE_MAX_LINES = 80;
 export const AUTHOR_ATTEMPTS = 3;
 
 /**
+ * How many distinct refusal shapes a suite carries forward into later rows'
+ * FIRST attempt.
+ *
+ * Measured on be100-rip (2026-08-31): the run's refusals were the same two or
+ * three families over and over — an `expectDbRows` on the case's own test data,
+ * a `workflow` goal naming controls the repository declares. Each cost a full
+ * authoring attempt (57 s, ~$0.44 on opus), per row, to teach the model a rule
+ * it had already been taught on the row before. The feedback text already
+ * exists and already works; it just never leaves the row that earned it.
+ *
+ * Six, and by frequency rather than recency: a lint that fired twenty times is
+ * the one worth pre-empting, and a long list of near-misses would crowd the
+ * request itself out of the model's attention — the failure mode this bound
+ * exists to prevent.
+ */
+export const SUITE_REFUSAL_MEMORY = 6;
+
+/**
+ * A refusal's SHAPE — the rule it broke, with this row's particulars removed.
+ *
+ * Two refusals of the same lint differ only in the quoted names, the step
+ * index and the numbers, so those are exactly what is stripped. Without this
+ * the memory would fill with six variants of one lint and teach nothing.
+ * Pure, so `tests/flow-author.test.ts` can pin it without a model.
+ */
+export function refusalShape(message: string): string {
+  return message
+    .split('\n')[0]!
+    .toLowerCase()
+    .replace(/"[^"]*"/g, '""')
+    .replace(/\(step \d+\)/g, '(step)')
+    .replace(/\d+/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * Actions the author may emit.
  *
  * A deliberate subset of `FlowStep`. `fillEach` and `expectTabOrder` are absent
@@ -114,6 +151,15 @@ export const AUTHOR_ACTIONS = [
   'forward',
   'scrollTo',
   'expectScrollable',
+  // Read a COUNT of matching elements / an element's TEXT into a named
+  // variable (`value` = the name), for a later expectCount/expectText that
+  // carries `{{name}}`. This is how "A matches B" is authored as a real
+  // check: save the table's count, then expect the tile's text to hold it —
+  // and how "no change after the action" is authored: save before, act,
+  // expect the same reading after. EN-2 audit: ten missed bugs were
+  // reconciliation claims asserted as mere presence.
+  'saveCount',
+  'saveText',
   'snapshot',
   'expectText',
   'expectVisible',
@@ -355,6 +401,16 @@ export interface AuthorRequest {
    * answer got wrong, and the value of a retry is entirely in that knowledge.
    */
   feedback?: readonly string[] | undefined;
+  /**
+   * Rules OTHER rows in this suite have already been refused for — see
+   * `SUITE_REFUSAL_MEMORY`. Kept apart from `feedback` because the two are
+   * different claims and the prompt must not conflate them: `feedback` says
+   * "your previous answer to THIS question was wrong", which is a fact; this
+   * says "the suite keeps making this mistake", which is a warning about a
+   * pattern, and wording it as the former on a first attempt would be a lie
+   * the model would then try to fix.
+   */
+  commonRefusals?: readonly string[] | undefined;
 }
 
 /**
@@ -434,14 +490,21 @@ const GROUNDED_RULES = `You have been given the accessibility tree of the live p
   selector for it. Emit the steps you can support and say plainly in "notes"
   which part could not be expressed and why.
 - The tree describes ONE page state. Controls on the journey's other pages and
-  dialogs are not in it — for those legs, a workflow step may act (see the
-  workflow entry) with the claim settled by agent-independent evidence.`;
+  dialogs are not in it — for those legs, ground each step in WHAT THE
+  REPOSITORY DECLARES when it names the control's rendered string (role +
+  declared label), and reach for a workflow step ONLY where neither a tree nor
+  the repository declares the control (see the workflow entry), with the claim
+  settled by agent-independent evidence. Where a tree and the repository
+  disagree, the tree wins — it is the live page.`;
 
 const UNGROUNDED_RULES = `You have NOT been given a page — you are working from the request alone.
 
-- You cannot know this application's real selectors, so do not pretend to. Use
-  readable role-based placeholders (role=button[name="Save"]) that an author will
-  correct, and list every one of them in "notes" as needing verification.
+- You cannot know this application's real selectors, so do not pretend to. When
+  WHAT THE REPOSITORY DECLARES names a control's rendered string, quote it —
+  role=button[name="Create Plan" i] grounded in the code is a real selector,
+  not a placeholder. Otherwise use readable role-based placeholders
+  (role=button[name="Save"]) that an author will correct, and list every
+  placeholder in "notes" as needing verification.
 - Keep the shape right even where the details must be guessed: correct actions,
   correct ordering, a real assertion.`;
 
@@ -487,9 +550,12 @@ ${DETERMINISM_RULES}
 ${procedure('HOW TO BUILD THE FLOW', [
   'Read the request and write down, for yourself: the persona and its exact credentials; the page or route under test; each CLAIM the request makes (one per line of its Expected output, or one per sentence that asserts something); any date the claim depends on; anything the request says is already true.',
   'setup = sign in (SIGNING IN, below), reach the page under test, and assert WHO is signed in. Nothing else goes in setup. If a date matters, setClock is the FIRST step of setup, before the first goto.',
-  'One case per claim. The case name is the request\'s own case id VERBATIM (PB_01_01, DB_07_01 …); when the request lists several independent claims under one id, suffix them " / 1", " / 2" in the order the request states them. Never invent a case name when the request has an id, and never merge two claims into one case.',
-  'For each case: the fewest steps that reach the claim, then the assertion(s) that would FAIL if the claim were false — nothing that passes either way. The sign-in proof and an expectUrl are PREPARATION, never the claim: every case must assert at least one line of the Expected output in the page\'s own terms (the option list a dropdown shows, the error message text, the count), and a case whose only assertions are the sign-in proof and a URL is refused.',
-  'Every selector comes from a tree you were given, in the canonical form. Only when the control appears in NO tree given to you may the leg be a workflow step (WORKFLOW GOALS, below).',
+  'EVERY TEST CASE HAS SOMETHING TO TEST — always. A body step that runs against the sign-in page is YOUR error, never a fact about the feature: the sign-in in setup must be complete (fill every field the form has, submit, prove it took) and the flow must have navigated to the page under test before the first body step. And never conclude a case cannot be tested: when the exact expected value is out of reach, assert the closest observable fact the page offers — the named element exists, the count reads as a number, the label the spec owns is rendered — and say in "notes" what was narrowed and why. A flow that tests nothing is not an answer.',
+  'One case per claim. The case name is the request\'s own case id VERBATIM (TC_01_01, API_02_03 …); when the request lists several independent claims under one id, suffix them " / 1", " / 2" in the order the request states them. Never invent a case name when the request has an id, and never merge two claims into one case.',
+  'For each case: the fewest steps that reach the claim, then the assertion(s) that would FAIL if the claim were false — nothing that passes either way. The sign-in proof and an expectUrl are PREPARATION, never the claim: EVERY numbered line of the Expected output (6.1, 6.2, …) gets its own assertion in the page terms that line names — the very element the line speaks of (the count box it names, the message it quotes, the option list it lists) — and the step\'s intent cites that line\'s number. A backend check may CORROBORATE a line, never replace it: a line about an on-screen number is proved by reading that number on screen. A case whose only assertions are the sign-in proof and a URL is refused.',
+  'Every selector comes from a tree you were given, in the canonical form. When the control appears in NO tree but WHAT THE REPOSITORY DECLARES names its rendered string (a component\'s words, a message catalog\'s value), write the step deterministically against that string — role + declared label, e.g. role=button[name="Create Plan" i], expectText quoting the declared value. Only when neither a tree nor the repository declares the control may the leg be a workflow step (WORKFLOW GOALS, below) — deterministic steps cost $0 and run in milliseconds; an agent leg costs model calls per turn.',
+  'EXPECTED VALUES ARE QUOTED, NEVER INVENTED: every value an assertion carries comes verbatim from the case (its Expected output, Test data or Note), from a document section, or from WHAT THE REPOSITORY DECLARES — in that order of authority. When the Expected output is too vague to assert (no value, no label, no message), take the anchor from the Note or the documents; when none of them holds one, say so in "notes" and assert the observable shape (the named element exists and holds a number) rather than inventing a value.',
+  'A CLAIM THAT TWO READINGS AGREE IS TWO READINGS, COMPARED: "the tile matches the table", "the summary equals the column count", "the number does not change after the action" is NEVER proved by asserting one side exists. Author it as saveCount (or saveText) of one surface into a named variable — the variable NAME goes in the step\'s "value" field — then expectCount/expectText on the other surface carrying {{that-name}} — and for a no-change claim, save BEFORE the action and compare the same reading AFTER. A number printed in the Expected output ("1-15 of 43") is an illustration from the sheet-writer\'s data, never a value to assert; the saved reading is the value.',
   'Run the checklist at the end of these instructions and fix what fails.',
 ])}
 
@@ -517,7 +583,11 @@ Actions available:
                   "value", the dropdown control itself in "selector". Works on
                   a native select and on a custom combobox alike — never fill
                   a dropdown, and never click it open to guess at its items:
-                  this one step opens it and picks.
+                  this one step opens it and picks. Name the control by role
+                  and visible label (role=combobox[name="…"]), NEVER by DOM
+                  internals (select:has(option…), option:checked) — no tree
+                  shows those, and an internals selector dead-ends on any
+                  custom widget.
 - check / uncheck tick or untick a checkbox, radio, or toggle. Prefer these
                   over click when the point is the resulting state — they
                   verify the state actually changed.
@@ -540,8 +610,8 @@ Actions available:
                   for you. Write explicit grounded steps against its controls,
                   exactly as you would for the first tree, and keep workflow
                   for the legs no captured tree covers. State the goal precisely, with the concrete
-                  values in it ("open RULE-TRV-001's edit dialog, set
-                  entitlement amount to 75000, save"), and then settle the
+                  values in it ("open ORD-1042's edit dialog, set
+                  quantity to 3, save"), and then settle the
                   claim with evidence INDEPENDENT of the agent — a DB check, a
                   request assertion, or page content read afterwards. An
                   assertion an agent made true proves nothing; an agent-driven
@@ -552,12 +622,16 @@ WORKFLOW GOALS — a workflow goal is judged by evidence, so write one the
                   values (ids, amounts, labels) taken verbatim from the
                   request; (c) when the leg ends on a different page, END with
                   the URL path the page will be on when the goal is met, in
-                  the form "… and end on /en/workflows/probation" — a goal
+                  the form "… and end on /orders/pending" — a goal
                   that names its destination is proved the moment the page
                   arrives there. NEVER a workflow step for: signing in when a
                   tree shows the sign-in form; accepting a consent page
                   (clickIfVisible); making an assertion true; anything a
-                  captured tree already contains the controls for.
+                  captured tree already contains the controls for; any control
+                  whose rendered string WHAT THE REPOSITORY DECLARES names —
+                  write those as explicit steps on the declared strings, and
+                  keep the goal to what neither a tree nor the repository
+                  declares.
 - setLocalStorage seed a key. "key" and "value". Must follow a goto — storage is
                   origin-scoped. If the key is what signs the user in, follow it
                   with ANOTHER goto to the page under test: an application reads
@@ -579,7 +653,15 @@ WORKFLOW GOALS — a workflow goal is judged by evidence, so write one the
 - expectText      element's text CONTAINS "value".
 - expectVisible / expectHidden      element is / is not visible.
 - expectEnabled / expectDisabled    control is / is not interactive.
-- expectCount     exactly "value" matches. "value" must be digits.
+- expectCount     exactly "value" matches. "value" must be digits, or a
+                  {{variable}} a saveCount/saveText step recorded.
+- saveCount       read HOW MANY elements match the selector into a variable.
+                  The VARIABLE NAME goes in "value" (e.g. value: "rows-before");
+                  a later expectCount carrying {{rows-before}} compares it.
+                  THE tool for a "matches" or "no change" claim.
+- saveText        read the element's visible text into a variable. The VARIABLE
+                  NAME goes in "value"; a later expectText carrying {{that-name}}
+                  compares it on the other surface.
 - back / forward  move through history. Use "back" to return to a list page
                   after checking a detail page, instead of navigating again.
 - scrollTo        scroll a control into view. Selector required.
@@ -794,8 +876,8 @@ dies on its second login.
 WHICH CREDENTIALS, in this order of precedence:
   1. The credentials the request ITSELF states for the persona it names (a
      "Login / persona" line, "sign in as X, password Y") — verbatim, character
-     for character. A catalog names its own personas, and a case about the
-     HRBP must sign in as the HRBP.
+     for character. A catalog names its own personas, and a case about one
+     persona must sign in as that persona.
   2. Otherwise, the "SIGN IN AS" section when one is present — the account the
      person running this supplied. Fill it EXACTLY as given.
   3. Otherwise you have no way to know a working password: use an obvious
@@ -833,8 +915,8 @@ WHAT A CLAIM HAS TO BE MADE OF
    are different claims, and only the second one fails when the app drops the
    submission and shows somebody else's.
 3. Quote the application's own words for a status. A store that models a state
-   as "pending" frequently renders it as something else entirely ("Awaiting
-   manager"); take the label from the accessibility tree, never from the state
+   as "pending" frequently renders it as something else entirely ("In
+   review"); take the label from the accessibility tree, never from the state
    name or from the requirement's wording.
 4. Never pin a live count inside a selector — "Status (3)" counts whatever the
    application holds right now, including rows a seed or an earlier run left.
@@ -965,6 +1047,17 @@ export function buildUserPrompt(request: AuthorRequest): string {
   // across all three authoring attempts, which is what lets a provider's
   // implicit prompt cache bill the resent capture at cache rates instead of
   // full price. Recency also puts the correction where the model weighs it most.
+  // Before the row's own feedback and after every shared byte, for the same
+  // caching reason — and because a correction about THIS flow should be the
+  // last thing read.
+  if (request.commonRefusals?.length) {
+    lines.push(
+      '',
+      'MISTAKES ALREADY REFUSED ON OTHER ROWS OF THIS SUITE. They are not about this flow — ' +
+        'they are the rules this catalog keeps breaking. Do not make them here:',
+      ...request.commonRefusals.map((entry) => `  - ${entry}`),
+    );
+  }
   if (request.feedback?.length) {
     lines.push(
       '',
@@ -1269,8 +1362,10 @@ export function dropReasonFor(
       ? 'the selector is a comment, not a selector — name a control from the tree'
       : 'the step names no selector — copy the control from the tree';
   }
-  if (/^(fill|type|selectOption|expectText|expectValue|expectCount|expectAttribute)$/.test(raw.action) && raw.value === '') {
-    return `${raw.action} needs a value`;
+  if (/^(fill|type|selectOption|expectText|expectValue|expectCount|expectAttribute|saveCount|saveText)$/.test(raw.action) && raw.value === '') {
+    return /^save/.test(raw.action)
+      ? `${raw.action} needs the VARIABLE NAME in "value" (e.g. value: "rows-before"; a later expect step compares {{rows-before}})`
+      : `${raw.action} needs a value`;
   }
   return 'the step could not be narrowed to a runnable form (a field it needs is missing or malformed)';
 }
@@ -1395,13 +1490,26 @@ function toFlowStep(
     case 'expectFocused':
       return needsSelector ? null : { action: 'expectFocused', selector, intent };
     case 'expectCount': {
-      // Every field arrives as a string; a non-numeric count is unusable rather
-      // than something to guess at.
+      // Digits, or a `{{variable}}` a saveCount/saveText step recorded — the
+      // compare half of a reconciliation claim. Anything else is unusable
+      // rather than something to guess at.
+      if (/^\{\{[\w.-]+\}\}$/.test(raw.value.trim())) {
+        return needsSelector ? null : { action: 'expectCount', selector, count: raw.value.trim(), intent };
+      }
       const count = Number(raw.value);
       return needsSelector || !Number.isInteger(count) || count < 0
         ? null
         : { action: 'expectCount', selector, count, intent };
     }
+    case 'saveCount':
+      // `value` names the variable the reading lands in.
+      return needsSelector || raw.value.trim() === ''
+        ? null
+        : { action: 'saveCount', selector, as: raw.value.trim(), intent };
+    case 'saveText':
+      return needsSelector || raw.value.trim() === ''
+        ? null
+        : { action: 'saveText', selector, as: raw.value.trim(), intent };
     case 'expectUrl':
       return raw.value === '' ? null : { action: 'expectUrl', value: raw.value, intent };
     case 'expectValue':
@@ -1723,6 +1831,13 @@ export function composeRefusal(violations: readonly Violation[]): AuthoringError
 
 export interface FlowAuthorOptions {
   model: FlowAuthorModel;
+  /**
+   * Total authoring attempts including the first (`AUTHOR_ATTEMPTS` when
+   * absent). Selectable per run — 1 is "one ask, no re-ask budget": cheaper
+   * and faster, at the price of losing the informed retry that the refusal
+   * feedback exists for.
+   */
+  attempts?: number | undefined;
   maxAxNodes?: number | undefined;
   /** Open the page's menus and disclosures before authoring. Default false. */
   probe?: boolean | undefined;
@@ -1800,9 +1915,23 @@ export class FlowAuthor {
   readonly #declaredOperations: readonly string[];
   readonly #backend: boolean;
   readonly #reviewer: FlowReviewer | undefined;
+  readonly #attempts: number;
+  /**
+   * Refusals this AUTHOR has already seen, across every row it has written —
+   * shape → { exemplar, count }. One author instance writes a whole catalog,
+   * so this is suite-scoped by construction. See `SUITE_REFUSAL_MEMORY`.
+   */
+  readonly #refusals = new Map<string, { exemplar: string; count: number }>();
 
   constructor(options: FlowAuthorOptions) {
     this.model = options.model;
+    // Per-run option first, then the Machinery dial, then the constant.
+    const dial = Number((process.env['WOWLIDATOR_AUTHOR_ATTEMPTS'] ?? '').trim());
+    const fallback = Number.isInteger(dial) && dial >= 1 && dial <= 5 ? dial : AUTHOR_ATTEMPTS;
+    this.#attempts =
+      options.attempts !== undefined && Number.isFinite(options.attempts)
+        ? Math.max(1, Math.floor(options.attempts))
+        : fallback;
     this.#probe = options.probe ?? false;
     this.#maxProbes = options.maxProbes;
     this.#maxAxNodes = options.maxAxNodes ?? DEFAULT_AUTHOR_MAX_NODES;
@@ -1817,6 +1946,33 @@ export class FlowAuthor {
     this.#backend = options.backend ?? true;
     this.#reviewer = options.reviewer;
     this.#onLog = options.onLog;
+  }
+
+  /** Remember a refusal by its shape, keeping the first message as the exemplar. */
+  #rememberRefusals(messages: readonly string[]): void {
+    for (const message of messages) {
+      const shape = refusalShape(message);
+      if (shape === '') continue;
+      const held = this.#refusals.get(shape);
+      if (held === undefined) this.#refusals.set(shape, { exemplar: message, count: 1 });
+      else held.count += 1;
+    }
+  }
+
+  /**
+   * The mistakes this suite keeps making, most frequent first, bounded.
+   *
+   * Only shapes seen more than once travel: a lint that fired on exactly one
+   * row is that row's problem, and pre-loading it onto unrelated rows is how a
+   * memory turns into a bias. The second occurrence is the evidence that it is
+   * a pattern rather than an accident.
+   */
+  #recalledRefusals(): string[] {
+    return [...this.#refusals.values()]
+      .filter((held) => held.count > 1)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, SUITE_REFUSAL_MEMORY)
+      .map((held) => held.exemplar);
   }
 
   /**
@@ -1844,6 +2000,13 @@ export class FlowAuthor {
        * the routes that matter are the row's, not the whole project's.
        */
       projectContext?: string | undefined;
+      /**
+       * Evidence to author AGAINST from the first ask (S6): the pre-run risk
+       * judge's concrete reasons ("the search box starts disabled", "no
+       * Start-date filter exists") from a prior attempt of this same row.
+       * The judge already knew the answer; it used to only shorten retries.
+       */
+      priorFeedback?: readonly string[] | undefined;
     } = {},
   ): Promise<AuthoredFlow> {
     const trimmed = prompt.trim();
@@ -1895,7 +2058,19 @@ export class FlowAuthor {
     // rule — the value of a retry is entirely in knowing what was refused),
     // and only then the loud refusal, which `runCases` scores as blocked
     // rather than failed.
-    const feedback: string[] = [];
+    // Seeded with the risk judge's prior reasons when the caller has them
+    // (S6): the first ask then already authors AGAINST "the search box starts
+    // disabled" instead of discovering it in a dead-ended run.
+    const feedback: string[] = [...(extra.priorFeedback ?? [])];
+    // Read once, before the first attempt: what this suite has already been
+    // refused for. A row authored while nothing has been refused yet sends
+    // nothing, which is byte-for-byte the prompt it always had.
+    const recalled = this.#recalledRefusals();
+    if (recalled.length > 0) {
+      this.#onLog?.(
+        `carrying ${recalled.length} rule(s) this suite has already been refused for into the first attempt`,
+      );
+    }
     let result!: Awaited<ReturnType<FlowAuthorModel['author']>>;
     // Every attempt that was refused ONLY for being thin, kept in case the
     // budget runs out with nothing better. See `AuthoringErrorSeverity`: the
@@ -1905,11 +2080,11 @@ export class FlowAuthor {
     let weak: { result: typeof result; note: string } | null = null;
     let accepted = false;
     let lastRefusal: AuthoringError | null = null;
-    for (let attempt = 1; attempt <= AUTHOR_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= this.#attempts; attempt += 1) {
       this.#onLog?.(
         attempt === 1
           ? `asking the generator role to write the flow…`
-          : `asking again with the refusal as feedback (attempt ${attempt}/${AUTHOR_ATTEMPTS})…`,
+          : `asking again with the refusal as feedback (attempt ${attempt}/${this.#attempts})…`,
       );
       result = await this.model.author({
         prompt: trimmed,
@@ -1926,6 +2101,10 @@ export class FlowAuthor {
         ...(journeyTree ? { journeyTree } : {}),
         ...(this.#scope ? { scope: this.#scope } : {}),
         ...(feedback.length > 0 ? { feedback } : {}),
+        // What earlier rows of this suite were refused for. Sent on every
+        // attempt: the rules do not stop applying once this row has its own
+        // refusal to fix.
+        ...(recalled.length > 0 ? { commonRefusals: recalled } : {}),
       });
       const caseCount = result.cases?.length ?? 1;
       this.#onLog?.(
@@ -2161,10 +2340,31 @@ export class FlowAuthor {
           );
         }
 
+        // **Before the wording lint**, which otherwise catches an undefined
+        // placeholder incidentally and blames it on a data row — the
+        // misdiagnosis that made three PL_02 rows rename the placeholder
+        // instead of removing it. A placeholder is diagnosed as a placeholder.
+        const unsaved = undefinedVariableRef([...(result.setup ?? []), ...result.steps]);
+        if (unsaved !== null) {
+          refuse(
+            `the authored flow "${result.name}" reads {{${unsaved.name}}} (step ${unsaved.index}), ` +
+              'but nothing in the flow ever saves that variable — the step asserts an unresolvable ' +
+              'placeholder and fails on every run. ' +
+              (unsaved.available.length > 0
+                ? `Saved in this flow: ${unsaved.available.map((n) => `{{${n}}}`).join(', ')}. `
+                : 'This flow saves no variables at all. ') +
+              'Either save the reading first (saveText/saveCount with the VARIABLE NAME in "value", ' +
+              'or a request step\'s save map) and compare against it, or drop the placeholder and ' +
+              'assert the literal value quoted from the test case, its Note, the documents or the ' +
+              'repository. Never invent a value.',
+          );
+        }
+
         const wordingOnData = wordingClaimAssertsDataValue(
           trimmed,
           [...(result.setup ?? []), ...result.steps],
           evidenceTree ?? '',
+          extra.projectContext ?? this.#projectContext,
         );
         if (wordingOnData !== null) {
           refuse(
@@ -2463,6 +2663,59 @@ export class FlowAuthor {
           }
         }
 
+        const codeEvidence = extra.projectContext ?? this.#projectContext;
+        const unrendered = ungroundedTextExpectation(result.steps, evidenceTree, codeEvidence, trimmed);
+        if (unrendered !== null) {
+          refuse(
+            `the authored flow "${result.name}" asserts the text ${JSON.stringify(unrendered.text)} ` +
+              `(step ${unrendered.index}), but no element in the page's accessibility tree renders it — ` +
+              'that is the requirement document\'s wording, and the step will dead-end on every run. ' +
+              (unrendered.nearest.length > 0
+                ? `The page renders: ${unrendered.nearest.map((n) => JSON.stringify(n)).join(', ')} — quote one of those, with its role from the tree, `
+                : 'Quote a name the tree actually shows, with its role, ') +
+              'and never the sheet\'s phrasing of it.',
+          );
+        }
+
+        const unreconciled = unreconciledMatchClaim(result.steps, trimmed);
+        if (unreconciled !== null) {
+          refuse(
+            `the case's Expected output makes a RECONCILIATION claim (${JSON.stringify(unreconciled)}), and the authored ` +
+              'flow never compares the two readings — it only asserts that things exist, which passes whether or not they ' +
+              'agree (ten such bugs shipped green in the EN-2 audit). Author it as: saveCount (or saveText) of one surface ' +
+              'into a variable — the variable NAME goes in the step\'s "value" field (e.g. value: "rows-before") — ' +
+              'then expectCount/expectText on the other surface carrying {{that-variable}}; for a ' +
+              '"no change" claim, save before the action and compare the same reading after it.',
+          );
+        }
+
+        const fixture = ungroundedFixtureAssertion(result.steps, fixtureFacts(trimmed));
+        if (fixture !== null) {
+          refuse(
+            `the authored flow "${result.name}" ${fixture.action}s on ${JSON.stringify(fixture.fact)} (step ${fixture.index}) as if it ` +
+              'already existed in the application — but that value is the case\'s TEST DATA: something the tester types ' +
+              'or creates, not a fact about the app. Nothing earlier in this flow creates it. Either author the creation ' +
+              '(the fill/insert steps that put it there) before asserting on it, or assert the SHAPE of the result ' +
+              '(a row exists, a count is a number) without naming the fixture value.',
+          );
+        }
+
+        const wrongRole = ungroundedSelectorRole(result.steps, evidenceTree);
+        if (wrongRole !== null) {
+          refuse(
+            wrongRole.disabled
+              ? `the authored flow "${result.name}" ${result.steps[wrongRole.index]?.action ?? 'acts on'}s ${JSON.stringify(wrongRole.name)} (step ${wrongRole.index}), ` +
+                `but the tree shows it DISABLED at rest: ${wrongRole.nearest[0]}. Something else must enable it first ` +
+                '(a filter chosen, a mode entered) — do that step before this one, or assert its disabled state instead.'
+              : `the authored flow "${result.name}" names role "${wrongRole.role}"${wrongRole.name === null ? '' : ` for ${JSON.stringify(wrongRole.name)}`} ` +
+                `(step ${wrongRole.index}), but no element of that role is anywhere in the page's accessibility tree — the step will resolve ` +
+                'nothing on every run. ' +
+                (wrongRole.nearest.length > 0
+                  ? `The page exposes it as: ${wrongRole.nearest.map((l) => `\`${l}\``).join(', ')} — use that role and name verbatim.`
+                  : 'Take the role and name from a line of the tree, never from what such a control usually is.'),
+          );
+        }
+
         const phantom = ungroundedCountRole(result.steps, evidenceTree);
         if (phantom !== null) {
           refuse(
@@ -2472,6 +2725,73 @@ export class FlowAuthor {
               'run. Count a role the tree actually lists (look at what the group ' +
               'container holds — e.g. buttons inside a radiogroup), or assert the ' +
               "items' visible text instead.",
+          );
+        }
+
+        const uncovered = unassertedExpectedItems(result.steps, trimmed);
+        if (uncovered.length > 0) {
+          refuse(
+            `the authored flow "${result.name}" asserts nothing for Expected line(s) ${uncovered.join(', ')} — ` +
+              'every numbered line of the Expected output gets its own assertion, in the page terms that line ' +
+              'names (the element it speaks of), with the line\'s number cited in the step\'s intent. A backend ' +
+              'check may corroborate a line but never replaces the on-screen reading the line asks for. Values ' +
+              'come verbatim from the case, its Note, the documents or the repository — never invented.',
+            {
+              // Weak, the `unsettledWorkflowClaim` rule: an uncovered line is
+              // a THIN claim, not a false one — it earns the re-ask, and a
+              // flow still uncovered when the budget runs out is handed over
+              // with the note rather than leaving the row flowless.
+              severity: 'weak',
+              note: `Expected line(s) ${uncovered.join(', ')} have no assertion — the flow proves less than the sheet asks`,
+            },
+          );
+        }
+
+        const delegated = workflowOverDeclaredControls(result.steps, codeEvidence);
+        if (delegated !== null) {
+          refuse(
+            `the authored flow "${result.name}" hands a workflow step (step ${delegated.index}) a goal ` +
+              `that names ${delegated.declared.map((d) => JSON.stringify(d)).join(', ')} — controls the ` +
+              'repository itself declares (WHAT THE REPOSITORY DECLARES). Write those interactions as ' +
+              'explicit deterministic steps grounded in the declared strings — click ' +
+              `role=button[name=${JSON.stringify(delegated.declared[0] ?? '')} i], expectText quoting the ` +
+              'declared value — they run in milliseconds at $0, and the healer repairs one that drifts. ' +
+              'Keep a workflow step ONLY for the part of the journey neither a tree nor the repository ' +
+              'declares, and word its goal without the declared controls.',
+            {
+              // Weak, like `unassertedExpectedItems` above: delegating a leg to
+              // a workflow step is a THIN flow, not a false one. Hard-refusing
+              // it is unwinnable whenever the destination page was never
+              // captured — the author cannot write deterministic steps for a
+              // tree it has not seen, so it re-delegates, is refused again, and
+              // the row dies flowless. Measured on PL_07: 5 of 10 rows were
+              // lost to exactly this. It earns the re-ask; a flow still
+              // delegating when the budget runs out is handed over with the
+              // note, so the row is proved less well rather than not at all.
+              severity: 'weak',
+              note:
+                `step ${delegated.index} delegates ${delegated.declared
+                  .map((d) => JSON.stringify(d))
+                  .join(', ')} to a workflow goal — declared controls the flow could have driven directly`,
+            },
+          );
+        }
+
+        const internals = inventedControlInternals([...(result.setup ?? []), ...result.steps]);
+        if (internals !== null) {
+          refuse(
+            `the authored flow "${result.name}" targets ${JSON.stringify(internals.selector)} ` +
+              `(step ${internals.index}) — a selector written against the control's DOM internals ` +
+              `(${internals.fragment}). No accessibility tree shows <select>, <option> or :checked; ` +
+              'the tree speaks roles, so that selector is invented and dead-ends on any custom widget. ' +
+              'Name the control by its role and visible label from a tree it appears in ' +
+              '(role=combobox[name="…" i]) — selectOption drives a native select and a custom ' +
+              'combobox alike through it, and expectText on the combobox reads its visible value. ' +
+              'When NO tree shows the control, write that leg as a workflow goal in user terms ' +
+              'instead ("the category filter shows All by default and offers exactly the listed ' +
+              'categories"), judged on evidence. A default written "All" or "No filter" is a state ' +
+              "the user can see — the control's visible value, an unfiltered listing — never an " +
+              'option:checked internal.',
           );
         }
         // Order is source order, so two runs of one broken flow produce the
@@ -2508,6 +2828,10 @@ export class FlowAuthor {
         // `buildUserPrompt` renders each entry on its own line, and a model
         // fixes a list far more reliably than a paragraph.
         feedback.push(...error.messages);
+        // Suite-scoped, so the NEXT row's first attempt already knows — see
+        // `SUITE_REFUSAL_MEMORY`. Recorded before the re-ask, so a row that
+        // breaks the same rule twice counts it twice.
+        this.#rememberRefusals(error.messages);
         // Every problem, not the headline: "3 problems with the authored flow"
         // tells a reader nothing about which rules the model keeps breaking,
         // and that list is the whole diagnostic value of a refusal.
@@ -2542,7 +2866,14 @@ export class FlowAuthor {
           axTree,
           journeyTree,
           interactions,
-          projectContext: this.#projectContext,
+          // **The row's own slice, not the author-wide one.** The reviewer
+          // judges by the evidence the AUTHOR saw, and for a catalog row that
+          // is `extra.projectContext` — the repository ranked against this
+          // row's words. Handing it the project-wide section instead made the
+          // reviewer poorer than the author it was checking, and it is the
+          // input `settleableFindings` reads to decide whether a finding is
+          // answerable at all.
+          projectContext: extra.projectContext ?? this.#projectContext,
           declaredRoutes: this.#declaredRoutes,
           prompt: trimmed,
         },
@@ -2954,6 +3285,7 @@ export function wordingClaimAssertsDataValue(
   prompt: string,
   steps: readonly FlowStep[],
   evidenceTree: string,
+  codeContext?: string,
 ): { index: number; value: string } | null {
   if (!WORDING_CLAIM.test(prompt)) return null;
   // No tree, no opinion. Ungrounded authoring has nothing to tell a label
@@ -2968,6 +3300,10 @@ export function wordingClaimAssertsDataValue(
     .map((line) => line.trim())
     .filter((line) => line !== '' && !DATA_ROLES.test(line))
     .map(fold);
+  // A string the repository declares (a message catalog's value, a
+  // component's words) is a label the spec owns — the code-grounded rail
+  // invites asserting it, same as ungroundedTextExpectation accepts it.
+  labelLines.push(...declaredControlStrings(codeContext).map(fold));
   for (const [index, step] of steps.entries()) {
     const text = assertedText(step);
     if (text === null) continue;
@@ -3490,6 +3826,386 @@ export function strandedCredentialFill(steps: readonly FlowStep[]): number | nul
  * evidence is not evidence of absence — the same rule the tree's own
  * truncation notice states.
  */
+/**
+ * A presence assertion whose quoted text appears in NO node of the tree the
+ * author was given — the sheet's wording asserted where the page renders
+ * something else.
+ *
+ * Measured 2026-08-28, the same case authored by two models and both flows
+ * run today with no model in the loop: a gemini-authored PL_02_01 asserted
+ * `role=heading[name="Benefit Plan Catalog…"]` (the tree's rendering) and
+ * passed; a claude-authored one asserted `text="Benefit Plans"`, `role=link
+ * [name="Benefit Plans" i]`, `role=heading[name="Benefit Plans" i]` — the
+ * REQUIREMENT's words — and dead-ended three times on a page that had the
+ * heading all along. The LANGUAGE rule ("quote the accessibility tree's own
+ * rendering, never the requirement document's wording") is a request in the
+ * prompt; this is the guarantee, provider-independent: a model that obeys
+ * never meets it, one that does not pays one informed re-ask that names the
+ * nearest real renderings instead of a dead-ended run.
+ *
+ * Grounding is a case-insensitive CONTIGUOUS match against node names with
+ * `url="…"` attributes stripped — word-wise matching would ground "Benefit
+ * Plans" on a link's `/benefits/plans` URL, exactly the phantom this exists
+ * to catch. Only `text=` and `role=…[name=…]` selectors are judged (the
+ * first `>>` segment). Exempt after a `workflow` step (the page it ends on
+ * was never captured) and on a truncated tree, the same two rules as
+ * `ungroundedUrlExpectation`.
+ */
+/**
+ * Every string the repository-context section declares the application
+ * renders: the quoted spans of `renders the … strings [locale, file]: key:
+ * "value" · …` lines and of a component's `says: "word" · "word"` detail.
+ * One extractor for every consumer, so "declared by the code" cannot mean two
+ * different things in two lints.
+ */
+export function declaredControlStrings(codeContext: string | undefined): string[] {
+  if (!codeContext) return [];
+  const found: string[] = [];
+  for (const m of codeContext.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+    const value = (m[1] ?? '').replace(/\\(.)/g, '$1').trim();
+    // A one-character span or a bare number is punctuation, not a label.
+    if (value.length >= 2 && !/^[\d\s.,%]+$/.test(value)) found.push(value);
+  }
+  return found;
+}
+
+/**
+ * A `workflow` step whose goal names a control the repository itself declares.
+ *
+ * The cost this removes: an agent leg pays model calls per turn for a journey
+ * whose controls the codebase already names — PL_07 spent 108 calls hunting a
+ * row behind a "Make Correction" control that `messages/en.json` declares
+ * verbatim, and the deterministic form (click the declared string, expect the
+ * declared dialog title) runs in milliseconds at $0 with the healer and the
+ * agent-assist rung as the error backstop. The refusal steers, it does not
+ * ban: the goal may keep the part NEITHER a tree nor the repository declares.
+ *
+ * Matching is deliberately narrow — only declared strings of 3+ characters,
+ * whole-word, case-insensitive, appearing in the goal's own text — so a goal
+ * about genuinely undeclared territory never trips it.
+ */
+export function workflowOverDeclaredControls(
+  steps: readonly FlowStep[],
+  codeContext: string | undefined,
+): { index: number; goal: string; declared: string[] } | null {
+  const declared = declaredControlStrings(codeContext).filter((v) => v.length >= 3);
+  if (declared.length === 0) return null;
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    if (step.action !== 'workflow') continue;
+    const goal = step.goal.toLowerCase();
+    const named = [
+      ...new Set(
+        declared.filter((v) => {
+          const needle = v.toLowerCase();
+          const at = goal.indexOf(needle);
+          if (at === -1) return false;
+          const before = at === 0 ? ' ' : goal[at - 1]!;
+          const after = at + needle.length >= goal.length ? ' ' : goal[at + needle.length]!;
+          return !/[\p{L}\p{N}]/u.test(before) && !/[\p{L}\p{N}]/u.test(after);
+        }),
+      ),
+    ];
+    if (named.length > 0) return { index: i, goal: step.goal, declared: named.slice(0, 5) };
+  }
+  return null;
+}
+
+export function ungroundedTextExpectation(
+  steps: readonly FlowStep[],
+  axTree: string | undefined,
+  /**
+   * The repository-context section the author was given, when any. Its quoted
+   * strings — a component's rendered words, a message catalog's values — are
+   * evidence the same way a tree's names are: the code declares the page
+   * renders them. Without this, every code-grounded assertion the prompt now
+   * invites would be refused by the very lint meant to protect it.
+   */
+  codeContext?: string | undefined,
+  /**
+   * The case's own text. Wording the SHEET itself asserts is exempt: the
+   * sheet's words ARE the claim, and refusing to author them rewrote real
+   * wording bugs into assertions about whatever the page renders — which
+   * then passed (EN-2 audit: the largest neutered-claim cluster). Let the
+   * verbatim claim run; an exact-match miss over text the page holds
+   * becomes a near-miss needs-review, which is the right verdict.
+   */
+  prompt?: string | undefined,
+): { index: number; text: string; nearest: string[] } | null {
+  if (!axTree || axTree.includes('TREE TRUNCATED')) return null;
+  const names: string[] = [];
+  for (const line of axTree.split('\n')) {
+    const m = /^\s*[A-Za-z]+\s+"((?:[^"\\]|\\.)*)"/.exec(line);
+    if (m && m[1] !== undefined && m[1] !== '') names.push(m[1]);
+  }
+  if (names.length === 0) return null;
+  names.push(...declaredControlStrings(codeContext));
+  const hay = names.map((n) => n.toLowerCase());
+  const tokens = (s: string): Set<string> =>
+    new Set(s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length > 1));
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    // The page after an agent leg was never captured — nothing to ground on.
+    if (step.action === 'workflow') return null;
+    if (step.action !== 'expectVisible' && step.action !== 'expectText') continue;
+    const head = (step.selector.split('>>')[0] ?? '').trim();
+    const named =
+      /^role=[a-z]+\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/i.exec(head) ??
+      /^text=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(.+))$/s.exec(head);
+    const text = (named?.[1] ?? named?.[2] ?? named?.[3] ?? '').replace(/\\(.)/g, '$1').trim();
+    if (text === '') continue;
+    const needle = text.toLowerCase();
+    // The sheet's own words ARE the claim — exempt, run it, and an exact-miss
+    // over text the page holds becomes a near-miss needs-review (the right
+    // verdict for a wording dispute), instead of this lint rewriting the
+    // claim into whatever the page renders, which then passes vacuously.
+    if (prompt !== undefined && prompt.toLowerCase().includes(needle)) continue;
+    if (hay.some((n) => n.includes(needle))) continue;
+    // The nearest real renderings: most shared words, ties in tree order.
+    const want = tokens(text);
+    const nearest = names
+      .map((n, at) => ({ n, at, hits: [...tokens(n)].filter((t) => want.has(t)).length }))
+      .filter((c) => c.hits > 0)
+      .sort((a, b) => b.hits - a.hits || a.at - b.at)
+      .slice(0, 3)
+      .map((c) => c.n);
+    return { index: i, text, nearest: [...new Set(nearest)] };
+  }
+  return null;
+}
+
+/**
+ * A selector whose ROLE the tree never exposes, on ANY action — the
+ * generalisation of `ungroundedCountRole` (S4 of the 2026-08-28 agent-flaw
+ * audit). Sixteen dead-ends on one page: the author wrote `role=combobox`,
+ * `role=textbox`, native `select` for filters the tree exposes as
+ * `button "Type:"`, `searchbox "Search benefit name"` — the roles a filter
+ * USUALLY has, not the ones this page has. The refusal names the tree's own
+ * line for the same name, so the re-ask can copy it.
+ *
+ * Second half, same line of the tree: a control marked `disabled` at rest
+ * (the tree prints the token) may not be filled or clicked as the first
+ * thing done to it — the repo's own test says the search box "starts
+ * disabled until a filter is chosen", and six flows filled it first.
+ *
+ * Only `role=…` / `[role="…"]` / a bare `select` are judged; CSS and text
+ * selectors say nothing the tree could contradict. A truncated tree
+ * declines, and `expectHidden`/`expectCount 0` are exempt — asserting an
+ * absence of a role the page lacks is the honest claim, not a phantom.
+ */
+export function ungroundedSelectorRole(
+  steps: readonly FlowStep[],
+  axTree: string | undefined,
+): { index: number; role: string; name: string | null; nearest: string[]; disabled: boolean } | null {
+  if (!axTree || axTree.includes('TREE TRUNCATED')) return null;
+  const lines = axTree.split('\n').map((l) => l.trim()).filter(Boolean);
+  const roles = new Set(lines.map((l) => (/^([a-z]+)\b/i.exec(l)?.[1] ?? '').toLowerCase()).filter(Boolean));
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    if (step.action === 'workflow') return null; // the page after a leg was never captured
+    if (!('selector' in step) || typeof step.selector !== 'string') continue;
+    if (step.action === 'expectHidden' || (step.action === 'expectCount' && (step as { count?: number }).count === 0)) continue;
+    const head = (step.selector.split('>>')[0] ?? '').trim();
+    // Three spellings, resolved to one (role, name) pair: the role engine
+    // with an optional name, the CSS attribute form anywhere in the head
+    // (`main [role="combobox"]`), and a native `select` element.
+    let role: string;
+    let name: string | null = null;
+    const engine = /^role=([a-z]+)(?:\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'))?/i.exec(head);
+    const attr = /\[role="([a-z]+)"\]/i.exec(head);
+    const native = /(?:^|\s)select\b/i.test(head);
+    if (engine) {
+      role = (engine[1] ?? '').toLowerCase();
+      name = (engine[2] ?? engine[3] ?? null)?.replace(/\\(.)/g, '$1') ?? null;
+    } else if (attr) {
+      role = (attr[1] ?? '').toLowerCase();
+    } else if (native) {
+      role = 'select';
+    } else {
+      continue;
+    }
+    const needle = name?.toLowerCase().replace(/\s*:$/, '') ?? null;
+    // The role exists on the page: fine unless it is disabled and this step acts on it first.
+    if (roles.has(role) || (role === 'select' && roles.has('combobox'))) {
+      if (needle !== null && (step.action === 'fill' || step.action === 'click' || step.action === 'type' || step.action === 'selectOption')) {
+        const line = lines.find((l) => new RegExp(`^${role}\\s+"[^"]*${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^"]*"`, 'i').test(l));
+        if (line !== undefined && /\bdisabled\b/.test(line)) {
+          return { index: i, role, name, nearest: [line], disabled: true };
+        }
+      }
+      continue;
+    }
+    // The role does not exist: name the lines that carry the same name under another role.
+    const nearest = needle === null
+      ? []
+      : lines.filter((l) => l.toLowerCase().includes(needle)).slice(0, 3);
+    return { index: i, role, name, nearest, disabled: false };
+  }
+  return null;
+}
+
+/**
+ * The identifier-shaped values a case's Test Data / Expected columns carry —
+ * plan ids, codes, record names — that a human tester was expected to CREATE
+ * or READ, never facts already true of the application (S3 of the
+ * 2026-08-28 audit). Thirteen be100 cases asserted `PL_07_01_02_03_04_05_06`,
+ * `BP-DENTAL-01`, `TH_MED_005`, "Mock Country (TH)", `43 rows` as
+ * pre-existing; the database holds none of them, and every one was filed as
+ * the application failing.
+ */
+/**
+ * A reconciliation claim the flow never actually compares (EN-2 audit — the
+ * largest missed-bug cluster). The Expected output says two readings agree
+ * ("tile matches the table", "เท่ากับ", "ตรงกับ") or that a reading does not
+ * move ("no change", "ไม่เปลี่ยน", "เท่าเดิม"); proving that requires a
+ * saved reading (`saveCount`/`saveText` → `{{var}}`) compared on the other
+ * side — mere presence assertions pass whether or not the readings agree.
+ * Returns the matched claim phrase, or null when the flow carries at least
+ * one save whose variable a later expect actually uses.
+ */
+export function unreconciledMatchClaim(
+  steps: readonly FlowStep[],
+  prompt: string,
+): string | null {
+  const m =
+    /(?:match(?:es)?|reconcil\w*|agrees? with|equals?|same as|ตรงกับ|เท่ากับ|สอดคล้อง|ตรงกัน)[^.\n]{0,80}(?:table|column|row|tile|summary|card|list|ตาราง|คอลัมน์|การ์ด)|(?:no change|unchanged|does not change|ไม่เปลี่ยน(?:แปลง)?|เท่าเดิม|คงเดิม)[^.\n]{0,60}(?:count|number|total|tile|จำนวน|ตัวเลข)|(?:count|number|total|tile|จำนวน)[^.\n]{0,60}(?:no change|unchanged|does not change|ไม่เปลี่ยน(?:แปลง)?|เท่าเดิม|คงเดิม)/i.exec(
+      prompt,
+    );
+  if (!m) return null;
+  const saved = new Set<string>();
+  for (const step of steps) {
+    if (step.action === 'saveCount' || step.action === 'saveText') saved.add((step as { as: string }).as);
+  }
+  const compared = steps.some((step) => {
+    if (!step.action.startsWith('expect')) return false;
+    const text = JSON.stringify(step);
+    return [...saved].some((name) => text.includes(`{{${name}}}`));
+  });
+  // A dbSnapshot + expectDbDelta/Unchanged pair is the DB spelling of the
+  // same comparison and satisfies the claim too.
+  const dbCompared =
+    steps.some((s) => s.action === 'dbSnapshot') &&
+    steps.some((s) => s.action === 'expectDbDelta' || s.action === 'expectDbUnchanged');
+  return compared || dbCompared ? null : m[0].trim().slice(0, 120);
+}
+
+/**
+ * A `{{name}}` the flow never saves.
+ *
+ * The flow language resolves `{{name}}` from the runtime variable store, filled
+ * by `saveCount`/`saveText` (`as`) and by a `request` step's `save` map. A
+ * reference to a name nothing ever saved is broken on every run, and until this
+ * lint existed nothing checked it — of 29 refusal rules, none looked at a
+ * variable reference.
+ *
+ * It went unnoticed because the failure was silent twice over. `PLACEHOLDER` in
+ * `api/variables.ts` did not accept hyphens, so `{{menu-label}}` matched
+ * nothing, `replace` returned the string untouched, and the unknown-name guard
+ * — which lives inside the replace callback — never ran. The flow then asserted
+ * the literal text `{{menu-label}}` against the page. Both halves are fixed now
+ * (the pattern takes hyphens, and `interpolate` throws on a brace pair it could
+ * not read), but a run-time throw is still late: the row has been authored,
+ * queued and started before anyone learns the name was never saved.
+ *
+ * The value of catching it HERE is the message. Measured on PL_02, an
+ * undefined placeholder was caught only incidentally by the wording lint, whose
+ * text blames "a value the test case never states … shown only as a data row" —
+ * advice for a different mistake. The model, told nothing about the
+ * placeholder, renamed it and resubmitted: PL_02_01 went `{{menu-label}}` →
+ * `{{menu-name}}`, PL_02_06 `{{delete-label}}` → `{{delete-word}}`, PL_02_04
+ * `{{correction-label}}` → `{{plans-term}}`. Three rows died renaming a
+ * placeholder because the refusal never mentioned it.
+ *
+ * Fatal, not weak: a flow asserting an unsaved variable proves nothing, and
+ * unlike the delegation rule it is always fixable from the message alone —
+ * either save the reading or assert a literal.
+ *
+ * Returns the first offender, with the names that ARE available so the re-ask
+ * can name them.
+ */
+export function undefinedVariableRef(
+  steps: readonly FlowStep[],
+): { index: number; name: string; available: string[] } | null {
+  const saved = new Set<string>();
+  for (const step of steps) {
+    if (step.action === 'saveCount' || step.action === 'saveText') {
+      saved.add((step as { as: string }).as);
+    }
+    const save = (step as { save?: Record<string, string> | undefined }).save;
+    if (save) for (const name of Object.keys(save)) saved.add(name);
+  }
+  for (const [index, step] of steps.entries()) {
+    // A save's own `as` names the variable being CREATED, never one read, and
+    // travels in the same object — exclude it or every save reports itself.
+    const { as: _as, save: _save, ...read } = step as Record<string, unknown>;
+    // Laxer than PLACEHOLDER on purpose: a brace pair the resolver cannot read
+    // is exactly as broken as a name nothing saved, and is the shape this lint
+    // was written for.
+    for (const m of JSON.stringify(read).matchAll(/\{\{([^}]*)\}\}/g)) {
+      const name = (m[1] ?? '').trim();
+      if (name !== '' && saved.has(name)) continue;
+      return { index, name, available: [...saved] };
+    }
+  }
+  return null;
+}
+
+export function fixtureFacts(caseText: string): string[] {
+  const block = /(?:Test data|TEST DATA|ข้อมูลทดสอบ)\s*:?\s*([\s\S]{0,1200}?)(?=\n\s*(?:Expected|Steps|Note|Menu|Persona|Preconditions)\b|$)/i.exec(caseText)?.[1] ?? '';
+  const ids = new Set<string>();
+  for (const m of `${block}\n${caseText}`.matchAll(/\b([A-Z][A-Z0-9]*(?:[_-][A-Za-z0-9]+){1,}|[A-Z]{2,}[-_]\d{2,})\b/g)) {
+    if (m[1] && /\d/.test(m[1])) ids.add(m[1]);
+  }
+  return [...ids];
+}
+
+/**
+ * A fixture value asserted to PRE-EXIST — as a DB where-clause, a row the
+ * flow clicks, an exact count — with nothing earlier in the flow creating it.
+ * A fixture may be TYPED (fill, selectOption) freely; it may be asserted
+ * only after a step in this flow typed it into a create/insert form, or
+ * after a `dbSnapshot`… no: after the flow itself performed the creation
+ * (a fill of the value followed by a click). Returns the first offender.
+ */
+export function ungroundedFixtureAssertion(
+  steps: readonly FlowStep[],
+  facts: readonly string[],
+): { index: number; fact: string; action: string } | null {
+  if (facts.length === 0) return null;
+  const typedSoFar = new Set<string>();
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    const text = JSON.stringify(step);
+    if (step.action === 'fill' || step.action === 'type' || step.action === 'selectOption') {
+      for (const f of facts) if (text.includes(f)) typedSoFar.add(f);
+      continue;
+    }
+    if (step.action === 'workflow') {
+      // An agent leg that names the fact as something to type/create counts as creation.
+      for (const f of facts) if (text.includes(f) && /\b(create|insert|fill|type|enter|add|save)\b/i.test((step as { goal?: string }).goal ?? '')) typedSoFar.add(f);
+      continue;
+    }
+    const asserts =
+      step.action === 'expectDbRow' ||
+      step.action === 'expectDbDelta' ||
+      step.action === 'expectCount' ||
+      step.action === 'expectText' ||
+      step.action === 'expectVisible' ||
+      step.action === 'click';
+    if (!asserts) continue;
+    for (const f of facts) {
+      if (!text.includes(f) || typedSoFar.has(f)) continue;
+      // A click on a row scoped by the fact, or a DB check keyed on it.
+      const scoped =
+        step.action === 'click'
+          ? new RegExp(`(has-text|name=|text=)[^>]*${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(text)
+          : true;
+      if (scoped) return { index: i, fact: f, action: step.action };
+    }
+  }
+  return null;
+}
+
 export function ungroundedCountRole(
   steps: readonly FlowStep[],
   axTree: string | undefined,
@@ -3505,6 +4221,94 @@ export function ungroundedCountRole(
     if (!match) continue;
     const role = match[1]!.toLowerCase();
     if (!new RegExp(`^${role}\\b`, 'im').test(axTree)) return { index: i, role };
+  }
+  return null;
+}
+
+/**
+ * The numbered items of a case's Expected output, from the authoring prompt.
+ *
+ * The catalog convention is decimal-numbered expectations ("6.1 จำนวนเพิ่มขึ้น
+ * +1 ใน Total Plans"); this reads them out of the prompt's own
+ * "Expected output:" block so the coverage lint below can ask, mechanically,
+ * whether each got an assertion. Prompts without such a block (the `go` path,
+ * free-text requests) yield nothing and the lint stays silent.
+ */
+export function expectedItemsIn(prompt: string): string[] {
+  const at = prompt.search(/^\s*Expected(?: output)?\s*:/im);
+  if (at === -1) return [];
+  const block = prompt.slice(at).split(/^\s*(?:Note|Test data|Steps|Menu path|Login \/ persona|Preconditions)\b/im)[0] ?? '';
+  const items = [...block.matchAll(/(?:^|\s)(\d+\.\d+)(?=\s)/g)].map((m) => m[1]!);
+  return [...new Set(items)];
+}
+
+/**
+ * Numbered Expected lines no assertion claims to cover.
+ *
+ * The hallucination this catches ran live (be100 PL_03_07): the sheet's
+ * expected output was "6.1 +1 in Total Plans; 6.2 +1 in Reimbursement by
+ * Employee and HR" and the authored flow proved a DB delta and a visible row
+ * name — real checks, but of a different claim; the counter boxes the sheet
+ * names were never read, and the intents cited "6.1/6.2" over checks that do
+ * not touch them. Mechanical half of the rule the prompt states: every
+ * numbered line's id must appear in at least one ASSERTION step's intent —
+ * intents on clicks and fills do not count as coverage. What the assertion
+ * actually reads is the model's honesty under the prompt rule; which lines
+ * have no assertion at all is checkable for $0, and is checked here.
+ */
+export function unassertedExpectedItems(
+  steps: readonly FlowStep[],
+  prompt: string,
+): string[] {
+  const items = expectedItemsIn(prompt);
+  if (items.length === 0) return [];
+  // An assertion step is always a carrier. A workflow goal carries an item
+  // ONLY when a later step asserts something — the authoring rule that an
+  // agent leg's claim must be settled by evidence independent of the agent,
+  // enforced here (EN-2 audit: behavioral Expected lines "covered" solely by
+  // a workflow goal's mention shipped unproved, and their bugs with them).
+  const carriers = steps
+    .filter((step, i) => {
+      if (step.action.startsWith('expect')) return true;
+      if (step.action === 'workflow' && step.goal !== '') {
+        return steps.some((later, j) => j > i && later.action.startsWith('expect'));
+      }
+      return false;
+    })
+    .map((step) => `${(step as { intent?: string }).intent ?? ''} ${(step as { goal?: string }).goal ?? ''}`)
+    .join('\n');
+  return items.filter((id) => !carriers.includes(id));
+}
+
+/**
+ * A selector written against a control's DOM implementation instead of its
+ * role.
+ *
+ * The habit this catches: a dropdown whose page the author never saw (it was
+ * in no tree) written as `main select:has(option:text-is("Medical"))`, with
+ * its default read via `option:checked` — thirty-one steps of one be100 case
+ * (PL_04_04, live) pinned to a native `<select>` on a page whose filter is a
+ * custom combobox, every one a guaranteed dead-end. No accessibility tree
+ * ever shows `<select>`, `<option>` or `:checked` — the tree speaks roles —
+ * so an internals selector is by construction invented, grounded or not, and
+ * the case's own words ("Default: All" means the state the user sees, not a
+ * DOM attribute) cannot rescue it.
+ *
+ * `role=option[name="…"]` stays legal — that is the tree's own notation for a
+ * listbox entry — and quoted strings are stripped first so `text="Select all"`
+ * never trips the element check.
+ */
+export function inventedControlInternals(
+  steps: readonly FlowStep[],
+): { index: number; selector: string; fragment: string } | null {
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    const selector = (step as { selector?: string }).selector;
+    if (typeof selector !== 'string' || selector === '') continue;
+    const unquoted = selector.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""');
+    if (/:checked\b/.test(unquoted)) return { index: i, selector, fragment: ':checked' };
+    const element = /(^|[^\w=-])(select|option)(?=$|[^\w-])/.exec(unquoted);
+    if (element !== null) return { index: i, selector, fragment: `<${element[2]}>` };
   }
   return null;
 }

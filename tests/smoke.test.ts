@@ -1547,6 +1547,27 @@ describe('a failure message must describe the failure it carries', () => {
     ]);
     assert.match(error.message, /^could not resolve "role=main"/);
   });
+
+  it('a memoed content repeat stays content — the wording reaches the judge, not a dead-end', () => {
+    // PL_02_07: the retry of a wording mismatch hit the dead-end memo, the
+    // step read as "could not resolve", and the dead-end status hid the
+    // near-miss from the judge.
+    const error = new StepResolutionError('[aria-label="breadcrumb"]', [
+      'fast "[aria-label="breadcrumb"]": expected text to contain "Benefit Plans", got "Benefit Plan Catalog"',
+      "known content mismatch: step 10 already read this element on this same page — not repaid; the text has not changed, and the wording is the judge's to rule on",
+    ]);
+    assert.equal(error.contentOnly, true);
+    assert.match(error.message, /resolved, but its content did not hold/);
+  });
+
+  it('a memo line alone proves nothing was read — resolution header, not content', () => {
+    const error = new StepResolutionError('#gone', [
+      'fast "#gone": locator.waitFor: Timeout 2000ms exceeded.',
+      "known content mismatch: step 3 already read this element on this same page — not repaid; the text has not changed, and the wording is the judge's to rule on",
+    ]);
+    assert.equal(error.contentOnly, false);
+    assert.match(error.message, /^could not resolve/);
+  });
 });
 
 describe('native form resubmit detection', () => {

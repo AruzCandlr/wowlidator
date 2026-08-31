@@ -223,9 +223,9 @@ The failed selector's role and name are the AUTHOR'S GUESS at the control, not a
 description of it. They are often written from a different page, an older build,
 or a written spec — so the element you are looking for may well have a different
 role and a different name from the one that failed. Match the author's *intent*
-against what the tree actually contains: an intent of "the Create Leave Request
-button" is served by a link named "Leave request Apply for leave" when that is
-what this page offers to do the job.
+against what the tree actually contains: an intent of "the Create Order
+button" is served by a link named "Orders New order" when that is what this
+page offers to do the job.
 
 Returning the selector that just failed is never an answer. If nothing in the
 tree can serve the intent, say so with a low confidence rather than repeating

@@ -21,7 +21,12 @@
  * a table is a different promise again — an operation accepts a request, a
  * table holds the state the request was supposed to change.
  */
-export type ProjectNodeKind = 'package' | 'component' | 'route' | 'test' | 'operation' | 'table';
+/**
+ * `message` — one i18n namespace of one locale file (`messages/en.json` ›
+ * `admin_benefits_plans`): the application's own rendered words, which the
+ * structural kinds never carried. See `ingesters/message-ingester.ts`.
+ */
+export type ProjectNodeKind = 'package' | 'component' | 'route' | 'test' | 'operation' | 'table' | 'message';
 
 export interface ProjectNode {
   /** Stable id, e.g. `component:src/components/Button.tsx#Button`. */

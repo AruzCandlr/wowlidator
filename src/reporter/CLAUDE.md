@@ -130,3 +130,55 @@ Two size decisions, because a report is one self-contained file and every byte l
 The report shows this as a **filmstrip above the timeline, assembled in the browser from the images already in the document** — each screenshot is emitted exactly once, inside its own step, and the strip reuses those `src` strings. Rendering the strip server-side would double the size of a file that already carries every image inline; there's a test asserting the count of embedded images equals the number of frames. There is deliberately **no `screenshot` badge** any more: every step has one, so it marks the ordinary case and tells a reader nothing — the same reason `fast` is unbadged. The Diagnostics cards state how many steps carry evidence and what it weighs, because report size is the whole cost of this default and should not be a mystery.
 
 **The MCP `run_flow` response strips screenshots** and returns `hasScreenshot: boolean` instead; megabytes of base64 in a tool result is a model-context disaster, and that matters roughly nine times more now than it did when only failures carried one. **The recording is stripped the same way**, leaving its width, height and byte count — it is the largest single thing a bundle can carry, and there is nothing a model can do with a webm.
+
+## The catalog report (`catalog-report.ts`, `reports/`, 2026-08-31)
+
+One self-contained HTML per catalog RUN in the local `reports/` folder
+(`reports/<runKey slug>.html` — stable per key, so a resume overwrites its own
+file), generated at the suite roll-up from the LEDGER, never fatally. Every
+planned case is a row — never-ran included — grouped by scenario with
+passed-of-N counts and the two-family chips. A case opens into a two-pane
+view: LEFT expandable steps (intent, selector, resolution, error, heal, agent
+turns, screenshot) plus history explanations (`analyseTrend`/`formatTrend`
+over `RunHistory.forFlow` + heal pressure) and the bundle's run notes; RIGHT
+the time record — a bar per step against the 2s fast-path budget, slowest
+named. Screenshots embed as data URIs: failure stills always, routine stills
+until `SCREENSHOT_BUDGET_BYTES` (15MB) is spent, then omitted with a note
+naming the proof bundle.
+
+**The film is here too, and it is the evidence a passing case has.** The
+runner's screenshot default is video-aware (`runner.ts`: filming ⇒
+`on-failure`), because the recording covers what stills would. Measured on
+be100-rip's 32 bundles, that is exactly what they hold — all 13 non-passing
+cases carry stills, 18 of 19 passing ones carry none — so a report that
+dropped the recording left a reader with **no evidence at all for every case
+that worked**. Each case now carries its own `<video>`, on the same rules as
+the stills: `VIDEO_BUDGET_BYTES` (25MB — median recording 55KB, tail 6MB, a
+whole catalog ~75MB embedded whole), and `chooseEmbeddedVideos` spends it in a
+pass of its own BEFORE rendering, non-passing cases first and smallest first
+within each group — document order would buy twenty passes and leave the
+failures, the cases a reader opens, with nothing. What does not fit is named,
+not dropped silently. Three mechanics are load-bearing: **the base64 rides on
+`data-webm` and becomes a Blob URL in the page** (Chrome will not load a
+`data:` video — `readyState 0` forever, no error, reads exactly like a corrupt
+file); **it is decoded when the case is opened, not at load** (dozens of
+recordings, and building every Blob on first paint stalls the page to make
+players nobody opened); and **the attribute is never removed**, because a Blob
+URL means nothing in another document and every export here is another
+document. Each filmed step carries a `play from here` cue **on its summary**,
+not in its body — measured in a browser, in the body it is inside a collapsed
+`<details>` and a reader has to expand every step to discover seeking exists;
+the handler's `preventDefault` is what stops a button inside a `<summary>`
+from toggling the step open as a side effect.
+
+Export is client-side (`Blob` + anchor): per-case (clones the section with this
+document's styles, strips only the export button, strips Blob `src`s, and
+writes `WOW_PLAYER` in alongside — without the player an exported case is a
+dead video in a file said to hold the evidence) and whole-catalog. A resume
+still shows evidence: carried outcomes re-read their bundle from the ledger's
+`proofPath`, so the report answers for the whole catalog rather than for the
+subset this process ran. Tests: `tests/catalog-report.test.ts` — pure for
+everything above, plus one CDP-gated test that the recording ACTUALLY PLAYS
+(against `tests/fixtures/recording.webm`), because a markup assertion would
+pass on a report whose every player spins forever, which is the bug this
+exists to fix.

@@ -239,6 +239,32 @@ Four rails hold it honest:
 
 Bad interpolation is also never reconstructed: an unknown `{{var}}` is the flow's problem, and nothing a rebuilt step does can save a variable the run never saved.
 
+## A content mismatch is a verdict, never a dead end (2026-08-28)
+
+A `StepResolutionError` whose attempts all read the element and missed only on
+its text (`contentOnly`) classifies the step `failed`, not `dead-end` — the
+control was never absent, the page answered, and `failed` is what keeps the
+run eligible for the near-miss gate (proved-? → the review judge). The
+dead-end memo cooperates: an exhausted ladder is remembered with a
+`contentMiss` flag, and a retry of a content miss appends
+`known content mismatch: …` (which preserves `contentOnly`) instead of
+`known dead end: …` (which does not). Reconstruction stays available — the
+claim survives verbatim and inserted preparation can make it true (a missing
+click before an expectText) — but `FlowRepairLoop` stops on a `needs-review`
+bundle unless the judge ruled it failed (ruled proved → passed; unruled →
+left for a human, since re-running only reproduces the same pair of
+strings). Live driver (be100 PL_02_07): a
+breadcrumb claim written "Benefit Plans" against a page rendering "Benefit
+Plan Catalog" was retried, memoed, stamped dead-end, and never reached the
+judge that exists precisely for that wording call.
+
+`expectText`'s recorded `actual` is first-reading-wins: the authored
+selector's own text is the honest actual, and later rungs (the kin climb, a
+heal onto a container) must not replace it — last-write-wins once put a whole
+page of innerText in the report's Actual column. The thrown message's `got`
+is capped at 200 chars for the same reason; the full first reading (400) stays
+on `detail.actual`.
+
 ## Keyboard and focus
 
 `press`, `expectFocused`, `expectTabOrder`. Focus order is the one accessibility property that cannot be read from a static tree — it only exists while tabbing.
@@ -288,3 +314,44 @@ Judged **after** the session bootstrap and the consent gate, never before: eithe
 
 **`runFlow` forwards to `SmartRunner.connect` field by field.** A field added to `RunFlowOptions` and not listed there reaches the runner as `undefined` and its guard silently never fires. Both `backend` and `declaredRoutes` were added and not listed; the 404 test caught it by seeing `routes=0` inside the runner, and `assertBackendAllowed` would otherwise have been dead code shipped green.
 
+
+## A visible that resolved on nothing proves nothing (S5, 2026-08-28)
+
+`expectVisible` on a positional or nameless selector (`role=combobox >> nth=0`, a bare `role=x`) whose element has no accessible name and no text records `detail.vacuous`, and `ProofBundleBuilder` seals such a run as `needs-review` with the step marked `unsure` — never green. PL_04_13: three of those passed on a page with zero comboboxes while the human had recorded the case Failed; the assertion could not fail, so it could not find the defect. A resume that dropped the agent role the pass was authored with is refused at the boundary (S8, `launch.agent` on the ledger) instead of erroring nine steps one by one.
+
+## Reconciliation is two readings, compared (`saveCount`/`saveText`, 2026-08-31)
+
+"The tile matches the table" / "no change after the action" was only authorable
+as presence checks, which pass whether or not the readings agree — the EN-2
+audit's largest missed-bug cluster (ten). `saveCount` reads how many elements
+match into the run's variable store (`runner.variables`), `saveText` reads an
+element's visible text; a later `expectCount` may carry a `{{variable}}` string
+(interpolated by `interpolateStep`, then converted — non-numeric after
+interpolation throws loudly), and `expectText` always could. Both saves go
+through `#step`, so the ladder and healer apply; `saveCount` waits for one
+attached match rather than silently recording 0 off a bogus selector — a
+legitimately-empty listing is saved via `saveText` of the page's own readout
+("0 of 0") instead. A save is not an assertion (not in `ASSERTION_ACTIONS`):
+the compare carries the claim.
+
+## A near-name on the right role is evidence, not absence (2026-08-31)
+
+When an assertion's `role=X[name="N"]` selector exhausts the ladder and the
+live tree holds a same-role node whose name is a `nearMiss` of N, the failed
+step now carries `expected`/`actual` ("the page's button is named "Proceed"")
+and `foundInPageText: true` — so it qualifies for proved-? and the review
+judge rules on the wording, instead of a bare "could not resolve" filing a
+false alarm (EN-2: exact-name misses on real controls were the largest
+false-alarm cluster). Evidence-gathering only: a failed tree capture changes
+nothing, and the step still fails.
+
+## Every run keeps its film (2026-08-31)
+
+`#videoCut` no longer discards a clean pass's recording: under the default
+`video: 'on'`, every run's film is kept — the pass keeps the whole thing,
+a failure keeps the film through the break (trimmed only when the failure was
+the last filmed moment), and `'always'` still means untrimmed plus viewer
+pacing. Asked for universally: "View actual flow" in the report and wowUI now
+plays on every run, not only the ones that broke. The cost is bundle size —
+the film is embedded in the proof JSON — and `--video off` remains the
+opt-out (also the way to inherit the attached browser's own context).

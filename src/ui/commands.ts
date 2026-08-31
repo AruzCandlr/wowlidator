@@ -121,6 +121,19 @@ const AUTHOR_CONCURRENCY_FIELD: Field = {
   advanced: true,
 };
 
+const AUTHOR_ATTEMPTS_FIELD: Field = {
+  name: 'author-attempts',
+  label: 'Authoring attempts per row',
+  type: 'number',
+  default: 3,
+  min: 1,
+  help:
+    'Total asks per row including the first — a refused flow is re-asked with the refusal as feedback. ' +
+    '1 is one ask and no re-ask budget: fastest and cheapest, at the price of weaker flows being handed over. ' +
+    'Blank uses the Machinery dial.',
+  advanced: true,
+};
+
 const CONCURRENCY_FIELD: Field = {
   name: 'concurrency',
   label: 'Cases at a time',
@@ -244,6 +257,13 @@ const COMMON_BROWSER_FIELDS: readonly Field[] = [
     label: 'Disable in-run step reconstruction',
     type: 'boolean',
     help: 'By default a failed step is rebuilt by the repair model against the live page and retried, up to 3 total tries, before being classified. Rescues are recorded and file a drift defect; assertions always keep their claim. Tick to classify on the first failure instead.',
+    advanced: true,
+  },
+  {
+    name: 'no-agent-early-stop',
+    label: 'Disable the agent’s early give-up',
+    type: 'boolean',
+    help: 'By default a workflow leg concedes after 3 turns finding nothing to act on, or 5 with no progress. Tick to raise both to 25 — the agent keeps trying far longer before conceding a leg. Slower and more thorough; use when a control is reachable but takes many steps.',
     advanced: true,
   },
   {
@@ -777,6 +797,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Run again from this case ONWARD in plan order — earlier verdicts are kept, everything from it (passes included) reruns on the current config. Implies Continue.',
       },
       {
+        name: 'rerun-case',
+        label: 'Re-author one case by id',
+        type: 'text',
+        repeatable: true,
+        help: 'Re-author exactly this case from its sheet row — fresh flow, current code — and run it, whatever its recorded verdict. Repeatable. Implies Continue.',
+      },
+      {
         name: 'resume',
         label: 'Continue where the last run stopped',
         type: 'boolean',
@@ -833,6 +860,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         advanced: true,
       },
       AUTHOR_CONCURRENCY_FIELD,
+      AUTHOR_ATTEMPTS_FIELD,
       CONCURRENCY_FIELD,
       AUTOHEAL_FIELD,
       {

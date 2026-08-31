@@ -4,7 +4,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { isPassing } from '../../engine/proof-bundle.js';
+import { isPassing, type AgentRecord } from '../../engine/proof-bundle.js';
 import { basename, dirname, resolve } from 'node:path';
 
 import { CacheManager } from '../../cache/cache-manager.js';
@@ -41,8 +41,10 @@ import {
   isFlow,
   openReport,
   prepare,
+  writeFlowFile,
   writeMachineReports,
 } from '../artifacts.js';
+import { withWorkflowScripts } from '../case-plan.js';
 import { EXIT, exitCodeFor, suiteExit } from '../exit.js';
 import type { CliOptions } from '../options.js';
 import { runCases, type SuiteCase } from '../run-cases.js';
@@ -119,6 +121,28 @@ export async function cmdRun(flowPaths: readonly string[], options: CliOptions):
     onStep: stepLogger(options),
     onPlan: planLogger(options),
   });
+
+  // Fold successful agent journeys back into the flow file as deterministic
+  // scripts — the same move `runCases` makes for suites (see run-cases.ts),
+  // so a single-flow run also leaves a $0 replay behind: the next run of
+  // this exact file replays the recorded steps with no model turn, and the
+  // proof written below keeps the full agent action log as the evidence.
+  // Best-effort on purpose: a script that could not be written costs a few
+  // model turns next run, never a verdict.
+  {
+    const journeys = bundle.steps
+      .map((step) => step.agent)
+      .filter((record): record is AgentRecord => record !== undefined && record.success);
+    const scripted = withWorkflowScripts(parsed, journeys);
+    if (scripted !== null) {
+      await writeFlowFile(resolve(flowPath), scripted)
+        .then(() =>
+          // stderr: `--json` owns stdout, and this is narration, not the result.
+          process.stderr.write('  scripted   agent journey recorded in the flow for $0 replay\n'),
+        )
+        .catch(() => undefined);
+    }
+  }
 
   const proofPath = await writeProofBundle(bundle, options.out);
   const target = resolveReportPath(

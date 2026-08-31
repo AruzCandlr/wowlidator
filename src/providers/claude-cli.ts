@@ -59,7 +59,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
-import { askWarm, closeClaudeSessions } from './claude-cli-session.js';
+import { askWarm, closeClaudeSessions, sessionTurnBudget } from './claude-cli-session.js';
+import { recordClaudeCliCall } from './claude-cli-usage-log.js';
+import {
+  claudeRetrievalCorpusSize,
+  ensureClaudeRetrievalServer,
+  RETRIEVAL_SERVER_NAME,
+  RETRIEVAL_TOOL_FULL,
+} from './claude-retrieval.js';
+import { assertUnderUsageCap } from './usage-cap.js';
+import { extractStructuredJson } from './model-output.js';
 import type {
   LanguageModelV4,
   LanguageModelV4CallOptions,
@@ -107,6 +116,40 @@ export const CLAUDE_CLI_NATIVE_SCHEMA =
   process.env['WOWLIDATOR_CLAUDE_CLI_NATIVE_SCHEMA'] !== '0';
 
 /**
+ * Whether a role that opted in (`ClaudeCliOptions.retrieval` — the generator
+ * and the healer, see `llm-factory.ts`) gets the BM25 `search_context` tool
+ * over the run's registered corpus. On by default; the tool only actually
+ * attaches when a command has registered something to search
+ * (`setClaudeRetrievalCorpus`), so a bare run is unchanged.
+ * `WOWLIDATOR_CLAUDE_CLI_RETRIEVAL=0` turns it off everywhere.
+ */
+export const CLAUDE_CLI_RETRIEVAL = process.env['WOWLIDATOR_CLAUDE_CLI_RETRIEVAL'] !== '0';
+
+/**
+ * The `--mcp-config` + merged `--allowed-tools` for a retrieval-enabled call,
+ * or null when there is nothing to search or the loopback server refused to
+ * start — in which case the call runs exactly as it would have without the
+ * feature. `=` forms throughout: both flags are variadic (see the args note).
+ */
+async function retrievalArgs(
+  enabled: boolean,
+  allowedTools: string | null,
+): Promise<{ mcpConfig: string | null; allowedTools: string | null }> {
+  if (!enabled || !CLAUDE_CLI_RETRIEVAL || claudeRetrievalCorpusSize() === 0) {
+    return { mcpConfig: null, allowedTools };
+  }
+  const url = await ensureClaudeRetrievalServer();
+  if (url === null) return { mcpConfig: null, allowedTools };
+  return {
+    mcpConfig: JSON.stringify({ mcpServers: { [RETRIEVAL_SERVER_NAME]: { type: 'http', url } } }),
+    allowedTools:
+      allowedTools === null || allowedTools === ''
+        ? RETRIEVAL_TOOL_FULL
+        : `${allowedTools},${RETRIEVAL_TOOL_FULL}`,
+  };
+}
+
+/**
  * What this process has spent on the CLI.
  *
  * Module-level on purpose, and that is also what makes it honest: the meter
@@ -121,6 +164,15 @@ export const CLAUDE_CLI_NATIVE_SCHEMA =
  * the input and bills at a fraction — a total that hid it would read as ten
  * times the spend it is.
  */
+/** One role's share of the meter — who spent it, not only how much. */
+export interface ClaudeCliRoleSpend {
+  calls: number;
+  costUsd: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+}
+
 export interface ClaudeCliUsage {
   calls: number;
   costUsd: number;
@@ -129,6 +181,13 @@ export interface ClaudeCliUsage {
   outputTokens: number;
   /** Wall time inside the CLI, including the process startup each call pays. */
   wallMs: number;
+  /**
+   * The same spend split by the ROLE that asked (`generator`, `healer`,
+   * `agent`, `data` — whatever `createModelForRole` stamped on the model).
+   * "This flow cost $2, of which authoring was $1.60 and heals $0.30" was
+   * unanswerable before this: the meter knew the total and nothing else.
+   */
+  byRole: Record<string, ClaudeCliRoleSpend>;
 }
 
 const usage: ClaudeCliUsage = {
@@ -138,16 +197,43 @@ const usage: ClaudeCliUsage = {
   cachedInputTokens: 0,
   outputTokens: 0,
   wallMs: 0,
+  byRole: {},
 };
+
+function roleBucket(role: string): ClaudeCliRoleSpend {
+  return (usage.byRole[role] ??= {
+    calls: 0,
+    costUsd: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+  });
+}
 
 /** What this process has spent so far. A copy — the caller cannot edit the meter. */
 export function claudeCliUsage(): ClaudeCliUsage {
-  return { ...usage };
+  return {
+    ...usage,
+    byRole: Object.fromEntries(Object.entries(usage.byRole).map(([role, spend]) => [role, { ...spend }])),
+  };
 }
 
 /** `after` minus `before`, for measuring one run's share of the meter. */
 export function claudeCliUsageSince(before: ClaudeCliUsage): ClaudeCliUsage {
   const now = usage;
+  const byRole: Record<string, ClaudeCliRoleSpend> = {};
+  for (const [role, spend] of Object.entries(now.byRole)) {
+    const prior = before.byRole[role];
+    const delta: ClaudeCliRoleSpend = {
+      calls: spend.calls - (prior?.calls ?? 0),
+      costUsd: spend.costUsd - (prior?.costUsd ?? 0),
+      inputTokens: spend.inputTokens - (prior?.inputTokens ?? 0),
+      cachedInputTokens: spend.cachedInputTokens - (prior?.cachedInputTokens ?? 0),
+      outputTokens: spend.outputTokens - (prior?.outputTokens ?? 0),
+    };
+    // A role that asked nothing in this slice says nothing about it.
+    if (delta.calls > 0) byRole[role] = delta;
+  }
   return {
     calls: now.calls - before.calls,
     costUsd: now.costUsd - before.costUsd,
@@ -155,6 +241,7 @@ export function claudeCliUsageSince(before: ClaudeCliUsage): ClaudeCliUsage {
     cachedInputTokens: now.cachedInputTokens - before.cachedInputTokens,
     outputTokens: now.outputTokens - before.outputTokens,
     wallMs: now.wallMs - before.wallMs,
+    byRole,
   };
 }
 
@@ -218,6 +305,7 @@ interface CliEnvelope {
   result?: string;
   is_error?: boolean;
   total_cost_usd?: number;
+  num_turns?: number;
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -257,12 +345,30 @@ export interface ClaudeCliOptions {
    * If unset, falls back to `WOWLIDATOR_CLAUDE_CLI_DISALLOWED_TOOLS` or `CLAUDE_CLI_DISALLOWED_TOOLS`.
    */
   disallowedTools?: string | readonly string[] | undefined;
+  /**
+   * Whether this role may search the run's registered corpus (repo context
+   * graph + context documents) via the loopback BM25 MCP tool. Set for the
+   * generator, healer and agent roles; see `claude-retrieval.ts`.
+   */
+  retrieval?: boolean | undefined;
+  /**
+   * Which role this model serves — stamps the meter's `byRole` bucket and
+   * the ledger row, so "what did authoring cost this flow" is answerable.
+   */
+  role?: string | undefined;
   /** Overridable for tests — the binary to run. */
   binary?: string | undefined;
   timeoutMs?: number | undefined;
 }
 
 export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
+  // The command this provider runs is HARDCODED below, on request
+  // (2026-08-27): it briefly went through the editable args template that
+  // `claude-tty`/`claude-cloud` still use, and was rolled back so the vector
+  // can be edited directly in this file. To change what `claude -p` runs,
+  // edit the `args` array in `doGenerate` below — and the warm session's
+  // launch args in `claude-cli-session.ts`, which must stay in step (or set
+  // WOWLIDATOR_CLAUDE_CLI_WARM=0 so only this file's vector runs).
   const binary = options.binary ?? 'claude';
   const effort =
     options.effort ??
@@ -271,11 +377,16 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
     DEFAULT_CLAUDE_CLI_EFFORT;
   const timeout = options.timeoutMs ?? CLAUDE_CLI_TIMEOUT_MS;
 
+  // Tools default to NONE, not to the CLI's default set. Every role here is
+  // ask→answer: the built-in tool schemas would be paid for on every cold
+  // start (as cache-write on warm ones), and a model that can reach for Bash
+  // or Read answers from what it fetched, not from the evidence it was given.
+  // `WOWLIDATOR_CLAUDE_CLI_TOOLS=default` restores the full set.
   const resolvedTools = formatToolArg(
     options.tools ??
       process.env['WOWLIDATOR_CLAUDE_CLI_TOOLS'] ??
       process.env['CLAUDE_CLI_TOOLS'] ??
-      null,
+      '',
   );
   const resolvedAllowedTools = formatToolArg(
     options.allowedTools ??
@@ -297,6 +408,10 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
     supportedUrls: {},
 
     async doGenerate(call: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
+      // The session usage cap, enforced in EVERY process — a run the panel
+      // never saw refuses its next call here. TTL-cached; throws only on a
+      // confirmed trip, worded as a provider refusal (an environment fact).
+      await assertUnderUsageCap();
       const startedMs = Date.now();
       const { system, text } = flattenPrompt(call.prompt);
       // The CLI validates against the schema itself, so it is not restated
@@ -308,6 +423,9 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
         call.responseFormat.schema !== undefined
           ? JSON.stringify(withoutSchemaKeyword(call.responseFormat.schema))
           : null;
+      // The BM25 search tool, when this role has it and there is a corpus.
+      const retrieval = await retrievalArgs(options.retrieval ?? false, resolvedAllowedTools);
+      // THE `claude -p` COMMAND. Edit this array to change what runs.
       const args = [
         '-p',
         '--model',
@@ -322,9 +440,21 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
           ? 'You answer exactly what is asked, with no preamble and no commentary.'
           : system,
         '--strict-mcp-config',
-        ...(resolvedTools !== null ? ['--tools', resolvedTools] : []),
-        ...(resolvedAllowedTools !== null ? ['--allowed-tools', resolvedAllowedTools] : []),
-        ...(resolvedDisallowedTools !== null ? ['--disallowed-tools', resolvedDisallowedTools] : []),
+        // No settings, hooks, plugins or skills: nothing outside the prompt
+        // may steer an answer, and none of it is paid for at startup.
+        '--setting-sources',
+        '',
+        '--disable-slash-commands',
+        // A per-call transcript on disk serves nobody — the proof bundle is
+        // the record — and skipping it removes a write per turn.
+        '--no-session-persistence',
+        // `=` form on purpose: these flags are variadic, and the space form
+        // with an empty value swallows the positional prompt (measured —
+        // "Input must be provided either through stdin or as a prompt").
+        ...(resolvedTools !== null ? [`--tools=${resolvedTools}`] : []),
+        ...(retrieval.allowedTools !== null ? [`--allowed-tools=${retrieval.allowedTools}`] : []),
+        ...(resolvedDisallowedTools !== null ? [`--disallowed-tools=${resolvedDisallowedTools}`] : []),
+        ...(retrieval.mcpConfig === null ? [] : [`--mcp-config=${retrieval.mcpConfig}`]),
         ...(schema === null ? [] : ['--json-schema', schema]),
         text,
       ];
@@ -345,10 +475,14 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
               system,
               schema,
               tools: resolvedTools,
-              allowedTools: resolvedAllowedTools,
+              allowedTools: retrieval.allowedTools,
               disallowedTools: resolvedDisallowedTools,
+              mcpConfig: retrieval.mcpConfig,
             },
             text,
+            // Per-role: authoring asks are independent of each other and pay
+            // for every earlier row they carry — see `sessionTurnBudget`.
+            sessionTurnBudget(options.role),
           );
           usage.calls += 1;
           usage.costUsd += warm.costUsd;
@@ -356,8 +490,33 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
           usage.inputTokens += warm.inputTokens;
           usage.cachedInputTokens += warm.cachedInputTokens;
           usage.outputTokens += warm.outputTokens;
+          const warmRole = roleBucket(options.role ?? 'unattributed');
+          warmRole.calls += 1;
+          warmRole.costUsd += warm.costUsd;
+          warmRole.inputTokens += warm.inputTokens;
+          warmRole.cachedInputTokens += warm.cachedInputTokens;
+          warmRole.outputTokens += warm.outputTokens;
+          // The cross-process ledger — fire-and-forget; see its module header.
+          void recordClaudeCliCall({
+            ts: new Date().toISOString(),
+            modelId: options.modelId,
+            path: 'warm',
+            costUsd: warm.costUsd,
+            inputTokens: warm.inputTokens,
+            cachedInputTokens: warm.cachedInputTokens,
+            cacheWriteTokens: warm.cacheWriteTokens,
+            outputTokens: warm.outputTokens,
+            wallMs: Date.now() - startedMs,
+            pid: process.pid,
+            turns: warm.turns,
+            ...(options.role === undefined ? {} : { role: options.role }),
+          });
+          // A JSON answer is unwrapped from fences/prose before the SDK
+          // parses it — packaging repair only; see `extractStructuredJson`.
+          const warmText =
+            call.responseFormat?.type === 'json' ? extractStructuredJson(warm.text) : warm.text;
           return {
-            content: warm.text === '' ? [] : [{ type: 'text', text: warm.text }],
+            content: warmText === '' ? [] : [{ type: 'text', text: warmText }],
             finishReason: { unified: 'stop', raw: 'stop' },
             usage: {
               inputTokens: {
@@ -381,6 +540,9 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
           cwd: neutralCwd(),
           timeout,
           maxBuffer: 32 * 1024 * 1024,
+          // The version check and telemetry are network calls inside the
+          // 3.4-4.3s startup this provider pays; a model call needs neither.
+          env: { ...process.env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
         });
         envelope = JSON.parse(stdout) as CliEnvelope;
       } catch (error) {
@@ -397,7 +559,11 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
         throw new Error(`claude CLI could not be asked — the provider refused the call: ${envelope.result ?? 'unknown error'}`);
       }
 
-      const answer = String(envelope.result ?? '');
+      // Same packaging repair as the warm path — the two vectors stay in step.
+      const answer =
+        call.responseFormat?.type === 'json'
+          ? extractStructuredJson(String(envelope.result ?? ''))
+          : String(envelope.result ?? '');
       usage.calls += 1;
       usage.costUsd += envelope.total_cost_usd ?? 0;
       usage.wallMs += Date.now() - startedMs;
@@ -409,6 +575,28 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
       usage.inputTokens += input;
       usage.cachedInputTokens += cacheRead;
       usage.outputTokens += output;
+      const coldRole = roleBucket(options.role ?? 'unattributed');
+      coldRole.calls += 1;
+      coldRole.costUsd += envelope.total_cost_usd ?? 0;
+      coldRole.inputTokens += input;
+      coldRole.cachedInputTokens += cacheRead;
+      coldRole.outputTokens += output;
+
+      // Same ledger as the warm path — one row per `claude -p` call.
+      void recordClaudeCliCall({
+        ts: new Date().toISOString(),
+        modelId: options.modelId,
+        path: 'cold',
+        costUsd: envelope.total_cost_usd ?? 0,
+        inputTokens: input,
+        cachedInputTokens: cacheRead,
+        cacheWriteTokens: cacheWrite,
+        outputTokens: output,
+        wallMs: Date.now() - startedMs,
+        pid: process.pid,
+        turns: envelope.num_turns ?? 1,
+        ...(options.role === undefined ? {} : { role: options.role }),
+      });
 
       return {
         content: answer === '' ? [] : [{ type: 'text', text: answer }],

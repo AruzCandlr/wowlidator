@@ -189,6 +189,42 @@ export function unscopedDestructiveClick(decision: DecisionLike, goal: string): 
 }
 
 /**
+ * How many ok clicks on the SAME selector one run tolerates before the next
+ * one is refused. Three, not two: a multi-select legitimately re-opens its
+ * dropdown once per pick (be100 PL_03_17 needed three), and the page-changed
+ * guard already lets those through — the pathology this exists for starts at
+ * the fourth.
+ */
+export const TOGGLE_CLICK_LIMIT = 3;
+
+/**
+ * Why a click that keeps re-pressing the same control must not run again, or
+ * null.
+ *
+ * Live (PL_03_02, 2026-08-27): a filter button whose listbox options never
+ * appeared in the truncated tree was clicked EIGHT times across 38 turns —
+ * each toggle changed the tree (open ↔ closed), so the repeated-on-unchanged-
+ * page guard never fired, the URL even changed mid-thrash, and the per-URL
+ * done-set restarted. 310 s of wall time on one leg, ok every time, learning
+ * nothing. Counted per run and per selector, across URLs, exactly because
+ * that is the shape the existing guards cannot see.
+ */
+export function repeatedToggleClick(
+  decision: DecisionLike,
+  okClicksThisRun: ReadonlyMap<string, number>,
+): string | null {
+  if (decision.action !== 'click' || decision.selector.trim() === '') return null;
+  const count = okClicksThisRun.get(decision.selector.trim()) ?? 0;
+  if (count < TOGGLE_CLICK_LIMIT) return null;
+  return (
+    `circling: you have already clicked "${decision.selector}" ${count} times this run and it has not ` +
+    `produced what the goal needs — it likely toggles open and closed. Do something different: press a ` +
+    `key into it (ArrowDown/Enter), act on another control the tree shows, or call fail and say what ` +
+    `the page will not reveal`
+  );
+}
+
+/**
  * The named thing a goal says should be SHOWING when it is done.
  *
  * Goals in a catalog are written to a shape: an action, then the state it

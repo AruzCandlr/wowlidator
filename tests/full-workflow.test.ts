@@ -844,6 +844,52 @@ describe('structured-output circuit breaker', () => {
     resetStructuredBreaker();
   });
 
+  it('opens per ROLE, not per model — a sibling role on the same model is still asked', async () => {
+    // be100, 2026-08-28: generator and agent both on claude-cli:sonnet; two
+    // bad authoring rows opened the breaker for the LABEL and the agent was
+    // refused without a call. The key is task@label now.
+    resetStructuredBreaker();
+    let asks = 0;
+    const neverJson = new MockLanguageModelV4({
+      provider: 'mock',
+      modelId: 'shared',
+      doGenerate: async () => {
+        asks += 1;
+        return {
+          content: [{ type: 'text', text: '{"steps":[]}' }],
+          finishReason: { unified: 'stop', raw: 'stop' },
+          usage: {
+            inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 5, text: 5, reasoning: 0 },
+          },
+          warnings: [],
+        };
+      },
+    });
+    const base = {
+      model: neverJson,
+      modelLabel: 'mock:shared',
+      schema: z.object({ steps: z.array(z.string()).min(1) }),
+      system: 's',
+      prompt: 'p',
+      maxRetries: 0,
+    };
+    for (let cycle = 0; cycle < 2; cycle++) {
+      await assert.rejects(() => generateStructured({ ...base, task: 'generator' }), (e: unknown) =>
+        e instanceof StructuredOutputUnavailableError &&
+        // The evidence is on the FIRST line, where every consumer reads it.
+        /model text began: "\{\\"steps\\":\[\]\}"/.test(e.message.split('\n')[0] ?? '') &&
+        /rejected steps: too_small/.test(e.message.split('\n')[0] ?? ''),
+      );
+    }
+    await assert.rejects(() => generateStructured({ ...base, task: 'generator' }), /circuit is open for the generator role/);
+    const before = asks;
+    // The healer shares the model and is NOT switched off by the generator.
+    await assert.rejects(() => generateStructured({ ...base, task: 'healer' }), /failed to produce a valid structured response/);
+    assert.ok(asks > before, 'the healer was actually asked');
+    resetStructuredBreaker();
+  });
+
   it('is classified as an environment failure by the exit contract', async () => {
     const { classifyError, EXIT } = await import('../src/cli/exit.js');
     assert.equal(
@@ -879,6 +925,7 @@ describe('config & llm-factory', () => {
       local: [LOCAL_LLM_PLACEHOLDER_KEY],
       'claude-cli': [CLAUDE_CLI_PLACEHOLDER_KEY],
       'claude-tty': [CLAUDE_CLI_PLACEHOLDER_KEY],
+      'claude-cloud': [CLAUDE_CLI_PLACEHOLDER_KEY],
     });
   });
 

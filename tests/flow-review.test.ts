@@ -13,6 +13,7 @@ import {
   applyReview,
   auditGrounding,
   FlowReviewer,
+  settleableFindings,
   type ReviewDecision,
   type ReviewEvidence,
   type ReviewModel,
@@ -229,5 +230,125 @@ describe('FlowReviewer', () => {
     const ungrounded = await author.author('create a plan');
     assert.equal(ungrounded.review, undefined);
     assert.equal((ungrounded.flow.steps[0] as { selector: string }).selector, 'role=button[name="New Plan"]');
+  });
+});
+
+/**
+ * P5 (2026-08-31): a finding no evidence could settle is not worth a model
+ * call. Measured on be100-rip, where the review's answer to a wall of these
+ * was `unsure` every time — which the audit already knew.
+ */
+describe('settleableFindings — what is worth asking about', () => {
+  const bare: ReviewEvidence = { axTree: TREE, prompt: 'PL_06_07 check the field' };
+
+  const auditOf = (steps: FlowStep[], ev: ReviewEvidence): ReturnType<typeof auditGrounding> =>
+    auditGrounding([], steps, ev);
+
+  it('drops a selector after a workflow leg when no tree, no repo index and no document names it', () => {
+    const steps: FlowStep[] = [
+      { action: 'workflow', goal: 'open the plan editor' },
+      { action: 'expectVisible', selector: 'role=button[name="ePatient"]' },
+    ];
+    const findings = auditOf(steps, bare);
+    assert.equal(findings.length, 1);
+    const { askable, unanswerable } = settleableFindings(findings, bare);
+    assert.equal(askable.length, 0);
+    assert.equal(unanswerable.length, 1);
+  });
+
+  it('keeps it the moment ANY evidence source could answer — a repo index…', () => {
+    const withRepo: ReviewEvidence = { ...bare, projectContext: 'route /:locale/plans renders PlanEditor' };
+    const findings = auditOf(
+      [
+        { action: 'workflow', goal: 'open the plan editor' },
+        { action: 'expectVisible', selector: 'role=button[name="ePatient"]' },
+      ],
+      withRepo,
+    );
+    assert.equal(settleableFindings(findings, withRepo).askable.length, 1);
+  });
+
+  it('…or the control being named in a document the author saw', () => {
+    const withDoc: ReviewEvidence = { ...bare, prompt: 'PL_06_07 the ePatient tag must disappear' };
+    const findings = auditOf(
+      [
+        { action: 'workflow', goal: 'open the plan editor' },
+        { action: 'expectVisible', selector: 'role=button[name="ePatient"]' },
+      ],
+      withDoc,
+    );
+    assert.equal(settleableFindings(findings, withDoc).askable.length, 1);
+  });
+
+  it('always asks about a path finding — a route needs no tree', () => {
+    const steps: FlowStep[] = [
+      { action: 'workflow', goal: 'open the editor' },
+      { action: 'expectUrl', value: '/en/nowhere-declared' },
+    ];
+    const findings = auditOf(steps, bare);
+    assert.equal(findings.length, 1);
+    assert.equal(settleableFindings(findings, bare).askable.length, 1);
+  });
+
+  it('a selector on a CAPTURED page is always asked — a tree can settle it', () => {
+    const findings = auditOf([{ action: 'click', selector: 'role=button[name="New Plan"]' }], bare);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0]!.afterWorkflow, false);
+    assert.equal(settleableFindings(findings, bare).askable.length, 1);
+  });
+});
+
+describe('FlowReviewer — the call it no longer makes', () => {
+  const bare: ReviewEvidence = { axTree: TREE, prompt: 'PL_06_07 check the field' };
+
+  it('does not ask when nothing is settleable, and says why in the record', async () => {
+    let asked = 0;
+    const model: ReviewModel = {
+      id: 'stub',
+      review: async () => {
+        asked += 1;
+        return { decisions: [] };
+      },
+    };
+    const setup: FlowStep[] = [];
+    const steps: FlowStep[] = [
+      { action: 'workflow', goal: 'open the plan editor' },
+      { action: 'expectVisible', selector: 'role=button[name="ePatient"]' },
+      { action: 'expectHidden', selector: 'role=button[name="Tops care"]' },
+    ];
+    const outcome = await new FlowReviewer({ model }).review(setup, steps, bare);
+    assert.equal(asked, 0, 'a call that could only answer "unsure" is not made');
+    assert.equal(outcome.record?.flagged, 2);
+    assert.equal(outcome.record?.unsure, 2, 'they are still counted — the problem did not go away');
+    assert.equal(outcome.record?.inputTokens, 0);
+    assert.match(outcome.record?.notes.join('\n') ?? '', /no evidence could settle this/);
+    assert.match(outcome.record?.notes.join('\n') ?? '', /--repo/);
+  });
+
+  it('still asks — and still counts the unaskable — when the two are mixed', async () => {
+    let flaggedSeen = -1;
+    const model: ReviewModel = {
+      id: 'stub',
+      review: async (request) => {
+        flaggedSeen = request.findings.length;
+        // Decide the one it WAS given, so the only `unsure` left in the tally
+        // is the one this change stopped asking about.
+        return {
+          decisions: request.findings.map((f) =>
+            decision({ section: f.section, index: f.index, verdict: 'keep' }),
+          ),
+        };
+      },
+    };
+    const steps: FlowStep[] = [
+      { action: 'workflow', goal: 'open the plan editor' },
+      { action: 'expectVisible', selector: 'role=button[name="ePatient"]' },
+      { action: 'expectUrl', value: '/en/nowhere-declared' },
+    ];
+    const outcome = await new FlowReviewer({ model }).review([], steps, bare);
+    assert.equal(flaggedSeen, 1, 'only the path finding is sent');
+    assert.equal(outcome.record?.flagged, 2, 'the tally is what the AUDIT found');
+    assert.equal(outcome.record?.kept, 1, 'the askable one was answered');
+    assert.equal(outcome.record?.unsure, 1, 'the unaskable one is unsure by construction');
   });
 });

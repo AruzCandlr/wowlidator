@@ -20,7 +20,12 @@ import {
 import { LlmDraftModel, draftCatalog } from '../../catalog/draft.js';
 import { extractDocumentFile } from '../../catalog/extract.js';
 import { CONTEXT_DOC_MAX_CHARS, referencedSources, selectRelevantContext } from '../../catalog/retrieve.js';
+import { assessDeadEndRisk, describeRisk, riskEnabled, type DeadEndRisk, type RiskModel } from '../../generator/dead-end-risk.js';
+import { fkPairsFromGraph } from '../sections.js';
+import { raiseSessionCapFor } from '../../providers/claude-cli-session.js';
 import { bm25 } from '../../context/relevance.js';
+import { setClaudeRetrievalCorpus } from '../../providers/claude-retrieval.js';
+import { StructuredOutputUnavailableError } from '../../providers/llm-factory.js';
 import {
   parseSequenceDiagram,
   recomputeLaneTestability,
@@ -112,7 +117,7 @@ import {
   writeLedger,
 } from '../suite-progress.js';
 import { vacuousFlow } from '../../generator/vacuous.js';
-import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, mapPool } from '../case-plan.js';
+import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, mapPool, orderScenariosFastestFirst } from '../case-plan.js';
 import { healHintsFrom } from '../../context/heal-hints.js';
 import type { CliOptions } from '../options.js';
 import { pauseRequested } from '../pause.js';
@@ -127,6 +132,7 @@ import {
   lineLogger,
   planLogger,
   stepLogger,
+  buildRiskModel,
 } from '../runtime.js';
 import { runCases, type SuiteCase } from '../run-cases.js';
 
@@ -167,6 +173,9 @@ export async function cmdGenerate(url: string | undefined, options: CliOptions):
           openApiSpec: options.openapi,
         }).build()
       : undefined);
+  // What a claude-cli generator/healer session may search on demand — the
+  // same graph the prompt slice is cut from. See `providers/claude-retrieval.ts`.
+  setClaudeRetrievalCorpus({ graph: projectGraph ?? null });
 
   let suite: GeneratedSuite;
   if (options.api) {
@@ -373,6 +382,9 @@ export async function cmdDraft(subject: string | undefined, options: CliOptions)
   for (const context of contextDocs) {
     if (context.note !== '') process.stdout.write(`  ! ${context.name}: ${context.note}\n`);
   }
+  // A claude-cli generator may search these documents on demand as well as
+  // being handed the retrieved slice — see `providers/claude-retrieval.ts`.
+  setClaudeRetrievalCorpus({ docs: contextDocs });
 
   // A page is optional and worth a lot when it is there: menu paths and control
   // names come out matching what is really on screen, rather than being invented
@@ -506,9 +518,12 @@ interface TableCase {
   /** `<scenarioId> <scenario title>` — the collapsible group label in wowUI. */
   scenario: string;
   caseTitle: string;
+  /** The pre-run dead-end risk, judged right after authoring — see `dead-end-risk.ts`. */
+  risk?: DeadEndRisk | undefined;
   /** The sheet's recorded Actual Result, normalised — accuracy's ground truth. */
   knownResult?: 'passed' | 'failed' | undefined;
 }
+
 
 /**
  * `Flow.caseContext` for one sheet row — the compact card the runtime model
@@ -519,6 +534,24 @@ interface TableCase {
  * behaviour ("Cancelled", "KNOWN FAIL", "confirmed 22 Jul") — exactly what a
  * model needs before spending turns proving a removed feature absent.
  */
+/**
+ * Why a sheet row must not be authored at all, or null (S7). `Cancelled`
+ * in Actual Result, or a Note that says the case is cancelled/dropped, is a
+ * row about a feature that no longer exists in the requirement — authoring
+ * it can only produce a false failure. Pending/TBC rows still author (the
+ * feature exists, its wording is unsettled) but the author is told, see
+ * `caseCard`.
+ */
+export function sheetGate(row: TestCaseRow): string | null {
+  const actual = row.actual.trim().toLowerCase();
+  const note = row.note.trim();
+  if (/^cancel+ed$|^ยกเลิก/.test(actual)) return 'the sheet records this case as Cancelled — the requirement dropped it';
+  if (/\b(cancel+ed|dropped|removed from (?:the )?req|out of scope)\b/i.test(note) && !/re-?test/i.test(actual)) {
+    return `the sheet's Note says the case was cancelled: "${note.slice(0, 80)}"`;
+  }
+  return null;
+}
+
 export function caseCard(row: TestCaseRow): string | undefined {
   const cut = (label: string, text: string, max: number): string | null => {
     const folded = text.replace(/\s+/g, ' ').trim();
@@ -528,11 +561,53 @@ export function caseCard(row: TestCaseRow): string | undefined {
   const lines = [
     cut('Case', `${row.caseId} ${row.testCase}`, 160),
     cut('Expected', row.expected, 420),
-    cut('Test data', row.testData, 120),
+    // 420, not 120 (2026-08-28): the old cut ended PL_03_07's card mid-value
+    // ("Benefit name = QA-Create Plan Benefit Type Reimbu…"), so every
+    // runtime role reading the card — the judge, the agent, the diagnosis —
+    // saw a truncated Test data and could only guess at the rest. The sheet's
+    // Test data IS the values the flow must type; it is the one column that
+    // must never be the thing cut.
+    cut('Test data', row.testData, 420),
+    // A dated requirement change in the Note ("pop-up → page 4 Aug", "TBC
+    // wording") is prepended as its own line, so the author reads "this is
+    // now a page, not a dialog" BEFORE it writes role=dialog (S7). Four
+    // be100 rows asserted a dialog the Note said had become a page.
+    /^(?=.*\b(?:tbc|update|changed?|became|now|new req)\b)/i.test(row.note)
+      ? `Requirement note (read before authoring — the sheet's later word outranks its steps): ${row.note.replace(/\s+/g, ' ').trim().slice(0, 200)}`
+      : null,
     cut('Persona', row.persona, 80),
     cut('Note', row.note, 200),
   ].filter((line): line is string => line !== null);
   return lines.length === 0 ? undefined : lines.join('\n');
+}
+
+/**
+ * Schedule facts for the section scheduler and the governor's db allowlist,
+ * from the indexed graph: FK pairs (a section is a join family) and every
+ * declared table name. Null graph → undefined, and the scheduler falls back
+ * to unexpanded table sections with the governor's db tools refusing.
+ */
+export function graphFactsOf(
+  graph: { nodes: readonly { kind: string; name: string }[]; edges: readonly { from: string; to: string; kind: string }[] } | null,
+): { fkPairs: readonly (readonly [string, string])[]; tables: readonly string[] } | undefined {
+  if (graph === null) return undefined;
+  return {
+    fkPairs: fkPairsFromGraph(graph),
+    tables: graph.nodes.filter((n) => n.kind === 'table').map((n) => n.name),
+  };
+}
+
+/**
+ * Does this row's Expected output (or its Note / Test data) hold anything an
+ * assertion can quote? Anchors, in the order sheets actually provide them: a
+ * number, a `field = value` pair, a double-quoted span. Vague is none of the
+ * three across all three columns — "increases correctly", "displays properly".
+ */
+export function expectedLacksAnchors(expected: string, note: string, testData: string): boolean {
+  if (expected.trim() === '') return false; // nothing claimed — a different lint's problem
+  const holds = (text: string): boolean =>
+    /\d/.test(text) || /\S\s*=\s*\S/.test(text) || /"[^"]{2,}"/.test(text);
+  return !holds(expected) && !holds(note) && !holds(testData);
 }
 
 async function authorEachRow(
@@ -558,6 +633,11 @@ async function authorEachRow(
      * the last row is authored would deadlock it by construction.
      */
     gate?: ScenarioGate | null | undefined;
+    /**
+     * The pre-run dead-end risk judge. Null = off, or the generator role does
+     * not resolve; every case then runs the ordinary way.
+     */
+    risk?: RiskModel | null | undefined;
   },
 ): Promise<{ first: AuthoredFlow; cases: TableCase[] }> {
   // Kept by sheet position, compacted at the end: rows authored side by side
@@ -566,7 +646,13 @@ async function authorEachRow(
   const slots: (TableCase | undefined)[] = new Array(rows.length).fill(undefined);
   let first: AuthoredFlow | undefined;
   const refused: string[] = [];
+  // Rows already re-authored once against the risk judge (S6) — once per row.
+  const riskRetried = new Set<string>();
   const workers = authorWorkers(options.authorConcurrency, options.config.roles.generator.provider);
+  // N authoring workers = up to N concurrent generator calls (plus a risk
+  // judge). The warm claude pool must fit them, or worker N+1 falls to a
+  // cold one-shot at full price — the run-pool already does this for lanes.
+  raiseSessionCapFor(workers);
   if (workers === 1 && options.authorConcurrency === undefined && rows.length > 1) {
     context.log?.(
       `authoring rows one at a time: the generator role is on ${options.config.roles.generator.provider}, ` +
@@ -582,6 +668,17 @@ async function authorEachRow(
   const authorRow = async (row: TestCaseRow, index: number, page?: Page): Promise<void> => {
     const log = rowLog(row);
     const scenarioKey = row.scenarioId || 'ungrouped';
+    // **The Note and Actual columns are a gate, not a footnote** (S7 of the
+    // 2026-08-28 audit). A row the sheet records as Cancelled is a feature
+    // the requirement dropped — four be100 rows were authored, run, and
+    // failed against filters removed on 6 Jul. It never reaches a model.
+    const gate = sheetGate(row);
+    if (gate !== null) {
+      context.gate?.authored(scenarioKey);
+      refused.push(`${row.caseId}: ${gate}`);
+      log?.(`  ${row.caseId}: skipped — ${gate}`);
+      return;
+    }
     if (context.gate) {
       // Author no further than the scenario the runner is in: a row of a
       // later scenario waits here until every earlier scenario's cases have
@@ -607,12 +704,29 @@ async function authorEachRow(
     // row's step vocabulary, and the prompt below can demand the value be
     // quoted from it rather than invented.
     const cited = referencedSources(`${row.testCase}\n${described}`);
+    // **Is the Expected output contextual enough to assert?** An expected
+    // result with no concrete anchor — no value, no "field = value" pair, no
+    // quoted label, no number in it or in the Note — leaves the author
+    // nothing to quote, and an author with nothing to quote invents
+    // (2026-08-28, asked for after PL_03_07). The check is $0; when it trips,
+    // the expected text itself is boosted in the retrieval query (the same
+    // term-frequency lever the citation boost uses) so the documents most
+    // likely to hold the missing values are the ones retrieved, and the row's
+    // description tells the author in one line where its anchors must come
+    // from.
+    const vague = expectedLacksAnchors(row.expected, row.note, row.testData);
+    const describedForPrompt = vague
+      ? `${described}\nExpected-result context: the Expected output above names no concrete value — take every asserted value from the Test data, the Note, the documents or the repository sections of this prompt, and never invent one.`
+      : described;
     const retrievalQuery =
       cited.length === 0
-        ? `${row.testCase}\n${described}`
-        : `${cited.join('\n')}\n${cited.join('\n')}\n${row.testCase}\n${described}`;
+        ? `${vague ? `${row.expected}\n${row.expected}\n` : ''}${row.testCase}\n${described}`
+        : `${cited.join('\n')}\n${cited.join('\n')}\n${vague ? `${row.expected}\n` : ''}${row.testCase}\n${described}`;
     if (cited.length > 0) {
       log?.(`  ${row.caseId}: the case cites ${cited.join('; ')} — retrieving it from the background and the repository`);
+    }
+    if (vague) {
+      log?.(`  ${row.caseId}: the expected output names no concrete value — retrieving context so assertions quote the documents/repository, not an invention`);
     }
     const selected = selectRelevantContext(context.context, retrievalQuery, {
       budgetChars: options.contextBudget,
@@ -630,7 +744,7 @@ async function authorEachRow(
           testable: true,
         },
       ],
-      { summary: context.summary, context: selected.documents, cases: [described] },
+      { summary: context.summary, context: selected.documents, cases: [describedForPrompt] },
     );
     log?.(`writing ${row.caseId}: ${row.testCase}…`);
     // **Each row's journey ends on its own page, so each row gets its own
@@ -648,6 +762,14 @@ async function authorEachRow(
             // The Menu column is the sheet saying where the row goes, in the
             // application's own labels; the title and steps second.
             where: [row.menu, row.testCase, row.steps].filter((t) => t !== '').join('\n'),
+            // **Not behind a flag on this path.** A sheet row names a
+            // destination that is almost never the start url, and authoring it
+            // from the sign-in tree alone is the failure this capture exists
+            // for: measured on PL_07, 10 of 10 rows had every Benefit Plan
+            // Catalog selector refused as "appears in no captured tree", 5 of
+            // them fatally. `--capture-journey` stays the opt-in for the
+            // single-page paths, where the start url usually IS the subject.
+            force: true,
           });
     // The repository slice ranked against THIS row's words — the shared
     // author-wide section describes the whole project; the routes that decide
@@ -695,11 +817,74 @@ async function authorEachRow(
         caseTitle: row.testCase,
         ...(knownResult === undefined ? {} : { knownResult }),
       };
+      // Judged on the evidence the author just read — the ranked documents,
+      // the repository slice, the declared routes — before a browser is spent.
+      // A case above the threshold runs once with every retry path off.
+      if (context.risk) {
+        const risk = await assessDeadEndRisk(
+          {
+            caseName: testCase.name,
+            caseText: `${row.testCase}\n${described}`,
+            flow: testCase.flow,
+            documents: selected.documents.map((d) => ({ name: d.name, text: d.text })),
+            repository: rowProjectContext,
+            declaredRoutes: declaredPageRoutes(context.graph ?? null),
+            backend: options.backend,
+            // The sheet's own Actual Result: a row the tester already saw
+            // fail is the strongest expected-fail evidence there is.
+            ...(knownResult === undefined ? {} : { knownResult }),
+          },
+          { model: context.risk, log: (line) => process.stderr.write(`${line}\n`) },
+        );
+        if (risk) {
+          testCase.risk = risk;
+          log?.(`  ${row.caseId}: ${describeRisk(risk)}`);
+          // **The judge's evidence feeds the author, once** (S6). A fail-fast
+          // verdict with concrete reasons is re-asked immediately with those
+          // reasons as feedback; the better flow wins. be100: "the search
+          // box starts disabled" (0.78), "no Start-date filter exists"
+          // (0.88) — each right, each spent on a full dead-ended run.
+          if (risk.verdict === 'fail-fast' && risk.reasons.length > 0 && !riskRetried.has(row.caseId)) {
+            riskRetried.add(row.caseId);
+            log?.(`  ${row.caseId}: re-authoring once against the risk judge's ${risk.reasons.length} reason(s)…`);
+            try {
+              const again = await author.author(prompt, page, {
+                journeyTree,
+                ...(rowProjectContext === '' ? {} : { projectContext: rowProjectContext }),
+                priorFeedback: risk.reasons.map((r) => `the pre-run risk judge found: ${r}`),
+              });
+              const riskAgain = await assessDeadEndRisk(
+                { caseName: testCase.name, caseText: `${row.testCase}\n${described}`, flow: again.flow,
+                  documents: selected.documents.map((d) => ({ name: d.name, text: d.text })), repository: rowProjectContext,
+                  declaredRoutes: declaredPageRoutes(context.graph ?? null), backend: options.backend,
+                  ...(knownResult === undefined ? {} : { knownResult }) },
+                { model: context.risk, log: (line) => process.stderr.write(`${line}\n`) },
+              );
+              // Only a genuinely better flow replaces the first — feedback must never make the result worse.
+              if (riskAgain && riskAgain.likelihood < risk.likelihood) {
+                testCase.flow = { ...again.flow, name: testCase.flow.name, ...(testCase.flow.polarity === undefined ? {} : { polarity: testCase.flow.polarity }), ...(card === undefined ? {} : { caseContext: card }) };
+                testCase.risk = riskAgain;
+                log?.(`  ${row.caseId}: re-authored — ${describeRisk(riskAgain)}`);
+              } else {
+                log?.(`  ${row.caseId}: the re-authored flow was no better; keeping the first`);
+              }
+            } catch (error) {
+              log?.(`  ${row.caseId}: re-authoring against the risk reasons failed — keeping the first (${error instanceof Error ? error.message.split('\n')[0] : String(error)})`);
+            }
+          }
+        }
+      }
       slots[index] = testCase;
       await context.onCase?.(testCase, first);
       context.gate?.authored(scenarioKey);
     } catch (error) {
-      if (!(error instanceof AuthoringError)) throw error;
+      // A model that could not answer — the re-ask budget spent, or a
+      // circuit already open — blocks THIS row with the reason and the run
+      // goes on (2026-08-28). It used to escape as a fatal: on be100 an open
+      // breaker thrown from one row's authoring review aborted the pass
+      // with 100 cases never reached. A dead role now costs each remaining
+      // row a millisecond and an honest "never ran: …" line, not the suite.
+      if (!(error instanceof AuthoringError) && !(error instanceof StructuredOutputUnavailableError)) throw error;
       // A refused row still advances the gate: a scenario that authors
       // nothing must clear, or every scenario after it waits forever.
       context.gate?.authored(scenarioKey);
@@ -1298,19 +1483,24 @@ async function captureJourneyTree(
    * and title — when the caller has it apart from the rest. Matched against
    * the application's own menu labels; the whole description is the fallback.
    */
-  hints: { where?: string | undefined } = {},
+  hints: { where?: string | undefined; force?: boolean | undefined } = {},
 ): Promise<string | undefined> {
   // `--scope e2e` turns this on by itself. An end-to-end test whose
   // destination page was never read cannot be grounded in it: measured, 9 of 9
   // authoring runs without the journey tree handed the middle of the journey
   // to a `workflow` step, and 0 of 3 did with it. Asking for e2e and getting
   // an ungrounded journey would be the flag failing to mean anything.
-  if (!options.captureJourney && options.scope !== 'e2e') return undefined;
+  if (!options.captureJourney && options.scope !== 'e2e' && hints.force !== true) return undefined;
   if (!options.captureJourney) {
     // Never silent: it is a navigation of someone's application that they did
     // not ask for by name, and they are owed the sentence saying which flag
     // asked for it.
-    log?.('journey capture: on because --scope e2e — an end-to-end test needs the page it ends on');
+    log?.(
+      options.scope === 'e2e'
+        ? 'journey capture: on because --scope e2e — an end-to-end test needs the page it ends on'
+        : "journey capture: on because this row's destination is not the start page — a catalog row " +
+          'authored from the sign-in tree alone hands every leg past it to a workflow step',
+    );
   }
   if (graph === null || options.url === undefined) {
     log?.('journey capture: needs both --repo (for the routes) and a start url — skipped');
@@ -1842,6 +2032,11 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     process.stderr.write(`wowlidator catalog: ${(error as Error).message}\n`);
     return 2;
   }
+  // Everything this run knows — graph and documents — becomes searchable by
+  // the claude-cli generator/healer sessions, the catalog document itself
+  // deliberately excluded (the boundary retrieval must not cross: the claims
+  // are the question, never the corpus the answer is retrieved from).
+  setClaudeRetrievalCorpus({ docs: contextDocs, graph: repoContextGraph });
   // The claims are what this catalog is about, so they decide which tables are
   // worth offering — same narrowing as the describe path, same reason.
   const tables = await tableInventory(
@@ -1884,6 +2079,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     policy: options.policy,
     probe: options.probe,
+    ...(options.authorAttempts === undefined ? {} : { attempts: options.authorAttempts }),
     ...(reviewer === null ? {} : { reviewer }),
     ...(tables.length > 0 ? { tables } : {}),
     ...(projectContext !== '' ? { projectContext } : {}),
@@ -1957,11 +2153,22 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
             claims: ledgerClaimsPath,
             ...(options.url === undefined ? {} : { url: options.url }),
             ...(options.repo === undefined ? {} : { repo: options.repo }),
+            agent: options.agent,
           },
         };
   let rows = allRows;
   if (options.resume) {
     const prior = ledgerSpec === undefined ? null : await readLedger(ledgerSpec.path);
+    // A resume that dropped a role the pass was authored with is refused
+    // here, once, with the fix — never nine per-step errors (S8).
+    if (prior?.launch?.agent === true && !options.agent) {
+      process.stderr.write(
+        'wowlidator catalog: this run was authored WITH the multi-page agent, and this resume has it off — ' +
+          'its workflow legs would error one by one. Configure the agent role (or drop --no-agent), or pass ' +
+          '--no-agent explicitly together with --rerun-errors to accept the downgrade and re-author.\n',
+      );
+      return EXIT.environment;
+    }
     // `--rerun-vacuous`: every recorded case whose flow on disk asserts
     // nothing about its claim is marked blocked in the ledger — a vacuous
     // pass was never a verdict — and the resume below picks it up.
@@ -2010,6 +2217,28 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           `${start} before it keep their verdicts; the rerun uses the current config`,
       );
     }
+    // The single-case re-author (the panel's "Re-author & run" and its work
+    // queue, 2026-08-28): the named cases lose their verdicts — whatever they
+    // were, passes included — and the resume loop then re-authors each from
+    // its sheet row with the CURRENT code and config before running it. The
+    // sheet row is the source of truth; the recorded flow file is not reused.
+    if (prior !== null && ledgerSpec !== undefined && options.rerunCases !== undefined && options.rerunCases.length > 0) {
+      const wanted = new Set(options.rerunCases);
+      const unknown = [...wanted].filter((id) => !prior.planned.some((p) => p === id || p.startsWith(id)));
+      if (unknown.length > 0) {
+        process.stderr.write(
+          `wowlidator catalog: --rerun-case ${unknown.join(', ')} matches no planned case. Planned ids: ${prior.planned.slice(0, 8).join(', ')}${prior.planned.length > 8 ? ', …' : ''}\n`,
+        );
+        return EXIT.usage;
+      }
+      const marked = markForRerun(
+        prior,
+        (_o, id) => wanted.has(id) || [...wanted].some((w) => id.startsWith(w)),
+        'rerun requested by case id — re-authored from the sheet row',
+      );
+      await writeLedger(ledgerSpec.path, prior);
+      log?.(`--rerun-case: ${marked.length} case(s) re-authored from their sheet rows and re-run: ${marked.join(', ')}`);
+    }
     if (prior !== null && ledgerSpec !== undefined && (options.rerunErrors || options.rerunFailed)) {
       const errors = options.rerunErrors ? markForRerun(prior, isErrorOutcome, 'rerun after error') : [];
       const failed = options.rerunFailed ? markForRerun(prior, isFailedOutcome, 'heal: re-run with autoheal') : [];
@@ -2040,6 +2269,42 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         return EXIT.ok;
       }
     }
+  }
+
+  // **Fastest scenario first.** With several scenarios queued, the sheet's
+  // order is just typing order — and the ScenarioGate makes the first
+  // scenario everyone else's wait. Reorder the scenario BLOCKS by estimated
+  // cost, measured history first (this catalog's own prior proof bundles),
+  // the sheet's Steps/Expected lines otherwise. Rows inside a scenario keep
+  // sheet order; --sheet-order keeps everything as typed; the roll-up still
+  // prints in planned (sheet) order either way.
+  if (!options.sheetOrder && new Set(rows.map((r) => r.scenarioId || 'ungrouped')).size > 1) {
+    const priorMs = new Map<string, number>();
+    const ledgerForSpeed = ledgerSpec === undefined ? null : await readLedger(ledgerSpec.path);
+    await Promise.all(
+      Object.entries(ledgerForSpeed?.outcomes ?? {}).map(async ([caseId, outcome]) => {
+        if (typeof outcome?.proofPath !== 'string' || outcome.proofPath === '') return;
+        try {
+          const bundle = JSON.parse(await readFile(outcome.proofPath, 'utf8')) as {
+            caseDurationMs?: number;
+            durationMs?: number;
+          };
+          const ms = bundle.caseDurationMs ?? bundle.durationMs;
+          if (typeof ms === 'number' && ms > 0) priorMs.set(caseId, ms);
+        } catch {
+          // A missing or unreadable bundle prices that row statically.
+        }
+      }),
+    );
+    const ordered = orderScenariosFastestFirst(rows, priorMs);
+    rows = ordered.rows;
+    log?.(
+      `scenario order, fastest estimate first: ${ordered.order
+        .map((o) => `${o.scenario} (~${Math.round(o.estimateMs / 1000)}s, ${o.rows} row(s))`)
+        .join(' → ')}` +
+        (priorMs.size > 0 ? ` — ${priorMs.size} row(s) priced from this catalog's own history` : '') +
+        ' (--sheet-order keeps the sheet’s order)',
+    );
   }
 
   // Announced once, at initialisation: this is the name under which the run —
@@ -2117,20 +2382,30 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       // deadlock a gate that waits on runs. `--author-lookahead all` restores
       // the old eager behaviour; a number widens the window by that many
       // scenarios.
+      // The Machinery card's off-switch, same voice as `--author-lookahead
+      // all`: authoring stops waiting on runs and every row authors as fast
+      // as the pool allows — what feeds the parallel lanes.
+      const gateOff = (process.env['WOWLIDATOR_SCENARIO_GATE'] ?? '').trim().toLowerCase() === 'off';
       const gate =
-        queue === null || options.authorLookahead === 'all'
+        queue === null || options.authorLookahead === 'all' || gateOff
           ? null
           : new ScenarioGate(
               rows.map((row) => row.scenarioId || 'ungrouped'),
               { lookahead: typeof options.authorLookahead === 'number' ? options.authorLookahead : 0 },
             );
       if (gate !== null) {
-        log?.('authoring keeps pace with the runs: a scenario is authored only once every scenario before it has finished running (--author-lookahead widens this)');
+        log?.('authoring keeps pace with the runs: a scenario is authored only once every scenario before it has finished running (--author-lookahead widens this; the Machinery card can turn the gate off)');
+      } else if (gateOff && queue !== null) {
+        log?.('scenario gate OFF (WOWLIDATOR_SCENARIO_GATE=off) — every row authors as fast as the pool allows');
       }
       // The healer repairs with the same retrieved context the author reads:
       // the repository's declarations for the failing page, and the
       // background documents ranked by the failed step's own words.
       const suiteHealHints = healHintsFrom(repoContextGraph ?? null, contextDocs);
+      const riskModel = buildRiskModel(options);
+      if (riskModel === null && riskEnabled()) {
+        log?.('pre-run dead-end risk is not judged: the generator role does not resolve — every case runs with every retry path');
+      }
       const queuedPaths: string[] = [];
       try {
         const authoredRows = await authorEachRow(rows, author, options, {
@@ -2139,6 +2414,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           log,
           graph: repoContextGraph,
           gate,
+          risk: riskModel,
           onCase:
             queue === null
               ? undefined
@@ -2153,6 +2429,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
                     group,
                     indexTitle: `wowlidator catalog — ${document.name}`,
                     declaredRoutes: declaredPageRoutes(repoContextGraph),
+                    graphFacts: graphFactsOf(repoContextGraph),
                     ledger: ledgerSpec,
                     healHints: suiteHealHints,
                     onCaseDone: (finished) => {
@@ -2186,6 +2463,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
                     scenarioId: testCase.scenarioId,
                     ...(group === undefined ? {} : { group: `${group}/${slugify(testCase.scenarioId)}` }),
                     generatedBy: testCase.flow.authoredBy,
+                    ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
                   });
                   gate?.queued(testCase.scenarioId);
                 },
@@ -2312,6 +2590,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       // The flow's own stamp, not the pass-wide one: it carries the scenario
       // and case title the run list groups and labels by.
       generatedBy: testCase.flow.authoredBy ?? catalogProvenance,
+      ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
     })),
     options,
     {
@@ -2319,6 +2598,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       group,
       indexTitle: `wowlidator catalog — ${document.name}`,
       declaredRoutes: declaredPageRoutes(repoContextGraph),
+      graphFacts: graphFactsOf(repoContextGraph),
       ledger: ledgerSpec,
       healHints: healHintsFrom(repoContextGraph ?? null, contextDocs),
     },
@@ -2370,6 +2650,7 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     policy: options.policy,
     probe: options.probe,
+    ...(options.authorAttempts === undefined ? {} : { attempts: options.authorAttempts }),
     ...(reviewer === null ? {} : { reviewer }),
     ...(tables.length > 0 ? { tables } : {}),
     ...(projectContext !== '' ? { projectContext } : {}),

@@ -24,6 +24,8 @@ import {
   goalMentionsSignIn,
   looksLikeSignIn,
   verificationOnlyGoal,
+  goalOutcome,
+  outcomeShown,
 } from '../src/orchestrator/goal-evidence.js';
 import { WorkflowAgent, type AgentDecision } from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
@@ -303,5 +305,22 @@ describe('the agent stops when the page arrives (CDP)', { skip: skipBrowser }, (
     assert.equal(result.turns, 1, 'arriving is finishing — the remaining budget must go unspent');
     assert.equal(turns, 1);
     assert.match(result.summary, /destination the goal names/);
+  });
+});
+
+describe('goalOutcome / outcomeShown (S1 — a finish is checked against the page)', () => {
+  it('reads "set X to Y" and "X = Y" goals into a checkable end state', () => {
+    assert.deepEqual(goalOutcome('On the catalog page, set the "Rows per page" control to 25, then stay on /en/plans'), { control: 'Rows per page', value: '25' });
+    assert.deepEqual(goalOutcome('Set the Status filter to Inactive'), { control: 'Status', value: 'Inactive' });
+    assert.deepEqual(goalOutcome('Fill Country = "Thailand (TH)" and save'), { control: 'Country', value: 'Thailand (TH)' });
+    assert.equal(goalOutcome('Open the main navigation menu and click HR'), null, 'a goal with no end state defers to the claim');
+  });
+
+  it('finds the state on the tree, on one line or a label→value neighbour, and never on a truncated tree', () => {
+    const tree = 'button "Rows per page"\nStaticText "25"\nbutton "Status: Inactive"\nStaticText "1–25 of 75"';
+    assert.match(outcomeShown({ control: 'Rows per page', value: '25' }, tree) ?? '', /Rows per page.*→.*"25"/);
+    assert.match(outcomeShown({ control: 'Status', value: 'Inactive' }, tree) ?? '', /Status: Inactive/);
+    assert.equal(outcomeShown({ control: 'Rows per page', value: '100' }, tree), null, 'the page shows 25, not 100 — the finish must be refused');
+    assert.equal(outcomeShown({ control: 'Rows per page', value: '25' }, `${tree}\n[TREE TRUNCATED: 4 of 90]`), null);
   });
 });

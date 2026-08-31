@@ -24,6 +24,7 @@ import { z } from 'zod';
 
 import {
   PROVIDER_META,
+  PROVIDERS,
   SERIAL_PROVIDERS,
   loadConfig,
   localLlmBaseUrl,
@@ -34,7 +35,8 @@ import {
 } from '../config.js';
 import { localFetch } from './local-fetch.js';
 import { createClaudeCli } from './claude-cli.js';
-import { createClaudeTty } from './claude-tty.js';
+import { createClaudeCloud, createClaudeTty } from './claude-tty.js';
+import { maybeLogClaudeQuota } from './claude-quota.js';
 import { dedupeKeyFor, serialGateFor } from './serial-gate.js';
 import { logLlmFailure, logLlmRequest, logLlmResponse } from './llm-log.js';
 import {
@@ -58,7 +60,7 @@ export class MissingApiKeyError extends Error {
         `  ${meta.freeTier}\n` +
         `  Add more than one as a comma-separated list (${meta.envKey}=key1,key2) ` +
         `and wowlidator fails over to the next automatically when one is exhausted.\n` +
-        `Or point the role elsewhere: WOWLIDATOR_${role.toUpperCase()}_PROVIDER=<google|groq|openrouter|emmiedev|zai|deepseek|local|claude-cli|claude-tty>`,
+        `Or point the role elsewhere: WOWLIDATOR_${role.toUpperCase()}_PROVIDER=<${PROVIDERS.join('|')}>`,
     );
     this.name = 'MissingApiKeyError';
     this.provider = provider;
@@ -147,6 +149,14 @@ export type ModelBuilder = (
     allowedTools?: string | readonly string[] | undefined;
     /** Disallowed tools for the provider session. */
     disallowedTools?: string | readonly string[] | undefined;
+    /**
+     * Whether the session may search the run's registered corpus (repo
+     * context graph + context documents) over the loopback BM25 MCP tool —
+     * `claude-cli` only; other providers ignore it. See `claude-retrieval.ts`.
+     */
+    retrieval?: boolean | undefined;
+    /** The role this model serves — spend attribution for session-billed providers. */
+    role?: string | undefined;
   },
 ) => LanguageModel;
 
@@ -165,11 +175,18 @@ const FACTORIES: Record<ProviderName, ModelBuilder> = {
       ...(options?.tools === undefined ? {} : { tools: options.tools }),
       ...(options?.allowedTools === undefined ? {} : { allowedTools: options.allowedTools }),
       ...(options?.disallowedTools === undefined ? {} : { disallowedTools: options.disallowedTools }),
+      ...(options?.retrieval === undefined ? {} : { retrieval: options.retrieval }),
+      ...(options?.role === undefined ? {} : { role: options.role }),
     }),
   // Same session, one warm interactive process per (model, effort) — pooled
   // in module state, because this builder runs on EVERY failover call.
   'claude-tty': (_apiKey, modelId, options) =>
     createClaudeTty({ modelId, ...(options?.effort === undefined ? {} : { effort: options.effort }) }),
+  // The same account with the work in a Claude Code cloud session — the warm
+  // terminal again, launched with `--cloud`. Pooled in module state for the
+  // same reason as `claude-tty`.
+  'claude-cloud': (_apiKey, modelId, options) =>
+    createClaudeCloud({ modelId, ...(options?.effort === undefined ? {} : { effort: options.effort }) }),
   google: (apiKey, modelId) => createGoogleGenerativeAI({ apiKey })(modelId),
   groq: (apiKey, modelId) => createGroq({ apiKey })(modelId),
   openrouter: (apiKey, modelId) => createOpenRouter({ apiKey })(modelId),
@@ -263,6 +280,15 @@ export function createModelForRole(
       tools: entry.tools,
       allowedTools: entry.allowedTools,
       disallowedTools: entry.disallowedTools,
+      // The roles whose questions outgrow their prompt mid-thought: the
+      // generator (what does this route render, which table holds this), the
+      // healer (does anything declare the control it is looking for), and the
+      // agent — which is only ever on the page BECAUSE a step failed as a
+      // blocker, exactly when knowing the application's declared routes and
+      // tables is worth a lookup. `data` stays off: its one job is inventing
+      // a value, and grounding it in the repo would be over-thinking a fill.
+      retrieval: role === 'generator' || role === 'healer' || role === 'agent',
+      role,
     }),
     id: modelIdFor(entry),
     keyIndex,
@@ -532,10 +558,17 @@ export async function generateStructured<T>(
   // Breaker first: a model that has already burned the full re-ask budget
   // twice does not get a third chance per call site — it gets one immediate
   // system failure, and the run's report says which role to repoint.
-  const tripped = exhaustedCycles.get(request.modelLabel) ?? 0;
+  // Keyed by ROLE and model, not model alone (2026-08-28). Live on be100: two
+  // authoring rows exhausted their re-asks on claude-cli:sonnet, the breaker
+  // opened for the LABEL — shared by generator, healer and agent, all on
+  // that model — and the agent was refused without a call on the very next
+  // case, then the whole catalog aborted. A role that keeps answering must
+  // never be switched off by a sibling's failures on the same model.
+  const breakerKey = `${request.task ?? 'model'}@${request.modelLabel}`;
+  const tripped = exhaustedCycles.get(breakerKey) ?? 0;
   if (tripped >= BREAKER_TRIPS) {
     throw new StructuredOutputUnavailableError(
-      `${request.modelLabel} structured-output circuit is open: it returned unusable ` +
+      `${request.modelLabel} structured-output circuit is open for the ${request.task ?? 'model'} role: it returned unusable ` +
         `objects through ${tripped} full re-ask cycles this session. This is a SYSTEM ` +
         `failure (the model, not the application). Point the role at a model that can ` +
         `do JSON-schema output — run \`wowlidator doctor\`, or set the role's ` +
@@ -556,8 +589,8 @@ export async function generateStructured<T>(
       });
       // A success halves the count rather than clearing it: one good roll
       // from a mostly-broken model must not reset the evidence against it.
-      const seen = exhaustedCycles.get(request.modelLabel) ?? 0;
-      if (seen > 0) exhaustedCycles.set(request.modelLabel, seen - 1);
+      const seen = exhaustedCycles.get(breakerKey) ?? 0;
+      if (seen > 0) exhaustedCycles.set(breakerKey, seen - 1);
       return response;
     } catch (error) {
       last = error;
@@ -592,7 +625,7 @@ export async function generateStructured<T>(
     }
   }
   if (worthReasking(last)) {
-    exhaustedCycles.set(request.modelLabel, (exhaustedCycles.get(request.modelLabel) ?? 0) + 1);
+    exhaustedCycles.set(breakerKey, (exhaustedCycles.get(breakerKey) ?? 0) + 1);
   }
   throw describeStructuredFailure(request, last);
 }
@@ -651,8 +684,14 @@ function describeStructuredFailure<T>(request: StructuredRequest<T>, error: unkn
   const headline = isKeyExhaustedError(error)
     ? `${request.modelLabel} could not be asked — the provider refused the call (rate limit, quota, or credential): ${detail}\n`
     : `${request.modelLabel} failed to produce a valid structured response: ${detail}\n`;
+  // The evidence rides the FIRST line (2026-08-28). Every consumer that
+  // shows a person why a row was blocked — the case line, the ledger reason,
+  // the fatal — keeps `message.split('\n')[0]`, and the evidence used to sit
+  // on line two: a whole be100 run reported "did not match schema" ten times
+  // with what the model actually said discarded at every one of them.
+  const evidence = describeGenerationFailure(error).trim();
   return new StructuredOutputUnavailableError(
-    headline + describeGenerationFailure(error) + advice,
+    `${headline.trimEnd()}${evidence === '' ? '' : ` ${evidence}`}\n${advice}`,
     request.modelLabel,
     error,
   );
@@ -699,6 +738,10 @@ async function attemptStructured<T>(
         outputTokens: response.outputTokens,
         object: response.object,
       });
+      // A claude-* call spends the signed-in account's own limits, so its
+      // headroom rides beside the call that spent from it. Fire-and-forget,
+      // cached, throttled — see `claude-quota.ts`; never on the hot path.
+      if (request.modelLabel.startsWith('claude-')) maybeLogClaudeQuota(task);
       return response;
     } catch (error) {
       request.pacer?.release();
@@ -714,6 +757,9 @@ async function attemptStructured<T>(
         }
       }
       logLlmFailure({ task, modelLabel: request.modelLabel, ms: Date.now() - started, error });
+      // A refused claude-* call is exactly when the account's headroom is the
+      // question — say where the limits stand next to the failure.
+      if (request.modelLabel.startsWith('claude-')) maybeLogClaudeQuota(task);
       throw error;
     }
   }
@@ -947,8 +993,9 @@ const REASONING_OUTPUT_FLOOR: Partial<Record<ProviderName, number>> = {
 // prose like the other two.
 // `claude-cli` is NOT among them: the CLI takes `--json-schema` and validates
 // against it, so restating the schema in the prompt would only cost tokens.
-// `claude-tty` IS: an interactive terminal has no schema channel at all.
-const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local', 'claude-tty']);
+// `claude-tty` IS: an interactive terminal has no schema channel at all —
+// and `claude-cloud` is that same terminal with the work in a cloud session.
+const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local', 'claude-tty', 'claude-cloud']);
 
 /**
  * Silence the one AI SDK warning this codebase makes untrue.

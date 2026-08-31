@@ -31,13 +31,25 @@ import {
   loginProofCannotFail,
   unsettledWorkflowClaim,
   interruptedCredentialSubmit,
+  declaredControlStrings,
+  expectedItemsIn,
+  unassertedExpectedItems,
+  unreconciledMatchClaim,
+  inventedControlInternals,
+  workflowOverDeclaredControls,
   ungroundedCountRole,
+  ungroundedTextExpectation,
+  ungroundedSelectorRole,
+  fixtureFacts,
+  ungroundedFixtureAssertion,
   unpinnedDateEntry,
   ungroundedUrlExpectation,
   unsynchronizedLoginSubmit,
   dbClaimWithoutDbCheck,
   BACKEND_OFF_REASON,
   buildUserPrompt,
+  refusalShape,
+  SUITE_REFUSAL_MEMORY,
   loginProofAssertsLoginPage,
   ungroundedGoto,
   unindexedRequestMethod,
@@ -365,6 +377,193 @@ describe('ungroundedCountRole', () => {
   it('ignores counts that are not role-shaped', () => {
     const steps: FlowStep[] = [{ action: 'expectCount', selector: '.card', count: 3 }];
     assert.equal(ungroundedCountRole(steps, TREE), null);
+  });
+});
+
+describe('code-grounded authoring — the repository as evidence', () => {
+  const CODE = [
+    'Project context for /:locale/admin/benefits/plans (src/app/[locale]/admin/benefits/plans/page.tsx):',
+    '  renders BenefitPlansScreen (src/…/BenefitPlansScreen.tsx) — says: "breadcrumb" · "Clear filters"',
+    '  BenefitPlansScreen renders the admin_benefits_plans strings [en, messages/en.json]: title: "Benefit Plan Catalog" · createPlan: "Create Plan" · makeCorrection: "Make Correction" · rows: "5"',
+  ].join('\n');
+
+  it('declaredControlStrings collects the quoted spans and drops bare numbers', () => {
+    const strings = declaredControlStrings(CODE);
+    assert.ok(strings.includes('Create Plan'), strings.join('|'));
+    assert.ok(strings.includes('Make Correction'));
+    assert.ok(strings.includes('breadcrumb'));
+    assert.ok(!strings.includes('5'), 'a bare number is not a label');
+    assert.deepEqual(declaredControlStrings(undefined), []);
+  });
+
+  it('ungroundedTextExpectation accepts text the code declares, tree or not', () => {
+    const TREE = 'main\n  heading "Something else"';
+    const steps: FlowStep[] = [
+      { action: 'expectText', selector: 'text="Benefit Plan Catalog"', value: 'Benefit Plan Catalog' },
+    ];
+    assert.notEqual(ungroundedTextExpectation(steps, TREE), null, 'refused without code evidence');
+    assert.equal(ungroundedTextExpectation(steps, TREE, CODE), null, 'the code declares the string');
+  });
+
+  it('workflowOverDeclaredControls flags a goal naming a declared control', () => {
+    // PL_07: 108 model calls hunting a journey whose control the code names.
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/benefits/plans' },
+      {
+        action: 'workflow',
+        goal: "locate the row for plan X and click Make Correction, then end on the correction dialog",
+      },
+    ];
+    const hit = workflowOverDeclaredControls(steps, CODE);
+    assert.equal(hit?.index, 1);
+    assert.ok(hit?.declared.includes('Make Correction'), hit?.declared.join('|'));
+  });
+
+  it('leaves a goal about genuinely undeclared territory alone', () => {
+    const steps: FlowStep[] = [
+      { action: 'workflow', goal: 'export the quarterly reconciliation and end on /exports' },
+    ];
+    assert.equal(workflowOverDeclaredControls(steps, CODE), null);
+    assert.equal(workflowOverDeclaredControls(steps, undefined), null, 'no code, no opinion');
+  });
+
+  it('matches whole words only — "plan" inside "planning" is not the control', () => {
+    const code = 'renders the x strings [en, m.json]: a: "Plan"';
+    const steps: FlowStep[] = [{ action: 'workflow', goal: 'open the planning workspace' }];
+    assert.equal(workflowOverDeclaredControls(steps, code), null);
+  });
+});
+
+describe('expected-output coverage', () => {
+  const PROMPT = [
+    'PL_03_07: Create Plan count check',
+    'Steps:',
+    '  1. open the menu',
+    'Expected output:',
+    '  6.1 +1 in Total Plans',
+    '  6.2 +1 in Reimbursement by Employee and HR',
+    'Note (from the sheet):',
+    '  Before: Total plans: 75',
+  ].join('\n');
+
+  it('reads the numbered items out of the Expected block only', () => {
+    assert.deepEqual(expectedItemsIn(PROMPT), ['6.1', '6.2']);
+    assert.deepEqual(expectedItemsIn('free-text request, no block'), []);
+  });
+
+  it('flags lines no assertion cites — PL_03_07: DB checks are not the counter boxes', () => {
+    const steps: FlowStep[] = [
+      { action: 'click', selector: 'role=button[name="Create Plan" i]', intent: '6.1/6.2 — press it' },
+      { action: 'expectVisible', selector: 'text="row"', intent: '6.1 — the counter moved' },
+    ];
+    // the click's intent citing 6.2 is not coverage; only assertions carry it
+    assert.deepEqual(unassertedExpectedItems(steps, PROMPT), ['6.2']);
+  });
+
+  it('a workflow goal carries an item only when a later step asserts something', () => {
+    const settled: FlowStep[] = [
+      { action: 'workflow', goal: '6.2 — read the Reimbursement box and verify it moved' },
+      { action: 'expectText', selector: 'text="Total plans"', value: '76', intent: '6.1 — the box' },
+    ];
+    assert.deepEqual(unassertedExpectedItems(settled, PROMPT), []);
+    // EN-2 audit: an Expected line "covered" solely by a goal's mention shipped
+    // unproved — the agent's claim must be settled by independent evidence.
+    const unsettled: FlowStep[] = [
+      { action: 'expectText', selector: 'text="Total plans"', value: '76', intent: '6.1 — the box' },
+      { action: 'workflow', goal: '6.2 — read the Reimbursement box and verify it moved' },
+    ];
+    assert.deepEqual(unassertedExpectedItems(unsettled, PROMPT), ['6.2']);
+  });
+
+  describe('unreconciledMatchClaim', () => {
+    const MATCH_PROMPT = 'Expected output: the Total Plans tile matches the table row count exactly.';
+    const NO_CHANGE_PROMPT = 'Expected output: จำนวน Total Plans ไม่เปลี่ยนแปลง after pressing Cancel.';
+    const presenceOnly: FlowStep[] = [
+      { action: 'expectVisible', selector: 'text="Total plans"', intent: 'the tile is there' },
+      { action: 'expectVisible', selector: 'role=table', intent: 'the table is there' },
+    ];
+
+    it('refuses a match claim proved only by presence — EN-2: ten such bugs shipped green', () => {
+      const hit = unreconciledMatchClaim(presenceOnly, MATCH_PROMPT);
+      assert.ok(hit !== null && /matches/.test(hit));
+    });
+
+    it('refuses a no-change claim in Thai with nothing saved', () => {
+      assert.ok(unreconciledMatchClaim(presenceOnly, NO_CHANGE_PROMPT) !== null);
+    });
+
+    it('is satisfied by a saved reading a later expect actually compares', () => {
+      const steps: FlowStep[] = [
+        { action: 'saveCount', selector: 'role=row', as: 'rows', intent: 'read the table' },
+        { action: 'expectText', selector: 'text="Total plans"', value: '{{rows}}', intent: 'tile equals table' },
+      ];
+      assert.equal(unreconciledMatchClaim(steps, MATCH_PROMPT), null);
+    });
+
+    it('a save whose variable nothing compares does not satisfy', () => {
+      const steps: FlowStep[] = [
+        { action: 'saveCount', selector: 'role=row', as: 'rows', intent: 'read the table' },
+        { action: 'expectVisible', selector: 'text="Total plans"', intent: 'tile is there' },
+      ];
+      assert.ok(unreconciledMatchClaim(steps, MATCH_PROMPT) !== null);
+    });
+
+    it('a dbSnapshot + expectDbUnchanged pair is the DB spelling of the comparison', () => {
+      const steps: FlowStep[] = [
+        { action: 'dbSnapshot', table: 'benefit_plan', as: 'before' } as unknown as FlowStep,
+        { action: 'expectDbUnchanged', snapshot: 'before' } as unknown as FlowStep,
+      ];
+      assert.equal(unreconciledMatchClaim(steps, NO_CHANGE_PROMPT), null);
+    });
+
+    it('says nothing about a case with no reconciliation wording', () => {
+      assert.equal(unreconciledMatchClaim(presenceOnly, 'Expected output: the page shows the catalog.'), null);
+    });
+  });
+});
+
+describe('inventedControlInternals', () => {
+  const click = (selector: string): FlowStep => ({ action: 'click', selector });
+
+  it('flags a native-select fantasy in both spellings — the element and :checked', () => {
+    // PL_04_04: thirty-one steps pinned to `main select:has(option:text-is("Medical"))`
+    // on a page whose filter is a custom combobox — every one a guaranteed dead-end.
+    const sel = 'main select:has(option:text-is("Medical"))';
+    assert.deepEqual(inventedControlInternals([click(sel)]), {
+      index: 0,
+      selector: sel,
+      fragment: '<select>',
+    });
+    assert.equal(
+      inventedControlInternals([
+        { action: 'expectText', selector: 'main select >> option:checked', value: 'All' },
+      ])?.fragment,
+      ':checked',
+    );
+  });
+
+  it("leaves the tree's own notation, quoted text and lookalike tokens alone", () => {
+    for (const ok of [
+      'role=option[name="Medical"]',
+      'role=combobox[name="Benefit Category" i]',
+      'text="Select all"',
+      '#option-list',
+      '.select2-container',
+      '[data-select="x"]',
+      'input[placeholder="Select a date"]',
+      'role=button[name="Search" i]',
+    ]) {
+      assert.equal(inventedControlInternals([click(ok)]), null, ok);
+    }
+  });
+
+  it('reports the first offending step of many', () => {
+    const steps: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/plans' },
+      click('role=combobox[name="Category" i]'),
+      click('select#category'),
+    ];
+    assert.equal(inventedControlInternals(steps)?.index, 2);
   });
 });
 
@@ -1241,7 +1440,7 @@ describe('the backend toggle', () => {
     // The model is told WHY, in words it can act on next attempt — and all
     // three get the same reason, because they were dropped for one.
     assert.ok(
-      result.dropped.every((one) => one.reason === BACKEND_OFF_REASON),
+      (result.dropped ?? []).every((one) => one.reason === BACKEND_OFF_REASON),
       JSON.stringify(result.dropped),
     );
     // The claim still has a proof, so this is not a vacuous flow.
@@ -2995,5 +3194,217 @@ describe('one attempt reports every lint the flow trips', () => {
     await assert.rejects(new FlowAuthor({ model: once }).author('sign in and check the status tab'));
     await assert.rejects(new FlowAuthor({ model: twice }).author('sign in and check the status tab'));
     assert.deepEqual(once.feedbacks[1], twice.feedbacks[1]);
+  });
+});
+
+describe('ungroundedTextExpectation', () => {
+  // The tree the author saw: the page renders "Benefit Plan Catalog", and the
+  // sidebar link's URL carries the word "plans" — the phantom word-wise
+  // grounding would fall for.
+  const TREE = [
+    'RootWebArea "Benefit Plan Catalog" url="http://x.test/en/admin/benefits/plans"',
+    'link "Benefits Admin" url="http://x.test/en/admin/benefits"',
+    'heading "Benefit Plan Catalog"',
+    'button "Make Correction"',
+  ].join('\n');
+  const step = (action: 'expectVisible' | 'expectText', selector: string) =>
+    ({ action, selector }) as never;
+
+  it('refuses the requirement\'s wording and names the tree\'s rendering (PL_02_01, two models, run today)', () => {
+    const hit = ungroundedTextExpectation([step('expectVisible', 'text="Benefit Plans" >> nth=0')], TREE);
+    assert.equal(hit?.index, 0);
+    assert.equal(hit?.text, 'Benefit Plans');
+    assert.deepEqual(hit?.nearest.slice(0, 1), ['Benefit Plan Catalog']);
+    assert.equal(ungroundedTextExpectation([step('expectVisible', 'role=heading[name="Benefit Plans" i]')], TREE)?.text, 'Benefit Plans');
+  });
+
+  it('accepts text the tree renders, in any case, quoted or bare, role or text form', () => {
+    assert.equal(ungroundedTextExpectation([step('expectVisible', 'text="Benefit Plan Catalog"')], TREE), null);
+    assert.equal(ungroundedTextExpectation([step('expectText', 'text=benefit plan')], TREE), null);
+    assert.equal(ungroundedTextExpectation([step('expectVisible', 'role=button[name="make correction" i]')], TREE), null);
+  });
+
+  it('never grounds a word on a URL attribute, only on what is rendered', () => {
+    // "plans" is in the RootWebArea url, in no rendered name.
+    assert.equal(ungroundedTextExpectation([step('expectVisible', 'text="plans"')], TREE)?.text, 'plans');
+  });
+
+  it('declines to judge after a workflow leg, on a truncated tree, and CSS/nameless selectors', () => {
+    assert.equal(ungroundedTextExpectation([{ action: 'workflow', goal: 'go somewhere' } as never, step('expectVisible', 'text="Elsewhere"')], TREE), null);
+    assert.equal(ungroundedTextExpectation([step('expectVisible', 'text="Nowhere"')], `${TREE}\n[TREE TRUNCATED: showing 4 of 9 nodes]`), null);
+    assert.equal(ungroundedTextExpectation([step('expectVisible', '#hero'), step('expectVisible', 'role=heading')], TREE), null);
+  });
+});
+
+describe('ungroundedSelectorRole (S4 — roles read from the tree, every action)', () => {
+  const TREE = [
+    'button "Benefit Category:"',
+    'button "Type:"',
+    'searchbox "Search benefit name" disabled',
+    'button "Rows per page"',
+    'table "Benefit plan catalog"',
+  ].join('\n');
+  const s = (action: string, selector: string) => ({ action, selector }) as never;
+
+  it('refuses a role the page never exposes and names the tree\'s own line for that name (16 be100 dead-ends)', () => {
+    const hit = ungroundedSelectorRole([s('selectOption', 'role=combobox[name="Benefit Category" i]')], TREE);
+    assert.equal(hit?.role, 'combobox');
+    assert.deepEqual(hit?.nearest, ['button "Benefit Category:"']);
+    assert.equal(ungroundedSelectorRole([s('expectValue', 'role=combobox[name="Rows per page" i]')], TREE)?.role, 'combobox');
+    assert.equal(ungroundedSelectorRole([s('expectText', 'main [role="combobox"]')], TREE)?.role, 'combobox');
+    assert.equal(ungroundedSelectorRole([s('selectOption', 'main select:has(option:text-is("Medical"))')], TREE)?.role, 'select');
+  });
+
+  it('refuses a fill/click on a control the tree marks disabled at rest (the search box, 6 flows)', () => {
+    const hit = ungroundedSelectorRole([s('fill', 'role=searchbox[name="Search benefit name" i]')], TREE);
+    assert.equal(hit?.disabled, true);
+    assert.match(hit?.nearest[0] ?? '', /disabled/);
+    // Asserting its disabled state is the honest claim and is allowed.
+    assert.equal(ungroundedSelectorRole([s('expectDisabled', 'role=searchbox[name="Search benefit name" i]')], TREE), null);
+  });
+
+  it('accepts roles the tree has, exempts absence claims, and declines after a workflow leg or on a truncated tree', () => {
+    assert.equal(ungroundedSelectorRole([s('click', 'role=button[name="Type:" i]')], TREE), null);
+    assert.equal(ungroundedSelectorRole([s('expectHidden', 'role=combobox[name="X"]')], TREE), null);
+    assert.equal(ungroundedSelectorRole([{ action: 'workflow', goal: 'open it' } as never, s('click', 'role=combobox')], TREE), null);
+    assert.equal(ungroundedSelectorRole([s('click', 'role=combobox')], `${TREE}\n[TREE TRUNCATED: 5 of 80]`), null);
+    assert.equal(ungroundedSelectorRole([s('click', '#hero'), s('click', 'text="Save"')], TREE), null, 'CSS/text say nothing the tree contradicts');
+  });
+});
+
+describe('fixtureFacts / ungroundedFixtureAssertion (S3 — test data is not an application fact)', () => {
+  const text = 'Test data: Benefit Plan ID = PL_07_01_02_03_04_05_06, Company C056, plan TH_MED_005\nExpected: 2.1 the row shows Toll';
+  it('extracts identifier-shaped fixture values', () => {
+    const f = fixtureFacts(text);
+    assert.ok(f.includes('PL_07_01_02_03_04_05_06'));
+    assert.ok(f.includes('TH_MED_005'));
+  });
+
+  it('refuses asserting a fixture pre-exists, and accepts it once the flow itself typed it', () => {
+    const facts = fixtureFacts(text);
+    const assertFirst = [
+      { action: 'goto', url: 'http://x/plans' },
+      { action: 'expectDbRow', table: 't', where: { benefit_plan_id: 'PL_07_01_02_03_04_05_06' } },
+    ] as never[];
+    assert.equal(ungroundedFixtureAssertion(assertFirst, facts)?.fact, 'PL_07_01_02_03_04_05_06');
+    const clickRow = [{ action: 'click', selector: 'tr:has-text("TH_MED_005") >> role=button[name="Make Correction"]' }] as never[];
+    assert.equal(ungroundedFixtureAssertion(clickRow, facts)?.fact, 'TH_MED_005');
+    const created = [
+      { action: 'fill', selector: 'role=textbox[name="Plan ID"]', value: 'PL_07_01_02_03_04_05_06' },
+      { action: 'click', selector: 'role=button[name="Save"]' },
+      { action: 'expectDbRow', table: 't', where: { benefit_plan_id: 'PL_07_01_02_03_04_05_06' } },
+    ] as never[];
+    assert.equal(ungroundedFixtureAssertion(created, facts), null, 'the flow made it true before asserting it');
+    assert.equal(ungroundedFixtureAssertion(assertFirst, []), null, 'no facts, nothing to judge');
+  });
+});
+
+/**
+ * P4 (2026-08-31): the refusal loop teaches one row at a time. Measured on
+ * be100-rip, the same two or three lints fired across the whole catalog, each
+ * costing a fresh 57 s authoring attempt to re-learn. The feedback text already
+ * exists; it just never left the row that earned it.
+ */
+describe('refusalShape — one lint, not six variants of it', () => {
+  it('strips the row\'s particulars so two refusals of one lint collapse', () => {
+    const a = 'the authored flow "PL_07_05" expectDbRows on "PL_07_01_02" (step 4) as if it existed';
+    const b = 'the authored flow "PL_06_30" expectDbRows on "TH_MED_005" (step 11) as if it existed';
+    assert.equal(refusalShape(a), refusalShape(b));
+  });
+
+  it('keeps genuinely different lints apart', () => {
+    const a = 'the authored flow "PL_07_05" expectDbRows on "X" (step 4) as if it existed';
+    const b = 'the authored flow "PL_07_05" hands a workflow step (step 0) a goal that names "Open"';
+    assert.notEqual(refusalShape(a), refusalShape(b));
+  });
+
+  it('reads only the first line — the rest is the explanation, not the rule', () => {
+    assert.equal(refusalShape('rule broken\nbecause of a long tail'), 'rule broken');
+    assert.equal(refusalShape(''), '');
+  });
+});
+
+describe('the suite\'s refusal memory', () => {
+  /** A model that always writes the same refusable flow (no goto before a credential fill). */
+  const stubbornModel = (seen: AuthorRequest[]): FlowAuthorModel => ({
+    id: 'stub:author',
+    async author(request) {
+      seen.push(request);
+      return {
+        name: 'stubborn',
+        rationale: '',
+        setup: [{ action: 'goto', url: '/en/home' }],
+        steps: [
+          { action: 'fill', selector: 'role=textbox >> nth=1', value: 'pw', intent: 'the password field' },
+          { action: 'expectVisible', selector: 'text=Dashboard', intent: 'landed' },
+        ],
+        teardown: [],
+        notes: '',
+        droppedSteps: 0,
+      };
+    },
+  });
+
+  it('says nothing on the first row — an untaught suite sends the prompt it always sent', async () => {
+    const seen: AuthorRequest[] = [];
+    const author = new FlowAuthor({ model: stubbornModel(seen) });
+    await author.author('row one').catch(() => undefined);
+    assert.equal(seen[0]?.commonRefusals, undefined, 'nothing has been refused yet');
+  });
+
+  it('carries a repeated rule into a LATER row\'s first attempt', async () => {
+    const seen: AuthorRequest[] = [];
+    const author = new FlowAuthor({ model: stubbornModel(seen) });
+    // Row one exhausts its attempts, so the same shape is recorded more than
+    // once — which is the evidence that it is a pattern, not an accident.
+    await author.author('row one').catch(() => undefined);
+    const before = seen.length;
+    await author.author('row two').catch(() => undefined);
+    const rowTwoFirstAsk = seen[before]!;
+    assert.ok(rowTwoFirstAsk.commonRefusals !== undefined, 'row two starts already knowing');
+    assert.ok(rowTwoFirstAsk.commonRefusals!.length > 0);
+    assert.equal(rowTwoFirstAsk.feedback, undefined, 'and it is NOT dressed up as this row\'s own refusal');
+  });
+
+  it('a rule seen once never travels — one row\'s accident is not the suite\'s pattern', async () => {
+    const seen: AuthorRequest[] = [];
+    let asks = 0;
+    const model: FlowAuthorModel = {
+      id: 'stub:author',
+      async author(request) {
+        seen.push(request);
+        asks += 1;
+        // Refusable on the very first ask only; every later ask is clean.
+        const setup: FlowStep[] =
+          asks === 1 ? [{ action: 'goto', url: '/en/home' }] : [{ action: 'goto', url: '/en/login' }];
+        const steps: FlowStep[] = [
+          { action: 'fill', selector: 'role=textbox >> nth=1', value: 'pw', intent: 'the password field' },
+          { action: 'expectVisible', selector: 'text=Dashboard', intent: 'landed' },
+        ];
+        return { name: 'once', rationale: '', setup, steps, teardown: [], notes: '', droppedSteps: 0 };
+      },
+    };
+    const author = new FlowAuthor({ model });
+    await author.author('row one').catch(() => undefined);
+    const before = seen.length;
+    await author.author('row two').catch(() => undefined);
+    assert.equal(seen[before]?.commonRefusals, undefined, 'seen once is not yet a pattern');
+  });
+
+  it('renders under a heading that does not claim it is about THIS flow', () => {
+    const text = buildUserPrompt({
+      prompt: 'a row',
+      commonRefusals: ['expectDbRows on the case\'s own test data'],
+      feedback: ['your goto is missing'],
+    } as AuthorRequest);
+    const commonAt = text.indexOf('MISTAKES ALREADY REFUSED ON OTHER ROWS');
+    const feedbackAt = text.indexOf('Your previous attempt at this flow was REFUSED');
+    assert.ok(commonAt > 0, 'the suite-wide block is rendered');
+    assert.ok(feedbackAt > commonAt, "this row's own correction is read last");
+    assert.match(text, /not about this flow/);
+  });
+
+  it('is bounded, so the request itself is never crowded out', () => {
+    assert.equal(SUITE_REFUSAL_MEMORY, 6);
   });
 });

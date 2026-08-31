@@ -118,7 +118,7 @@ Rules:
   that enforces nothing.
 - Every expectation must be observable by the person running the steps. "The
   data is saved correctly" is not; "the record appears in the list with status
-  In probation" is.
+  Pending" is.
 - Never invent a feature the material does not mention. Fewer, real cases beat a
   full-looking sheet about an application that does not exist.
 - Boundaries get their own case with the values in testData (14, 15, 29, 30).

@@ -82,3 +82,7 @@ Four details found by running it against real files:
 - **A sparse spreadsheet row keeps its column letters.** A row with values in A, D and Q is not a three-column row, and flattening it would move data under the wrong heading.
 
 There is a real `.xlsx` (written by openpyxl) and a real `.pdf` in `tests/fixtures/`: a ZIP reader tested only against its own writer proves the two agree, not that either is right.
+
+## Fastest scenario first (2026-08-28)
+
+A multi-scenario catalog no longer runs in typing order: `orderScenariosFastestFirst` (`src/cli/case-plan.ts`, pure) reorders the scenario BLOCKS by ascending estimated cost before the queue and the ScenarioGate are built, so the cheapest verdicts land first and cheap scenarios fail fast ahead of expensive ones. Cost per row is the catalog's OWN history where it exists — the prior progress ledger's proof bundles, `caseDurationMs` — and a static estimate otherwise (Steps lines + half-weighted Expected lines + a writer penalty, since a case that writes runs alone and serializes the pool). Only the ordering matters, never the number; rows keep sheet order inside their scenario; ties break to sheet order; the chosen order is logged with its estimates. `--sheet-order` keeps the sheet's order (the same flag that keeps writers in place), and the roll-up still prints in planned (sheet) order either way — execution order and reading order are different concerns.

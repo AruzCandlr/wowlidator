@@ -11,6 +11,7 @@ import {
   effectiveStatus,
   formatProofSummary,
   isPassing,
+  familyLabel,
   issueSteps,
   writeProofBundle,
   type AgentRecord,
@@ -19,6 +20,30 @@ import {
   type ProofBundle,
 } from '../engine/proof-bundle.js';
 import { runFlow, type Flow, type RunFlowOptions } from '../engine/runner.js';
+import type { DeadEndRisk } from '../engine/proof-bundle.js';
+import { describeRisk } from '../generator/dead-end-risk.js';
+import {
+  caseScheduleMeta,
+  sectionAliaser,
+  compatibleCases,
+  expandSections,
+  isGloballyExclusive,
+  sectionsEnabled,
+  windowsInterfere,
+  type CaseScheduleMeta,
+} from './sections.js';
+import { SectionLocks, dataGateFor, dataLocksEnabled, dataWindows } from './data-locks.js';
+import {
+  LlmGovernorModel,
+  QueueGovernor,
+  RuleGovernorModel,
+  governorMode,
+  validateGovernorRead,
+  validateGovernorWrite,
+  type GovernorObservation,
+} from '../orchestrator/queue-governor.js';
+import { raiseSessionCapFor } from '../providers/claude-cli-session.js';
+import { describeDiagnosis, diagnoseError } from '../generator/error-diagnosis.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
 import { writeFlowFile } from './artifacts.js';
 import { FlowRepairLoop } from '../repair/flow-repair-loop.js';
@@ -26,8 +51,14 @@ import { LlmFlowRepairModel } from '../repair/flow-repair-model.js';
 import { RepairMemory } from '../repair/repair-memory.js';
 import { SessionVault } from '../engine/session-vault.js';
 import { slugify } from '../reporter/html-reporter.js';
-import { formatTrend } from '../history/run-history.js';
+import { RunHistory, analyseTrend, formatTrend } from '../history/run-history.js';
 import { resolveReportPath, writeHtmlReport } from '../reporter/html-reporter.js';
+import {
+  catalogReportPath,
+  renderCatalogReport,
+  writeCatalogReport,
+  type CatalogReportCase,
+} from '../reporter/catalog-report.js';
 import {
   DEFAULT_INDEX_FILENAME,
   writeSuiteIndex,
@@ -71,10 +102,11 @@ import {
   assertRolesResolvable,
   buildAgent,
   buildDataModel,
+  buildDiagnosisModel,
   buildHealer,
   buildInvestigationAgent,
-  buildStepRepair,
   buildReviewJudge,
+  buildStepRepair,
   emitTagged,
   lineLogger,
   planLogger,
@@ -110,6 +142,37 @@ export interface SuiteCase {
   generatedBy?: GenerationProvenance | undefined;
   /** Static findings, ridden along with one case so they are not lost. */
   defects?: readonly Defect[] | undefined;
+  /**
+   * The pre-run dead-end risk judged after authoring (`dead-end-risk.ts`).
+   * `fail-fast` runs the case once with no healer, no agent, no reconstruction
+   * and no repair loop — see `failFastRunOptions`. Absent = the ordinary run.
+   */
+  risk?: DeadEndRisk | undefined;
+}
+
+/**
+ * The run options a fail-fast case gets: the same run, every retry path off.
+ * A dead-end that costs one run is a fact; one that costs four runs and six
+ * model calls is the same fact, paid for four times. Exported so the rule is
+ * one function and tested as one.
+ */
+export function failFastRunOptions(base: RunFlowOptions, flow?: Flow): RunFlowOptions {
+  void flow;
+  // Refined 2026-08-28 (asked for in so many words): a risk-flagged case
+  // keeps the AGENT — once per step — and loses every RERUN. The agent stays
+  // because a workflow leg has exactly one executor and the assist rung is a
+  // single consult at the step that actually failed; "once per step" holds by
+  // construction, since reconstruction (`stepRepair: null`) and the repair
+  // loop are off, so a step fails at most once, walks the ladder at most
+  // once, and the dead-end memo stops any identical retry from re-asking.
+  // What fail-fast still removes: the healer (a model retry of the selector)
+  // and every path that RE-RUNS a failed step or the whole case.
+  return {
+    ...base,
+    healer: null,
+    makeHealer: undefined,
+    stepRepair: null,
+  };
 }
 
 /**
@@ -145,6 +208,13 @@ export async function runCases(
      * graph open for authoring.
      */
     declaredRoutes?: readonly string[] | undefined;
+    /**
+     * Schedule facts from the indexed repository, when the caller holds a
+     * graph: FK pairs (a section is a JOIN FAMILY, not a table) and the
+     * declared tables (the governor's db-tool allowlist). Absent = table
+     * sections stay unexpanded and the governor's db tools refuse.
+     */
+    graphFacts?: { fkPairs: readonly (readonly [string, string])[]; tables: readonly string[] } | undefined;
     /**
      * Where to keep the suite's progress ledger (see `suite-progress.ts`),
      * with the case ids the suite set out to prove. Omit and no ledger is
@@ -271,6 +341,9 @@ export async function runCases(
   // pre-applied to every later case that walks into the same break on the
   // same page, instead of each of them rediscovering it with model calls.
   const repairMemory = autoheal ? new RepairMemory() : null;
+  // The post-run judge for a SYSTEM ERROR — a run that delivered no verdict.
+  // Built once for the suite; called only on `status === 'error'` bundles.
+  const diagnosisModel = buildDiagnosisModel(options);
   // One session across the whole suite: the sign-in a case establishes is
   // banked as storage state and injected into later cases' own isolated
   // contexts (never a shared context), so a flow that does not sign itself
@@ -370,23 +443,213 @@ export async function runCases(
 
   // The roster, per arrival. For a closed list that is the whole plan up
   // front, as before; for a queue it is one line as each case is queued.
+  //
+  // Section-aware since 2026-08-28 (docs/parallel-run-spec.md): a writer is
+  // globally exclusive only when its sections are unknown, global, or it
+  // deletes; two writers of DISJOINT sections share the pool. Off
+  // (`WOWLIDATOR_SECTIONS=off`) restores the binary writer lock.
+  // **Nothing is flagged any more** (2026-08-31): a case is dispatched the
+  // moment a lane is free, and the serialisation happens INSIDE the run, at
+  // the steps that actually change data — see `data-locks.ts` for the
+  // measurement that prompted it. `WOWLIDATOR_DATA_LOCKS=off` restores the
+  // case-level rule below.
+  const useLocks = dataLocksEnabled();
+  const locks = new SectionLocks();
+  const useSections = sectionsEnabled();
+  const fkPairs = where.graphFacts?.fkPairs ?? [];
+  const metas: CaseScheduleMeta[] = [];
+  // Route↔table aliasing: a case carrying both keys proves they are one
+  // section, and from then on the pair is compared as one — see
+  // `sectionAliaser` for the co-run this prevents.
+  const aliases = sectionAliaser();
+  const metaOf = (testCase: SuiteCase, index: number): CaseScheduleMeta => {
+    if (metas[index] === undefined) {
+      const raw = caseScheduleMeta(testCase.flow);
+      metas[index] = { ...raw, sections: expandSections(raw.sections, fkPairs) };
+      aliases.note(metas[index]!);
+    }
+    return { ...metas[index]!, sections: aliases.canon(metas[index]!.sections) };
+  };
   const exclusive: boolean[] = [];
   const scheduleOf = (testCase: SuiteCase, index: number): boolean => {
-    if (exclusive[index] === undefined) exclusive[index] = caseWrites(testCase.flow);
+    if (exclusive[index] === undefined) {
+      exclusive[index] = useLocks
+        ? false
+        : useSections
+          ? isGloballyExclusive(metaOf(testCase, index))
+          : caseWrites(testCase.flow);
+    }
     return exclusive[index]!;
+  };
+
+  // ---- interference registry + governor state ------------------------------
+  /** Every case's window and sections, for the interference detector. */
+  const windows = new Map<number, { name: string; meta: CaseScheduleMeta; startedMs: number; endedMs: number }>();
+  const inFlightMeta = new Map<number, { name: string; meta: CaseScheduleMeta; startedMs: number }>();
+  const heldCases = new Set<string>();
+  /** Governor pool override; null = the ordinary sizing. Never above ceiling. */
+  let poolOverride: number | null = null;
+  let governorHold = false;
+
+  /** Set once the governor is built below; canRunWith fires blocked events through it. */
+  let governorRef: QueueGovernor | null = null;
+  const blockedPolls = new Map<number, number>();
+
+  const heldBlocks = (name: string): boolean =>
+    [...heldCases].some((id) => name === id || name.startsWith(`${id} `) || name.startsWith(id));
+
+  const canRunWith = (
+    testCase: SuiteCase,
+    index: number,
+    inflight: readonly { item: SuiteCase; index: number }[],
+  ): boolean => {
+    const held = heldBlocks(testCase.name);
+    // Under data locks the only thing that can refuse a dispatch is an
+    // explicit hold: two cases that touch the same section are no longer kept
+    // apart here, they queue at the step that changes the data. That also
+    // ends the head-of-line blocking this check used to cause — the loop
+    // takes cases in order, so one un-dispatchable case stalled every
+    // compatible case behind it.
+    const compatible =
+      !held &&
+      (useLocks ||
+        !useSections ||
+        inflight.every(({ item, index: otherIndex }) =>
+          compatibleCases(metaOf(testCase, index), metaOf(item, otherIndex)),
+        ));
+    if (compatible) {
+      blockedPolls.delete(index);
+      return true;
+    }
+    // A dispatch refused ~25 polls (~5s of lanes finishing nothing) is the
+    // governor's queue-blocked event — once per case, fire-and-forget, and
+    // only when a governor exists at all.
+    const polls = (blockedPolls.get(index) ?? 0) + 1;
+    blockedPolls.set(index, polls);
+    if (polls === 25 && governorRef !== null) void governorRef.onEvent(observe('queue-blocked'));
+    return false;
+  };
+
+  // ---- the queue governor (docs/parallel-run-spec.md §2.4) -----------------
+  // Advisory and event-driven: absent, off, or out of budget, everything
+  // above runs exactly as the deterministic scheduler alone. Built only for
+  // a parallel suite — a serial run has no queue to govern.
+  const poolCeiling = (): number => Math.max(concurrencyOf(), 2);
+  // `rules` (the default) is a pure function — no model, no budget pressure,
+  // so it may speak on every event; `model` restores the LLM governor with
+  // its hard turn budget. See `governorMode`.
+  const govMode = governorMode();
+  const recentFailures: string[] = [];
+  const governor: QueueGovernor | null =
+    parallel && govMode !== 'off' && (govMode === 'rules' || options.agent)
+      ? new QueueGovernor({
+          model: govMode === 'rules' ? new RuleGovernorModel() : new LlmGovernorModel({ factory: options.factory }),
+          ...(govMode === 'rules' ? { budget: 10_000 } : {}),
+          hooks: {
+            hold: (caseId) => {
+              if (caseId === '') return false;
+              heldCases.add(caseId);
+              return true;
+            },
+            release: (caseId) => heldCases.delete(caseId),
+            resizePool: (size) => {
+              poolOverride = Math.max(1, Math.min(poolCeiling(), size));
+              return poolOverride;
+            },
+            rerunAlone: () => false, // granted only at case end, through the detector's own path
+            dbRead: async (sql) => {
+              const gate = validateGovernorRead(sql);
+              if (!gate.ok) return `refused: ${gate.reason}`;
+              return runGovernorSql(sql, process.env['WOWLIDATOR_DB_URL'], 'read');
+            },
+            dbWrite: async (sql) => {
+              const admin = process.env['WOWLIDATOR_DB_ADMIN_URL'];
+              if (admin === undefined || admin.trim() === '') {
+                return 'refused: WOWLIDATOR_DB_ADMIN_URL is not set — the governor may not write without an operator-supplied admin credential';
+              }
+              const gate = validateGovernorWrite(sql, where.graphFacts?.tables ?? []);
+              if (!gate.ok) return `refused: ${gate.reason}`;
+              return runGovernorSql(sql, admin, 'write');
+            },
+          },
+          log: (line) => process.stderr.write(`  ${line}\n`),
+        })
+      : null;
+  governorRef = governor;
+
+  /** One statement through a short-lived client. Lazy import: a suite with no governor DB use never demands the driver. */
+  async function runGovernorSql(sql: string, url: string | undefined, kind: 'read' | 'write'): Promise<string> {
+    if (url === undefined || url.trim() === '') return `refused: no ${kind === 'read' ? 'WOWLIDATOR_DB_URL' : 'admin'} connection configured`;
+    try {
+      const { connectDb } = await import('../db/client.js');
+      const client = await connectDb({ url });
+      try {
+        const result = await client.query(sql, []);
+        return `${result.rowCount} row(s) in ${result.durationMs}ms` + (kind === 'read' ? `: ${JSON.stringify(result.rows.slice(0, 3)).slice(0, 300)}` : '');
+      } finally {
+        await client.close();
+      }
+    } catch (error) {
+      return `failed: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`;
+    }
+  }
+
+  /** The compact observation a governor turn reads — bounded on purpose. */
+  const observe = (event: GovernorObservation['event']): GovernorObservation => {
+    const now = Date.now();
+    const pending: string[] = [];
+    queue.items.forEach((c, i) => {
+      if (collected[i] !== undefined || inFlightMeta.has(i)) return;
+      const m = metaOf(c, i);
+      pending.push(`${c.name.slice(0, 60)} [${m.writes ? 'writer' : 'reader'}${m.deletes ? ' deletes' : ''} ${m.sections.join(' ') || 'no-sections'}]${heldBlocks(c.name) ? ' HELD' : ''}`);
+    });
+    const lanes = [...inFlightMeta.values()].map(
+      (l) => `${l.name.slice(0, 60)} [${l.meta.writes ? 'writer' : 'reader'} ${l.meta.sections.join(' ') || 'no-sections'}] ${Math.round((now - l.startedMs) / 1000)}s`,
+    );
+    const done = collected.filter((c) => c !== undefined);
+    const tally = `passed ${done.filter((c) => c!.verdict === 'passed').length} · failed ${done.filter((c) => c!.verdict === 'failed').length} · blocked ${done.filter((c) => c!.verdict === 'blocked').length} · left ${queue.items.length - done.length}`;
+    const interfered = [...windows.values()].filter((w) => w.name.includes('interference')).length;
+    const fact = (name: string, meta: CaseScheduleMeta): { name: string; writes: boolean; sections: readonly string[] } => ({
+      name,
+      writes: meta.writes,
+      sections: meta.sections,
+    });
+    const pendingFacts = queue.items
+      .map((c, i) => ({ c, i }))
+      .filter(({ i }) => collected[i] === undefined && !inFlightMeta.has(i))
+      .slice(0, 30)
+      .map(({ c, i }) => fact(c.name, metaOf(c, i)));
+    const flyingFacts = [...inFlightMeta.values()].map((l) => fact(l.name, l.meta));
+    return {
+      event,
+      pendingFacts,
+      flyingFacts,
+      recentFailures: recentFailures.slice(-6),
+      queue: pending.slice(0, 20),
+      lanes,
+      tally,
+      health: [
+        `pool ${poolOverride ?? concurrencyOf()} (ceiling ${poolCeiling()})`,
+        `held cases: ${heldCases.size === 0 ? 'none' : [...heldCases].join(', ')}`,
+        `interference stamps so far: ${interfered}`,
+      ],
+      pool: { current: poolOverride ?? concurrencyOf(), max: poolCeiling() },
+    };
   };
   if (parallel && !streaming) {
     const alone = queue.items.filter((c, i) => scheduleOf(c, i)).length;
+    const locked = useLocks ? queue.items.filter((c) => dataWindows(c.flow, fkPairs).length > 0).length : 0;
     const reordered = !options.sheetOrder && alone > 0 && alone < queue.length;
     process.stdout.write(
       `\n  cases      ${queue.length}, up to ${concurrencyOf()} at a time` +
         (alone > 0 ? ` (${alone} change data and run alone)` : '') +
+        (locked > 0 ? ` (${locked} change data — each locks its own section only while changing and checking it)` : '') +
         (reordered ? `\n             readers run first, before anything changes the data they assert on (--sheet-order keeps the list's own order)` : '') +
         `\n`,
     );
     for (const [index, testCase] of queue.items.entries()) {
       process.stdout.write(
-        `  [c${index + 1}]      ${scheduleOf(testCase, index) ? 'alone  ' : 'shared '} ${testCase.name}\n`,
+        `  [c${index + 1}]      ${scheduleOf(testCase, index) ? 'alone  ' : useLocks && dataWindows(testCase.flow, fkPairs).length > 0 ? 'locks  ' : 'shared '} ${testCase.name}\n`,
       );
     }
     process.stdout.write('\n');
@@ -399,9 +662,13 @@ export async function runCases(
     );
   }
 
+  // The warm claude pool must fit the lanes, or the (concurrency+1)th ask
+  // falls to a cold one-shot — the exact bill parallelism exists to avoid.
+  if (parallel) raiseSessionCapFor(concurrencyOf());
+  if (governor !== null && !streaming && queue.length > 1) void governor.onEvent(observe('suite-start'));
   await runQueue(
     queue,
-    concurrencyOf,
+    () => Math.min(poolOverride ?? concurrencyOf(), Math.max(concurrencyOf(), poolOverride ?? 1)),
     (testCase, index) => scheduleOf(testCase, index),
     async (testCase, index) => {
     // A streaming list has no roster to print up front, so each case's
@@ -428,8 +695,29 @@ export async function runCases(
     }
     if (parallel) emitTagged(tag, `case "${testCase.name}" started\n`);
     else log?.(`\nrunning "${testCase.name}"…`);
+    // The case's own clock, started at pickup: the bundle's `durationMs` is
+    // one flow attempt, and under --repair the last attempt is the SHORTEST
+    // part of what a person actually waited through.
+    const caseStartedMs = Date.now();
+    const caseStartedAt = new Date().toISOString();
+    inFlightMeta.set(index, { name: testCase.name, meta: metaOf(testCase, index), startedMs: caseStartedMs });
+    // Judged above the risk threshold after authoring: run once, and let the
+    // dead-end be a dead-end — no heal, no agent, no reconstruction, no
+    // repair loop. The verdict is recorded like any other; only the retries
+    // are withheld, and the proof says so (`bundle.risk`, a note).
+    const failFast = testCase.risk?.verdict === 'fail-fast';
+    if (testCase.risk) emitTagged(tag, `  risk       ${describeRisk(testCase.risk)}\n`);
+    // The case's own share of the suite's lock table: the spans of THIS flow
+    // that change data, and nothing else. A reader gets null and never
+    // touches the table. Built per case, because the windows are step
+    // identities in this flow's own objects.
+    const caseGate =
+      useLocks && parallel
+        ? (flow: Flow): ReturnType<typeof dataGateFor> =>
+            dataGateFor(flow, locks, { fkPairs, onLog: (line) => emitTagged(tag, `  ${line}\n`) })
+        : null;
     try {
-      const caseRunOptions: RunFlowOptions = {
+      const ordinaryRunOptions: RunFlowOptions = {
         cdpUrl: options.cdp,
         // Concurrent cases must not share a browser context, whatever the
         // video mode says — see `SmartRunnerOptions.isolate`.
@@ -438,13 +726,20 @@ export async function runCases(
         sessionVault,
         screenshots: options.screenshots,
         video: options.video,
-        agentAssist: options.agentAssist,
+        // The agent as ERROR BACKSTOP, not journey driver (2026-08-28, asked
+        // for with code-grounded authoring): flows are now written to run
+        // deterministically — tree- or code-grounded steps instead of agent
+        // legs — so in a suite that built an agent at all, the assist rung is
+        // armed and the agent is consulted only at the step that actually
+        // failed. `--no-agent` still turns both off; fail-fast still strips it.
+        agentAssist: options.agentAssist || options.agent,
       backend: options.backend,
       declaredRoutes: where.declaredRoutes,
         captureDelayMs: options.captureDelayMs,
       stepDelayMs: options.stepDelayMs,
         makeHealer: buildHealer(options, where.healHints),
       stepRepair: buildStepRepair(options),
+      dataGate: caseGate,
       reviewJudge: buildReviewJudge(options),
         healer: options.heal ? undefined : null,
         agent: buildAgent(options, tag),
@@ -460,9 +755,12 @@ export async function runCases(
         defects: testCase.defects,
         generatedBy: testCase.generatedBy,
       };
+      const caseRunOptions = failFast
+        ? failFastRunOptions(ordinaryRunOptions, testCase.flow)
+        : ordinaryRunOptions;
 
       let bundle;
-      if (autoheal) {
+      if (autoheal && !failFast) {
         // The loop runs the first attempt itself, so the case is not run twice
         // — a clean first pass is one run, exactly as without autoheal.
         const loop = new FlowRepairLoop({
@@ -487,6 +785,77 @@ export async function runCases(
         bundle = await runFlow(testCase.flow, caseRunOptions);
       }
 
+      // Stamp the case span before the bundle is persisted — from pickup to
+      // now, whatever number of attempts it took.
+      bundle.caseStartedAt = caseStartedAt;
+      bundle.caseDurationMs = Date.now() - caseStartedMs;
+      if (testCase.risk) {
+        bundle.risk = testCase.risk;
+        bundle.notes = [...(bundle.notes ?? []), describeRisk(testCase.risk)];
+      }
+      // **The interference detector** (docs/parallel-run-spec.md, defect #11):
+      // a non-pass produced while another lane WROTE an intersecting section
+      // is not yet a verdict about the application. The bundle is stamped,
+      // and the case re-runs ONCE with nothing else in flight — the re-run's
+      // outcome stands, with the first attempt's status on the note. This is
+      // the honesty backstop for every mis-drawn section boundary.
+      if (useSections && parallel && !isPassing(bundle.status) && bundle.status !== 'needs-review') {
+        const mine = { meta: metaOf(testCase, index), startedMs: caseStartedMs, endedMs: Date.now() };
+        const culprits = [...windows.entries(), ...[...inFlightMeta.entries()].map(([i, l]) => [i, { ...l, endedMs: Date.now() }] as const)]
+          .filter(([otherIndex, other]) => otherIndex !== index && windowsInterfere(mine, other))
+          .map(([, other]) => other.name);
+        if (culprits.length > 0) {
+          const firstStatus = bundle.status;
+          const stamp = `possible cross-case interference: ${[...new Set(culprits)].slice(0, 3).join(', ')} wrote an intersecting data section during this run — re-ran alone`;
+          emitTagged(tag, `  interference  ${stamp}\n`, 'err');
+          governorHold = true;
+          try {
+            // Drain: nothing else may be mid-flight while the re-run proves
+            // the verdict clean. Bounded wait — lanes always finish.
+            while (inFlightMeta.size > 1) await new Promise((resolve) => setTimeout(resolve, 500));
+            const rerun = await runFlow(testCase.flow, caseRunOptions);
+            rerun.caseStartedAt = caseStartedAt;
+            rerun.caseDurationMs = Date.now() - caseStartedMs;
+            if (testCase.risk) rerun.risk = testCase.risk;
+            rerun.notes = [...(rerun.notes ?? []), `${stamp} (first attempt: ${firstStatus})`];
+            bundle = rerun;
+          } finally {
+            governorHold = false;
+          }
+        }
+      }
+      // The governor hears about a case that still did not pass — it may
+      // hold a sibling, shrink the pool, or seed the fixture the section is
+      // starved on. Fire-and-forget: a verdict never waits on advice.
+      if (!isPassing(bundle.status)) {
+        recentFailures.push(bundle.error ?? bundle.status);
+        if (recentFailures.length > 20) recentFailures.shift();
+      }
+      if (governor !== null && !isPassing(bundle.status)) void governor.onEvent(observe('case-ended'));
+      // A SYSTEM ERROR gets one healer-role call saying which layer broke —
+      // the test catalog, the generator, the agent, the environment or the
+      // application — and the fix when one exists. Written into the bundle
+      // BEFORE it is persisted, so the proof, the report and the panel all
+      // carry it. A test-failure is a verdict and is never diagnosed.
+      if (bundle.status === 'error' && diagnosisModel) {
+        const diagnosis = await diagnoseError(
+          {
+            caseName: testCase.name,
+            caseText: testCase.flow.caseContext ?? testCase.name,
+            bundle,
+            declaredRoutes: where.declaredRoutes ?? [],
+            hints: where.healHints,
+          },
+          { model: diagnosisModel, log: (line) => emitTagged(tag, `${line}
+`, 'err') },
+        );
+        if (diagnosis) {
+          bundle.diagnosis = diagnosis;
+          bundle.notes = [...(bundle.notes ?? []), describeDiagnosis(diagnosis)];
+          emitTagged(tag, `  diagnosis  ${describeDiagnosis(diagnosis)}
+`);
+        }
+      }
       const proofPath = await writeProofBundle(bundle, options.out);
       const target = resolveReportPath(
         { path: options.report, dir: options.reportDir, enabled: options.reportEnabled },
@@ -544,7 +913,7 @@ export async function runCases(
         reason: blocked ?? failureOf(bundle),
       };
       if (parallel) {
-        emitTagged(tag, `case "${testCase.name}" ${blocked !== null ? 'blocked' : bundle.status}\n`);
+        emitTagged(tag, `case "${testCase.name}" ${blocked !== null ? 'blocked' : familyLabel(bundle.status)}\n`);
       }
       // Fold successful agent journeys back into the flow file as
       // deterministic scripts, so the next run of this same file replays
@@ -572,9 +941,20 @@ export async function runCases(
       collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
       await noteOutcome(collected[index]!, { flowPath: testCase.flowPath });
       where.onCaseDone?.(testCase, collected[index]!);
+    } finally {
+      // The case's window joins the registry either way — the interference
+      // detector needs finished writers, and a lane must never stay
+      // "in flight" after a throw.
+      const lane = inFlightMeta.get(index);
+      if (lane !== undefined) {
+        windows.set(index, { ...lane, endedMs: Date.now() });
+        inFlightMeta.delete(index);
+      }
     }
     },
     () => pauseRequested(pauseFile),
+    canRunWith,
+    () => governorHold,
   ).catch(async (error: unknown) => {
     if (ledger !== null && where.ledger !== undefined) {
       ledger.ended = {
@@ -789,6 +1169,66 @@ export async function runCases(
     process.stdout.write(
       `  progress   ${where.ledger.path}${left.length === 0 ? '' : ` — ${left.length} left; continue with --resume`}\n`,
     );
+
+    // **The catalog report** (2026-08-31): one self-contained HTML per catalog
+    // run in the local `reports/` folder — every planned case grouped by
+    // scenario, never-ran rows included, screenshots embedded, a two-pane
+    // case view (steps left, time record right), history explanations, and
+    // client-side export of one case or the whole file. Built from the
+    // LEDGER, so a resume regenerates the same file (stable per run key)
+    // with the carried verdicts in it. Never fatal — a report that cannot
+    // be written must not fail the suite that earned the verdicts.
+    try {
+      const history = options.history ? new RunHistory(options.historyPath) : null;
+      const scenarioOf = new Map<string, string>();
+      for (const item of queue.items) {
+        const id = item.name.split(/\s/)[0] ?? item.name;
+        scenarioOf.set(id, item.scenarioId ?? item.group ?? 'ungrouped');
+      }
+      const guessScenario = (id: string): string =>
+        scenarioOf.get(id) ?? (id.match(/^([A-Za-z]+_\d+)/)?.[1] ?? 'ungrouped');
+      const reportCases: CatalogReportCase[] = [];
+      for (const id of ledger.planned) {
+        const outcome = ledger.outcomes[id];
+        const bundleOutcome = outcomes.find((o) => o.name === (outcome?.name ?? id) && o.bundle !== null);
+        const bundle = bundleOutcome?.bundle ?? null;
+        let historyLines: string[] = [];
+        if (bundle !== null && history !== null) {
+          try {
+            const prior = await history.forFlow(bundle.name);
+            const trend = analyseTrend(bundle, prior.slice(0, -1));
+            historyLines = [formatTrend(trend)];
+            const heals = prior.reduce((sum, e) => sum + e.jitHeals, 0);
+            if (heals > 0) historyLines.push(`${heals} heal(s) paid across the recorded runs — the selectors are drifting`);
+          } catch {
+            historyLines = [];
+          }
+        }
+        reportCases.push({
+          id,
+          name: outcome?.name ?? id,
+          scenario: guessScenario(id),
+          verdict: outcome === undefined ? 'never-ran' : outcome.verdict,
+          status: outcome?.status ?? null,
+          reason: outcome?.reason ?? null,
+          bundle,
+          history: historyLines,
+        });
+      }
+      const path = catalogReportPath(ledger.runKey, ledger.title);
+      await writeCatalogReport(
+        path,
+        renderCatalogReport({
+          title: ledger.title,
+          runKey: ledger.runKey,
+          generatedAt: ledger.generatedAt,
+          cases: reportCases,
+        }),
+      );
+      process.stdout.write(`  catalog report ${path}\n`);
+    } catch (error) {
+      process.stderr.write(`  ! catalog report could not be written: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}\n`);
+    }
   }
   return outcomes;
 }

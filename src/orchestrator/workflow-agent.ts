@@ -23,7 +23,7 @@ import { SELECTOR_SYNTAX_RULES, captureAxNodes } from '../healer/jit-healer.js';
 import { CONSENT_ACCEPT_NAME, CONSENT_GATE_URL_PATTERN, acceptConsentGateAnywhere, consentGateShowing } from '../engine/sign-in.js';
 import { scopeUrl, type CacheManager } from '../cache/cache-manager.js';
 import type { AxNode } from '../healer/jit-healer.js';
-import { decisionKey, focusTree, goalAlreadyShowing, renderTree, selectorGrounded, selectorName, unscopedDestructiveClick } from './agent-guards.js';
+import { decisionKey, focusTree, goalAlreadyShowing, renderTree, repeatedToggleClick, selectorGrounded, selectorName, unscopedDestructiveClick } from './agent-guards.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
 import {
   LlmFactory,
@@ -31,7 +31,7 @@ import {
   type ModelSource,
 } from '../providers/llm-factory.js';
 import type { AgentAction, AgentRecord } from '../engine/proof-bundle.js';
-import { atGoalDestination, destinationReached, goalDestination } from './goal-evidence.js';
+import { atGoalDestination, destinationReached, goalDestination, goalOutcome, outcomeShown } from './goal-evidence.js';
 import { DETERMINISM_RULES, procedure } from '../providers/prompt-discipline.js';
 
 // 8 until 2026-08-24, then 12, then unbounded (2026-08-24): every fixed number
@@ -71,6 +71,28 @@ export const AGENT_NO_PROGRESS_TURNS = 5;
  * would only say it again, at a model call each.
  */
 export const AGENT_LOOK_ONLY_TURNS = 3;
+/**
+ * The no-progress ceiling when the early-give-up toggle is OFF
+ * (`WOWLIDATOR_AGENT_EARLY_STOP=off` / `--no-agent-early-stop`). "Off" must
+ * not mean "loop forever" — with `maxSteps` unbounded by default, a leg that
+ * can never find its control would spend model calls without end — so it
+ * means "try much harder before giving up, still bounded." The look-only
+ * soft handoff is also lifted to this number, so nothing stops early. A hard
+ * `maxSteps` still wins when one is set.
+ */
+export const AGENT_NO_PROGRESS_OFF_TURNS = 25;
+
+/**
+ * Whether the agent's early-give-up judges (look-only at 3, no-progress at 5)
+ * are on. On by default; `WOWLIDATOR_AGENT_EARLY_STOP=off` turns them off
+ * process-wide, and `--no-agent-early-stop` / the panel toggle per run. Off
+ * raises both to `AGENT_NO_PROGRESS_OFF_TURNS`, so the agent keeps trying far
+ * longer before conceding a leg — slower and more thorough, the trade the
+ * person is making by turning it off.
+ */
+export function agentEarlyStopDefault(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env['WOWLIDATOR_AGENT_EARLY_STOP']?.trim().toLowerCase() !== 'off';
+}
 
 /**
  * Actions that look again rather than act: they can never change the
@@ -82,7 +104,26 @@ export const AGENT_LOOK_ONLY_TURNS = 3;
  * to look again, was told it already had, asked once more, and the run was
  * recorded as a harness error with the goal's control on screen.
  */
-export const IDLE_ACTIONS: ReadonlySet<string> = new Set(['wait', 'scroll']);
+export const IDLE_ACTIONS: ReadonlySet<string> = new Set(['wait', 'scroll', 'read']);
+/**
+ * The actions that actually ENGAGE a control the goal is about — the thing a
+ * leg is trying to reach. A leg that never lands one of these has found
+ * nothing to act on, whatever else it did (scrolled, reloaded, missed): the
+ * broadened reading/unreachable handoff keys on this, so a leg that only ever
+ * missed its clicks ends as fast as one that only scrolled, instead of paying
+ * the full stall budget at 1.5 s a miss. `goto` is deliberately NOT here — a
+ * page reload is not engaging a control (see the visited-URL rule below).
+ */
+export const INTERACTION_ACTIONS: ReadonlySet<string> = new Set([
+  'click',
+  'fill',
+  'press',
+  'hover',
+  'check',
+  'uncheck',
+  'type',
+  'selectOption',
+]);
 /** Everything a `readOnly` run may do: look, look again, and answer. */
 export const READ_ONLY_ACTIONS: ReadonlySet<string> = new Set([...IDLE_ACTIONS, 'finish', 'fail']);
 /**
@@ -162,6 +203,13 @@ export const AGENT_ACTIONS = [
   // observed evidence instead of the model's word. It cannot write, which
   // keeps the vocabulary's safety argument intact.
   'dbCount',
+  // Read a control's CURRENT state — name, value, checked, expanded,
+  // disabled — from the live tree, into the history, at $0 and with no
+  // side effect. Audit 2026-08-28: the agent had no way to know whether
+  // "Country" or "Rows per page" had taken, so it clicked again to find
+  // out, and the repeat guard stalled the leg. Looking is cheaper than
+  // re-acting, and an observation in the record is evidence a claim is not.
+  'read',
   'finish',
   'fail',
 ] as const;
@@ -320,7 +368,13 @@ Each turn you see the current URL, the page's accessibility tree, and what you h
            If the tree is the same after a wait, waiting longer will not
            change it: act on what is there, or call fail and say why.
 - goto   — navigate directly. Absolute URL in "url".
-- finish — the goal is met. Explain how you know in "reasoning".
+- read   — report a control's CURRENT state (its value, whether it is checked,
+           expanded, disabled) without touching it. Selector in "selector".
+           Use it to learn whether a choice has taken BEFORE deciding to click
+           again, and before you finish: a finish is checked against what the
+           page shows, not against what you did.
+- finish — the goal is met. Explain how you know in "reasoning", quoting the
+           tree line that shows the end state — never "the click succeeded".
 - fail   — the goal cannot be reached from here. Explain why.
 
 ${SELECTOR_SYNTAX_RULES}
@@ -501,6 +555,12 @@ export interface WorkflowAgentOptions {
    * cap it anyway, e.g. the capture pilot's deliberately short leash.
    */
   maxSteps?: number | undefined;
+  /**
+   * Whether the early-give-up judges (look-only at 3, no-progress at 5) fire.
+   * Defaults to `agentEarlyStopDefault()` (env). Off raises both ceilings to
+   * `AGENT_NO_PROGRESS_OFF_TURNS` — the agent keeps trying much longer.
+   */
+  earlyStop?: boolean | undefined;
   maxAxNodes?: number | undefined;
   actionTimeoutMs?: number | undefined;
   /**
@@ -626,6 +686,10 @@ export class WorkflowAgent {
   readonly model: AgentModel;
 
   readonly #maxSteps: number;
+  /** No-progress ceiling: 5 with early-stop on, AGENT_NO_PROGRESS_OFF_TURNS off. */
+  readonly #noProgressTurns: number;
+  /** Look-only soft-handoff turns: 3 with early-stop on, the same ceiling off. */
+  readonly #lookOnlyTurns: number;
   readonly #maxAxNodes: number;
   readonly #actionTimeoutMs: number;
   readonly #allowedOrigins: string[] | undefined;
@@ -635,6 +699,9 @@ export class WorkflowAgent {
   constructor(options: WorkflowAgentOptions) {
     this.model = options.model;
     this.#maxSteps = options.maxSteps ?? DEFAULT_AGENT_MAX_STEPS;
+    const earlyStop = options.earlyStop ?? agentEarlyStopDefault();
+    this.#noProgressTurns = earlyStop ? AGENT_NO_PROGRESS_TURNS : AGENT_NO_PROGRESS_OFF_TURNS;
+    this.#lookOnlyTurns = earlyStop ? AGENT_LOOK_ONLY_TURNS : AGENT_NO_PROGRESS_OFF_TURNS;
     this.#maxAxNodes = options.maxAxNodes ?? DEFAULT_AGENT_MAX_NODES;
     this.#actionTimeoutMs = options.actionTimeoutMs ?? DEFAULT_AGENT_ACTION_TIMEOUT_MS;
     this.#allowedOrigins = options.allowedOrigins;
@@ -654,6 +721,7 @@ export class WorkflowAgent {
     // goal would mark every step after a looked-only one the same way,
     // whether or not it was.
     this.#lookedOnly = false;
+    this.#settledBy = null;
     const memory = runOptions.memory ?? this.#memory;
     // What this run may do at all: `readOnly` is the strictest form, an
     // explicit set is the middle ground (the reveal pass), absent is the full
@@ -687,11 +755,18 @@ export class WorkflowAgent {
     // turn ceiling: reset by any ok action, so it can only end a loop that is
     // demonstrably not advancing.
     let turnsWithoutProgress = 0;
+    // One informed refusal of a finish the live tree contradicts (S1).
+    let finishRefusedForState = false;
 
     // What has been DONE and not undone: the key of every ok action, cleared
     // whenever the URL moves (a new page is a new state, and the same click
     // may be right again there).
     const doneHere = new Set<string>();
+    // Ok clicks per selector for the WHOLE run, never cleared: the guard for
+    // a control the agent keeps toggling open and closed, which resets both
+    // `doneHere` (the tree changes each time) and the per-URL state (see
+    // `repeatedToggleClick`).
+    const okClicks = new Map<string, number>();
     // Interstitials this loop has already cleared-and-returned from — once
     // per distinct accept, so a gate that will not stay cleared becomes a
     // recorded stall rather than a loop (spec F2's guard).
@@ -702,6 +777,18 @@ export class WorkflowAgent {
     // agent already advanced is a gate ON THE WAY somewhere (the
     // two-interstitials journey — returning would destroy the progress).
     let progressMade = false;
+    // Whether any action that ENGAGES a control ever landed (INTERACTION_ACTIONS).
+    // A leg that never does has found nothing the goal names — the broadened
+    // reading/unreachable handoff below keys on this. PL_07_03 (2026-08-27):
+    // three legs hunting a filter combobox that is not in the tree, every
+    // click a 1.5 s miss, never one ok interaction — 77 s of stall for a leg
+    // the following assertion answers in 2 s.
+    let interactedEver = false;
+    // URLs this leg has already been on. A `goto` back to one of them is a
+    // reload, not forward progress, and must not reset the no-progress judge —
+    // the measured legs reloaded the plans page repeatedly to "get a clean
+    // tree", buying five fresh turns each time and never converging.
+    const visitedUrls = new Set<string>([startUrl]);
     let lastUrlSeen = startUrl;
     // Where the agent is going: the step's page until a goto asks for
     // another. A gate cleared mid-run returns here, never to the app's home.
@@ -859,7 +946,7 @@ export class WorkflowAgent {
               `${[...allowedActions].filter((one) => one !== 'finish' && one !== 'fail').join(', ')}. ` +
               'Use one of those, or answer now with finish or fail'
             : null) ??
-          this.#refuse(candidate, axTree, doneHere, destination, page.url(), ask, goal);
+          this.#refuse(candidate, axTree, doneHere, okClicks, destination, page.url(), ask, goal);
         if (refusal === null) {
           decision = candidate;
         } else if (ask === 0) {
@@ -875,11 +962,14 @@ export class WorkflowAgent {
             actions.push(this.#record(actions.length, candidate, page.url(), false, 0, refusal));
             return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens);
           }
-          if (refusal.startsWith('destructive')) {
+          if (refusal.startsWith('destructive') || refusal.startsWith('circling')) {
             // Never acted on, however the model insists: recorded as a
             // failed action so the report shows what was refused and why,
             // and the turn counts as no progress — the run goes on, because
             // the right row may still be found (or `fail` said honestly).
+            // `circling` (the same selector clicked past TOGGLE_CLICK_LIMIT)
+            // shares the shape: acting would spend the turn re-learning what
+            // three earlier clicks already proved.
             actions.push(this.#record(actions.length, candidate, page.url(), false, 0, refusal));
             history.push(`click ${candidate.selector} — REFUSED: ${refusal}`);
             refusedTurn = true;
@@ -897,7 +987,7 @@ export class WorkflowAgent {
       if (decision === null) {
         if (refusedTurn) {
           turnsWithoutProgress += 1;
-          if (turnsWithoutProgress >= AGENT_NO_PROGRESS_TURNS) {
+          if (turnsWithoutProgress >= this.#noProgressTurns) {
             summary =
               `agent stalled: nothing advanced in ${turnsWithoutProgress} consecutive turns` +
               ` (last refusal: ${actions[actions.length - 1]?.error ?? ''})`;
@@ -908,6 +998,42 @@ export class WorkflowAgent {
       }
 
       if (decision.action === 'finish') {
+        // **A finish is accepted on the page's word, not the model's.** When
+        // the goal names an end state (`goalOutcome`), the live tree is
+        // re-read and must show it. A miss is refused ONCE with what the tree
+        // actually shows; a second insistence is recorded as a claimed
+        // finish that the page contradicts — the same shape as the
+        // contradicted-destination rule. A goal naming no state falls
+        // through, and the record says the success rests on the claim.
+        // A readOnly run cannot act, so refusing its finish to make it "set"
+        // the state is a turn burnt by construction — and its finish IS the
+        // answer (the triage look's verdict travels in it). Found live: the
+        // triage look's goal text parses as an outcome, the settlement
+        // refused the verdict once, and every fail verdict cost two model
+        // calls instead of one.
+        const outcome = runOptions.readOnly === true ? null : goalOutcome(goal);
+        if (outcome !== null) {
+          const liveTree = renderTree(focusTree(await captureAxNodes(page, Number.MAX_SAFE_INTEGER), goal, this.#maxAxNodes), Number.MAX_SAFE_INTEGER);
+          const shown = outcomeShown(outcome, liveTree);
+          if (shown === null) {
+            if (!finishRefusedForState) {
+              finishRefusedForState = true;
+              const reason =
+                `the goal says ${outcome.control} should show ${JSON.stringify(outcome.value)}, and no node in the ` +
+                'current tree shows that — read the control (action "read") and set it, or call fail and say what the page shows instead';
+              history.push(`(refused finish: ${reason})`);
+              actions.push(this.#record(actions.length, decision, page.url(), false, 0, reason));
+              turnsWithoutProgress += 1;
+              continue;
+            }
+            summary = `agent claimed finish, but the page does not show ${outcome.control} = ${JSON.stringify(outcome.value)}`;
+            actions.push(this.#record(actions.length, decision, page.url(), false, 0, summary));
+            return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens);
+          }
+          this.#settledBy = { rule: 'observed-state', evidence: shown };
+        } else {
+          this.#settledBy = { rule: 'agent-claim', evidence: decision.reasoning.slice(0, 200) };
+        }
         success = true;
         summary = decision.reasoning;
         actions.push(this.#record(actions.length, decision, page.url(), true, 0));
@@ -992,7 +1118,12 @@ export class WorkflowAgent {
         );
 
         if (ok && page.url() === urlBefore) doneHere.add(decisionKey(current));
+        if (ok && current.action === 'click' && current.selector.trim() !== '') {
+          const sel = current.selector.trim();
+          okClicks.set(sel, (okClicks.get(sel) ?? 0) + 1);
+        }
         if (ok && current.action === 'goto' && !CONSENT_GATE_URL_PATTERN.test(current.url)) intendedUrl = current.url;
+        if (ok && INTERACTION_ACTIONS.has(current.action)) interactedEver = true;
 
         // **An interstitial cleared mid-goal returns to the step's own page**
         // (docs/consent-gate-recovery-spec.md, F2). Accepting a consent gate
@@ -1060,7 +1191,19 @@ export class WorkflowAgent {
       // journey that keeps landing actions keeps going, and one that keeps
       // missing, or keeps looking, ends on evidence rather than on a turn
       // number.
-      if (actions.slice(turnStart).some((a) => a.ok && !IDLE_ACTIONS.has(a.action))) {
+      // A turn advances when it lands an ok action that ENGAGES a control, or
+      // a `goto` that reached a URL this leg had not seen. A `goto` back to a
+      // page already visited is a reload — not progress — and no longer buys
+      // five fresh turns (PL_07_03: the plans page reloaded turn after turn).
+      const advanced = actions.slice(turnStart).some((a) => {
+        if (!a.ok || IDLE_ACTIONS.has(a.action)) return false;
+        if (a.action !== 'goto') return true;
+        const url = page.url();
+        if (visitedUrls.has(url)) return false;
+        visitedUrls.add(url);
+        return true;
+      });
+      if (advanced) {
         turnsWithoutProgress = 0;
       } else {
         turnsWithoutProgress += 1;
@@ -1078,16 +1221,34 @@ export class WorkflowAgent {
         // deliberate: a leg that landed one real action earlier and only
         // got stuck looking afterward is a different, more ordinary stall,
         // and stays on the 5-turn judge above.
-        const lookedOnly = actions.length > 0 && actions.every((a) => IDLE_ACTIONS.has(a.action));
-        if (lookedOnly && turnsWithoutProgress >= AGENT_LOOK_ONLY_TURNS) {
-          summary =
-            `agent looked and found nothing to act on: ${turnsWithoutProgress} turn(s) of scrolling and ` +
-            'waiting with no control the goal could name — this is a reading question, and the ' +
-            "flow's own assertions after this step are what answer it";
+        // The reading/unreachable handoff, two shapes with one meaning —
+        // nothing the goal names is on the page:
+        //  - PURELY looked (scroll/wait only): a reading question, as before.
+        //  - Attempted to engage a control and never once succeeded (every
+        //    click a miss, interleaved with scrolls and reloads): the control
+        //    the goal names is not there (PL_07_03, 2026-08-27 — three legs
+        //    hunting a filter combobox absent from the tree).
+        // Both hand off SOFTLY at AGENT_LOOK_ONLY_TURNS: whatever the flow
+        // asserts next is the proof, so a goal the agent truly could not
+        // fulfil still fails — at its assertion in 2 s, not after 77 s of
+        // 1.5 s misses. A leg of failed GOTOs is neither: that is navigation
+        // that did not arrive, an ordinary stall on the 5-turn judge. And a
+        // leg that DID engage a control earlier (`interactedEver`) is a
+        // genuine mid-journey stall, also left to the 5-turn judge.
+        const onlyLooked = actions.length > 0 && actions.every((a) => IDLE_ACTIONS.has(a.action));
+        const missedEveryInteraction = !interactedEver && actions.some((a) => INTERACTION_ACTIONS.has(a.action));
+        if ((onlyLooked || missedEveryInteraction) && turnsWithoutProgress >= this.#lookOnlyTurns) {
+          summary = missedEveryInteraction
+            ? `agent found nothing the goal names to act on: ${turnsWithoutProgress} turn(s) of looking and ` +
+              'missed clicks with no control the goal could reach — this reads as a page that does not offer ' +
+              "it, and the flow's own assertions after this step are what answer it"
+            : `agent looked and found nothing to act on: ${turnsWithoutProgress} turn(s) of scrolling and ` +
+              'waiting with no control the goal could name — this is a reading question, and the ' +
+              "flow's own assertions after this step are what answer it";
           this.#lookedOnly = true;
           break;
         }
-        if (turnsWithoutProgress >= AGENT_NO_PROGRESS_TURNS) {
+        if (turnsWithoutProgress >= this.#noProgressTurns) {
           const lastFailed = [...actions].reverse().find((a) => !a.ok);
           summary =
             `agent stalled: nothing advanced in ${turnsWithoutProgress} consecutive turns` +
@@ -1345,6 +1506,7 @@ export class WorkflowAgent {
       inputTokens,
       outputTokens,
       ...(this.#lookedOnly ? { lookedOnly: true } : {}),
+      ...(success && this.#settledBy !== null ? { settledBy: this.#settledBy.rule, settledEvidence: this.#settledBy.evidence } : {}),
     };
   }
 
@@ -1368,6 +1530,7 @@ export class WorkflowAgent {
     decision: AgentDecision,
     axTree: string,
     doneHere: ReadonlySet<string>,
+    okClicks: ReadonlyMap<string, number>,
     destination: string | null,
     currentUrl: string,
     ask: number,
@@ -1384,6 +1547,10 @@ export class WorkflowAgent {
     // grounding question: the control exists, and that is the problem.
     const destructive = unscopedDestructiveClick(decision, goal);
     if (destructive !== null) return destructive;
+    // A control clicked past TOGGLE_CLICK_LIMIT this run is a toggle being
+    // thrashed (PL_03_02's 38-turn dropdown), whatever the tree did since.
+    const circling = repeatedToggleClick(decision, okClicks);
+    if (circling !== null) return circling;
     // `scroll` is in this list (2026-08-25): scrolling to a name the tree
     // does not show waited the full action timeout, three turns running, on
     // every "bring row PL_03_… into view" leg whose row was not rendered.
@@ -1521,6 +1688,28 @@ export class WorkflowAgent {
         break;
       }
 
+      case 'read': {
+        if (!decision.selector) throw new Error('read decision carried no selector');
+        await this.#target(page, decision.selector);
+        const loc = page.locator(decision.selector).first();
+        const [name, value, checked, expanded, disabled] = await Promise.all([
+          loc.evaluate((el) => (el as unknown as { innerText?: string }).innerText?.trim().slice(0, 120) ?? '').catch(() => ''),
+          loc.inputValue({ timeout: 500 }).catch(() => ''),
+          loc.getAttribute('aria-checked').catch(() => null),
+          loc.getAttribute('aria-expanded').catch(() => null),
+          loc.isDisabled({ timeout: 500 }).catch(() => false),
+        ]);
+        const facts = [
+          name ? `text ${JSON.stringify(name)}` : '',
+          value ? `value ${JSON.stringify(value)}` : '',
+          checked !== null ? `checked=${checked}` : '',
+          expanded !== null ? `expanded=${expanded}` : '',
+          disabled ? 'DISABLED' : '',
+        ].filter(Boolean);
+        this.#lastTargetNote = `observed ${facts.length ? facts.join(', ') : 'an element with no readable state'}`;
+        break;
+      }
+
       case 'dbCount': {
         if (!decision.selector) throw new Error('dbCount decision carried no table (name it in selector)');
         if (this.#dbProbe === null) {
@@ -1575,6 +1764,13 @@ export class WorkflowAgent {
    * one agent instance answers many workflow steps across a run.
    */
   #lookedOnly = false;
+  /**
+   * How a successful finish was settled: `observed-state` (the harness
+   * re-read the goal's end state off the live tree) or `agent-claim` (the
+   * goal named no checkable state and the model's word stands — visible in
+   * the record so an all-claim run is never mistaken for a proved one).
+   */
+  #settledBy: { rule: 'observed-state' | 'agent-claim'; evidence: string } | null = null;
   /** This run's read-only DB access, when the runner provided one. */
   #dbProbe: AgentDbProbe | null = null;
 

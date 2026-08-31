@@ -21,9 +21,11 @@ import {
   selectorName,
   goalAlreadyShowing,
   goalSurfaceNames,
+  repeatedToggleClick,
+  TOGGLE_CLICK_LIMIT,
   unscopedDestructiveClick,
 } from '../src/orchestrator/agent-guards.js';
-import { AGENT_ACTIONS, AGENT_LOOK_ONLY_TURNS, AGENT_NO_PROGRESS_TURNS, WorkflowAgent, parseWherePairs, type AgentDecision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
+import { AGENT_ACTIONS, AGENT_LOOK_ONLY_TURNS, AGENT_NO_PROGRESS_OFF_TURNS, AGENT_NO_PROGRESS_TURNS, WorkflowAgent, agentEarlyStopDefault, parseWherePairs, type AgentDecision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
 import type { AxNode } from '../src/healer/jit-healer.js';
 
@@ -131,6 +133,38 @@ describe('unscopedDestructiveClick', () => {
     assert.equal(unscopedDestructiveClick(click('role=button[name="Edit" i] >> nth=0'), goal), null);
     assert.equal(unscopedDestructiveClick(click('role=button[name="Delete" i] >> nth=0'), 'delete the first draft'), null);
     assert.equal(unscopedDestructiveClick({ action: 'fill', selector: 'role=textbox[name="Delete reason"]', value: 'x', url: '' }, goal), null);
+  });
+});
+
+describe('agentEarlyStopDefault (the retry toggle, pure)', () => {
+  it('is on unless the env says off', () => {
+    assert.equal(agentEarlyStopDefault({}), true);
+    assert.equal(agentEarlyStopDefault({ WOWLIDATOR_AGENT_EARLY_STOP: 'off' }), false);
+    assert.equal(agentEarlyStopDefault({ WOWLIDATOR_AGENT_EARLY_STOP: 'OFF' }), false);
+    assert.equal(agentEarlyStopDefault({ WOWLIDATOR_AGENT_EARLY_STOP: 'on' }), true);
+  });
+});
+
+describe('repeatedToggleClick', () => {
+  const click = { action: 'click', selector: 'role=button[name="Type:" i]', value: '', url: '' };
+
+  it('lets a multi-select re-open its dropdown up to the limit', () => {
+    const counts = new Map([[click.selector, TOGGLE_CLICK_LIMIT - 1]]);
+    assert.equal(repeatedToggleClick(click, counts), null);
+  });
+
+  it('refuses the click past the limit, whatever the tree did since (PL_03_02\'s 8-toggle thrash)', () => {
+    const counts = new Map([[click.selector, TOGGLE_CLICK_LIMIT]]);
+    const refusal = repeatedToggleClick(click, counts);
+    assert.match(refusal ?? '', /^circling:/);
+    assert.match(refusal ?? '', /Do something different/);
+  });
+
+  it('says nothing about other actions, other selectors, or an empty selector', () => {
+    const counts = new Map([[click.selector, 99]]);
+    assert.equal(repeatedToggleClick({ ...click, action: 'press' }, counts), null);
+    assert.equal(repeatedToggleClick({ ...click, selector: 'role=button[name="Other" i]' }, counts), null);
+    assert.equal(repeatedToggleClick({ ...click, selector: '' }, counts), null);
   });
 });
 
@@ -359,6 +393,86 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
       result.actions.filter((a) => a.action === 'scroll' && a.ok).length >= AGENT_LOOK_ONLY_TURNS,
       'the insisted-on scrolls were performed, not refused',
     );
+  });
+
+  it('hands off fast when every control-engaging click misses (PL_07_03: a filter absent from the tree)', async () => {
+    // A nameless-role selector passes grounding (there is no name to check
+    // against the tree) and then MISSES at the locator, 1.5 s each. The old
+    // looked-only handoff needed EVERY action to be a scroll/wait, so a leg
+    // that tried clicks and missed rode the full 5-turn stall at 1.5 s a miss
+    // (measured: 77 s on one PL_07 leg). Now a leg that never once engages a
+    // control hands off at AGENT_LOOK_ONLY_TURNS, softly — the flow's next
+    // assertion is the proof.
+    const { model } = scripted([{ action: 'click', selector: 'role=combobox >> nth=0' }]);
+    const agent = new WorkflowAgent({ model });
+    const started = Date.now();
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/start`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'open the Type filter and pick Reimbursement');
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.lookedOnly, true, 'a soft handoff, not a hard failure');
+    assert.match(result.summary, /found nothing the goal names to act on/);
+    assert.equal(result.turns, AGENT_LOOK_ONLY_TURNS, 'ended at the look-only budget, not the 5-turn stall');
+    assert.ok(result.actions.every((a) => !a.ok), 'every click missed — nothing was engaged');
+    assert.ok(Date.now() - started < 20_000, `took ${Date.now() - started} ms`);
+  });
+
+  it('earlyStop:false lifts the give-up ceilings — the leg runs far longer before conceding', async () => {
+    // The toggle. With early-stop ON, this leg hands off at 3 (missed every
+    // interaction). With it OFF, both ceilings rise to AGENT_NO_PROGRESS_OFF_TURNS,
+    // so the agent keeps trying — the trade the person makes for thoroughness.
+    const { model } = scripted([{ action: 'click', selector: 'role=combobox >> nth=0' }]);
+    const agent = new WorkflowAgent({ model, earlyStop: false });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/start`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'open the Type filter and pick Reimbursement');
+    });
+    assert.equal(result.success, false);
+    assert.ok(
+      result.turns > AGENT_LOOK_ONLY_TURNS,
+      `ran ${result.turns} turns — past the ${AGENT_LOOK_ONLY_TURNS}-turn early handoff`,
+    );
+    assert.equal(result.turns, AGENT_NO_PROGRESS_OFF_TURNS, 'conceded at the lifted ceiling');
+  });
+
+  it('a leg of failed GOTOs is a navigation stall, NOT a nothing-to-act-on handoff', async () => {
+    // The guard that must not over-fire: failed navigation is not "the page
+    // does not offer the control" — it never tried a control. It rides the
+    // 5-turn no-progress stall, and a re-visited URL does not reset it.
+    const { model } = scripted(
+      Array.from({ length: AGENT_NO_PROGRESS_TURNS + 2 }, (_, i) => ({
+        action: 'goto' as const,
+        url: `https://blocked-${i}.example/`,
+      })),
+    );
+    const agent = new WorkflowAgent({ model });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/start`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'reach the reporting screen');
+    });
+    assert.equal(result.lookedOnly ?? false, false, 'not a reading-question handoff');
+    assert.match(result.summary, /stalled: nothing advanced/);
+    assert.equal(result.turns, AGENT_NO_PROGRESS_TURNS);
+  });
+
+  it('a leg that only reloads the same page is bounded, never endless', async () => {
+    // PL_07_03: the agent reloaded the plans page turn after turn to "get a
+    // clean tree". Two guards keep that finite, and the invariant that matters
+    // is that the leg STOPS. An exact repeated goto is caught by the repeat
+    // guard first (`stalled: repeated "goto…"`); the visited-URL rule (a
+    // reload is not progress) bounds the mixed case the repeat guard cannot
+    // see — reloads interleaved with scrolls and missed clicks. Either way the
+    // turn count is small and finite; the bug was a leg that never ended.
+    const { model } = scripted([{ action: 'goto', url: `${origin}/en/start` }]);
+    const agent = new WorkflowAgent({ model });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/start`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'reach the reporting screen');
+    });
+    assert.equal(result.success, false);
+    assert.match(result.summary, /stalled/);
+    assert.ok(result.turns <= AGENT_NO_PROGRESS_TURNS, `bounded in ${result.turns} turns`);
   });
 
   it('fails a scroll to a name the tree does not show fast, like a click', async () => {

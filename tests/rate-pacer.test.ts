@@ -101,6 +101,9 @@ describe('googleLimitsFor', () => {
     });
     // An id not in the table gets the default, never "no limit".
     assert.deepEqual(googleLimitsFor('gemini-9-ultra', {}), { rpm: 10, tpm: 250_000, rpd: 250 });
+    // 2026-08-31, stated by the operator: the 3.5 lite tier allows 500/day —
+    // it used to fall to the 250 default and the pacer warned 70 cases early.
+    assert.deepEqual(googleLimitsFor('gemini-3.5-flash-lite', {}), { rpm: 10, tpm: 250_000, rpd: 500 });
   });
 });
 
