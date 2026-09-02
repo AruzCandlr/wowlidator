@@ -387,3 +387,28 @@ export function outcomeShown(outcome: GoalOutcome, axTree: string): string | nul
   }
   return null;
 }
+
+/**
+ * The value a `set X to Y` goal names — the same field `goalOutcome` already
+ * extracts, named for a second use: has the goal ever cited a concrete value
+ * the page would have to show for the goal to be satisfiable at all?
+ *
+ * Deliberately reuses `goalOutcome`'s narrow parse rather than a looser one —
+ * a false positive here (claiming a value was named when it was not) would
+ * end a leg that never asked for anything checkable.
+ */
+export function goalCitedValue(goal: string): string | null {
+  return goalOutcome(goal)?.value ?? null;
+}
+
+/**
+ * Has this value appeared ANYWHERE in this tree — no control pairing, unlike
+ * `outcomeShown`. Deliberately loose in the direction that costs nothing: a
+ * false "seen" only means the hunt guard below stays quiet one turn longer,
+ * where a false "not seen" would end a leg that could still succeed. A
+ * truncated tree never counts — absence from it is not absence from the page.
+ */
+export function valueAppearsAnywhere(value: string, axTree: string): boolean {
+  if (value.trim() === '' || axTree.includes('TREE TRUNCATED')) return false;
+  return axTree.toLowerCase().includes(value.trim().toLowerCase());
+}

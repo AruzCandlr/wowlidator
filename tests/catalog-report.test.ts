@@ -133,12 +133,40 @@ describe('embedded evidence and the budget', () => {
 });
 
 describe('export', () => {
-  it('ships the client-side export for one case and for the catalog', () => {
-    const html = renderCatalogReport({ title: 't', runKey: null, generatedAt: null, cases: [kase({})] });
-    assert.match(html, /function exportCase\(/);
+  it('a proved case exports to its own workbook, relative to this file, beside the recording', () => {
+    const html = renderCatalogReport({ title: 't', runKey: 'pl-02@2026-08-31T04:00:00.000Z', generatedAt: null, cases: [kase({})] });
+    assert.match(html, /<a class="btn export-case" download href="pl-02-2026-08-31t04-00-00-000z-media\/pl-02-01\.xlsx"/);
+    assert.match(html, /Export \(Excel\)/);
+    // The link must not toggle the case open as a side effect of downloading.
+    assert.match(html, /export-case" download href="[^"]+" onclick="event\.stopPropagation\(\)"/);
+  });
+
+  it('a case that did not pass has the button DISABLED — there is no proof to hand over', () => {
+    for (const verdict of ['failed', 'blocked', 'review', 'never-ran'] as const) {
+      const html = renderCatalogReport({
+        title: 't', runKey: null, generatedAt: null,
+        cases: [kase({ verdict, status: verdict === 'never-ran' ? null : 'failed', bundle: verdict === 'never-ran' ? null : bundle([step({ status: 'failed' })]) })],
+      });
+      assert.match(html, /<button class="btn export-case" type="button" disabled/, verdict);
+      assert.ok(!html.includes('pl-02-01.xlsx'), `${verdict} must not link a workbook`);
+    }
+  });
+
+  it('the header links the run workbook and still exports the whole catalog client-side', () => {
+    const html = renderCatalogReport({ title: 't', runKey: 'pl-02@2026-08-31T04:00:00.000Z', generatedAt: null, cases: [kase({})] });
     assert.match(html, /function exportCatalog\(/);
-    assert.match(html, /onclick="exportCase\(event,'case-pl-02-01'\)"/);
     assert.match(html, /Export catalog/);
+    assert.match(html, /href="pl-02-2026-08-31t04-00-00-000z-passed\.xlsx"/);
+  });
+
+  it('a live report says it is in progress and reloads itself; a finished one does neither', () => {
+    const cases = [kase({}), kase({ id: 'PL_02_02', name: 'PL_02_02 later', verdict: 'never-ran', status: null, bundle: null })];
+    const live = renderCatalogReport({ title: 't', runKey: null, generatedAt: null, cases, live: true });
+    assert.match(live, /in progress — 1 of 2 case\(s\) finished/);
+    assert.match(live, /<meta http-equiv="refresh" content="60"\/>/);
+    const done = renderCatalogReport({ title: 't', runKey: null, generatedAt: null, cases });
+    assert.ok(!done.includes('http-equiv="refresh"'));
+    assert.ok(!done.includes('in progress'));
   });
 });
 
@@ -278,12 +306,12 @@ describe('the recording in the page', () => {
     assert.match(html, /the recording was 90MB/);
   });
 
-  it('an exported case takes the player and the bytes with it', () => {
+  it('an exported catalog takes the player and the bytes with it', () => {
     const html = render([withVideo({ id: 'A' }, 'QUJD')]);
-    // The export writes this variable into the file it downloads; without it
-    // an exported case is a dead player in a file said to hold the evidence.
+    // The player rides the page as a value too, so a copy of the document
+    // carries it; without it an export is a dead player in a file said to
+    // hold the evidence.
     assert.match(html, /var WOW_PLAYER = /);
-    assert.match(html, /WOW_PLAYER \+ '<\/scr'/);
     // A Blob URL means nothing in another document, so it must be stripped…
     assert.match(html, /function wowStripBlobs/);
     // …while the base64 stays put, which is what makes the export playable.

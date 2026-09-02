@@ -3,6 +3,10 @@
  * data model — plus the live-progress loggers. Split out of cli.ts verbatim.
  */
 
+import type { ExtractedDocument } from '../catalog/extract.js';
+import { connectDb, defaultDbConfig, type DbClient } from '../db/client.js';
+import type { FlowAuthorOptions } from '../generator/flow-author.js';
+import { LlmValueResolverModel } from '../generator/value-resolution.js';
 import { FlowReviewer, LlmFlowReviewModel } from '../generator/flow-review.js';
 import { LlmRiskModel, riskEnabled, type RiskModel } from '../generator/dead-end-risk.js';
 import { LlmDiagnosisModel, diagnosisEnabled, type DiagnosisModel } from '../generator/error-diagnosis.js';
@@ -208,6 +212,33 @@ export function buildFlowReviewer(options: CliOptions): FlowReviewer | null {
     model: new LlmFlowReviewModel({ factory: options.factory }),
     onLog: lineLogger(options),
   });
+}
+
+/**
+ * Value resolution at authoring time (`src/generator/value-resolution.ts`):
+ * the agent role answers the retrieval and database questions and the
+ * generator role invents the flagged stand-in; the database is opened lazily,
+ * read-only, and only when `WOWLIDATOR_DB_URL` is set. Default on;
+ * `--no-value-resolution` / `WOWLIDATOR_VALUE_RESOLUTION=off` returns
+ * undefined, which the author reads as "refuse a token as before". With no
+ * agent key the model is null: test data and the deterministic stand-in still
+ * work, and the flag still lands on the step.
+ */
+export function buildValueResolution(
+  options: CliOptions,
+  documents?: readonly ExtractedDocument[] | undefined,
+): FlowAuthorOptions['valueResolution'] {
+  if (!options.valueResolution) return undefined;
+  const model = options.factory.canResolve('agent') ? new LlmValueResolverModel({ factory: options.factory, role: 'agent' }) : null;
+  let client: Promise<DbClient | null> | null = null;
+  const db = (): Promise<DbClient | null> => {
+    if (client === null) {
+      const config = defaultDbConfig();
+      client = config === null ? Promise.resolve(null) : connectDb(config).catch(() => null);
+    }
+    return client;
+  };
+  return { model, db, ...(documents === undefined ? {} : { documents }) };
 }
 
 export function buildDataModel(options: CliOptions): LlmDataModel {

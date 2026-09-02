@@ -456,6 +456,21 @@ const REQUESTS: Record<ProviderName, (key: string | undefined) => ModelRequest> 
     headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
     parse: (body) => openAiShape(body),
   }),
+  airforce: (key) => ({
+    url: 'https://api.airforce/v1/models',
+    headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
+    parse: (body) => openAiShape(body),
+  }),
+  cerebras: (key) => ({
+    url: 'https://api.cerebras.ai/v1/models',
+    headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
+    parse: (body) => openAiShape(body),
+  }),
+  requesty: (key) => ({
+    url: 'https://router.requesty.ai/v1/models',
+    headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
+    parse: (body) => openAiShape(body),
+  }),
   // Never reached — `fetchModels` short-circuits every `FIXED_MODEL_PROVIDERS`
   // entry before any request is built. These exist because `REQUESTS` is
   // total over `ProviderName`.

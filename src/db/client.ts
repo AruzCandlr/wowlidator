@@ -118,6 +118,18 @@ export function isLoopbackDsn(dsn: string): boolean {
   }
 }
 
+/**
+ * The RESTORE connection, from `WOWLIDATOR_DB_RESTORE_URL` — a second, separate
+ * DSN on purpose: the read-only session is read-only by construction, and the
+ * one thing in this directory that writes (`baseline.ts`'s restore) must be
+ * opted into with a credential the operator chose for it. Null when unset.
+ */
+export function restoreDbConfig(): DbConfig | null {
+  const url = process.env['WOWLIDATOR_DB_RESTORE_URL'];
+  if (!url) return null;
+  return { url, remoteOk: process.env['WOWLIDATOR_DB_REMOTE_OK'] === '1' };
+}
+
 /** Read the default DB config from env. `undefined` when none is configured. */
 export function defaultDbConfig(): DbConfig | null {
   const url = process.env['WOWLIDATOR_DB_URL'];
@@ -166,11 +178,12 @@ function qualifiedName(schema: string, table: string, currentSchema: string): st
 }
 
 class PgDbClient implements DbClient {
-  readonly id = 'pg';
+  readonly id: string;
   readonly #client: import('pg').Client;
 
-  constructor(client: import('pg').Client) {
+  constructor(client: import('pg').Client, id = 'pg') {
     this.#client = client;
+    this.id = id;
   }
 
   async query(sql: string, params: readonly unknown[]): Promise<DbResult> {
@@ -243,10 +256,25 @@ class PgDbClient implements DbClient {
  * behind its own client rather than behind an `if`.
  */
 export async function connectDb(config: DbConfig): Promise<DbClient> {
+  return connectPg(config, 'read');
+}
+
+/**
+ * The write-capable connection, for the baseline restore and nothing else.
+ * Same driver, same remote-host refusal, no read-only layer — which is why it
+ * takes its own DSN (`WOWLIDATOR_DB_RESTORE_URL`) and is never the default.
+ */
+export async function connectDbWritable(config: DbConfig): Promise<DbClient> {
+  return connectPg(config, 'write');
+}
+
+async function connectPg(config: DbConfig, mode: 'read' | 'write'): Promise<DbClient> {
   const dsn = config.url;
   if (!dsn) {
     throw new DbUnavailableError(
-      'no connection is configured — set WOWLIDATOR_DB_URL to a postgres:// connection string',
+      mode === 'read'
+        ? 'no connection is configured — set WOWLIDATOR_DB_URL to a postgres:// connection string'
+        : 'no restore connection is configured — set WOWLIDATOR_DB_RESTORE_URL to a postgres:// connection string with write access',
     );
   }
   if (!isLoopbackDsn(dsn) && config.remoteOk !== true) {
@@ -271,12 +299,12 @@ export async function connectDb(config: DbConfig): Promise<DbClient> {
     await raw.connect();
     // Layer 2 of read-only: even a bug in the statement builder cannot write
     // through a session that refuses writes. (Layer 3 is a read-only grant.)
-    await raw.query('SET default_transaction_read_only = on');
+    if (mode === 'read') await raw.query('SET default_transaction_read_only = on');
   } catch (error) {
     await raw.end().catch(() => undefined);
     const detail = error instanceof Error ? error.message.split('\n')[0] : String(error);
     throw new DbUnavailableError(`could not connect to ${maskDsn(dsn)}: ${detail}`);
   }
 
-  return new PgDbClient(raw);
+  return new PgDbClient(raw, mode === 'read' ? 'pg' : 'pg-rw');
 }

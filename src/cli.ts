@@ -41,7 +41,7 @@ import {
 import { USAGE } from './cli/usage.js';
 import { cmdAuthor, cmdCatalog, cmdDraft, cmdGenerate } from './cli/commands/authoring.js';
 import { cmdGo } from './cli/commands/go.js';
-import { cmdCache, cmdContext, cmdDoctor, cmdHistory } from './cli/commands/maintenance.js';
+import { cmdCache, cmdCatalogReport, cmdContext, cmdDb, cmdDoctor, cmdHistory } from './cli/commands/maintenance.js';
 import { cmdCrawl, cmdRun, cmdWatch } from './cli/commands/run.js';
 
 // Re-exported for the tests (tests/suite-outcomes.test.ts) and for embedders
@@ -149,7 +149,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       // than relying on a default the two surfaces disagree about.
       backend: { type: 'boolean', default: false },
       'no-agent-capture': { type: 'boolean', default: false },
+      'no-target-highlight': { type: 'boolean', default: false },
+      'db-baseline': { type: 'string' },
+      'db-baseline-tables': { type: 'string' },
       'no-author-review': { type: 'boolean', default: false },
+      'no-value-resolution': { type: 'boolean', default: false },
       'no-reconstruct': { type: 'boolean', default: false },
       'no-agent-early-stop': { type: 'boolean', default: false },
       json: { type: 'boolean', default: false },
@@ -333,7 +337,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     video,
     agentAssist: values['agent-assist'] === true || config.agentAssist,
     agentCapture: values['no-agent-capture'] !== true,
+    highlightTarget: values['no-target-highlight'] !== true,
+    dbBaseline: values['db-baseline'],
+    dbBaselineTables: (values['db-baseline-tables'] ?? process.env['WOWLIDATOR_DB_BASELINE_TABLES'] ?? '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter((t) => t !== ''),
     authorReview: values['no-author-review'] !== true,
+    valueResolution: values['no-value-resolution'] !== true && process.env['WOWLIDATOR_VALUE_RESOLUTION'] !== 'off',
     // Three retry rules, each toggleable by flag AND by env (so a run started
     // from a terminal or the panel obeys the same `.env` line):
     //  - reconstruction (retry a failed step up to 3×): --no-reconstruct, or
@@ -468,6 +479,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return cmdWatch(positionals[1], options);
     case 'doctor':
       return cmdDoctor(options);
+    case 'report':
+      return cmdCatalogReport(positionals[1], options);
+    case 'db':
+      return cmdDb(positionals[1], positionals[2], options);
     case 'mcp':
       await mcpMain();
       return 0;

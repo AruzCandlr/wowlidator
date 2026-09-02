@@ -545,6 +545,28 @@ export interface ProofStep {
    */
   db?: DbCheckRecord | undefined;
   /**
+   * What this step acted on or checked, read from the live element at the
+   * moment of the step (2026-09-02): the selector that resolved, the
+   * element's role and accessible name (or tag and text) and where it sat on
+   * the page. The screenshot draws a red rectangle around exactly this box.
+   * Absent for a step with no element — a navigation, an HTTP step, an
+   * absence assertion — and for a step whose element could not be read in
+   * time; never a reason for a step to fail. See `engine/target.ts`.
+   */
+  target?: StepTarget | undefined;
+  /**
+   * What this backend step did to the tables under test, against the run's
+   * database BASELINE (the snapshot taken before the run — see
+   * `src/db/baseline.ts`), one entry per baseline table. Compared to the
+   * baseline, not to the previous step, so a reader sees the cumulative
+   * state the run has put the data in. Evidence, never a verdict: an
+   * unchanged table is recorded too, and a probe that failed leaves
+   * `dbProbeError` instead. Only on HTTP and DB steps, only when a baseline
+   * exists for the run.
+   */
+  dbChanges?: StepDbChange[] | undefined;
+  dbProbeError?: string | undefined;
+  /**
    * Base64 JPEG, embedded directly into the HTML report.
    *
    * With video recording on this is a *failure* still only: the run is already
@@ -592,6 +614,94 @@ export interface ProofStep {
   superseded?: boolean | undefined;
   /** Set on a step that ran as an in-run reconstruction of a failed one. */
   reconstruction?: ReconstructionRecord | undefined;
+}
+
+/** One baseline table's state after a backend step — see `ProofStep.dbChanges`. */
+export interface StepDbChange {
+  table: string;
+  baselineRows: number;
+  rows: number;
+  /** Content hash differs from the baseline's. */
+  changed: boolean;
+  inserted?: number | undefined;
+  deleted?: number | undefined;
+  updated?: number | undefined;
+  /** Up to `DIFF_SAMPLE_MAX` changed rows, keyed on the primary key, every cell redacted. */
+  sample?: { kind: 'inserted' | 'deleted' | 'updated'; key: string; row: Record<string, string> }[] | undefined;
+}
+
+/** What the bundle records about the run's database baseline — names and a time, never values. */
+export interface DbBaselineSummary {
+  tables: string[];
+  takenAt: string;
+}
+
+/** One line per changed table — what `formatStepLine` and the reports print. */
+export function describeDbChanges(changes: readonly StepDbChange[] | undefined): string[] {
+  if (changes === undefined) return [];
+  return changes
+    .filter((c) => c.changed)
+    .map((c) => {
+      const parts: string[] = [];
+      if (c.inserted) parts.push(`+${c.inserted} inserted`);
+      if (c.deleted) parts.push(`−${c.deleted} deleted`);
+      if (c.updated) parts.push(`~${c.updated} updated`);
+      const delta = parts.length > 0 ? parts.join(', ') : `${c.baselineRows} → ${c.rows} rows`;
+      return `db ${c.table}: ${delta} vs baseline`;
+    });
+}
+
+/** The element a step acted on or checked — see `ProofStep.target`. */
+export interface StepTarget {
+  /** The selector that resolved to it (the healed one, when healed). */
+  selector: string;
+  /** Lower-case tag name. */
+  tag?: string | undefined;
+  /** ARIA role, explicit or implied by the tag. */
+  role?: string | undefined;
+  /** Accessible name — aria-label, label, alt, title, placeholder or text. */
+  name?: string | undefined;
+  /** Visible text when it differs from the name, trimmed. */
+  text?: string | undefined;
+  /** Document-coordinate CSS px at capture time; the red rectangle's box. */
+  box?: { x: number; y: number; width: number; height: number } | undefined;
+}
+
+/**
+ * One line naming a target: `button "Sign in" · 120×40 at (30,200)`. The
+ * same wording in the CLI, the reports, the workbook and the panel.
+ */
+export function describeTarget(target: StepTarget | undefined): string | null {
+  if (target === undefined) return null;
+  const what = target.role ?? target.tag ?? 'element';
+  const label = target.name ?? target.text;
+  const parts = [label === undefined ? what : `${what} ${JSON.stringify(label)}`];
+  if (target.box) {
+    parts.push(`${target.box.width}×${target.box.height} at (${target.box.x},${target.box.y})`);
+  }
+  return parts.join(' · ');
+}
+
+/**
+ * Where an input step's value came from, when authoring had to find or invent
+ * it — read off `detail.valueSource` (`generator/value-resolution.ts`). One
+ * wording for the CLI, both HTML reports, the Excel export and wowUI. Null
+ * when the sheet stated the value itself.
+ */
+export function describeValueSource(step: { detail?: Record<string, unknown> | undefined }): string | null {
+  const raw = step.detail?.['valueSource'];
+  if (typeof raw !== 'object' || raw === null) return null;
+  const source = raw as { kind?: unknown; detail?: unknown };
+  if (typeof source.kind !== 'string') return null;
+  const detail = typeof source.detail === 'string' ? source.detail : '';
+  if (source.kind === 'generated') return `generated — ${detail || 'a stand-in the author invented'}`;
+  return `from ${source.kind}${detail ? `: ${detail}` : ''}`;
+}
+
+/** True when the step typed a value the author invented rather than one the sheet stated. */
+export function valueWasGenerated(step: { detail?: Record<string, unknown> | undefined }): boolean {
+  const raw = step.detail?.['valueSource'] as { kind?: unknown } | undefined;
+  return typeof raw === 'object' && raw !== null && raw.kind === 'generated';
 }
 
 /** What an in-run reconstruction did to a failed step, kept as evidence. */
@@ -980,6 +1090,12 @@ export interface ProofBundle {
    * a case whose data was never seeded. See `src/generator/error-diagnosis.ts`.
    */
   diagnosis?: ErrorDiagnosis | undefined;
+  /**
+   * The database baseline this run compared its backend steps against, when
+   * one was taken (`src/db/baseline.ts`): which tables and when. The values
+   * live in the local baseline file only.
+   */
+  dbBaseline?: DbBaselineSummary | undefined;
 }
 
 export interface ProofBundleBuilderOptions {
@@ -1014,6 +1130,7 @@ export class ProofBundleBuilder {
   readonly #onStep: ((step: ProofStep) => void) | undefined;
   #coverage: CoverageReport | undefined;
   #trend: RunTrend | undefined;
+  #dbBaseline: DbBaselineSummary | undefined;
   #variables: Record<string, string> | undefined;
   #notes: string[] = [];
   #errorIsTally = false;
@@ -1280,6 +1397,11 @@ export class ProofBundleBuilder {
     this.#trend = trend;
   }
 
+  /** See `ProofBundle.dbBaseline`. */
+  setDbBaseline(summary: DbBaselineSummary): void {
+    this.#dbBaseline = summary;
+  }
+
   /** Selectors that actually resolved — the input to coverage measurement. */
   resolvedSelectors(): string[] {
     const touched: string[] = [];
@@ -1339,6 +1461,19 @@ export class ProofBundleBuilder {
     // say) must not relabel some earlier step's failure.
     if (action !== undefined && last.action !== action) return;
     last.status = status;
+  }
+
+  /**
+   * Attach a backend step's baseline comparison to the step just recorded.
+   * A separate method because the probe is async and runs AFTER the step is
+   * on the record — the alternative is threading a promise through every
+   * `addStep` call. No-op when there is no last step.
+   */
+  annotateDbChanges(changes: StepDbChange[] | undefined, probeError: string | undefined): void {
+    const last = this.#steps[this.#steps.length - 1];
+    if (last === undefined) return;
+    if (changes !== undefined) last.dbChanges = changes;
+    if (probeError !== undefined) last.dbProbeError = probeError;
   }
 
   get steps(): readonly ProofStep[] {
@@ -1616,6 +1751,7 @@ export class ProofBundleBuilder {
       video: this.#video,
       coverage: this.#coverage,
       trend: this.#trend,
+      ...(this.#dbBaseline === undefined ? {} : { dbBaseline: this.#dbBaseline }),
       variables: this.#variables,
       ...(this.#notes.length > 0 ? { notes: [...this.#notes] } : {}),
       generatedBy: this.#generatedBy,
@@ -1684,6 +1820,12 @@ export function formatStepLine(step: ProofStep): string {
   if (step.intent) lines.push(`      ${step.intent}`);
   const comparison = expectedActual(step);
   if (comparison) lines.push(`      ${comparison}`);
+  const described = describeTarget(step.target);
+  if (described !== null) lines.push(`      target: ${described}`);
+  const valueFrom = describeValueSource(step);
+  if (valueFrom !== null) lines.push(`      value ${valueFrom}`);
+  for (const change of describeDbChanges(step.dbChanges)) lines.push(`      ${change}`);
+  if (step.dbProbeError) lines.push(`      db baseline probe failed: ${step.dbProbeError}`);
   if (step.status !== 'passed' && step.error) lines.push(`      ${step.error.split('\n')[0]}`);
   return lines.join('\n');
 }

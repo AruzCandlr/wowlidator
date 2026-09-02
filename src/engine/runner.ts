@@ -52,6 +52,7 @@ import type {
   FlowDbUnchangedSpec,
 } from '../db/db-actions.js';
 import { defaultDbConfig, type DbClient, type DbConfig } from '../db/client.js';
+import type { DbBaselineProbe } from '../db/baseline.js';
 import {
   DEFAULT_CAPTURE_DELAY_MS,
   captureEvidence,
@@ -113,13 +114,16 @@ import {
   isTextSelector,
   qualifyBareRole,
   relaxRoleName,
+  withoutGreeting,
   relaxTextSelector,
   sanitizeSelector,
 } from './selector.js';
 import { expandFlow, hasIncludes } from './compose.js';
 import {
+  API_STEP_ACTIONS,
   BACKEND_TIER_ACTIONS,
   BROWSER_FREE_ACTIONS,
+  DB_STEP_ACTIONS,
   ProofBundleBuilder,
   type AgentRecord,
   type StepDecision,
@@ -134,8 +138,10 @@ import {
   type ProofStep,
   type RejectedHeal,
   type ResolutionSource,
+  type StepTarget,
   nearMiss,
 } from './proof-bundle.js';
+import { captureTarget, TARGET_READ_BUDGET_MS } from './target.js';
 import { inferPolarity, type TestPolarity } from './polarity.js';
 import type { DataGate } from '../cli/data-locks.js';
 
@@ -233,6 +239,21 @@ export interface SmartRunnerOptions {
    */
   screenshots?: ScreenshotMode | undefined;
   /**
+   * Draw a red rectangle around the step's target in its screenshot, so the
+   * evidence shows what was acted on or checked, not only the page it sat on.
+   * Default true. The target itself (`ProofStep.target`) is recorded either
+   * way; this only decides whether the still is marked. See `engine/target.ts`.
+   */
+  highlightTarget?: boolean | undefined;
+  /**
+   * When set, every backend step (HTTP or DB) is followed by a probe of the
+   * run's database BASELINE, and what it did to the tables under test is
+   * recorded on the step (`ProofStep.dbChanges`). Evidence only, never a
+   * verdict; a failing probe records `dbProbeError` and the step is
+   * unaffected. See `src/db/baseline.ts`. Injected so tests stub it.
+   */
+  dbBaselineProbe?: DbBaselineProbe | undefined;
+  /**
    * Pause before each screenshot, so the page has painted. A navigation waits
    * for `domcontentloaded`, which is earlier than "there is something to look
    * at"; see `evidence.ts`. Zero captures as soon as the load states allow.
@@ -243,6 +264,16 @@ export interface SmartRunnerOptions {
    * it. Default false — see `#agentRescue` for why this is opt-in.
    */
   agentAssist?: boolean | undefined;
+  /**
+   * A tighter per-run turn ceiling for every `workflow` step's agent call —
+   * see `WorkflowAgent`'s `RunOptions.maxSteps`. Absent leaves the agent's
+   * own instance-wide budget (`DEFAULT_AGENT_MAX_STEPS`, unbounded unless
+   * `WOWLIDATOR_AGENT_MAX_STEPS` is set) untouched. Set by
+   * `failFastRunOptions` (`run-cases.ts`) for a case the pre-run risk judge
+   * already flagged as likely to dead-end or fail: the agent still gets its
+   * one shot, on a shorter leash, rather than an unbounded one.
+   */
+  agentMaxSteps?: number | undefined;
   /**
    * Whether this run may exercise the backend at all. Default `true` — the
    * behaviour every run had before the toggle existed. `false` and no HTTP or
@@ -369,6 +400,16 @@ const SEQUENCE_POLL_MS = 150;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Where an input step's value came from when the sheet did not state it —
+ * resolved at authoring time (`generator/value-resolution.ts`). `generated`
+ * is the one a reader must know about: a stand-in the author invented.
+ */
+export interface StepValueSource {
+  kind: 'test-data' | 'repo' | 'db' | 'generated';
+  detail: string;
 }
 
 /** One value in a data-driven step, with what should hold after filling it. */
@@ -1011,6 +1052,92 @@ export function scriptMismatchNote(expected: string, actual: string): string {
  * moves, and the agent drives the browser wholesale; everything else that
  * changes the URL did so without being asked.
  */
+/**
+ * Steps that PUT A VALUE IN — the ones the entry rung of last resort can
+ * hand to the agent, because for these "did it work" is answerable by reading
+ * the value back rather than by re-running a selector.
+ *
+ * `check`/`uncheck` are deliberately absent: their value is a state, not a
+ * string, and the ladder's own re-run already decides them.
+ */
+const ENTRY_ACTIONS: ReadonlySet<string> = new Set(['fill', 'fillRetry', 'type', 'selectOption']);
+
+/**
+ * Did the control end up holding what the step asked for?
+ *
+ * Deliberately tolerant in one direction only: a control routinely RENDERS a
+ * value differently from the way it was typed — a date field shows
+ * `1 Sep 2027` for `01 Sep 2027`, a combobox reports its label with the
+ * surrounding row text. So the asked-for value need only be present in what
+ * came back, case- and space-insensitively. It is never the other way round:
+ * an empty control can never satisfy a non-empty ask.
+ */
+/**
+ * The `YYYY-MM-DD` a native `<input type="date">` accepts, from the way a
+ * person writes a date — or `null` when the text is not unambiguously a date.
+ *
+ * Playwright's `fill` on a date input rejects anything else with `Malformed
+ * value` (measured), and a sheet writes dates the way people read them:
+ * `01 Sep 2027`, `1 September 2027`, `Sep 1, 2027`. Only unambiguous shapes are
+ * converted; `01/09/2027` is left alone, because whether it is January or
+ * September depends on who wrote it, and a wrong guess would enter a wrong
+ * date silently.
+ */
+/**
+ * The field names a step's intent speaks of — `Hire Date`, `Date of Birth`,
+ * `National ID / Tax ID` — as the label a hidden input is named by.
+ *
+ * Title-Case runs (with `of`/`/`/`&` allowed inside) and anything quoted, up to
+ * three, longest first, so "key Hire Date = 15 Sep 2027 into the Hire Date
+ * field" yields `Hire Date` once. Pure; tested through the shell rung.
+ */
+export function fieldNamesIn(intent: string | undefined): string[] {
+  if (intent === undefined || intent.trim() === '') return [];
+  const found = new Set<string>();
+  for (const m of intent.matchAll(/["“']([^"”']{2,60})["”']/g)) found.add(m[1]!.trim());
+  for (const m of intent.matchAll(/\b([A-Z][A-Za-z]+(?:(?:\s+(?:of|the|and|&|\/)\s*|\s+)[A-Z][A-Za-z]*)*)\b/g)) {
+    // Strip the verb a step intent opens with ("Enter the National ID / Tax
+    // ID" → "National ID / Tax ID"), then drop what is left of the openers,
+    // months and anything numeric — those are never a field's label.
+    const phrase = m[1]!
+      .trim()
+      .replace(/^(?:Step|Case|Test|Expected|Key(?:\s+in)?|Fill(?:\s+in)?|Enter|Select|Click|Set|Type|Choose|Then|And)\b(?:\s+(?:the|a|an|in|into))?\s*/, '')
+      .trim();
+    if (phrase === '' || !/^[A-Z]/.test(phrase)) continue;
+    if (/^(The|Then|And|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Age|Today)$/.test(phrase)) continue;
+    if (/\d/.test(phrase)) continue;
+    found.add(phrase);
+  }
+  return [...found].sort((a, b) => b.length - a.length).slice(0, 3);
+}
+
+export function isoDateOf(text: string): string | null {
+  const t = text.trim();
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
+  if (iso) return t;
+  const MONTHS: Record<string, string> = {
+    jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+    jul: '07', aug: '08', sep: '09', sept: '09', oct: '10', nov: '11', dec: '12',
+  };
+  const dmy = /^(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/.exec(t);
+  const mdy = /^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$/.exec(t);
+  const [d, mon, y] = dmy ? [dmy[1]!, dmy[2]!, dmy[3]!] : mdy ? [mdy[2]!, mdy[1]!, mdy[3]!] : [null, null, null];
+  if (d === null || mon === null || y === null) return null;
+  const mm = MONTHS[mon.slice(0, 4).toLowerCase()] ?? MONTHS[mon.slice(0, 3).toLowerCase()];
+  if (mm === undefined) return null;
+  const dd = d.padStart(2, '0');
+  if (Number(dd) < 1 || Number(dd) > 31) return null;
+  return `${y}-${mm}-${dd}`;
+}
+
+export function valueMatches(asked: string, held: string): boolean {
+  const fold = (v: string): string => v.toLowerCase().replace(/\s+/g, ' ').trim();
+  const a = fold(asked);
+  const h = fold(held);
+  if (a === '') return h === '';
+  return h.includes(a);
+}
+
 const NAVIGATING_ACTIONS: ReadonlySet<string> = new Set([
   'goto',
   'click',
@@ -1071,6 +1198,8 @@ export class SmartRunner {
   readonly #fastTimeoutMs: number;
   readonly #healedTimeoutMs: number;
   readonly #screenshots: ScreenshotMode;
+  readonly #highlightTarget: boolean;
+  readonly #dbBaselineProbe: DbBaselineProbe | null;
   readonly #captureDelayMs: number;
   /**
    * Set only when this runner created a recording context, which is also the
@@ -1085,6 +1214,8 @@ export class SmartRunner {
   /** The caption now showing, re-applied whenever a navigation wipes it. */
   #caption = '';
   readonly #agentAssist: boolean;
+  /** See `SmartRunnerOptions.agentMaxSteps`. `undefined` leaves the agent's own budget alone. */
+  readonly #agentMaxSteps: number | undefined;
   /** Whether this run may exercise the backend at all — see `assertBackendAllowed`. */
   readonly #backend: boolean;
   /** What the application's repository declares — see `RouteNotFoundError`. */
@@ -1176,7 +1307,11 @@ export class SmartRunner {
     this.#screenshots =
       options.screenshots ?? ((options.video ?? 'on') !== 'off' ? 'on-failure' : 'all');
     this.#captureDelayMs = options.captureDelayMs ?? DEFAULT_CAPTURE_DELAY_MS;
+    this.#highlightTarget = options.highlightTarget ?? true;
+    this.#dbBaselineProbe = options.dbBaselineProbe ?? null;
+    if (this.#dbBaselineProbe !== null) this.bundle.setDbBaseline(this.#dbBaselineProbe.summary());
     this.#agentAssist = options.agentAssist ?? false;
+    this.#agentMaxSteps = options.agentMaxSteps;
     this.#backend = options.backend ?? true;
     this.#declaredRoutes = options.declaredRoutes ?? [];
     this.stepRepair = options.stepRepair ?? null;
@@ -1562,14 +1697,27 @@ export class SmartRunner {
     this.page = popup;
   }
 
-  async fill(selector: string, value: string, intent?: string): Promise<void> {
+  async fill(selector: string, value: string, intent?: string, valueSource?: StepValueSource): Promise<void> {
     await this.#step(
       'fill',
       selector,
       intent,
       (locator, timeout) => locator.fill(value, { timeout }),
-      { value },
+      this.#withValueSource({ value }, valueSource),
     );
+  }
+
+  /**
+   * Carry the step's value provenance onto the proof, and say out loud when a
+   * value was GENERATED by the author: the run typed a stand-in, and a reader
+   * judging the result has to know it was not the sheet's data.
+   */
+  #withValueSource(detail: Record<string, unknown>, source: StepValueSource | undefined): Record<string, unknown> {
+    if (source === undefined) return detail;
+    if (source.kind === 'generated') {
+      this.bundle.note(`value generated by the author for ${String(detail['value'] ?? '')}: ${source.detail}`);
+    }
+    return { ...detail, valueSource: source };
   }
 
   /**
@@ -1577,8 +1725,8 @@ export class SmartRunner {
    * native `<select>` and a custom combobox. `fill` throws on a select and
    * `click` can only open one; this is the action that completes it.
    */
-  async selectOption(selector: string, value: string, intent?: string): Promise<void> {
-    const detail: Record<string, unknown> = { value };
+  async selectOption(selector: string, value: string, intent?: string, valueSource?: StepValueSource): Promise<void> {
+    const detail: Record<string, unknown> = this.#withValueSource({ value }, valueSource);
     await this.#step(
       'selectOption',
       selector,
@@ -1707,7 +1855,7 @@ export class SmartRunner {
    * for autocomplete/typeahead/masked fields that react per keystroke, which
    * `fill`'s single programmatic assignment cannot wake.
    */
-  async type(selector: string, value: string, intent?: string): Promise<void> {
+  async type(selector: string, value: string, intent?: string, valueSource?: StepValueSource): Promise<void> {
     await this.#step(
       'type',
       selector,
@@ -1726,7 +1874,7 @@ export class SmartRunner {
           timeout: Math.max(this.#healedTimeoutMs, value.length * TYPE_KEY_DELAY_MS + 1000),
         });
       },
-      { value },
+      this.#withValueSource({ value }, valueSource),
     );
   }
 
@@ -3169,6 +3317,7 @@ export class SmartRunner {
         detail,
         screenshot: touchesPage ? await this.#shoot('routine') : undefined,
       });
+      await this.#probeDbBaseline(action);
     } catch (error) {
       const evidence = this.#networkEvidence(netMark);
       this.bundle.addStep({
@@ -3308,6 +3457,7 @@ export class SmartRunner {
       caseContext: this.#caseContext,
       ...(script === undefined ? {} : { script }),
       ...(this.#agentDbProbe() ?? {}),
+      ...(this.#agentMaxSteps === undefined ? {} : { maxSteps: this.#agentMaxSteps }),
     });
     const urlAfter = this.page.url();
     const headingsAfter = await this.#headingsNow();
@@ -3385,6 +3535,12 @@ export class SmartRunner {
           'the control it reported on may exist on the original page'
         : '';
 
+    // The evidence of an agent leg is the control it was working on — the
+    // last one it acted on successfully — outlined and scrolled into view,
+    // so the still shows the section the agent reached rather than the top
+    // of the page the step began on (asked for 2026-09-02).
+    const lastActed = [...(record.actions ?? [])].reverse().find((a) => a.ok && typeof a.selector === 'string' && a.selector !== '');
+    const agentTarget = lastActed?.selector ? await this.#target(lastActed.selector) : undefined;
     this.bundle.addStep({
       action: 'workflow',
       selector: null,
@@ -3420,7 +3576,8 @@ export class SmartRunner {
       },
       agent: record,
       network: traffic.calls.length > 0 ? traffic.calls : undefined,
-      screenshot: await this.#shoot(failed ? 'failure' : 'notable'),
+      target: agentTarget,
+      screenshot: await this.#shoot(failed ? 'failure' : 'notable', agentTarget),
       error: failed ? `${record.summary}${displaced}` : undefined,
     });
 
@@ -3617,7 +3774,14 @@ export class SmartRunner {
         run,
         netMark,
         typeof detail?.['expected'] === 'string' ? (detail['expected'] as string) : undefined,
+        // An input step's own value, for the entry rung of last resort.
+        ENTRY_ACTIONS.has(action) && typeof detail?.['value'] === 'string'
+          ? (detail['value'] as string)
+          : undefined,
       );
+      // The element the step just used, read before the shutter so the
+      // record and the rectangle describe the same thing.
+      const target = await this.#target(result.resolvedSelector);
       this.bundle.addStep({
         action,
         intent,
@@ -3633,6 +3797,7 @@ export class SmartRunner {
         dialog: result.dialog,
         agent: result.agent,
         decision: result.decision,
+        target,
         screenshot: await this.#shoot(
           // A heal, a dismissed dialog or an agent intervention is a passing
           // step that still changed what the test exercised; the rest are
@@ -3642,6 +3807,7 @@ export class SmartRunner {
             result.resolution === 'agent'
             ? 'notable'
             : 'routine',
+          target,
         ),
       });
 
@@ -3767,6 +3933,11 @@ export class SmartRunner {
           }
         }
       }
+      // A failed step may still HAVE a target: an assertion that found its
+      // element and disagreed with its content. A short read of the authored
+      // selector marks it in the still when it is there; a selector that
+      // matched nothing costs one bounded miss and records no target.
+      const failedTarget = await this.#target(selector, Math.min(TARGET_READ_BUDGET_MS, 750));
       this.bundle.addStep({
         action,
         intent,
@@ -3794,7 +3965,8 @@ export class SmartRunner {
         rejectedHeals: resolution?.rejectedHeals,
         decision: resolution?.decision,
         network: evidence.calls.length > 0 ? evidence.calls : undefined,
-        screenshot: await this.#shoot('failure'),
+        target: failedTarget,
+        screenshot: await this.#shoot('failure', failedTarget),
       });
       if (resolution) {
         // Remember an exhausted ladder for this page+selector, so an identical
@@ -4017,8 +4189,38 @@ export class SmartRunner {
    * `evidence.ts`, because the crawler captures on the same terms and two
    * copies of that rule would drift.
    */
-  async #shoot(kind: EvidenceKind): Promise<string | undefined> {
-    return captureEvidence(this.page, this.#screenshots, kind, this.#captureDelayMs);
+  /**
+   * A backend step just ran — probe the database baseline and record what the
+   * tables under test look like against it. Only for HTTP and DB steps, and
+   * only when a baseline probe is configured; evidence, never a verdict, so a
+   * probe that throws lands on the step as `dbProbeError` and nothing else.
+   */
+  async #probeDbBaseline(action: string): Promise<void> {
+    if (this.#dbBaselineProbe === null) return;
+    if (!API_STEP_ACTIONS.has(action) && !DB_STEP_ACTIONS.has(action)) return;
+    try {
+      const changes = await this.#dbBaselineProbe.probe();
+      this.bundle.annotateDbChanges(changes, undefined);
+    } catch (error) {
+      this.bundle.annotateDbChanges(undefined, error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error));
+    }
+  }
+
+  async #shoot(kind: EvidenceKind, target?: StepTarget | undefined): Promise<string | undefined> {
+    // The rectangle is drawn from the target's selector, live, at the
+    // shutter — not from the box recorded a moment earlier, which the settle
+    // may have moved. Only when the run wants it and there is a target.
+    const highlight =
+      this.#highlightTarget && target !== undefined ? this.page.locator(target.selector).first() : undefined;
+    return captureEvidence(this.page, this.#screenshots, kind, this.#captureDelayMs, highlight);
+  }
+
+  /**
+   * What the step acted on, read from the live element. Bounded and
+   * never-throwing (`captureTarget`); `null` selectors read as no target.
+   */
+  async #target(selector: string | null, budgetMs: number = TARGET_READ_BUDGET_MS): Promise<StepTarget | undefined> {
+    return captureTarget(this.page, selector, budgetMs);
   }
 
   /**
@@ -4637,6 +4839,11 @@ export class SmartRunner {
     netMark?: number | undefined,
     /** The text this step is looking for, when it is looking for one. */
     expected?: string | undefined,
+    /**
+     * The value an INPUT step is putting in, when it is one. What the entry
+     * rung below hands the agent, and what it reads back to decide.
+     */
+    entry?: string | undefined,
   ): Promise<ResolveResult<unknown>> {
     const attempts: string[] = [];
     // Candidates the healer proposed and refused. Evidence about what was
@@ -4659,6 +4866,88 @@ export class SmartRunner {
     } catch (error) {
       noteInterception(error);
       attempts.push(`fast "${selector}": ${describe(error)}`);
+    }
+
+    // 1.02. **A read-only shell over the real input** (2026-09-02).
+    //
+    // `fill` on a read-only input does not fail — it WAITS for the field to
+    // become editable until the timeout, so every rung below would burn its
+    // whole budget on the same element (measured: 56 s, 41 s and 93 s for the
+    // three inputs of ec10 HIR-EC-001, and none of them entered anything).
+    // The shape behind it is a common date-picker idiom: a visible read-only
+    // text box carrying the placeholder ("Select date") drawn over a hidden
+    // `<input type="date">` that the label actually points at
+    // (humi-SIT `HumiDatePicker`, StepIdentity's Hire Date). The tree lists
+    // both; the flow took the one whose NAME was the placeholder.
+    //
+    // So: if the element resolved and is read-only, this is not a resolution
+    // problem and no later rung can fix it. Fill the editable input beside it
+    // — as an ISO date when it is a date input — and when there is none, go
+    // straight to the agent rather than time out four more times.
+    let readOnlyShell = false;
+    if (entry !== undefined && (action === 'fill' || action === 'fillRetry')) {
+      const shell = await this.#readOnlyShell(selector);
+      if (shell !== null) {
+        readOnlyShell = true;
+        attempts.push(`read-only: "${selector}" resolved but is a read-only field — a display, not the input`);
+        // **The label first, the neighbour second.** Four "Select date" shells
+        // sit on the hire form, so `.first()` of the given selector is a
+        // guess at WHICH date. The step's own intent almost always names the
+        // field ("key Hire Date = 15 Sep 2027"), and the hidden input is
+        // named by that label — try those names as textboxes before the
+        // positional sibling.
+        for (const label of fieldNamesIn(intent)) {
+          const byLabel = `role=textbox[name=${JSON.stringify(label)} i]`;
+          try {
+            const input = this.page.locator(byLabel).first();
+            if ((await this.page.locator(byLabel).count()) !== 1) continue;
+            const kind = await input
+              .evaluate((el) => ((el as unknown as { type?: string; readOnly?: boolean }).readOnly ? 'readonly' : ((el as unknown as { type?: string }).type ?? '').toLowerCase()), undefined, { timeout: this.#fastTimeoutMs })
+              .catch(() => 'readonly');
+            if (kind === 'readonly') continue;
+            const asDate = kind === 'date' ? isoDateOf(entry) : null;
+            if (kind === 'date' && asDate === null) continue;
+            await input.fill(asDate ?? entry, { timeout: this.#fastTimeoutMs });
+            this.bundle.note(
+              `${selector}: the visible field is a read-only display; filled the input the label ` +
+                `"${label}" points at (${byLabel})` + (asDate !== null && asDate !== entry ? ` as ${asDate}` : ''),
+            );
+            return { value: undefined, resolution: 'narrow', resolvedSelector: byLabel };
+          } catch (error) {
+            attempts.push(`label-input "${byLabel}": ${describe(error)}`);
+          }
+        }
+        if (shell.sibling !== null) {
+          try {
+            const target = this.page.locator(shell.sibling).first();
+            const asDate = shell.siblingType === 'date' ? isoDateOf(entry) : null;
+            if (shell.siblingType === 'date' && asDate === null) {
+              attempts.push(`shell-input "${shell.sibling}": a date input, but ${JSON.stringify(entry)} is not an unambiguous date`);
+            } else {
+              await target.fill(asDate ?? entry, { timeout: this.#fastTimeoutMs });
+              this.bundle.note(
+                `${selector}: the visible field is a read-only display over the real input; ` +
+                  `filled the input beneath it (${shell.sibling})` +
+                  (asDate !== null && asDate !== entry ? ` as ${asDate}` : ''),
+              );
+              return { value: undefined, resolution: 'narrow', resolvedSelector: shell.sibling };
+            }
+          } catch (error) {
+            attempts.push(`shell-input "${shell.sibling}": ${describe(error)}`);
+          }
+        } else {
+          attempts.push('read-only: no editable input beside it');
+        }
+      }
+    }
+    if (readOnlyShell) {
+      // Nothing between here and the agent can make a read-only field
+      // writable; skipping those rungs is what turns a 90-second miss into a
+      // few seconds — and the agent may know the control's own way in.
+      const entered = await this.#agentEnter(action, selector, intent, entry, attempts);
+      if (entered !== null) return entered;
+      const failure = new StepResolutionError(selector, attempts);
+      throw failure;
     }
 
     // 1.05. Known dead end — $0, and a stop.
@@ -4725,6 +5014,30 @@ export class SmartRunner {
         return { value, resolution: 'case', resolvedSelector: relaxed };
       } catch (error) {
         attempts.push(`case "${relaxed}": ${describe(error)}`);
+      }
+    }
+
+    // 1.12. Volatile greeting — the same assertion, minus the time of day.
+    //
+    // "Good afternoon, ผู้ดูแลระบบ" was authored as the sign-in proof, and the
+    // page — on a clock the flow itself pinned to midnight with `setClock` —
+    // said "Good morning, ผู้ดูแลระบบ". Six cases of one catalog failed on
+    // that single line (ec10, 2026-09-02) about an application that had
+    // signed the admin in perfectly well. The greeting is not the fact; the
+    // name after it is, so the selector is re-matched on the name alone. Free,
+    // deterministic, and recorded as `narrow` — re-matched against the page
+    // text — so the report says the wording moved.
+    const ungreeted = withoutGreeting(selector);
+    if (ungreeted) {
+      try {
+        const value = await run(this.page.locator(ungreeted), this.#fastTimeoutMs);
+        this.bundle.note(
+          `${selector}: matched on the name alone — the page greets by time of day, and ` +
+            `the greeting is not the fact this step proves (resolved as ${ungreeted})`,
+        );
+        return { value, resolution: 'narrow', resolvedSelector: ungreeted };
+      } catch (error) {
+        attempts.push(`greeting "${ungreeted}": ${describe(error)}`);
       }
     }
 
@@ -5144,9 +5457,185 @@ export class SmartRunner {
     const triaged = await this.#agentTriage(action, selector, intent, expected, run, attempts);
     if (triaged !== null) return triaged;
 
+    // 5. **Entry of last resort.** Everything above re-runs the AUTHOR'S OWN
+    // selector, which is the right rule while the selector is merely hard to
+    // reach — and the wrong one when the selector names a control the page
+    // does not have. Live (ec10 HIR-EC-001, 2026-09-02): the flow keyed a Hire
+    // Date into `role=textbox[name="Select date" i] >> nth=0` and chose an
+    // Event Reason from `role=combobox[name="Event Reason" i]`; the agent's
+    // look reported, correctly, that no `combobox` role exists on that page at
+    // all — the control is a `button`. Three input steps burned 190 seconds
+    // and the case never entered a single value, so nothing after it meant
+    // anything. Asked for 2026-09-02.
+    //
+    // So for an INPUT step only, the agent is asked to put the value in by
+    // whatever the page actually offers, keyboard and paste included, and the
+    // result is judged by READING THE VALUE BACK rather than by re-running a
+    // selector already known not to resolve.
+    const entered = await this.#agentEnter(action, selector, intent, entry, attempts);
+    if (entered !== null) return entered;
+
     const failure = new StepResolutionError(selector, attempts);
     if (rejectedHeals?.length) failure.rejectedHeals = rejectedHeals;
     throw failure;
+  }
+
+  /**
+   * Put the value in by whatever the page actually offers — the entry rung.
+   *
+   * Every other rung ends by re-running the author's own selector, which is
+   * exactly right while that selector is merely hard to reach. It is useless
+   * when the selector names a control the page does not have: re-running
+   * `role=combobox[name="Event Reason" i]` on a page whose Event Reason is a
+   * `button` fails however well the agent understood the form.
+   *
+   * So this rung asks for the OUTCOME rather than the action: set this field
+   * to this value, with the whole input vocabulary including keyboard and
+   * paste. What decides it is a read-back of the value — from the author's
+   * selector if it resolves now, otherwise from the control the agent last
+   * acted on. A step that passes here is recorded `agent`, and a runtime
+   * defect says the flow's selector needs rewriting, because paying a model
+   * to rediscover the same field every run is a cost, not a fix.
+   *
+   * Gated by `--agent-assist` for the same reason the repair stage is: it
+   * types into someone's application.
+   */
+  /**
+   * Is the resolved element a read-only field, and is there an editable input
+   * beside it that the label really points at? Bounded, never throws — a page
+   * that cannot answer is simply not this case.
+   */
+  async #readOnlyShell(
+    selector: string,
+  ): Promise<{ sibling: string | null; siblingType: string | null } | null> {
+    try {
+      const shell = this.page.locator(selector).first();
+      const state = await shell.evaluate(
+        (el) => {
+          const node = el as unknown as { readOnly?: boolean; tagName?: string };
+          return { readOnly: node.readOnly === true, tag: node.tagName ?? '' };
+        },
+        undefined,
+        { timeout: this.#fastTimeoutMs },
+      );
+      if (!state.readOnly) return null;
+      const sibling = `${selector} >> xpath=.. >> input:not([readonly]):not([type="hidden"]):not([disabled])`;
+      const count = await this.page.locator(sibling).count();
+      if (count !== 1) return { sibling: null, siblingType: null };
+      const type = await this.page
+        .locator(sibling)
+        .first()
+        .evaluate((el) => ((el as unknown as { type?: string }).type ?? '').toLowerCase(), undefined, {
+          timeout: this.#fastTimeoutMs,
+        })
+        .catch(() => '');
+      return { sibling, siblingType: type };
+    } catch {
+      return null;
+    }
+  }
+
+  async #agentEnter(
+    action: string,
+    selector: string,
+    intent: string | undefined,
+    entry: string | undefined,
+    attempts: string[],
+  ): Promise<ResolveResult<unknown> | null> {
+    // Not gated by --agent-assist, unlike the repair stage above it: that
+    // stage CHANGES the application on its own initiative, whereas this one
+    // performs the very write the flow's own step already asked for. The
+    // step is the authorisation; the read-back is the check.
+    if (entry === undefined || this.#agent === null) return null;
+
+    const what = intent && intent.trim() !== '' ? intent.trim() : `${action} ${selector}`;
+    const goal =
+      `The test could not put a value into this control with its own selector, and that selector ` +
+      `may name a role this page does not use. Put the value in, using whatever the page really ` +
+      `offers, then stop.\n` +
+      `WHAT THE STEP IS FOR: ${what}\n` +
+      `THE SELECTOR THAT FAILED: ${selector}\n` +
+      `THE VALUE TO ENTER: ${JSON.stringify(entry)}\n` +
+      `You may fill, type key by key, choose an option, press keys, or paste — paste inserts the ` +
+      `whole value at once and is the way into a control that refuses both an assignment and ` +
+      `typing, such as a date picker or a masked field. Read the control first if you are unsure ` +
+      `what it is. Do not submit the form, and change nothing else. Call finish once the control ` +
+      `holds the value.`;
+
+    let record: AgentRecord;
+    try {
+      record = await this.#agent.run(this.page, goal, {
+        memory: cacheAgentMemory(this.#cache),
+        caseContext: this.#caseContext,
+      });
+    } catch (error) {
+      attempts.push(`agent-enter: ${describe(error)}`);
+      return null;
+    }
+
+    // **The agent's word is not the evidence.** Read the value back — from the
+    // author's selector if it resolves now, else from the control the agent
+    // last acted on successfully.
+    const acted = [...(record.actions ?? [])]
+      .reverse()
+      .find((a) => a.ok && typeof a.selector === 'string' && a.selector !== '');
+    const candidates = [selector, acted?.selector].filter(
+      (c): c is string => typeof c === 'string' && c !== '',
+    );
+    for (const candidate of candidates) {
+      const held = await this.#readEntered(candidate);
+      if (held === null) continue;
+      if (!valueMatches(entry, held)) continue;
+      this.#recordRuntimeDefect(
+        'usability',
+        'medium',
+        'A value could only be entered after the agent found the control',
+        `"${selector}" could not take ${JSON.stringify(entry)}; the agent entered it via ` +
+          `${JSON.stringify(candidate)} (${record.summary || 'no summary'}). Rewrite the step ` +
+          'against the control the page actually renders, so the run stops paying a model to ' +
+          'rediscover it.',
+        selector,
+      );
+      attempts.push(`agent-enter: entered via "${candidate}", read back as ${JSON.stringify(held)}`);
+      return { value: undefined, resolution: 'agent', resolvedSelector: candidate, agent: record };
+    }
+    attempts.push(
+      `agent-enter: the value was not in the control afterwards (${record.summary || 'no summary'})`,
+    );
+    return null;
+  }
+
+  /**
+   * What a control currently holds, as text — an input's `value`, a
+   * select's chosen label, or the element's own text for a custom control
+   * that renders its choice. `null` when nothing could be read.
+   */
+  async #readEntered(selector: string): Promise<string | null> {
+    try {
+      const locator = this.page.locator(selector).first();
+      const held = await locator.evaluate(
+        (el) => {
+          const node = el as unknown as {
+            value?: unknown;
+            selectedOptions?: ArrayLike<{ label?: string }>;
+            getAttribute?: (name: string) => string | null;
+            innerText?: string;
+            textContent?: string;
+          };
+          const chosen = node.selectedOptions?.[0]?.label;
+          if (typeof chosen === 'string' && chosen !== '') return chosen;
+          if (typeof node.value === 'string' && node.value !== '') return node.value;
+          const aria = node.getAttribute?.('aria-valuetext') ?? node.getAttribute?.('value');
+          if (typeof aria === 'string' && aria !== '') return aria;
+          return node.innerText ?? node.textContent ?? '';
+        },
+        undefined,
+        { timeout: this.#fastTimeoutMs },
+      );
+      return typeof held === 'string' ? held : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -5299,7 +5788,7 @@ export class SmartRunner {
     // The author's own selector, and its free variants — exactly the
     // `#agentRescue` contract. Whatever the agent says it did, this is what
     // decides the step.
-    for (const candidate of [selector, relaxRoleName(selector), qualifyBareRole(selector)]) {
+    for (const candidate of [selector, relaxRoleName(selector), qualifyBareRole(selector), withoutGreeting(selector)]) {
       if (candidate === null) continue;
       try {
         const value = (await run(this.page.locator(candidate), this.#healedTimeoutMs)) as T;
@@ -5615,14 +6104,14 @@ export type FlowStep =
       else?: FlowStep[] | undefined;
       intent?: string | undefined;
     }
-  | { action: 'fill'; selector: string; value: string; intent?: string | undefined }
+  | { action: 'fill'; selector: string; value: string; intent?: string | undefined; valueSource?: StepValueSource | undefined }
   /** Choose a dropdown option by its visible label — native `<select>` or custom combobox. */
-  | { action: 'selectOption'; selector: string; value: string; intent?: string | undefined }
+  | { action: 'selectOption'; selector: string; value: string; intent?: string | undefined; valueSource?: StepValueSource | undefined }
   /** Tick / untick a checkbox, radio, or ARIA toggle, verifying the state changed. */
   | { action: 'check'; selector: string; intent?: string | undefined }
   | { action: 'uncheck'; selector: string; intent?: string | undefined }
   /** Type key by key — for autocomplete/typeahead/masked fields `fill` cannot wake. */
-  | { action: 'type'; selector: string; value: string; intent?: string | undefined }
+  | { action: 'type'; selector: string; value: string; intent?: string | undefined; valueSource?: StepValueSource | undefined }
   | { action: 'waitFor'; selector: string; intent?: string | undefined }
   /**
    * Hand the browser to the agent until `goal` is satisfied. `script` is a
@@ -6589,10 +7078,10 @@ async function executeStep(
         await runner.click(step.selector, step.intent);
         break;
       case 'fill':
-        await runner.fill(step.selector, step.value, step.intent);
+        await runner.fill(step.selector, step.value, step.intent, step.valueSource);
         break;
       case 'selectOption':
-        await runner.selectOption(step.selector, step.value, step.intent);
+        await runner.selectOption(step.selector, step.value, step.intent, step.valueSource);
         break;
       case 'check':
         await runner.check(step.selector, step.intent);
@@ -6601,7 +7090,7 @@ async function executeStep(
         await runner.uncheck(step.selector, step.intent);
         break;
       case 'type':
-        await runner.type(step.selector, step.value, step.intent);
+        await runner.type(step.selector, step.value, step.intent, step.valueSource);
         break;
       case 'waitFor':
         await runner.waitFor(step.selector, step.intent);
@@ -6832,9 +7321,15 @@ export interface RunFlowOptions {
   sessionVault?: SessionVault | undefined;
 
   screenshots?: ScreenshotMode | undefined;
+  /** See `SmartRunnerOptions.highlightTarget`. */
+  highlightTarget?: boolean | undefined;
+  /** See `SmartRunnerOptions.dbBaselineProbe`. */
+  dbBaselineProbe?: DbBaselineProbe | undefined;
   captureDelayMs?: number | undefined;
   /** Let the agent make an unreachable control reachable. Default false. */
   agentAssist?: boolean | undefined;
+  /** See `SmartRunnerOptions.agentMaxSteps`. */
+  agentMaxSteps?: number | undefined;
   /**
    * Whether this run may exercise the backend at all. Default `true` — the
    * behaviour every run had before the toggle existed. `false` and no HTTP or
@@ -6966,6 +7461,7 @@ async function executeApiSteps(
   issues: StepIssue[],
   bundle?: ProofBundleBuilder,
   dataGate?: DataGate | null,
+  dbBaselineProbe?: DbBaselineProbe | null,
 ): Promise<void> {
   for (const step of steps) {
     // The same step-level data lock the browser path takes — a browser-free
@@ -7012,6 +7508,13 @@ async function executeApiSteps(
             `"${step.action}" needs a browser; this flow was run without one because every ` +
               'other step was an API or DB step',
           );
+      }
+      if (dbBaselineProbe && (API_STEP_ACTIONS.has(step.action) || DB_STEP_ACTIONS.has(step.action))) {
+        try {
+          bundle?.annotateDbChanges(await dbBaselineProbe.probe(), undefined);
+        } catch (probeError) {
+          bundle?.annotateDbChanges(undefined, probeError instanceof Error ? (probeError.message.split('\n')[0] ?? '') : String(probeError));
+        }
       }
     } catch (error) {
       const kind = classifyStepFailure(step.action, error);
@@ -7067,6 +7570,7 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
     polarity: apiPolarity.polarity,
     polaritySource: apiPolarity.source,
   });
+  if (options.dbBaselineProbe) bundle.setDbBaseline(options.dbBaselineProbe.summary());
   if (options.defects?.length) bundle.addDefects(options.defects);
 
   let defectSeq = 0;
@@ -7110,13 +7614,13 @@ export async function runApiFlow(flow: Flow, options: RunFlowOptions = {}): Prom
   const gate = options.dataGate?.(flow) ?? null;
   try {
     if (flow.setup?.length) {
-      await executeApiSteps(api, db, flow.setup, flow.baseUrl, issues, bundle, gate);
+      await executeApiSteps(api, db, flow.setup, flow.baseUrl, issues, bundle, gate, options.dbBaselineProbe);
     }
-    await executeApiSteps(api, db, flow.steps, flow.baseUrl, issues, bundle, gate);
+    await executeApiSteps(api, db, flow.steps, flow.baseUrl, issues, bundle, gate, options.dbBaselineProbe);
     // Teardown still always runs — its job is to clean up regardless of how
     // the body went, and that reasoning has nothing to do with browsers.
     if (flow.teardown?.length) {
-      await executeApiSteps(api, db, flow.teardown, flow.baseUrl, issues, bundle, gate);
+      await executeApiSteps(api, db, flow.teardown, flow.baseUrl, issues, bundle, gate, options.dbBaselineProbe);
     }
   } finally {
     gate?.releaseAll();
@@ -7296,8 +7800,11 @@ export async function runFlow(
       inheritSession: options.inheritSession ?? !signsInItself(flow),
       flowSignsInItself: signsInItself(flow),
       screenshots: options.screenshots,
+      highlightTarget: options.highlightTarget,
+      dbBaselineProbe: options.dbBaselineProbe,
       captureDelayMs: options.captureDelayMs,
       agentAssist: options.agentAssist,
+      agentMaxSteps: options.agentMaxSteps,
       // Forwarded explicitly, like everything else here. `connect` takes a
       // fresh object rather than this one, so a field added to
       // `RunFlowOptions` and not listed here reaches the runner as undefined

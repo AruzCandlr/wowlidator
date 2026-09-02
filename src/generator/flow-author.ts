@@ -32,7 +32,19 @@ import { BACKEND_TIER_ACTIONS } from '../engine/proof-bundle.js';
 
 import { SELECTOR_SYNTAX_RULES, captureAxTree } from '../healer/jit-healer.js';
 import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
-import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
+import { withQualifiedRole, withRelaxedRoleName, withStableGreeting } from '../engine/selector.js';
+import {
+  PLACEHOLDER_TOKEN,
+  formatStatedFor,
+  fromDb,
+  fromRepo,
+  fromTestData,
+  resolveValues,
+  type ValueNeed,
+  type ValueResolutionContext,
+  type ValueResolverModel,
+} from './value-resolution.js';
+import { fieldNamesIn } from '../engine/runner.js';
 import { matchesRoutePattern } from '../context/context-engine.js';
 import { nearestRoutes, pathnameOf, routeIsDeclared } from '../context/route-match.js';
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
@@ -44,6 +56,7 @@ import {
 } from '../providers/llm-factory.js';
 import { hasAssertion } from '../engine/runner.js';
 import { vacuousClaim } from './vacuous.js';
+import { describeUnprovedExclusivity, unprovedExclusivity } from './exclusivity.js';
 import type { Flow, FlowStep } from '../engine/runner.js';
 import { DEFAULT_MUTATION_POLICY, type MutationPolicy } from './test-generator.js';
 import type { FlowReviewer, ReviewRecord } from './flow-review.js';
@@ -549,12 +562,19 @@ ${DETERMINISM_RULES}
 
 ${procedure('HOW TO BUILD THE FLOW', [
   'Read the request and write down, for yourself: the persona and its exact credentials; the page or route under test; each CLAIM the request makes (one per line of its Expected output, or one per sentence that asserts something); any date the claim depends on; anything the request says is already true.',
-  'setup = sign in (SIGNING IN, below), reach the page under test, and assert WHO is signed in. Nothing else goes in setup. If a date matters, setClock is the FIRST step of setup, before the first goto.',
+  'setup = sign in (SIGNING IN, below), reach the page under test, and assert WHO is signed in — by the persona\'s NAME as the chrome renders it (text=ผู้ดูแลระบบ), NEVER by a time-of-day greeting: "Good morning/afternoon" follows the clock, and setClock moves the clock. Nothing else goes in setup. If a date matters, setClock is the FIRST step of setup, before the first goto.',
   'EVERY TEST CASE HAS SOMETHING TO TEST — always. A body step that runs against the sign-in page is YOUR error, never a fact about the feature: the sign-in in setup must be complete (fill every field the form has, submit, prove it took) and the flow must have navigated to the page under test before the first body step. And never conclude a case cannot be tested: when the exact expected value is out of reach, assert the closest observable fact the page offers — the named element exists, the count reads as a number, the label the spec owns is rendered — and say in "notes" what was narrowed and why. A flow that tests nothing is not an answer.',
   'One case per claim. The case name is the request\'s own case id VERBATIM (TC_01_01, API_02_03 …); when the request lists several independent claims under one id, suffix them " / 1", " / 2" in the order the request states them. Never invent a case name when the request has an id, and never merge two claims into one case.',
+  'THE CASE\'S "Steps" COLUMN IS A SCRIPT TO PERFORM, NOT BACKGROUND TO READ. When the request carries one, carry out its numbered steps IN ORDER with the Test data\'s own values: กรอก/คีย์/enter → fill, เลือก → selectOption or click, กด/click → click, Submit → the submit control. Asserting that a field EXISTS is not performing the step that fills it, and a flow that inspects the empty form has not run the case. The claim of a key-in case is what the system does AFTER the data is entered and submitted — you cannot reach it without entering the data. Only where a step is genuinely impossible here (a value no tree and no document supplies) do you skip it, and then the step\'s intent says which numbered step was skipped and why.',
   'For each case: the fewest steps that reach the claim, then the assertion(s) that would FAIL if the claim were false — nothing that passes either way. The sign-in proof and an expectUrl are PREPARATION, never the claim: EVERY numbered line of the Expected output (6.1, 6.2, …) gets its own assertion in the page terms that line names — the very element the line speaks of (the count box it names, the message it quotes, the option list it lists) — and the step\'s intent cites that line\'s number. A backend check may CORROBORATE a line, never replace it: a line about an on-screen number is proved by reading that number on screen. A case whose only assertions are the sign-in proof and a URL is refused.',
+  '"ONLY" MEANS ONLY. When an Expected line says the page shows ONLY / JUST / EXACTLY / NOTHING BUT the items it lists — English "only", "just", "exactly", "solely", "no other"; Thai "เฉพาะ", "แสดงเฉพาะ", "แค่", "เพียง", "เท่านั้น" — it is a claim about the WHOLE set, and the whole set is proved by COUNTING it: open the list, then expectCount on the ITEM role the opened list exposes in the tree or probe report (role=option, role=menuitem, the buttons inside the listbox …) with "value" = the number the line enumerates ("3 ค่า" → 3; "New Hire / Replacement / Migration" → 3), PLUS expectVisible of each listed item, PLUS expectHidden of any item the line names as absent. expectVisible of the listed items and expectHidden of the named absentees ALONE are refused: they pass when a fourth, unlisted item appears, which is exactly what the line forbids. When no tree or probe shows the item role, count what it does show for one open item and say so in "notes" — never drop the count.',
+  'THE CONTROL IS THE ONE THE LABEL POINTS AT, WITH THE ROLE THE TREE SHOWS. A textbox whose name is a PLACEHOLDER ("Select date", "เลือกวันที่", "Search…") is usually a read-only display drawn over the real input — fill the textbox named by the field\'s LABEL instead (textbox "Hire Date", not textbox "Select date"). A date input takes its value as YYYY-MM-DD (2027-09-01), never as the page displays it. And a dropdown that the tree lists as a button (aria-haspopup) is a button: selectOption on role=button[name="Event Reason" i], never role=combobox — invent no role the tree did not show.',
   'Every selector comes from a tree you were given, in the canonical form. When the control appears in NO tree but WHAT THE REPOSITORY DECLARES names its rendered string (a component\'s words, a message catalog\'s value), write the step deterministically against that string — role + declared label, e.g. role=button[name="Create Plan" i], expectText quoting the declared value. Only when neither a tree nor the repository declares the control may the leg be a workflow step (WORKFLOW GOALS, below) — deterministic steps cost $0 and run in milliseconds; an agent leg costs model calls per turn.',
+  'AN OPEN QUESTION IS NOT AN EXPECTED VALUE: a case that writes "= ?" followed by an id (OQ-HIR-140, CF-SIT-19) is saying NOBODY KNOWS YET and asking the tester to read the answer off the run. Never assert the id, and never invent the answer. Assert the fact around it that the case does state — the field is there, the notice appears, the record was created — and let the run record the rest.',
+  'AN ANGLE-BRACKET TOKEN IS A PLACEHOLDER, NEVER A VALUE — AND NOT YOURS TO INVENT. <HR_ADMIN_ACCOUNT>, <NON_EXISTING_EMPLOYEE_ID>, <VALID_EMPLOYEE_ID> stand for something the tester supplies. Write the step with the TOKEN LEFT IN PLACE as its value: the harness resolves it after you — from the Test data, from the repository and documents, from the database (proving a NON_EXISTING id really is absent), or by generating one — and records on the step where the value came from. If you resolve it yourself the provenance is lost and a made-up id is reported as if it were data. Never type the token\'s text into a field as if it were the value, and never invent a replacement.',
+  'EVERY NUMBERED STEP OF THE SCRIPT IS PERFORMED, THROUGH THE LAST ONE. The claim of a key-in case lives in its final steps — Submit, then the profile check — so a flow that stops after step 3 of 7 has verified a form and proved nothing about the hire. Cite the step in each intent ("Step 5: …"); if a step truly cannot be performed here, write a step whose intent says "skipped step N: <why>" so the gap is visible, never silent.',
   'EXPECTED VALUES ARE QUOTED, NEVER INVENTED: every value an assertion carries comes verbatim from the case (its Expected output, Test data or Note), from a document section, or from WHAT THE REPOSITORY DECLARES — in that order of authority. When the Expected output is too vague to assert (no value, no label, no message), take the anchor from the Note or the documents; when none of them holds one, say so in "notes" and assert the observable shape (the named element exists and holds a number) rather than inventing a value.',
+  'A CLAIM OF "ONLY" OR OF AN EXACT COUNT IS A COUNT, NOT A LIST OF PRESENCES. "dropdown แสดง 3 ค่า", "แสดงเฉพาะ A / B / C", "only these options", "exactly 3" means: A, B and C are offered AND NOTHING ELSE IS. Three expectVisible steps pass whether or not a fourth option exists — they cannot fail on the defect the claim is about. Author it as: open the control, expectCount of its options (role=option, 3), then expectVisible of each named value; an "ไม่แสดง X" line is an expectHidden of X on top of the count, never instead of it.',
   'A CLAIM THAT TWO READINGS AGREE IS TWO READINGS, COMPARED: "the tile matches the table", "the summary equals the column count", "the number does not change after the action" is NEVER proved by asserting one side exists. Author it as saveCount (or saveText) of one surface into a named variable — the variable NAME goes in the step\'s "value" field — then expectCount/expectText on the other surface carrying {{that-name}} — and for a no-change claim, save BEFORE the action and compare the same reading AFTER. A number printed in the Expected output ("1-15 of 43") is an illustration from the sheet-writer\'s data, never a value to assert; the saved reading is the value.',
   'Run the checklist at the end of these instructions and fix what fails.',
 ])}
@@ -964,6 +984,7 @@ ${SELECTOR_SYNTAX_RULES}
 ${selfCheck([
   'Every case has at least one expect* step, and each would FAIL if its claim were false.',
   'When the request states an expected concrete value — a date, a number, an amount, an exact label ("the extension date should be 18 Nov 2026", "the tile shows at least 1") — that exact value is what an expect* step asserts; asserting that the field or card is merely visible is the claim going untested. If the request itself says the value currently comes out wrong (a KNOWN FAIL note), assert the value the claim REQUIRES, so the run reports the failure the note describes.',
+  'Every Expected line that says ONLY / JUST / EXACTLY / เฉพาะ / แค่ / เพียง / เท่านั้น about a set of items has an expectCount of that set equal to the number the line enumerates — presence and hidden checks alone do not satisfy it.',
   'Case names are the request\'s own case ids, verbatim; body steps of one case are contiguous.',
   'Nothing sits between the credential fills and the submit click — no assertion, no wait, no goto.',
   'A two-step sign-in has fill identity → click Next → fill input[type="password"] → click submit; a consent gate is a clickIfVisible right after the submit; then the login proof — expectHidden of the submit control, or an expectUrl of a path the evidence states outright, never one inferred; then goto the page under test.',
@@ -1388,9 +1409,13 @@ function toFlowStep(
   // ASCII first: models typeset ids like RULE‑FUEL‑002 with it (run 4's
   // DB_08_01, live), no DOM renders ids that way, and a selector quoting the
   // fancy glyph can never match the ASCII row it means.
+  // A time-of-day greeting is never the fact a step proves — the page chooses
+  // it by the clock, and the flow's own `setClock` moves the clock — so a
+  // selector quoting one is written against the name after it instead
+  // (`withoutGreeting`; ec10, 2026-09-02: six false failures on one line).
   const selector = needsSelector
     ? ''
-    : withRelaxedRoleName(withQualifiedRole(fromTreeNotation(raw.selector.replace(/‑/g, '-'))));
+    : withStableGreeting(withRelaxedRoleName(withQualifiedRole(fromTreeNotation(raw.selector.replace(/‑/g, '-')))));
 
   switch (raw.action) {
     case 'goto':
@@ -1893,6 +1918,20 @@ export interface FlowAuthorOptions {
    * flow is exactly what the author wrote. See `flow-review.ts`.
    */
   reviewer?: FlowReviewer | undefined;
+  /**
+   * Resolve the values a sheet leaves as tokens (`<NON_EXISTING_EMPLOYEE_ID>`)
+   * or descriptions before the lints see them — from the case's own text, the
+   * documents and repository, the database (read-only), or, flagged, from the
+   * generator itself. See `value-resolution.ts`. Absent = off: a token is
+   * refused by `typesPlaceholderToken` as before.
+   */
+  valueResolution?:
+    | {
+        model: ValueResolverModel | null;
+        db?: (() => Promise<import('../db/client.js').DbClient | null>) | undefined;
+        documents?: readonly import('../catalog/extract.js').ExtractedDocument[] | undefined;
+      }
+    | undefined;
   /** Called at each authoring lifecycle event — for live progress output. */
   onLog?: ((line: string) => void) | undefined;
 }
@@ -1915,6 +1954,7 @@ export class FlowAuthor {
   readonly #declaredOperations: readonly string[];
   readonly #backend: boolean;
   readonly #reviewer: FlowReviewer | undefined;
+  readonly #valueResolution: FlowAuthorOptions['valueResolution'];
   readonly #attempts: number;
   /**
    * Refusals this AUTHOR has already seen, across every row it has written —
@@ -1945,6 +1985,7 @@ export class FlowAuthor {
     this.#declaredOperations = options.declaredOperations ?? [];
     this.#backend = options.backend ?? true;
     this.#reviewer = options.reviewer;
+    this.#valueResolution = options.valueResolution;
     this.#onLog = options.onLog;
   }
 
@@ -1982,6 +2023,54 @@ export class FlowAuthor {
    * on screen. Without it the flow is shape-correct but its selectors are
    * guesses, and `grounded` says so.
    */
+  /**
+   * For every "skipped step N: <why>" the flow carries, the field the reason
+   * says was missing and the value the repo/db sources can supply for it.
+   * Only when the reason speaks of a missing value/id; a step skipped for any
+   * other reason (needs another module, destructive) is left alone.
+   */
+  async #valuesForSkippedSteps(
+    steps: readonly FlowStep[],
+    caseText: string,
+    promptText: string,
+    projectContext: string | undefined,
+  ): Promise<{ step: number; field: string; value: string; source: string }[]> {
+    if (this.#valueResolution === undefined) return [];
+    const out: { step: number; field: string; value: string; source: string }[] = [];
+    const seen = new Set<number>();
+    for (const step of steps) {
+      const intent = (step as { intent?: unknown }).intent;
+      if (typeof intent !== 'string') continue;
+      for (const m of intent.matchAll(/skip(?:ped)?\s+step\s+(\d{1,2})\s*(?:\(([^)]*)\))?\s*[:—-]?\s*([^.;]*)/gi)) {
+        const n = Number(m[1]);
+        if (seen.has(n)) continue;
+        const reason = `${m[2] ?? ''} ${m[3] ?? ''}`;
+        if (!/\b(no|without|missing|lack|unknown|not (?:yet )?exist|ไม่มี|ไม่ทราบ)\b/i.test(reason) || !/\b(id|value|employee|code|number|record)\b/i.test(reason)) continue;
+        const field = fieldNamesIn(reason)[0] ?? fieldNamesIn(intent)[0];
+        if (field === undefined) continue;
+        seen.add(n);
+        const need: ValueNeed = { section: 'steps', index: -1, field, token: null, nonExisting: false, format: formatStatedFor(field, caseText) };
+        const ctx: ValueResolutionContext = {
+          caseText,
+          promptText,
+          model: this.#valueResolution.model,
+          ...(this.#valueResolution.db === undefined ? {} : { db: this.#valueResolution.db }),
+          ...(this.#valueResolution.documents === undefined ? {} : { documents: this.#valueResolution.documents }),
+          ...(projectContext === undefined ? {} : { projectContext }),
+          onLog: (line) => this.#onLog?.(line),
+        };
+        let answer = fromTestData(need, caseText);
+        answer ??= await fromRepo(need, ctx).catch(() => null);
+        answer ??= await fromDb(need, ctx).catch(() => null);
+        if (answer !== null) {
+          this.#onLog?.(`  step ${n} was skipped for want of ${field}; ${answer.source.kind} has ${answer.value} — asking again`);
+          out.push({ step: n, field, value: answer.value, source: `${answer.source.kind}: ${answer.source.detail}` });
+        }
+      }
+    }
+    return out;
+  }
+
   async author(
     prompt: string,
     page?: Page,
@@ -2007,6 +2096,21 @@ export class FlowAuthor {
        * The judge already knew the answer; it used to only shorten retries.
        */
       priorFeedback?: readonly string[] | undefined;
+      /**
+       * This row was already refused once for asserting text the captured
+       * trees do not render. A second strict pass would refuse it again for
+       * the same reason — the page it needs was never captured — so the
+       * tree-grounding lint is `weak` for this call: the flow is handed over
+       * with the note, and the RUN proves or dead-ends the wording against
+       * the real page. Set by the catalog's resume for refused rows only.
+       */
+      lenientGrounding?: boolean | undefined;
+      /**
+       * The case's own words, separated from the retrieved background. What
+       * decides whether this is a claim about WORDING — see
+       * `wordingClaimAssertsDataValue`.
+       */
+      caseText?: string | undefined;
     } = {},
   ): Promise<AuthoredFlow> {
     const trimmed = prompt.trim();
@@ -2226,6 +2330,66 @@ export class FlowAuthor {
         }
       }
 
+      // **Values before lints** (2026-09-02). A token the sheet left in place
+      // of a value is resolved here — test data, documents/repository, the
+      // database, or a flagged stand-in — so `typesPlaceholderToken` below is
+      // the backstop for what nothing could answer, not the first word. Never
+      // fatal: a stage that throws leaves the steps as authored.
+      const skippedStepComplaints: Violation[] = [];
+      if (this.#valueResolution !== undefined && result.steps.length > 0) {
+        try {
+          const ctx: ValueResolutionContext = {
+            caseText: extra.caseText ?? trimmed,
+            promptText: trimmed,
+            model: this.#valueResolution.model,
+            ...(this.#valueResolution.db === undefined ? {} : { db: this.#valueResolution.db }),
+            ...(this.#valueResolution.documents === undefined ? {} : { documents: this.#valueResolution.documents }),
+            ...((extra.projectContext ?? this.#projectContext) === undefined ? {} : { projectContext: extra.projectContext ?? this.#projectContext }),
+            onLog: (line) => this.#onLog?.(line),
+          };
+          const outcome = await resolveValues(result.setup ?? [], result.steps, ctx);
+          if (outcome.resolved.length > 0) {
+            result.setup = outcome.setup;
+            result.steps = outcome.steps;
+            const flagged = outcome.resolved.filter((r) => r.source.kind === 'generated');
+            const note =
+              `${outcome.resolved.length} value(s) resolved before the lints` +
+              (flagged.length > 0 ? `; ${flagged.length} GENERATED by the author: ${flagged.map((r) => `${r.need.field}=${r.value}`).join(', ')}` : '');
+            result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
+          }
+        } catch (error) {
+          this.#onLog?.(`value resolution did not run: ${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}`);
+        }
+
+        // **A step skipped for want of a value is not skipped if a source has
+        // the value.** The skip marker exists for steps that truly cannot be
+        // performed; measured on ec10_2x HIR-EC-012 it became the escape hatch:
+        // "skipped step 4 (Verify a real Replaced Employee ID): no valid id
+        // exists to key in here" — while the database beside the app held
+        // hundreds. Then steps 6 and 7 were skipped BECAUSE step 4 was, and
+        // the case's claim went untested. So each skipped step's reason is
+        // read for the field it lacks, the repo and db sources are asked, and
+        // a value they supply goes back to the model as a refusal it must act
+        // on — fatal on the first attempts, accepted with a note on the last.
+        // Collected here, filed once `refuse` exists below: this block runs
+        // before the lint scope that defines it.
+        try {
+          const supplied = await this.#valuesForSkippedSteps(result.steps, extra.caseText ?? trimmed, trimmed, extra.projectContext);
+          for (const found of supplied) {
+            skippedStepComplaints.push({
+              message:
+                `the authored flow "${result.name}" skips step ${found.step} for want of a value, but a source ` +
+                `has one: ${found.field} = ${found.value} (${found.source}). Author step ${found.step} with that ` +
+                'value, and the steps that were skipped only because it was missing.',
+              severity: 'weak',
+              note: `step ${found.step} skipped although ${found.field} = ${found.value} was available from ${found.source}`,
+            });
+          }
+        } catch (error) {
+          this.#onLog?.(`skipped-step lookup did not run: ${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}`);
+        }
+      }
+
       try {
         // Every lint runs and every complaint is collected before anything is
         // thrown. Stopping at the first one cost a whole attempt per problem
@@ -2244,6 +2408,7 @@ export class FlowAuthor {
             note: options.note ?? message,
           });
         };
+        violations.push(...skippedStepComplaints);
 
         // Same bar the generator holds itself to: a flow that asserts nothing
         // passes whether or not the feature works. Refusing is the point —
@@ -2365,6 +2530,7 @@ export class FlowAuthor {
           [...(result.setup ?? []), ...result.steps],
           evidenceTree ?? '',
           extra.projectContext ?? this.#projectContext,
+          extra.caseText,
         );
         if (wordingOnData !== null) {
           refuse(
@@ -2375,6 +2541,76 @@ export class FlowAuthor {
               'a correctly worded page. Assert the labels the spec owns — the heading, breadcrumb, ' +
               "column headers, button and filter labels — quoting each from the test case's words or " +
               'from a heading/label node of the tree.',
+          );
+        }
+
+        // The case's own script, carried out — see `skipsAuthoredScript`. Only
+        // the BODY counts: a sign-in's fills are preparation, never the case.
+        const skipped =
+          extra.caseText === undefined ? null : skipsAuthoredScript(extra.caseText, result.steps);
+        if (skipped !== null) {
+          refuse(
+            `the authored flow "${result.name}" never performs the data entry its case scripts: the ` +
+              `case's Steps say ${JSON.stringify(skipped.demanded)}, and the flow's body performs nothing ` +
+              'of the kind — no fill, type, selectOption, check, click or workflow leg — it opens the page ' +
+              'and asserts that things exist. A case is about what the system does AFTER its steps are ' +
+              "carried out, so a page that merely exists proves nothing either way. Carry out the case's numbered " +
+              "steps in order, with the Test data's own values, then assert the Expected output on the " +
+              'result. If a step truly cannot be performed here, say so in the step intent rather than ' +
+              'dropping it.',
+          );
+        }
+
+        const readOnlyFill = fillsReadOnlyNode([...(result.setup ?? []), ...result.steps], evidenceTree);
+        if (readOnlyFill !== null) {
+          refuse(
+            `the authored flow "${result.name}" fills textbox ${JSON.stringify(readOnlyFill.name)} (step ` +
+              `${readOnlyFill.index}), which the tree marks READONLY — that is the picker's display, not its ` +
+              'input, and a fill there waits out its timeout and enters nothing. The input is the textbox named ' +
+              "by the field's LABEL" +
+              (readOnlyFill.writable.length > 0
+                ? ` — the tree offers: ${readOnlyFill.writable.map((w) => JSON.stringify(w)).join(', ')}`
+                : '') +
+              '. Fill that one, and give a date input its value as YYYY-MM-DD.',
+          );
+        }
+
+        const token = typesPlaceholderToken([...(result.setup ?? []), ...result.steps]);
+        if (token !== null) {
+          refuse(
+            `the authored flow "${result.name}" ${token.action}s the literal token ${JSON.stringify(token.token)} ` +
+              `(step ${token.index}) — that is the sheet's PLACEHOLDER for a value the tester supplies, not the ` +
+              'value. Resolve it: from the Test data when it names the real value, from the run\'s own ' +
+              'credentials for an account, and for a NON_EXISTING / INVALID token from the format the case ' +
+              'states — a well-formed value the system must reject (an 8-digit Employee ID that cannot exist). ' +
+              'Typing the token tests the API\'s handling of angle brackets, which is not the case.',
+          );
+        }
+
+        // The whole script, through its last step — see `unperformedScriptSteps`.
+        const unperformed =
+          extra.caseText === undefined ? null : unperformedScriptSteps(extra.caseText, result.steps);
+        if (unperformed !== null) {
+          refuse(
+            `the authored flow "${result.name}" performs the case's script only through step ` +
+              `${unperformed.performedThrough} of ${unperformed.total} — it never reaches: ` +
+              unperformed.missing.map((m) => `${m.n}. ${m.text}`).join(' · ') +
+              ". The case's claim lives in its LAST steps (Submit, then the profile check); a flow that " +
+              'stops early has verified a form and proved nothing about the outcome. Author every numbered ' +
+              'step, citing it in the intent ("Step 5: …"); a step that truly cannot be performed here gets a ' +
+              'step whose intent says "skipped step N: <why>", so the gap is visible.',
+          );
+        }
+
+        const openQuestion = assertsOpenQuestion([...(result.setup ?? []), ...result.steps]);
+        if (openQuestion !== null) {
+          refuse(
+            `the authored flow "${result.name}" asserts ${JSON.stringify(openQuestion.value)} ` +
+              `(step ${openQuestion.index}), but ${openQuestion.marker} is the test case's marker for an ` +
+              'OPEN QUESTION — a value nobody has answered yet, which the case asks the tester to READ ' +
+              'off the run and send to BA/SA. It is not text the application renders, so the assertion ' +
+              'can only fail. Assert what the case does state, and leave the open question to the run: ' +
+              'take the surrounding fact (the field exists, the notice appears) rather than the id.',
           );
         }
 
@@ -2674,6 +2910,25 @@ export class FlowAuthor {
                 ? `The page renders: ${unrendered.nearest.map((n) => JSON.stringify(n)).join(', ')} — quote one of those, with its role from the tree, `
                 : 'Quote a name the tree actually shows, with its role, ') +
               'and never the sheet\'s phrasing of it.',
+            extra.lenientGrounding
+              ? {
+                  severity: 'weak',
+                  note:
+                    `step ${unrendered.index} asserts ${JSON.stringify(unrendered.text)}, which no captured tree renders — ` +
+                    'accepted on a resume after a strict refusal so the run can prove or dead-end it against the real page',
+                }
+              : {},
+          );
+        }
+
+        const unbounded = unboundedExclusivityClaim(result.steps, extra.caseText ?? trimmed);
+        if (unbounded !== null) {
+          refuse(
+            `the case claims a closed set — ${JSON.stringify(unbounded.claim)} — and the authored flow ` +
+              `"${result.name}" only asserts that named values are PRESENT. Presence of each passes when a ` +
+              'fourth value is offered, so the flow cannot fail on the defect this case exists to catch. ' +
+              `Open the control and assert the COUNT of its options (expectCount role=option${unbounded.wanted === null ? '' : ` = ${unbounded.wanted}`}), ` +
+              'then the presence of each named value; an "ไม่แสดง X" line is an expectHidden on top of the count, never instead of it.',
           );
         }
 
@@ -2744,6 +2999,26 @@ export class FlowAuthor {
               severity: 'weak',
               note: `Expected line(s) ${uncovered.join(', ')} have no assertion — the flow proves less than the sheet asks`,
             },
+          );
+        }
+
+        // "Only" means only (2026-09-02, ec10_3x HIR-EC-029): the sheet said
+        // "แสดงเฉพาะ New Hire / Replacement / Migration", the flow proved the
+        // three visible and three named codes hidden, and went green over a
+        // list nothing had counted. An exclusive set is proved by its count;
+        // fatal, because a flow without it reports a pass the sheet forbids.
+        const exclusive = unprovedExclusivity(result.steps, extra.caseText ?? trimmed);
+        if (exclusive !== null) {
+          const size = exclusive.claim.count === null ? 'the items the line enumerates' : String(exclusive.claim.count);
+          refuse(
+            `the authored flow "${result.name}" — ${describeUnprovedExclusivity(exclusive)}. ` +
+              `"${exclusive.claim.marker}" is a claim about the WHOLE set: after the step that opens or shows the ` +
+              'list, add expectCount on the ITEM role the opened list exposes in the tree or the probe report ' +
+              `(role=option, role=menuitem, the buttons inside the listbox …) with value ${size}, and cite the ` +
+              'Expected line in its intent. Keep the expectVisible of each listed item and the expectHidden of ' +
+              'each named absentee — they are necessary, not sufficient. Never drop the count: a list of thirty ' +
+              'entries passes every presence and hidden check.',
+            { note: describeUnprovedExclusivity(exclusive) },
           );
         }
 
@@ -3252,6 +3527,238 @@ export function credentialEchoAssertions(
   return indexes;
 }
 
+/**
+ * The sheet's marker for something NOBODY KNOWS YET: `OQ-HIR-78`, `CF-SIT-19`,
+ * and the `= ?` that introduces them ("ข้อความ Notice ที่แน่นอน = ? OQ-HIR-140").
+ * The convention is explicit in the rows that carry it — *run it, record what
+ * the system shows, send it to BA/SA to confirm* — so the id is the NAME of an
+ * unanswered question, never a value the page renders.
+ *
+ * Live (ec10 HIR-EC-009, 2026-09-02): the flow asserted
+ * `expectVisible text=OQ-HIR-78` against the New Hire form. It can only fail,
+ * and it fails as though the application were missing something.
+ */
+const OPEN_QUESTION = /\b(?:OQ|CF)-[A-Za-z]+-\d+\b/;
+
+/**
+ * A step asserting an open-question marker, or `null`.
+ *
+ * Deliberately narrow: only the id shape, and only where the flow ASSERTS it.
+ * A `fill` whose value happens to carry one is the tester's own data, and an
+ * intent that mentions the question is a note to a reader, not a claim.
+ */
+export function assertsOpenQuestion(
+  steps: readonly FlowStep[],
+): { index: number; value: string; marker: string } | null {
+  for (const [index, step] of steps.entries()) {
+    const text = assertedText(step);
+    if (text === null) continue;
+    const marker = OPEN_QUESTION.exec(text);
+    if (marker !== null) return { index, value: text, marker: marker[0] };
+  }
+  return null;
+}
+
+/**
+ * A case whose Steps column asks for data to be ENTERED — `กรอก`, `คีย์`,
+ * `เลือก`, `กด Submit`, "fill in", "key in", "select", "submit".
+ *
+ * Deliberately about INPUT, not about navigation: "ไปที่ EC > New Hire" and
+ * "ค้นหาด้วย Employee ID" are ways of arriving somewhere, and a read-only case
+ * (a menu is visible, a column list is complete) must never be caught by this.
+ */
+const SCRIPT_DEMANDS_INPUT =
+  /(?:^|[\s\-•])(?:กรอก|คีย์|ระบุ|เลือก|ติ๊ก|กดปุ่ม|กด\s*Submit|บันทึก)|\b(?:fill(?: in| out)?|key[- ]?in|enter|type|select|tick|check|submit|save)\b/i;
+
+/**
+ * A script that asks the tester to DO something on the page — press, accept,
+ * open, publish, sign in, tick — even where nothing is typed. Distinct from
+ * `SCRIPT_DEMANDS_INPUT` because the satisfying action differs: a `click` or a
+ * `workflow` leg performs "กดยอมรับ"; only a fill performs "กรอก".
+ *
+ * ec10_2x CNS-EC-028 (2026-09-02): five steps — sign in, open the attachment,
+ * accept, publish version 2.0, sign in as the second employee — authored as
+ * three `expectVisible` and nothing else. The input lint did not fire because
+ * the script types nothing; this one would have.
+ */
+const SCRIPT_DEMANDS_ACTION =
+  /(?:^|[\s\-•\d.])(?:กด|ยอมรับ|ประกาศ|เปิด(?:ไฟล์|หน้า|เมนู)|เข้าสู่ระบบ|ล็อกอิน|อัปโหลด|ลบ|แก้ไข|สร้าง)|\b(?:click|press|tap|accept|approve|publish|announce|open|upload|log ?in|sign ?in|delete|edit|create)\b/i;
+
+/** Body steps that engage the page at all — an action of any kind, or a leg the agent drives. */
+const ACTION_STEPS: ReadonlySet<string> = new Set([
+  'click',
+  'clickIfVisible',
+  'fill',
+  'fillRetry',
+  'type',
+  'selectOption',
+  'check',
+  'uncheck',
+  'press',
+  'hover',
+  'setValue',
+  'workflow',
+  'upload',
+  'closeModal',
+]);
+
+/** Body steps that actually put something into the page. */
+const INPUT_ACTIONS: ReadonlySet<string> = new Set([
+  'fill',
+  'fillRetry',
+  'type',
+  'selectOption',
+  'check',
+  'uncheck',
+  'setValue',
+]);
+
+/**
+ * The authored flow never performs the data entry its case scripts.
+ *
+ * Live (ec10 HIR-EC-001, 2026-09-02): the sheet's eight numbered steps key an
+ * identity, walk the Province → District → Sub-District cascade, fill position
+ * and compensation, press Submit and then verify the created profile. The
+ * authored flow signed in, opened the form, and asserted that an "Employee ID"
+ * label and the words "Auto-generated by system" were on screen — fifteen
+ * steps, two fills, both of them the login. It proved the form exists. It
+ * never ran the case, so nothing it asserts can be evidence for or against the
+ * claim, and the Expected output it answered was not the sheet's.
+ *
+ * The rule is narrow on purpose. It fires only when the script asks for input
+ * (`SCRIPT_DEMANDS_INPUT`) and the flow's BODY performs none — setup is
+ * excluded, so a sign-in's own fills never satisfy it and never trip it.
+ * A read-only case scripts no input and is never touched.
+ */
+export function skipsAuthoredScript(
+  caseText: string,
+  bodySteps: readonly FlowStep[],
+): { demanded: string; performed: number } | null {
+  const scripted = /Steps:\n([\s\S]*?)(?:\n[A-Z][a-z]+(?: output)?:|$)/.exec(caseText);
+  const script = scripted?.[1] ?? '';
+  if (script.trim() === '') return null;
+  const demandedInput = SCRIPT_DEMANDS_INPUT.exec(script);
+  if (demandedInput !== null) {
+    const performed = bodySteps.filter((step) => INPUT_ACTIONS.has(step.action)).length;
+    if (performed === 0) return { demanded: demandedInput[0].trim(), performed };
+  }
+  // No typing asked for, but the script still asks the tester to ACT: a body
+  // of nothing but assertions has not performed it either.
+  const demandedAction = SCRIPT_DEMANDS_ACTION.exec(script);
+  if (demandedAction !== null) {
+    const performed = bodySteps.filter((step) => ACTION_STEPS.has(step.action)).length;
+    if (performed === 0) return { demanded: demandedAction[0].trim(), performed };
+  }
+  return null;
+}
+
+/**
+ * A `fill`/`type` aimed at a textbox the tree marks `readonly`, when the tree
+ * shows no writable textbox of that name — the read-only display of a date
+ * picker, taken for the input (ec10 HIR-EC-001, 2026-09-02: four
+ * `textbox "Select date" readonly` lines, the real inputs listed beside them as
+ * `textbox "Hire Date"` and `textbox "Date of Birth"`). Returns the step and
+ * the writable textboxes the tree does offer, so the refusal can name them.
+ */
+export function fillsReadOnlyNode(
+  steps: readonly FlowStep[],
+  axTree: string | undefined,
+): { index: number; name: string; writable: string[] } | null {
+  if (!axTree) return null;
+  const lines = axTree.split('\n').map((l) => l.trim()).filter(Boolean);
+  const readOnly = new Set<string>();
+  const writable: string[] = [];
+  for (const line of lines) {
+    const m = /^textbox\s+"((?:[^"\\]|\\.)*)"(.*)$/.exec(line);
+    if (m === null) continue;
+    const name = m[1]!.toLowerCase();
+    if (/\breadonly\b/.test(m[2]!)) readOnly.add(name);
+    else writable.push(m[1]!);
+  }
+  if (readOnly.size === 0) return null;
+  const writableNames = new Set(writable.map((w) => w.toLowerCase()));
+  for (const [index, step] of steps.entries()) {
+    if (step.action !== 'fill' && step.action !== 'fillRetry' && step.action !== 'type') continue;
+    const m = /^role=textbox\[name=(?:"([^"]+)"|'([^']+)')(?:\s+i)?\]/.exec(step.selector.trim());
+    const name = (m?.[1] ?? m?.[2] ?? '').toLowerCase();
+    if (name === '' || !readOnly.has(name) || writableNames.has(name)) continue;
+    return { index, name: m?.[1] ?? m?.[2] ?? '', writable: [...new Set(writable)].slice(0, 6) };
+  }
+  return null;
+}
+
+/**
+ * A value that is still the sheet's angle-bracket TOKEN — `<NON_EXISTING_EMPLOYEE_ID>`,
+ * `<HR_ADMIN_ACCOUNT>` — typed as if it were data.
+ *
+ * Live (ec10_2 HIR-EC-012, 2026-09-02): the flow filled Replaced Employee ID
+ * with the literal `<NON_EXISTING_EMPLOYEE_ID>`; the page URL-encoded it into
+ * `check-replaced-employee/%3CNON_EXIS…`, the API rejected malformed input,
+ * and the step "proved" a rejection the case never asked about. A token names
+ * something the tester supplies; it is never itself the input.
+ */
+// `PLACEHOLDER_TOKEN` lives in value-resolution.ts, which resolves what this lint would refuse.
+
+export function typesPlaceholderToken(
+  steps: readonly FlowStep[],
+): { index: number; token: string; action: string } | null {
+  for (const [index, step] of steps.entries()) {
+    if (step.action !== 'fill' && step.action !== 'fillRetry' && step.action !== 'type' && step.action !== 'selectOption') continue;
+    const value = (step as { value?: unknown }).value;
+    if (typeof value !== 'string') continue;
+    const m = PLACEHOLDER_TOKEN.exec(value);
+    if (m !== null) return { index, token: m[0], action: step.action };
+  }
+  return null;
+}
+
+/**
+ * The numbered steps of the case's script the flow never reaches.
+ *
+ * The procedure asks the author to cite the script step in each intent
+ * ("Step 3: กด Verify"), and it does. That makes coverage checkable without
+ * understanding Thai prose: parse the script's `N.` lines, collect the numbers
+ * the intents cite, and any numbered step beyond the highest cited one — that
+ * no intent marks "skipped step N: why" — was silently dropped. Live (ec10_2
+ * HIR-EC-012): the flow cited steps 2 and 3 of a 7-step script and stopped;
+ * the valid-replacement check, the identity data, Submit and the profile check
+ * — the case's actual claim — were never authored, and the run reported on a
+ * form it had only half filled.
+ *
+ * Returns null when the flow cites no step at all (nothing to reason from) or
+ * when the script has no numbered steps.
+ */
+export function unperformedScriptSteps(
+  caseText: string,
+  steps: readonly FlowStep[],
+): { performedThrough: number; total: number; missing: { n: number; text: string }[] } | null {
+  const scripted = /Steps:\n([\s\S]*?)(?:\n[A-Z][a-z]+(?: output)?(?: \(from the sheet\))?:|$)/.exec(caseText);
+  const script = scripted?.[1] ?? '';
+  const numbered: { n: number; text: string }[] = [];
+  for (const line of script.split('\n')) {
+    const m = /^\s*(\d{1,2})[.)]\s*(.+)$/.exec(line);
+    if (m !== null) numbered.push({ n: Number(m[1]), text: m[2]!.trim().slice(0, 80) });
+  }
+  if (numbered.length < 2) return null;
+  const cited = new Set<number>();
+  const skipped = new Set<number>();
+  for (const step of steps) {
+    const intent = (step as { intent?: unknown }).intent;
+    if (typeof intent !== 'string') continue;
+    for (const m of intent.matchAll(/(?:skip(?:ped)?\s+step|step|ขั้นตอน(?:ที่)?)\s*(\d{1,2})/gi)) {
+      const n = Number(m[1]);
+      if (/skip/i.test(m[0])) skipped.add(n);
+      else cited.add(n);
+    }
+  }
+  if (cited.size === 0) return null;
+  const performedThrough = Math.max(...cited);
+  const total = Math.max(...numbered.map((x) => x.n));
+  const missing = numbered.filter((x) => x.n > performedThrough && !skipped.has(x.n) && !cited.has(x.n));
+  if (missing.length === 0) return null;
+  return { performedThrough, total, missing };
+}
+
 /** A claim about how the page is worded, in either of the sheet's languages. */
 const WORDING_CLAIM =
   /\b(spell\w*|wording|worded|label\w*|caption\w*|typo\w*|terminology|copy text|text (?:is|matches|reads|appears) )\b|ข้อความ|สะกด|คำแสดง|คำที่แสดง|ตัวสะกด/i;
@@ -3286,8 +3793,26 @@ export function wordingClaimAssertsDataValue(
   steps: readonly FlowStep[],
   evidenceTree: string,
   codeContext?: string,
+  /**
+   * The CASE's own words, when the caller can separate them from the prompt.
+   *
+   * **What decides "is this a wording claim" must be the case, never the
+   * background.** The prompt a catalog row is authored from carries the
+   * retrieved requirement documents as well as the row, and `WORDING_CLAIM`
+   * matches the Thai `ข้อความ` — "message" — which any Thai specification
+   * contains many times over. Measured on ec10 (2026-09-02): of ten rows only
+   * three say `ข้อความ` themselves, yet every row was classified a wording
+   * claim from the background alone, and this lint then refused each one for
+   * asserting a value the retrieved documents happened not to quote — a new
+   * hire's own keyed name, a duplicate-notice, a success message. Four rows
+   * were lost that way and none of them was about wording at all.
+   *
+   * Absent (a hand-authored flow, `wow go`) the prompt stands in, exactly as
+   * before.
+   */
+  caseText?: string | undefined,
 ): { index: number; value: string } | null {
-  if (!WORDING_CLAIM.test(prompt)) return null;
+  if (!WORDING_CLAIM.test(caseText ?? prompt)) return null;
   // No tree, no opinion. Ungrounded authoring has nothing to tell a label
   // from a row with, and a lint that refuses on absent evidence refuses
   // every honest wording flow too (caught by the echo-pipeline test, whose
@@ -4065,6 +4590,40 @@ export function ungroundedSelectorRole(
  * pre-existing; the database holds none of them, and every one was filed as
  * the application failing.
  */
+/**
+ * An exclusivity or exact-count claim the flow never bounds.
+ *
+ * Live (ec10_3x HIR-EC-029, 2026-09-02): the Expected output reads "dropdown
+ * แสดง 3 ค่า : Event Reason บนหน้า Key-in แสดงเฉพาะ New Hire / Replacement /
+ * Migration". The page offered a dozen reasons — DATA MIGRATION, HIREDM,
+ * H_NEWHIRE, H_RPLMENT, MT_EMP_INFO … — which is the defect the case exists
+ * to catch. The flow asserted `expectVisible "New Hire"`, `"Replacement"`,
+ * `"Migration"`: three presences that pass on a dropdown of a hundred. The case
+ * only went red at all because one presence tripped on wording, so the report
+ * blamed a label and never mentioned the extra options.
+ *
+ * The claim is a COUNT ("3 ค่า") or an "only" ("เฉพาะ"); proving it needs an
+ * `expectCount` (or an `expectHidden` of every value the case says must not
+ * appear, when it lists them — but the count is what closes the set). Returns
+ * the claim phrase when the flow has neither.
+ */
+export function unboundedExclusivityClaim(
+  steps: readonly FlowStep[],
+  caseText: string,
+): { claim: string; wanted: number | null } | null {
+  // The numbered form first, wherever it sits: "แสดง 3 ค่า" carries the bound
+  // the refusal can name, while "เฉพาะ …" only says there is one.
+  const counted_ =
+    /(?:แสดง|มี|shows?|displays?|offers?|lists?|contains?|exactly|มีแค่|เพียง)\s*(\d{1,3})\s*(?:ค่า|รายการ|ตัวเลือก|options?|values?|items?|entries|rows?|choices)/i.exec(caseText);
+  const only_ = /(?:แสดงเฉพาะ|เฉพาะ|only(?: these| the following)?|nothing else|no other|ไม่มีค่าอื่น|เท่านั้น)[^.\n]{0,120}/i.exec(caseText);
+  const m = counted_ ?? only_;
+  if (m === null) return null;
+  const wanted = counted_ !== null ? Number(counted_[1]) : null;
+  const counted = steps.some((step) => step.action === 'expectCount');
+  if (counted) return null;
+  return { claim: m[0].trim().slice(0, 140), wanted };
+}
+
 /**
  * A reconciliation claim the flow never actually compares (EN-2 audit — the
  * largest missed-bug cluster). The Expected output says two readings agree

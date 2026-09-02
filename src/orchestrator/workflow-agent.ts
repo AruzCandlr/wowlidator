@@ -24,14 +24,22 @@ import { CONSENT_ACCEPT_NAME, CONSENT_GATE_URL_PATTERN, acceptConsentGateAnywher
 import { scopeUrl, type CacheManager } from '../cache/cache-manager.js';
 import type { AxNode } from '../healer/jit-healer.js';
 import { decisionKey, focusTree, goalAlreadyShowing, renderTree, repeatedToggleClick, selectorGrounded, selectorName, unscopedDestructiveClick } from './agent-guards.js';
-import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
+import { normaliseAgentSelector } from '../engine/selector.js';
 import {
   LlmFactory,
   generateStructuredForModel,
   type ModelSource,
 } from '../providers/llm-factory.js';
 import type { AgentAction, AgentRecord } from '../engine/proof-bundle.js';
-import { atGoalDestination, destinationReached, goalDestination, goalOutcome, outcomeShown } from './goal-evidence.js';
+import {
+  atGoalDestination,
+  destinationReached,
+  goalCitedValue,
+  goalDestination,
+  goalOutcome,
+  outcomeShown,
+  valueAppearsAnywhere,
+} from './goal-evidence.js';
 import { DETERMINISM_RULES, procedure } from '../providers/prompt-discipline.js';
 
 // 8 until 2026-08-24, then 12, then unbounded (2026-08-24): every fixed number
@@ -43,7 +51,20 @@ import { DETERMINISM_RULES, procedure } from '../providers/prompt-discipline.js'
 // turns in which nothing advanced — see below), and a model failure each end it, and none of
 // them can end a journey that is actually advancing. WOWLIDATOR_AGENT_MAX_STEPS
 // (or `maxSteps`) reinstates a hard turn ceiling for whoever wants one.
-export const DEFAULT_AGENT_MAX_STEPS = envMaxSteps() ?? Infinity;
+//
+// "Unbounded" turned out to have a gap the loop's own judges do not cover
+// (2026-09-02, HIR-EC-010, live): a leg that keeps landing genuinely OK
+// clicks on a succession of WRONG controls never trips the no-progress judge
+// (every one of those turns is real progress by that judge's own rule) and
+// never repeats one selector often enough to trip the toggle-circling guard
+// either — 101 turns, ~27 minutes, on one goal whose value did not exist on
+// the page. `AGENT_VALUE_HUNT_TURNS` and `AGENT_FAIL_FAST_MAX_STEPS` are the
+// targeted fixes for that shape. This default stays a BACKSTOP for the legs
+// neither of those reaches — a goal `goalCitedValue` cannot parse, or a case
+// with no pre-run risk verdict (a hand-authored flow, `go`/`generate`) — sized
+// well above the ~12–15 actions an honest long journey needs, so it is a
+// dead-loop guard, not a second ceiling competing with the judges above.
+export const DEFAULT_AGENT_MAX_STEPS = envMaxSteps() ?? 60;
 
 /**
  * Consecutive turns in which nothing ADVANCED before the loop stops itself.
@@ -71,6 +92,39 @@ export const AGENT_NO_PROGRESS_TURNS = 5;
  * would only say it again, at a model call each.
  */
 export const AGENT_LOOK_ONLY_TURNS = 3;
+/**
+ * The gap the no-progress judge cannot see (2026-09-02, be100 HIR-EC-010,
+ * live): a `set Employee Group to "G - Internship"` goal against an app whose
+ * control only offers "1"/"2" — the agent OBSERVED that at turn one, then
+ * spent 100 more turns opening a different wrong subsection each time.
+ * `AGENT_NO_PROGRESS_TURNS` never caught it, because every one of those turns
+ * landed an OK click on a NEW control — genuine progress by that judge's own
+ * rule, just never toward anything the page can satisfy. This is a second,
+ * narrower judge for the one shape the first cannot cover: a goal that names
+ * a concrete value (`goalCitedValue`, the `set X to Y` parse `goalOutcome`
+ * already does) which has not appeared in ANY tree this leg has observed —
+ * not paired with its control, unlike `outcomeShown`; anywhere at all — after
+ * this many turns. Generous on purpose: a value that is genuinely a few
+ * navigations away must still be reached, so this fires only once the no-
+ * progress judge's own patience (`AGENT_NO_PROGRESS_TURNS`) has already been
+ * exceeded once over. A truncated tree on ANY turn withdraws the judge for
+ * the rest of the leg — absence from a truncated tree is not absence from the
+ * page, and a leg that size was never this guard's target.
+ */
+export const AGENT_VALUE_HUNT_TURNS = 8;
+/**
+ * The turn ceiling `failFastRunOptions` (`run-cases.ts`) hands a case the
+ * pre-run risk judge already flagged, via `RunOptions.maxSteps`. A fail-fast
+ * verdict already means "a near-certain fail is a fact retries only
+ * re-prove" for the RUN as a whole (no healer, no reconstruction, no
+ * repair) — this is the same reasoning applied to the one agent shot such a
+ * case still gets, which was otherwise unbounded and, live (HIR-EC-010,
+ * 2026-09-02), ran 101 turns on one already-flagged goal. Generous enough
+ * for a genuine multi-page journey (the comment on `DEFAULT_AGENT_MAX_STEPS`
+ * prices one at ~12–15 actions); tight enough that a leg circling a value
+ * that structurally does not exist stops paying for it quickly.
+ */
+export const AGENT_FAIL_FAST_MAX_STEPS = 15;
 /**
  * The no-progress ceiling when the early-give-up toggle is OFF
  * (`WOWLIDATOR_AGENT_EARLY_STOP=off` / `--no-agent-early-stop`). "Off" must
@@ -122,25 +176,31 @@ export const INTERACTION_ACTIONS: ReadonlySet<string> = new Set([
   'check',
   'uncheck',
   'type',
+  'paste',
   'selectOption',
 ]);
 /** Everything a `readOnly` run may do: look, look again, and answer. */
 export const READ_ONLY_ACTIONS: ReadonlySet<string> = new Set([...IDLE_ACTIONS, 'finish', 'fail']);
 /**
  * What a `reveal` run may do: everything read-only, plus the actions that
- * bring an EXISTING control into reach — open a menu, focus a field, follow a
- * link. Never `fill`, and never `dbCount`.
+ * bring an EXISTING control into reach — open a menu, follow a link, tick a
+ * box or pick a dropdown option that gates the section the target is in.
+ * Never `fill` and never `type`, and never `dbCount`.
  *
  * The distinction is the one this codebase has always drawn between preparing
  * a page and performing a step, and it matters most for an ASSERTION: a claim
- * an agent typed into existence proves nothing, so the repair pass offered to
- * an assertion may reveal what is already there and no more. `dbCount` is
- * excluded for a second reason as well — it is a backend action, and a run
- * with backend testing off must not reach the database by any route.
+ * an agent *typed* into existence proves nothing, so the repair pass offered
+ * to an assertion may set a control's state but must not write the asserted
+ * text into a field. `dbCount` is excluded for a second reason as well — it is
+ * a backend action, and a run with backend testing off must not reach the
+ * database by any route.
  */
 export const REVEAL_ACTIONS: ReadonlySet<string> = new Set([
   ...READ_ONLY_ACTIONS,
   'click',
+  'check',
+  'uncheck',
+  'selectOption',
   'press',
   'hover',
   'goto',
@@ -192,6 +252,24 @@ export const TARGET_ATTACH_MS = 1_500;
 export const AGENT_ACTIONS = [
   'click',
   'fill',
+  // Deliberate form interaction — the same vocabulary the generator and the
+  // engine already have, so the agent drives a form the way a human tester
+  // does instead of click-and-guess. `check`/`uncheck` set a checkbox, radio
+  // or ARIA toggle and confirm the state changed; `selectOption` picks by
+  // visible label from a native <select> OR a custom listbox; `type` fires a
+  // real keydown per character for autocomplete / typeahead / masked fields
+  // that `fill`'s one assignment cannot wake; `paste` inserts the whole value
+  // at the caret as a paste does, which is the only way into a control that
+  // refuses both an assignment and per-key input — a date picker, a masked
+  // field, a rich editor (ec10 HIR-EC-001, 2026-09-02: `Select date` took
+  // neither). None is destructive: the safety
+  // argument is unchanged — the vocabulary still cannot express a purchase or
+  // a delete except through a `click` the goal explicitly named.
+  'check',
+  'uncheck',
+  'selectOption',
+  'type',
+  'paste',
   'press',
   'hover',
   'scroll',
@@ -231,13 +309,14 @@ const DecisionSchema = lenientObject({
   selector: z
     .string()
     .describe(
-      'Playwright selector for click/fill/press/hover, or the element to scroll into view. ' +
+      'Playwright selector for click/fill/type/check/uncheck/selectOption/press/hover, or the element to scroll into view. ' +
         'For dbCount: the database table name (schema-qualified if shown that way). Empty otherwise.',
     ),
   value: z
     .string()
     .describe(
-      'Text for fill, key name for press (Enter, Escape, Tab, ArrowDown). ' +
+      'Text for fill/type, the option\'s VISIBLE LABEL for selectOption, key name for press (Enter, Escape, Tab, ArrowDown). ' +
+        'check/uncheck take no value. ' +
         'For dbCount: the where clause as "column=value, column2=value2" equality pairs, or empty to count the whole table. Empty otherwise.',
     ),
   url: z.string().describe('Absolute URL for goto. Empty otherwise.'),
@@ -351,7 +430,18 @@ const SYSTEM_PROMPT = `You are driving a real web browser to reach a stated goal
 
 Each turn you see the current URL, the page's accessibility tree, and what you have already tried. Choose exactly one action:
 - click  — press a control. Put a Playwright selector in "selector".
-- fill   — type into a field. Selector plus "value".
+- fill   — set a field's value in one go. Selector plus "value". Right for an
+           ordinary text/email/number field.
+- type   — type into a field key by key, firing real keyboard events. Selector
+           plus "value". Use INSTEAD of fill only for a field that reacts per
+           keystroke: autocomplete, typeahead, a masked input.
+- check / uncheck — tick or untick a checkbox, radio, or ARIA toggle. Selector
+           only, no value. Prefer these over click when the point is the
+           resulting state — they confirm it actually changed.
+- selectOption — choose from a dropdown. The option's VISIBLE LABEL in "value",
+           the dropdown control itself in "selector". Works on a native select
+           and a custom listbox alike — never fill a dropdown, and never click
+           it open to guess at its items: this one action opens it and picks.
 - press  — send a key. Key name in "value" (Enter, Escape, Tab, ArrowDown).
            Optional "selector" focuses that element first. Use for a listbox or
            menu that only opens on a keypress, or to dismiss an overlay.
@@ -370,6 +460,9 @@ Each turn you see the current URL, the page's accessibility tree, and what you h
 - goto   — navigate directly. Absolute URL in "url".
 - read   — report a control's CURRENT state (its value, whether it is checked,
            expanded, disabled) without touching it. Selector in "selector".
+A tree line ending in "readonly" is a DISPLAY, not an input: writing into it changes nothing. Its
+real input is beside it, named by the field's label (textbox "Hire Date" next to textbox "Select date"
+readonly) — fill or paste into THAT, and give a date input its value as YYYY-MM-DD.
            Use it to learn whether a choice has taken BEFORE deciding to click
            again, and before you finish: a finish is checked against what the
            page shows, not against what you did.
@@ -527,16 +620,17 @@ export class LlmAgentModel implements AgentModel {
 
     return {
       action: object.action,
-      // Same accessible-name case mismatch the generator and healer hit — the
-      // model is reading names out of the AX tree we gave it. See
-      // `src/engine/selector.ts`.
-      selector: withRelaxedRoleName(withQualifiedRole(object.selector)),
+      // The model is reading names out of the AX tree we gave it, and copies
+      // its notation back as readily as it copies its case — `region "X"` as
+      // a selector is a guaranteed miss and a turn burned. See
+      // `normaliseAgentSelector` in `src/engine/selector.ts`.
+      selector: normaliseAgentSelector(object.selector),
       value: object.value,
       url: object.url,
       reasoning: object.reasoning,
       next: (object.next ?? []).slice(0, AGENT_PLAN_AHEAD).map((step) => ({
         action: step.action,
-        selector: withRelaxedRoleName(withQualifiedRole(step.selector)),
+        selector: normaliseAgentSelector(step.selector),
         value: step.value,
         url: step.url,
       })),
@@ -576,6 +670,16 @@ export interface WorkflowAgentOptions {
 
 export interface RunOptions {
   memory?: AgentMemory | undefined;
+  /**
+   * A per-call turn ceiling, tighter than the instance's own `maxSteps`
+   * (`WorkflowAgentOptions.maxSteps` / `DEFAULT_AGENT_MAX_STEPS`) — never
+   * looser: the effective cap is `Math.min` of the two. For a caller that
+   * knows THIS leg has already spent its retry budget (a pre-run fail-fast
+   * risk verdict — `run-cases.ts`'s `failFastRunOptions`) and wants a
+   * shorter leash on the one shot it still gets, without lowering every
+   * other leg's instance-wide budget.
+   */
+  maxSteps?: number | undefined;
   /**
    * Look, never touch. Every action that could change the application —
    * click, fill, press, hover, goto, dbCount — is refused before it runs;
@@ -730,6 +834,14 @@ export class WorkflowAgent {
     const allowedActions: ReadonlySet<string> | null =
       runOptions.readOnly === true ? READ_ONLY_ACTIONS : (runOptions.allowedActions ?? null);
     this.#dbProbe = runOptions.dbProbe ?? null;
+    // A per-call ceiling can only LOWER the instance's own budget, never
+    // raise it — `runOptions.maxSteps` exists for a caller that knows this
+    // particular leg has already spent its retry budget (a fail-fast risk
+    // verdict, `run-cases.ts`'s `failFastRunOptions`) and wants a tighter
+    // leash on the one shot it still gets, not for widening a leash someone
+    // else set deliberately.
+    const effectiveMaxSteps =
+      runOptions.maxSteps !== undefined ? Math.min(this.#maxSteps, runOptions.maxSteps) : this.#maxSteps;
     const actions: AgentAction[] = [];
     const history: string[] = [];
     // The origins the agent may navigate to: the caller's list, else the page
@@ -762,10 +874,10 @@ export class WorkflowAgent {
     // whenever the URL moves (a new page is a new state, and the same click
     // may be right again there).
     const doneHere = new Set<string>();
-    // Ok clicks per selector for the WHOLE run, never cleared: the guard for
-    // a control the agent keeps toggling open and closed, which resets both
-    // `doneHere` (the tree changes each time) and the per-URL state (see
-    // `repeatedToggleClick`).
+    // Ok activations (click or press) per selector for the WHOLE run, never
+    // cleared: the guard for a control the agent keeps toggling or stepping
+    // through, which resets both `doneHere` (the tree changes each time) and
+    // the per-URL state (see `repeatedToggleClick`).
     const okClicks = new Map<string, number>();
     // Interstitials this loop has already cleared-and-returned from — once
     // per distinct accept, so a gate that will not stay cleared becomes a
@@ -811,7 +923,7 @@ export class WorkflowAgent {
       const replayed = await this.#replay(page, remembered, allowed, actions, history, startUrl, goal);
       if (replayed === null) {
         summary = `replayed ${remembered.length} recorded action(s) from an earlier run that reached this goal — no model turn spent`;
-        return this.#result(goal, true, summary, actions, 0, startedMs, 0, 0);
+        return this.#result(goal, true, summary, actions, 0, startedMs, 0, 0, effectiveMaxSteps);
       }
       memory?.forget(key as string);
       history.push(`(a remembered solution was replayed and failed at action ${replayed + 1}; asking the model)`);
@@ -829,7 +941,7 @@ export class WorkflowAgent {
       if (replayed === null) {
         this.#remember(key, memory, actions);
         summary = `replayed ${script.length} scripted action(s) recorded on the flow itself — no model turn spent`;
-        return this.#result(goal, true, summary, actions, 0, startedMs, 0, 0);
+        return this.#result(goal, true, summary, actions, 0, startedMs, 0, 0, effectiveMaxSteps);
       }
       history.push(`(the flow's recorded script failed at action ${replayed + 1}; asking the model)`);
     }
@@ -851,13 +963,14 @@ export class WorkflowAgent {
         startedMs,
         0,
         0,
+        effectiveMaxSteps,
       );
     }
 
     const preflight = await this.#preflight(page, goal, startUrl, destination, allowed, actions, history);
     if (preflight !== null) {
       this.#remember(key, memory, actions);
-      return this.#result(goal, true, preflight, actions, 0, startedMs, 0, 0);
+      return this.#result(goal, true, preflight, actions, 0, startedMs, 0, 0, effectiveMaxSteps);
     }
     progressMade = actions.some((a) => a.ok && a.action !== 'wait' && a.action !== 'scroll' && !/consent gate/.test(a.reasoning));
 
@@ -872,12 +985,21 @@ export class WorkflowAgent {
     // password fills stay refused.
     let lastTreeSeen: string | null = null;
 
+    // See `AGENT_VALUE_HUNT_TURNS`: the value a `set X to Y` goal names, and
+    // whether it has shown up in any tree this leg has looked at. `null`
+    // means either the goal names no such value (most goals) or the value
+    // has already been seen — both are "nothing to watch for" states, kept
+    // as one variable so the per-turn check below is a single comparison.
+    const huntedValue = goalCitedValue(goal);
+    let huntedValueSeenAtTurn: number | null = null;
+    let sawTruncatedTree = false;
+
     for (;;) {
       // A configured ceiling still holds (the capture pilot's short leash,
       // WOWLIDATOR_AGENT_MAX_STEPS); the default is no ceiling at all, and
       // then only the logic below — finish/fail, arrival, a stall, no
       // progress, a model failure — ends the loop.
-      if (turns >= this.#maxSteps) {
+      if (turns >= effectiveMaxSteps) {
         summary = `agent gave up after ${turns} turns without reaching the goal`;
         break;
       }
@@ -911,6 +1033,27 @@ export class WorkflowAgent {
       if (lastTreeSeen !== null && axTree !== lastTreeSeen) doneHere.clear();
       lastTreeSeen = axTree;
 
+      // The value-hunt guard: a goal naming a concrete value that has not
+      // shown up ANYWHERE after several turns is evidence the value is not
+      // reachable from here, however many still-successful clicks keep
+      // landing on other controls. See `AGENT_VALUE_HUNT_TURNS`.
+      if (axTree.includes('TREE TRUNCATED')) sawTruncatedTree = true;
+      if (huntedValue !== null && huntedValueSeenAtTurn === null && valueAppearsAnywhere(huntedValue, axTree)) {
+        huntedValueSeenAtTurn = turns;
+      }
+      if (
+        huntedValue !== null &&
+        huntedValueSeenAtTurn === null &&
+        !sawTruncatedTree &&
+        turns > AGENT_VALUE_HUNT_TURNS
+      ) {
+        summary =
+          `agent gave up: the goal's value ${JSON.stringify(huntedValue)} never appeared on any of the ` +
+          `${turns} page state(s) this leg observed — it may not exist on this journey, rather than merely ` +
+          'being hard to reach';
+        break;
+      }
+
       // One decision per turn, with at most ONE informed re-ask when the
       // first answer is one the loop can see is wasted: a selector that names
       // nothing in the tree, an ok action repeated on an unchanged page, a
@@ -930,12 +1073,12 @@ export class WorkflowAgent {
             // Snapshot: the agent keeps mutating `history`, and an observation
             // handed to the model must not change under it after the fact.
             history: [...history],
-            stepsRemaining: this.#maxSteps - turns,
+            stepsRemaining: effectiveMaxSteps - turns,
             ...(feedback === undefined ? {} : { feedback }),
           });
         } catch (error) {
           summary = `agent model failed: ${describe(error)}`;
-          return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens);
+          return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens, effectiveMaxSteps);
         }
         inputTokens += candidate.inputTokens ?? 0;
         outputTokens += candidate.outputTokens ?? 0;
@@ -960,18 +1103,18 @@ export class WorkflowAgent {
           if (refusal.startsWith('stalled')) {
             summary = `agent ${refusal}`;
             actions.push(this.#record(actions.length, candidate, page.url(), false, 0, refusal));
-            return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens);
+            return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens, effectiveMaxSteps);
           }
           if (refusal.startsWith('destructive') || refusal.startsWith('circling')) {
             // Never acted on, however the model insists: recorded as a
             // failed action so the report shows what was refused and why,
             // and the turn counts as no progress — the run goes on, because
             // the right row may still be found (or `fail` said honestly).
-            // `circling` (the same selector clicked past TOGGLE_CLICK_LIMIT)
-            // shares the shape: acting would spend the turn re-learning what
-            // three earlier clicks already proved.
+            // `circling` (the same selector clicked or pressed past
+            // TOGGLE_CLICK_LIMIT) shares the shape: acting would spend the
+            // turn re-learning what three earlier activations already proved.
             actions.push(this.#record(actions.length, candidate, page.url(), false, 0, refusal));
-            history.push(`click ${candidate.selector} — REFUSED: ${refusal}`);
+            history.push(`${candidate.action} ${candidate.selector} — REFUSED: ${refusal}`);
             refusedTurn = true;
             break;
           }
@@ -979,7 +1122,7 @@ export class WorkflowAgent {
             // An unverified finish is recorded as one — never as success.
             summary = `agent claimed finish, but ${refusal}`;
             actions.push(this.#record(actions.length, candidate, page.url(), false, 0, refusal));
-            return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens);
+            return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens, effectiveMaxSteps);
           }
           decision = candidate;
         }
@@ -1028,7 +1171,7 @@ export class WorkflowAgent {
             }
             summary = `agent claimed finish, but the page does not show ${outcome.control} = ${JSON.stringify(outcome.value)}`;
             actions.push(this.#record(actions.length, decision, page.url(), false, 0, summary));
-            return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens);
+            return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens, effectiveMaxSteps);
           }
           this.#settledBy = { rule: 'observed-state', evidence: shown };
         } else {
@@ -1118,7 +1261,17 @@ export class WorkflowAgent {
         );
 
         if (ok && page.url() === urlBefore) doneHere.add(decisionKey(current));
-        if (ok && current.action === 'click' && current.selector.trim() !== '') {
+        // `press` counts here too (2026-09-02): a targeted press (a selector
+        // given, as opposed to a bare key sent to whatever has focus)
+        // activates its control exactly as a click does, and a model that
+        // reaches for `press` on a stepper it keeps hammering must not
+        // escape the same circling guard a `click` would trip — see
+        // `repeatedToggleClick` for the incident this closes (HIR-EC-009).
+        if (
+          ok &&
+          (current.action === 'click' || current.action === 'press') &&
+          current.selector.trim() !== ''
+        ) {
           const sel = current.selector.trim();
           okClicks.set(sel, (okClicks.get(sel) ?? 0) + 1);
         }
@@ -1260,7 +1413,7 @@ export class WorkflowAgent {
 
     if (success) this.#remember(key, memory, actions);
 
-    return this.#result(goal, success, summary, actions, turns, startedMs, inputTokens, outputTokens);
+    return this.#result(goal, success, summary, actions, turns, startedMs, inputTokens, outputTokens, effectiveMaxSteps);
   }
 
   /**
@@ -1423,7 +1576,7 @@ export class WorkflowAgent {
     if (link) {
       const decision: AgentDecision = {
         action: 'click',
-        selector: withRelaxedRoleName(`role=link[name=${JSON.stringify(link.name)}]`),
+        selector: normaliseAgentSelector(`role=link[name=${JSON.stringify(link.name)}]`),
         value: '',
         url: '',
         reasoning: `the tree shows a link to ${destination}, the goal's destination`,
@@ -1491,6 +1644,7 @@ export class WorkflowAgent {
     startedMs: number,
     inputTokens: number,
     outputTokens: number,
+    effectiveMaxSteps: number,
   ): WorkflowResult {
     return {
       goal,
@@ -1500,8 +1654,12 @@ export class WorkflowAgent {
       actions,
       turns,
       // JSON has no Infinity: an unbounded run records null, and every reader
-      // treats null as "no ceiling was set".
-      maxSteps: Number.isFinite(this.#maxSteps) ? this.#maxSteps : null,
+      // treats null as "no ceiling was set". Records the CALL's effective
+      // ceiling, not just the instance's — a fail-fast leg's tighter
+      // `runOptions.maxSteps` override belongs on its own record, or a
+      // reader would see "gave up after 12 turns" against a reported budget
+      // of the instance's much larger (or unbounded) default.
+      maxSteps: Number.isFinite(effectiveMaxSteps) ? effectiveMaxSteps : null,
       latencyMs: Date.now() - startedMs,
       inputTokens,
       outputTokens,
@@ -1588,6 +1746,7 @@ export class WorkflowAgent {
       case 'fill': {
         if (!decision.selector) throw new Error('fill decision carried no selector');
         await this.#target(page, decision.selector);
+        await this.#writable(page, decision.selector);
         const field = page.locator(decision.selector).first();
         await field.fill(decision.value, { timeout: this.#actionTimeoutMs });
         // **A fill the framework reverts is the quietest false negative in
@@ -1615,6 +1774,119 @@ export class WorkflowAgent {
             }
           }
         }
+        break;
+      }
+
+      case 'check':
+      case 'uncheck': {
+        if (!decision.selector) throw new Error(`${decision.action} decision carried no selector`);
+        await this.#target(page, decision.selector);
+        const box = page.locator(decision.selector).first();
+        const want = decision.action === 'check';
+        try {
+          // Native checkbox/radio — Playwright verifies the resulting state.
+          await box.setChecked(want, { timeout: this.#actionTimeoutMs });
+        } catch (error) {
+          // A styled toggle: read aria-checked/aria-pressed, click only if it
+          // differs, re-read to confirm. A control that exposes no state at
+          // all is left with the original error — clicking it blind is how a
+          // "toggle" silently does the wrong thing.
+          const read = (): Promise<boolean | null> =>
+            box
+              .evaluate((el) => {
+                const a = el.getAttribute('aria-checked') ?? el.getAttribute('aria-pressed');
+                return a === null ? null : a === 'true';
+              })
+              .catch(() => null);
+          const before = await read();
+          if (before === null) throw error;
+          if (before !== want) {
+            await box.click({ timeout: this.#actionTimeoutMs });
+            const after = await read();
+            if (after !== want) {
+              throw new Error(
+                `clicked ${JSON.stringify(decision.selector)} but it still reports ` +
+                  `${after === null ? 'no state' : after ? 'checked' : 'unchecked'} — try another control`,
+              );
+            }
+          }
+        }
+        break;
+      }
+
+      case 'selectOption': {
+        if (!decision.selector) throw new Error('selectOption decision carried no selector');
+        if (!decision.value) throw new Error('selectOption decision carried no option label (put it in value)');
+        await this.#target(page, decision.selector);
+        const control = page.locator(decision.selector).first();
+        try {
+          // Native <select> — by visible label, then by value/text as a
+          // fallback for a label that is really the option's value attribute.
+          await control.selectOption({ label: decision.value }, { timeout: this.#actionTimeoutMs });
+        } catch (nativeError) {
+          try {
+            await control.selectOption(decision.value, { timeout: 1_000 });
+          } catch {
+            // A custom listbox/combobox: open it, then click the option by
+            // its accessible name. Mirrors what the engine does for the same
+            // widget — never "fill" a dropdown, never guess its items.
+            await control.click({ timeout: this.#actionTimeoutMs });
+            const option = page
+              .getByRole('option', { name: decision.value, exact: false })
+              .first();
+            try {
+              await option.click({ timeout: this.#actionTimeoutMs });
+            } catch {
+              throw new Error(
+                `could not choose ${JSON.stringify(decision.value)} in ${JSON.stringify(decision.selector)} — ` +
+                  `it is not a <select> and no option with that name appeared (${describe(nativeError)})`,
+              );
+            }
+          }
+        }
+        break;
+      }
+
+      case 'paste': {
+        // **The last way in.** A control that refuses `fill` (one assignment)
+        // and `type` (a keydown per character) usually has a listener that
+        // rejects both — a date picker that only accepts its own calendar, a
+        // masked input, a contenteditable. `insertText` delivers the whole
+        // string at the caret through the same input path a real paste uses,
+        // which those controls do accept.
+        //
+        // Focus first and clear what is there, so a paste replaces rather than
+        // appends. Both are best-effort: a control that cannot be cleared is
+        // still worth pasting into, and the read-back the caller does is what
+        // decides whether it took.
+        if (!decision.selector) throw new Error('paste decision carried no selector');
+        await this.#target(page, decision.selector);
+        await this.#writable(page, decision.selector);
+        const target = page.locator(decision.selector).first();
+        await target.click({ timeout: this.#actionTimeoutMs }).catch(() => undefined);
+        await target.fill('', { timeout: this.#actionTimeoutMs }).catch(async () => {
+          // Not a fillable control: select everything and let the insert replace it.
+          await page.keyboard.press('ControlOrMeta+a').catch(() => undefined);
+        });
+        await page.keyboard.insertText(decision.value);
+        break;
+      }
+
+      case 'type': {
+        if (!decision.selector) throw new Error('type decision carried no selector');
+        await this.#target(page, decision.selector);
+        await this.#writable(page, decision.selector);
+        const field = page.locator(decision.selector).first();
+        // Focus and clear the way a user would, then type key by key so a
+        // field that reacts per keystroke (autocomplete, typeahead, masked
+        // input) actually wakes. No read-back guard: such a field routinely
+        // transforms what it holds, and that is the point of using `type`.
+        await field.click({ timeout: this.#actionTimeoutMs });
+        await field.fill('', { timeout: this.#actionTimeoutMs }).catch(() => undefined);
+        await field.pressSequentially(decision.value, {
+          delay: 25,
+          timeout: Math.max(this.#actionTimeoutMs, decision.value.length * 25 + 1_000),
+        });
         break;
       }
 
@@ -1692,12 +1964,15 @@ export class WorkflowAgent {
         if (!decision.selector) throw new Error('read decision carried no selector');
         await this.#target(page, decision.selector);
         const loc = page.locator(decision.selector).first();
-        const [name, value, checked, expanded, disabled] = await Promise.all([
+        const [name, value, checked, expanded, disabled, readonly] = await Promise.all([
           loc.evaluate((el) => (el as unknown as { innerText?: string }).innerText?.trim().slice(0, 120) ?? '').catch(() => ''),
           loc.inputValue({ timeout: 500 }).catch(() => ''),
           loc.getAttribute('aria-checked').catch(() => null),
           loc.getAttribute('aria-expanded').catch(() => null),
           loc.isDisabled({ timeout: 500 }).catch(() => false),
+          // A read-only field is the fact that decides whether writing here can
+          // ever work — worth one more read on the same turn.
+          loc.evaluate((el) => (el as unknown as { readOnly?: boolean }).readOnly === true).catch(() => false),
         ]);
         const facts = [
           name ? `text ${JSON.stringify(name)}` : '',
@@ -1705,6 +1980,7 @@ export class WorkflowAgent {
           checked !== null ? `checked=${checked}` : '',
           expanded !== null ? `expanded=${expanded}` : '',
           disabled ? 'DISABLED' : '',
+          readonly ? 'READONLY — a display; the input the label points at is beside it' : '',
         ].filter(Boolean);
         this.#lastTargetNote = `observed ${facts.length ? facts.join(', ') : 'an element with no readable state'}`;
         break;
@@ -1753,6 +2029,65 @@ export class WorkflowAgent {
     }
     const count = await locator.count().catch(() => 1);
     if (count > 1) this.#lastTargetNote = `${count} matched, acted on the first`;
+  }
+
+  /**
+   * Refuse, in one turn and in words the next turn can act on, to write into a
+   * field that cannot take a value.
+   *
+   * Live (ec10_2 HIR-EC-002, 2026-09-02): the agent pasted a date into
+   * `textbox "Select date"` and the action reported ✓ — a read-only input
+   * silently ignores inserted text, so the field still showed the pinned
+   * today and the model, told nothing, went on to guess `spinbutton "Day Day"`
+   * and `[aria-label="Hire Date"]`. A success that teaches nothing is the
+   * worst outcome a turn can have. The page's own shape is named in the
+   * error, because it is the same shape every time: the input the label
+   * points at sits beside the display.
+   */
+  async #writable(page: Page, selector: string): Promise<void> {
+    const state = await page
+      .locator(selector)
+      .first()
+      .evaluate(
+        (el) => {
+          const node = el as unknown as {
+            readOnly?: boolean;
+            disabled?: boolean;
+            isContentEditable?: boolean;
+            tagName?: string;
+            getAttribute?: (n: string) => string | null;
+          };
+          const tag = (node.tagName ?? '').toLowerCase();
+          const label = node.getAttribute?.('aria-label') ?? node.getAttribute?.('placeholder') ?? '';
+          return {
+            readOnly: node.readOnly === true || node.getAttribute?.('aria-readonly') === 'true',
+            disabled: node.disabled === true || node.getAttribute?.('aria-disabled') === 'true',
+            editable: tag === 'input' || tag === 'textarea' || tag === 'select' || node.isContentEditable === true,
+            label,
+          };
+        },
+        undefined,
+        { timeout: TARGET_ATTACH_MS },
+      )
+      .catch(() => null);
+    if (state === null) return;
+    if (state.readOnly) {
+      throw new Error(
+        `"${selector}" is a READ-ONLY field — a display, not the input; writing into it changes nothing. ` +
+          `The real input is usually beside it and named by the field's LABEL: try ` +
+          `role=textbox[name="<the label, e.g. Hire Date>" i], or read the tree for a sibling input without ` +
+          `readonly. A date input takes YYYY-MM-DD.`,
+      );
+    }
+    if (state.disabled) {
+      throw new Error(`"${selector}" is DISABLED — nothing can be entered until whatever enables it is done first.`);
+    }
+    if (!state.editable) {
+      throw new Error(
+        `"${selector}" is not an input, textarea, select or editable region — it cannot take typed text. ` +
+          'If it is a dropdown, use selectOption; if it opens a picker, click it and act on what opens.',
+      );
+    }
   }
 
   /** Set by `#target` for the history line of the action that follows. */

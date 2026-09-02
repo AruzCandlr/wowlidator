@@ -10,7 +10,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 
-import { DIALS, GATES, describeDials, describeGates, persistDial, persistGate } from '../src/ui/gates.js';
+import {
+  DIALS,
+  GATES,
+  SELECTS,
+  describeDials,
+  describeGates,
+  describeSelects,
+  persistDial,
+  persistGate,
+  persistSelect,
+} from '../src/ui/gates.js';
 
 let dir: string;
 
@@ -88,5 +98,56 @@ describe('the dials — numeric machinery settings', () => {
     assert.match(await readFile(envPath, 'utf8'), /^WOWLIDATOR_AUTHOR_ATTEMPTS=1$/m);
     await assert.rejects(() => persistDial('WOWLIDATOR_AUTHOR_ATTEMPTS', 9, envPath, env), /1 to 5/);
     await assert.rejects(() => persistDial('PATH', 3, envPath, env), /not a machinery dial/);
+  });
+});
+
+describe('the selects — reasoning effort per role', () => {
+  it('reads a known effort, else the role default (generator high, the rest low)', () => {
+    const views = describeSelects({});
+    assert.equal(views.length, SELECTS.length);
+    assert.equal(views.find((s) => s.env === 'WOWLIDATOR_GENERATOR_EFFORT')?.value, 'high');
+    assert.equal(views.find((s) => s.env === 'WOWLIDATOR_HEALER_EFFORT')?.value, 'low');
+    assert.equal(
+      describeSelects({ WOWLIDATOR_GENERATOR_EFFORT: 'medium' }).find((s) => s.env === 'WOWLIDATOR_GENERATOR_EFFORT')
+        ?.value,
+      'medium',
+    );
+    assert.equal(
+      describeSelects({ WOWLIDATOR_GENERATOR_EFFORT: 'turbo' }).find((s) => s.env === 'WOWLIDATOR_GENERATOR_EFFORT')
+        ?.value,
+      'high',
+      'an unknown value falls back to the default',
+    );
+  });
+
+  it('every role that resolves an --effort has a select', () => {
+    for (const env of [
+      'WOWLIDATOR_GENERATOR_EFFORT',
+      'WOWLIDATOR_HEALER_EFFORT',
+      'WOWLIDATOR_AGENT_EFFORT',
+      'WOWLIDATOR_DATA_EFFORT',
+      'WOWLIDATOR_GOVERNOR_EFFORT',
+    ]) {
+      assert.ok(SELECTS.some((s) => s.env === env), env);
+    }
+  });
+
+  it('persists a valid effort, refuses an unknown value and an unknown var by name', async () => {
+    const envPath = join(dir, '.env-select');
+    const env: NodeJS.ProcessEnv = {};
+    const view = await persistSelect('WOWLIDATOR_GENERATOR_EFFORT', 'medium', envPath, env);
+    assert.equal(view.value, 'medium');
+    assert.equal(env['WOWLIDATOR_GENERATOR_EFFORT'], 'medium');
+    assert.match(await readFile(envPath, 'utf8'), /^WOWLIDATOR_GENERATOR_EFFORT=medium$/m);
+    // Same line edited, not appended twice.
+    await persistSelect('WOWLIDATOR_GENERATOR_EFFORT', 'low', envPath, env);
+    const text = await readFile(envPath, 'utf8');
+    assert.equal((text.match(/WOWLIDATOR_GENERATOR_EFFORT=/g) ?? []).length, 1);
+    assert.match(text, /^WOWLIDATOR_GENERATOR_EFFORT=low$/m);
+    await assert.rejects(
+      () => persistSelect('WOWLIDATOR_GENERATOR_EFFORT', 'turbo', envPath, env),
+      /must be one of low, medium, high/,
+    );
+    await assert.rejects(() => persistSelect('PATH', 'low', envPath, env), /not a machinery select/);
   });
 });

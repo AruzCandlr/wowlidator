@@ -4,7 +4,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { formatCoverage, meaningfulCoverage } from '../coverage/ax-coverage.js';
 import {
@@ -20,6 +20,7 @@ import {
   type ProofBundle,
 } from '../engine/proof-bundle.js';
 import { runFlow, type Flow, type RunFlowOptions } from '../engine/runner.js';
+import { AGENT_FAIL_FAST_MAX_STEPS } from '../orchestrator/workflow-agent.js';
 import type { DeadEndRisk } from '../engine/proof-bundle.js';
 import { describeRisk } from '../generator/dead-end-risk.js';
 import {
@@ -51,14 +52,31 @@ import { LlmFlowRepairModel } from '../repair/flow-repair-model.js';
 import { RepairMemory } from '../repair/repair-memory.js';
 import { SessionVault } from '../engine/session-vault.js';
 import { slugify } from '../reporter/html-reporter.js';
-import { RunHistory, analyseTrend, formatTrend } from '../history/run-history.js';
+import { RunHistory, formatTrend } from '../history/run-history.js';
 import { resolveReportPath, writeHtmlReport } from '../reporter/html-reporter.js';
+import { CatalogLiveReport } from './catalog-live-report.js';
 import {
-  catalogReportPath,
-  renderCatalogReport,
-  writeCatalogReport,
-  type CatalogReportCase,
-} from '../reporter/catalog-report.js';
+  baselineMaxRows,
+  baselinePath,
+  baselineProbe,
+  detectBaselineTables,
+  readBaseline,
+  resolveBaselineMode,
+  restoreBaseline,
+  tablesNamedBySteps,
+  takeBaseline,
+  writeBaseline,
+  type Baseline,
+  type DbBaselineProbe,
+} from '../db/baseline.js';
+import {
+  connectDb,
+  connectDbWritable,
+  defaultDbConfig,
+  maskDsn,
+  restoreDbConfig,
+  type DbClient,
+} from '../db/client.js';
 import {
   DEFAULT_INDEX_FILENAME,
   writeSuiteIndex,
@@ -66,6 +84,7 @@ import {
 } from '../reporter/suite-index.js';
 import { EXIT, failureOf, harnessOnly, neverRan, type CaseOutcome } from './exit.js';
 import { vacuousFlow } from '../generator/vacuous.js';
+import { describeUnprovedExclusivity, unprovedExclusivity } from '../generator/exclusivity.js';
 import {
   caseIdOf,
   carriedOutcomes,
@@ -148,6 +167,13 @@ export interface SuiteCase {
    * and no repair loop — see `failFastRunOptions`. Absent = the ordinary run.
    */
   risk?: DeadEndRisk | undefined;
+  /**
+   * Authoring REFUSED to write this case (a flow lint held on the last
+   * attempt). There is no flow to run; the lane records it `blocked` with the
+   * reason and the attempt count, so the ledger and the report carry it and a
+   * resume can decide whether to author it again. See `suite-progress.ts`.
+   */
+  refused?: { reason: string; attempt: number } | undefined;
 }
 
 /**
@@ -167,11 +193,23 @@ export function failFastRunOptions(base: RunFlowOptions, flow?: Flow): RunFlowOp
   // once, and the dead-end memo stops any identical retry from re-asking.
   // What fail-fast still removes: the healer (a model retry of the selector)
   // and every path that RE-RUNS a failed step or the whole case.
+  //
+  // The agent's ONE shot also gets a shorter leash (2026-09-02): the risk
+  // judge already spent a call concluding this case will likely dead-end or
+  // fail, and `AGENT_NO_PROGRESS_TURNS`/`AGENT_LOOK_ONLY_TURNS` do not catch
+  // a leg that keeps landing genuinely-successful clicks on the WRONG
+  // controls (live, HIR-EC-010: 101 turns hunting a value that does not
+  // exist on the page). `Math.min` so an explicit tighter cap the caller
+  // already set is never loosened.
   return {
     ...base,
     healer: null,
     makeHealer: undefined,
     stepRepair: null,
+    agentMaxSteps:
+      base.agentMaxSteps !== undefined
+        ? Math.min(base.agentMaxSteps, AGENT_FAIL_FAST_MAX_STEPS)
+        : AGENT_FAIL_FAST_MAX_STEPS,
   };
 }
 
@@ -246,6 +284,13 @@ export async function runCases(
      * catalog path passes the graph and documents it already holds.
      */
     healHints?: HealHintsProvider | undefined;
+    /**
+     * The plan's rows in the sheet's own words, for a run whose cases are
+     * still being authored. The database baseline detects its tables from
+     * these so the snapshot can be taken BEFORE the first case runs without
+     * waiting for authoring to finish — see the baseline block below.
+     */
+    planRows?: readonly { name: string; text: string }[] | undefined;
   },
 ): Promise<CaseOutcome[]> {
   const log = lineLogger(options);
@@ -289,15 +334,40 @@ export async function runCases(
     process.once('SIGINT', onSignal);
     process.once('SIGTERM', onSignal);
   }
+  // **The catalog report is live** (2026-09-02): written now, with every
+  // planned case a `never ran` row (or the verdict an earlier pass under the
+  // same run key recorded), and rewritten after each case — so the panel's
+  // Report button opens the current state of the catalog at any point of the
+  // run, and a rerun updates the same file rather than minting another.
+  // Beside it, the per-case workbook of each case that passed. Never fatal.
+  const liveReport =
+    ledger === null || where.ledger === undefined
+      ? null
+      : new CatalogLiveReport({
+          ledger: () => ledger!,
+          scenarioOf: (id) => {
+            const item = queue.items.find((c) => caseIdOf(c.name) === id);
+            return item === undefined ? undefined : (item.scenarioId ?? item.group);
+          },
+          history: options.history ? new RunHistory(options.historyPath) : null,
+          onError: (message) => process.stderr.write(`  ! catalog report could not be written: ${message}\n`),
+        });
   const noteOutcome = async (
     outcome: CaseOutcome,
-    extra: { flowPath?: string | undefined; vacuous?: boolean | undefined; proofPath?: string | undefined } = {},
+    extra: {
+      flowPath?: string | undefined;
+      vacuous?: boolean | undefined;
+      proofPath?: string | undefined;
+      authoringRefused?: number | undefined;
+    } = {},
   ): Promise<void> => {
     if (ledger === null || where.ledger === undefined) return;
     ledger.generatedAt = where.ledger.stamp?.() ?? ledger.generatedAt;
     ledger.runKey = where.ledger.runKey?.() ?? ledger.runKey;
     recordOutcome(ledger, outcome, extra);
     await writeLedger(where.ledger.path, ledger).catch(() => undefined);
+    liveReport?.record(outcome.name, outcome.bundle);
+    void liveReport?.refresh();
   };
   const entries: IndexEntry[] = [];
 
@@ -312,6 +382,98 @@ export async function runCases(
   const queue = streaming
     ? cases
     : closedQueue(options.sheetOrder ? cases : readersFirst(cases));
+  // The report exists before the first case has a verdict.
+  if (liveReport !== null) await liveReport.refresh();
+
+  // **The database baseline** (2026-09-02, asked for). Before the first case
+  // runs: work out which tables the authored flows are about, snapshot exactly
+  // those, and hand every case a probe that records — on each backend step —
+  // what the run has done to them against that snapshot. After the run
+  // (below), put the tables back when the mode says to. A resume never
+  // re-snapshots: the state before the ORIGINAL run is the baseline, whatever
+  // the cases since have written, so the ledger's baseline is authoritative.
+  const baselineResolved = resolveBaselineMode(options.dbBaseline);
+  if (baselineResolved.note !== null) log?.(`db baseline: ${baselineResolved.note}`);
+  let baselineProbeForRun: DbBaselineProbe | null = null;
+  let baselineClient: DbClient | null = null;
+  let activeBaseline: Baseline | null = null;
+  const priorBaseline = ledger?.dbBaseline;
+  if (baselineResolved.mode !== 'off') {
+    try {
+      const config = defaultDbConfig();
+      if (config === null) {
+        log?.('db baseline: WOWLIDATOR_DB_URL is not set — skipping');
+      } else if (priorBaseline !== undefined) {
+        // A resume: reuse the snapshot the original run took.
+        activeBaseline = await readBaseline(priorBaseline.path);
+        baselineClient = await connectDb(config);
+        baselineProbeForRun = baselineProbe(baselineClient, activeBaseline, baselineMaxRows());
+        log?.(
+          `db baseline  reusing ${activeBaseline.tables.length} table(s) snapshotted ${priorBaseline.takenAt} (resume)`,
+        );
+      } else {
+        // **Detected from the PLAN, not from the finished flows** (2026-09-02).
+        // The first version waited here for authoring to close the queue,
+        // because a flow's DB steps are the surest source of table names.
+        // That silently disabled pipelining: a ten-row catalog authored for
+        // ten minutes with a case sitting ready in the queue and the engine
+        // parked in a 200ms poll — the parallelism policy is the point of the
+        // streaming path, and a baseline must not cost it. The sheet's own
+        // words name the same tables through source (b), the operator can
+        // always add more, and one FK hop covers the joins; so detection runs
+        // NOW, on the plan rows plus whatever has authored already, and the
+        // snapshot is taken before the first case is dispatched.
+        baselineClient = await connectDb(config);
+        const schema = await baselineClient.introspect();
+        const authoredSoFar = queue.items.map((c) => ({ name: c.name, flow: c.flow }));
+        const planned = (where.planRows ?? []).filter(
+          (row) => !authoredSoFar.some((c) => caseIdOf(c.name) === caseIdOf(row.name)),
+        );
+        const detected = detectBaselineTables(
+          [...authoredSoFar, ...planned],
+          schema,
+          { fkPairs: where.graphFacts?.fkPairs, extra: options.dbBaselineTables },
+        );
+        if (detected.length === 0) {
+          log?.('db baseline  no tables under test detected — nothing to snapshot');
+          await baselineClient.close().catch(() => undefined);
+          baselineClient = null;
+        } else {
+          log?.(
+            `db baseline  ${detected.length} table(s) from ${authoredSoFar.length} authored + ` +
+              `${planned.length} planned row(s): ` +
+              detected.map((d) => `${d.table} (${d.why[0] ?? 'detected'})`).join(', '),
+          );
+          activeBaseline = await takeBaseline(baselineClient, detected, schema, {
+            runKey: ledger?.runKey ?? null,
+          });
+          const path = await writeBaseline(baselinePath(ledger?.runKey ?? null), activeBaseline);
+          baselineProbeForRun = baselineProbe(baselineClient, activeBaseline, baselineMaxRows());
+          const notRestorable = activeBaseline.tables.filter((t) => !t.restorable);
+          log?.(
+            `db baseline  snapshot ${path} — ` +
+              activeBaseline.tables.map((t) => `${t.table} ${t.rowCount} row(s)`).join(', ') +
+              (notRestorable.length > 0 ? ` · ${notRestorable.length} not restorable (${notRestorable.map((t) => t.table).join(', ')})` : ''),
+          );
+          if (ledger !== null && where.ledger !== undefined) {
+            ledger.dbBaseline = {
+              path,
+              tables: activeBaseline.tables.map((t) => t.table),
+              takenAt: activeBaseline.takenAt,
+              mode: baselineResolved.mode,
+            };
+            await writeLedger(where.ledger.path, ledger).catch(() => undefined);
+          }
+        }
+      }
+    } catch (error) {
+      // Never fatal: a baseline that could not be taken is a run without one.
+      log?.(`db baseline: could not prepare — ${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}`);
+      await baselineClient?.close().catch(() => undefined);
+      baselineClient = null;
+      baselineProbeForRun = null;
+    }
+  }
 
   // Outcomes are collected **by index**, never appended: cases finish in
   // whatever order they finish, and the roll-up, the suite index and the exit
@@ -490,6 +652,16 @@ export async function runCases(
   /** Governor pool override; null = the ordinary sizing. Never above ceiling. */
   let poolOverride: number | null = null;
   let governorHold = false;
+  /**
+   * Cases whose non-pass was stamped as possible cross-case interference.
+   * Each re-runs ALONE — but after the plan, not in the middle of it: the
+   * lane records its provisional verdict and moves on, and the re-runs go
+   * one at a time once the pool is empty. The old shape held the lane open
+   * waiting for every other lane to finish; three lanes stamped at once each
+   * waited for the other two and the run froze for good (2026-09-02, ec10NS
+   * c6 — no lane can leave the in-flight set while it is waiting inside it).
+   */
+  const pendingSoloReruns: { name: string; run: () => Promise<void> }[] = [];
 
   /** Set once the governor is built below; canRunWith fires blocked events through it. */
   let governorRef: QueueGovernor | null = null;
@@ -679,6 +851,19 @@ export async function runCases(
       );
     }
     const tag = tagOf(index);
+    // **A case authoring refused to write has no flow to run.** It is recorded
+    // blocked with the lint's reason — on the ledger, so the report's row
+    // says why instead of "never ran", and so the next resume knows how many
+    // times this row has been refused (see `AUTHORING_REFUSAL_CAP`).
+    if (testCase.refused !== undefined) {
+      const reason = `authoring refused (attempt ${testCase.refused.attempt}): ${testCase.refused.reason}`;
+      emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
+      if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
+      collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
+      await noteOutcome(collected[index]!, { authoringRefused: testCase.refused.attempt });
+      where.onCaseDone?.(testCase, collected[index]!);
+      return;
+    }
     // **A flow that proves nothing about its claim is not run.** Its only
     // assertions are the sign-in proof and a URL, so the browser would spend
     // a minute producing a green that says nothing; it is recorded as
@@ -686,6 +871,21 @@ export async function runCases(
     const vacuous = vacuousFlow(testCase.flow);
     if (vacuous !== null) {
       const reason = `vacuous flow — ${vacuous}; re-authored on --resume`;
+      emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
+      if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
+      collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
+      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, vacuous: true });
+      where.onCaseDone?.(testCase, collected[index]!);
+      return;
+    }
+    // **"Only" means only.** A flow on disk whose case says the page shows
+    // ONLY / เฉพาะ / เท่านั้น a listed set, and which never counts that set,
+    // passes over a list of any length (ec10_3x HIR-EC-029, 2026-09-02). It
+    // is the vacuous shape for one claim: blocked with the reason, re-authored
+    // on `--resume` under the author's exclusivity lint — never run green.
+    const exclusive = unprovedExclusivity(testCase.flow.steps, testCase.flow.caseContext ?? testCase.name);
+    if (exclusive !== null) {
+      const reason = `exclusivity unproved — ${describeUnprovedExclusivity(exclusive)}; re-authored on --resume`;
       emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
       if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
       collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
@@ -725,6 +925,7 @@ export async function runCases(
         cachePath: options.cache,
         sessionVault,
         screenshots: options.screenshots,
+        highlightTarget: options.highlightTarget,
         video: options.video,
         // The agent as ERROR BACKSTOP, not journey driver (2026-08-28, asked
         // for with code-grounded authoring): flows are now written to run
@@ -754,10 +955,131 @@ export async function runCases(
         onPlan: planLogger(options, tag),
         defects: testCase.defects,
         generatedBy: testCase.generatedBy,
+        ...(baselineProbeForRun === null ? {} : { dbBaselineProbe: baselineProbeForRun }),
       };
       const caseRunOptions = failFast
         ? failFastRunOptions(ordinaryRunOptions, testCase.flow)
         : ordinaryRunOptions;
+
+      /**
+       * Everything that happens to a finished bundle: diagnosis, proof file,
+       * report, verdict classification, the flow-file script fold, the ledger.
+       * One function because a solo re-run (interference) needs to do all of
+       * it again for its replacement verdict.
+       */
+      const settle = async (bundle: ProofBundle, { notify }: { notify: boolean }): Promise<void> => {
+        // The governor hears about a case that still did not pass — it may
+        // hold a sibling, shrink the pool, or seed the fixture the section is
+        // starved on. Fire-and-forget: a verdict never waits on advice.
+        if (!isPassing(bundle.status)) {
+          recentFailures.push(bundle.error ?? bundle.status);
+          if (recentFailures.length > 20) recentFailures.shift();
+        }
+        if (governor !== null && !isPassing(bundle.status)) void governor.onEvent(observe('case-ended'));
+        // A SYSTEM ERROR gets one healer-role call saying which layer broke —
+        // the test catalog, the generator, the agent, the environment or the
+        // application — and the fix when one exists. Written into the bundle
+        // BEFORE it is persisted, so the proof, the report and the panel all
+        // carry it. A test-failure is a verdict and is never diagnosed.
+        if (bundle.status === 'error' && diagnosisModel) {
+          const diagnosis = await diagnoseError(
+            {
+              caseName: testCase.name,
+              caseText: testCase.flow.caseContext ?? testCase.name,
+              bundle,
+              declaredRoutes: where.declaredRoutes ?? [],
+              hints: where.healHints,
+            },
+            { model: diagnosisModel, log: (line) => emitTagged(tag, `${line}
+  `, 'err') },
+          );
+          if (diagnosis) {
+            bundle.diagnosis = diagnosis;
+            bundle.notes = [...(bundle.notes ?? []), describeDiagnosis(diagnosis)];
+            emitTagged(tag, `  diagnosis  ${describeDiagnosis(diagnosis)}
+  `);
+          }
+        }
+        const proofPath = await writeProofBundle(bundle, options.out);
+        const target = resolveReportPath(
+          { path: options.report, dir: options.reportDir, enabled: options.reportEnabled },
+          {
+            runId: bundle.runId,
+            name: bundle.name,
+            status: bundle.status,
+            // index/kind are what stop one case's report overwriting the next.
+            ...(cases.length === 1 ? {} : { index: index + 1 }),
+            group: testCase.group ?? where.group,
+            kind: testCase.kind,
+          },
+        );
+        const reportPath = target === null ? null : await writeHtmlReport(bundle, target);
+
+        emitTagged(
+          tag,
+          `\n${formatProofSummary(bundle)}\n` +
+            (meaningfulCoverage(bundle) ? `  ${formatCoverage(bundle.coverage!)}\n` : '') +
+            (bundle.trend ? `  ${formatTrend(bundle.trend)}\n` : '') +
+            `  proof      ${proofPath}\n` +
+            (reportPath === null ? '' : `  report     ${reportPath}\n`),
+        );
+        // Two ways a run delivers no verdict: it never got going at all
+        // (`neverRan`), or it broke off on the machinery alone — every broken
+        // step an `error`, nothing about the application contradicted
+        // (`harnessOnly`; a database that was never configured, an agent that
+        // gave up, a provider that refused the call). Both score `blocked`,
+        // never `failed`: filing the harness's own gap as a product defect is
+        // the false test failure this suite used to produce 136 times over.
+        const blocked = neverRan(bundle) ?? harnessOnly(bundle);
+        if (blocked !== null) {
+          // Said out loud, at the moment it happens, and on stderr: this is not a
+          // verdict, and a reader scanning stdout for verdicts must not take it
+          // for one. It keeps its report — the evidence of what went wrong is
+          // still worth having — but it is not filed among the results.
+          emitTagged(tag, `  ! no verdict: ${blocked}\n`, 'err');
+        }
+        if (reportPath !== null && blocked === null) indexed[index] = { bundle, reportPath };
+        collected[index] = {
+          name: testCase.name,
+          verdict:
+            blocked !== null
+              ? 'blocked'
+              // The status a consumer acts on: an auto-review ruling (the
+              // judge at 70%+) or a human ruling outranks the machine's
+              // deferral, so a ruled run scores passed/failed, not 'review'.
+              : effectiveStatus(bundle) === 'needs-review'
+                ? 'review'
+                : isPassing(effectiveStatus(bundle))
+                  ? 'passed'
+                  : 'failed',
+          bundle,
+          reportPath: reportPath ?? undefined,
+          reason: blocked ?? failureOf(bundle),
+        };
+        if (parallel) {
+          emitTagged(tag, `case "${testCase.name}" ${blocked !== null ? 'blocked' : familyLabel(bundle.status)}\n`);
+        }
+        // Fold successful agent journeys back into the flow file as
+        // deterministic scripts, so the next run of this same file replays
+        // them with no model turn — the flow-file half of `AgentMemory`.
+        // Best-effort on purpose: a script that could not be written costs a
+        // few model turns next run, never a verdict.
+        if (testCase.flowPath !== undefined && blocked === null) {
+          const journeys = bundle.steps
+            .map((step) => step.agent)
+            .filter((record): record is AgentRecord => record !== undefined && record.success);
+          const scripted = withWorkflowScripts(testCase.flow, journeys);
+          if (scripted !== null) {
+            await writeFlowFile(testCase.flowPath, scripted)
+              .then(() => emitTagged(tag, `  scripted   agent journey recorded in the flow for $0 replay\n`))
+              .catch(() => undefined);
+          }
+        }
+        await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, proofPath });
+        // The scenario gate counts each case once; a solo re-run replaces a
+        // verdict it has already counted.
+        if (notify) where.onCaseDone?.(testCase, collected[index]!);
+      };
 
       let bundle;
       if (autoheal && !failFast) {
@@ -795,10 +1117,13 @@ export async function runCases(
       }
       // **The interference detector** (docs/parallel-run-spec.md, defect #11):
       // a non-pass produced while another lane WROTE an intersecting section
-      // is not yet a verdict about the application. The bundle is stamped,
-      // and the case re-runs ONCE with nothing else in flight — the re-run's
-      // outcome stands, with the first attempt's status on the note. This is
-      // the honesty backstop for every mis-drawn section boundary.
+      // is not yet a verdict about the application. The bundle is stamped and
+      // recorded as it stands — provisional — and the case is queued to re-run
+      // ONCE with nothing else in flight, after the rest of the plan; the
+      // re-run's outcome then replaces it, with the first attempt's status on
+      // the note. The lane itself never waits: waiting here is what deadlocked
+      // three lanes that were stamped together. This is the honesty backstop
+      // for every mis-drawn section boundary.
       if (useSections && parallel && !isPassing(bundle.status) && bundle.status !== 'needs-review') {
         const mine = { meta: metaOf(testCase, index), startedMs: caseStartedMs, endedMs: Date.now() };
         const culprits = [...windows.entries(), ...[...inFlightMeta.entries()].map(([i, l]) => [i, { ...l, endedMs: Date.now() }] as const)]
@@ -806,133 +1131,37 @@ export async function runCases(
           .map(([, other]) => other.name);
         if (culprits.length > 0) {
           const firstStatus = bundle.status;
-          const stamp = `possible cross-case interference: ${[...new Set(culprits)].slice(0, 3).join(', ')} wrote an intersecting data section during this run — re-ran alone`;
-          emitTagged(tag, `  interference  ${stamp}\n`, 'err');
-          governorHold = true;
-          try {
-            // Drain: nothing else may be mid-flight while the re-run proves
-            // the verdict clean. Bounded wait — lanes always finish.
-            while (inFlightMeta.size > 1) await new Promise((resolve) => setTimeout(resolve, 500));
-            const rerun = await runFlow(testCase.flow, caseRunOptions);
-            rerun.caseStartedAt = caseStartedAt;
-            rerun.caseDurationMs = Date.now() - caseStartedMs;
-            if (testCase.risk) rerun.risk = testCase.risk;
-            rerun.notes = [...(rerun.notes ?? []), `${stamp} (first attempt: ${firstStatus})`];
-            bundle = rerun;
-          } finally {
-            governorHold = false;
-          }
+          const stamp = `possible cross-case interference: ${[...new Set(culprits)].slice(0, 3).join(', ')} wrote an intersecting data section during this run`;
+          emitTagged(tag, `  interference  ${stamp} — verdict provisional; re-runs alone once the rest of the plan is done\n`, 'err');
+          bundle.notes = [...(bundle.notes ?? []), `${stamp} — provisional: re-runs alone after the rest of the plan`];
+          pendingSoloReruns.push({
+            name: testCase.name,
+            run: async () => {
+              emitTagged(tag, `\nre-running alone "${testCase.name}" — first attempt ${firstStatus}, flagged as possible interference\n`);
+              inFlightMeta.set(index, { name: testCase.name, meta: metaOf(testCase, index), startedMs: Date.now() });
+              try {
+                const rerun = await runFlow(testCase.flow, caseRunOptions);
+                rerun.caseStartedAt = caseStartedAt;
+                rerun.caseDurationMs = Date.now() - caseStartedMs;
+                if (testCase.risk) rerun.risk = testCase.risk;
+                rerun.notes = [...(rerun.notes ?? []), `${stamp} — re-ran alone (first attempt: ${firstStatus})`];
+                await settle(rerun, { notify: false });
+              } catch (error) {
+                // The provisional verdict stands, and says why it is provisional.
+                const reason = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);
+                emitTagged(tag, `  ! solo re-run did not complete — the first attempt's verdict stands: ${reason}\n`, 'err');
+              } finally {
+                const lane = inFlightMeta.get(index);
+                if (lane !== undefined) {
+                  windows.set(index, { ...lane, endedMs: Date.now() });
+                  inFlightMeta.delete(index);
+                }
+              }
+            },
+          });
         }
       }
-      // The governor hears about a case that still did not pass — it may
-      // hold a sibling, shrink the pool, or seed the fixture the section is
-      // starved on. Fire-and-forget: a verdict never waits on advice.
-      if (!isPassing(bundle.status)) {
-        recentFailures.push(bundle.error ?? bundle.status);
-        if (recentFailures.length > 20) recentFailures.shift();
-      }
-      if (governor !== null && !isPassing(bundle.status)) void governor.onEvent(observe('case-ended'));
-      // A SYSTEM ERROR gets one healer-role call saying which layer broke —
-      // the test catalog, the generator, the agent, the environment or the
-      // application — and the fix when one exists. Written into the bundle
-      // BEFORE it is persisted, so the proof, the report and the panel all
-      // carry it. A test-failure is a verdict and is never diagnosed.
-      if (bundle.status === 'error' && diagnosisModel) {
-        const diagnosis = await diagnoseError(
-          {
-            caseName: testCase.name,
-            caseText: testCase.flow.caseContext ?? testCase.name,
-            bundle,
-            declaredRoutes: where.declaredRoutes ?? [],
-            hints: where.healHints,
-          },
-          { model: diagnosisModel, log: (line) => emitTagged(tag, `${line}
-`, 'err') },
-        );
-        if (diagnosis) {
-          bundle.diagnosis = diagnosis;
-          bundle.notes = [...(bundle.notes ?? []), describeDiagnosis(diagnosis)];
-          emitTagged(tag, `  diagnosis  ${describeDiagnosis(diagnosis)}
-`);
-        }
-      }
-      const proofPath = await writeProofBundle(bundle, options.out);
-      const target = resolveReportPath(
-        { path: options.report, dir: options.reportDir, enabled: options.reportEnabled },
-        {
-          runId: bundle.runId,
-          name: bundle.name,
-          status: bundle.status,
-          // index/kind are what stop one case's report overwriting the next.
-          ...(cases.length === 1 ? {} : { index: index + 1 }),
-          group: testCase.group ?? where.group,
-          kind: testCase.kind,
-        },
-      );
-      const reportPath = target === null ? null : await writeHtmlReport(bundle, target);
-
-      emitTagged(
-        tag,
-        `\n${formatProofSummary(bundle)}\n` +
-          (meaningfulCoverage(bundle) ? `  ${formatCoverage(bundle.coverage!)}\n` : '') +
-          (bundle.trend ? `  ${formatTrend(bundle.trend)}\n` : '') +
-          `  proof      ${proofPath}\n` +
-          (reportPath === null ? '' : `  report     ${reportPath}\n`),
-      );
-      // Two ways a run delivers no verdict: it never got going at all
-      // (`neverRan`), or it broke off on the machinery alone — every broken
-      // step an `error`, nothing about the application contradicted
-      // (`harnessOnly`; a database that was never configured, an agent that
-      // gave up, a provider that refused the call). Both score `blocked`,
-      // never `failed`: filing the harness's own gap as a product defect is
-      // the false test failure this suite used to produce 136 times over.
-      const blocked = neverRan(bundle) ?? harnessOnly(bundle);
-      if (blocked !== null) {
-        // Said out loud, at the moment it happens, and on stderr: this is not a
-        // verdict, and a reader scanning stdout for verdicts must not take it
-        // for one. It keeps its report — the evidence of what went wrong is
-        // still worth having — but it is not filed among the results.
-        emitTagged(tag, `  ! no verdict: ${blocked}\n`, 'err');
-      }
-      if (reportPath !== null && blocked === null) indexed[index] = { bundle, reportPath };
-      collected[index] = {
-        name: testCase.name,
-        verdict:
-          blocked !== null
-            ? 'blocked'
-            // The status a consumer acts on: an auto-review ruling (the
-            // judge at 70%+) or a human ruling outranks the machine's
-            // deferral, so a ruled run scores passed/failed, not 'review'.
-            : effectiveStatus(bundle) === 'needs-review'
-              ? 'review'
-              : isPassing(effectiveStatus(bundle))
-                ? 'passed'
-                : 'failed',
-        bundle,
-        reportPath: reportPath ?? undefined,
-        reason: blocked ?? failureOf(bundle),
-      };
-      if (parallel) {
-        emitTagged(tag, `case "${testCase.name}" ${blocked !== null ? 'blocked' : familyLabel(bundle.status)}\n`);
-      }
-      // Fold successful agent journeys back into the flow file as
-      // deterministic scripts, so the next run of this same file replays
-      // them with no model turn — the flow-file half of `AgentMemory`.
-      // Best-effort on purpose: a script that could not be written costs a
-      // few model turns next run, never a verdict.
-      if (testCase.flowPath !== undefined && blocked === null) {
-        const journeys = bundle.steps
-          .map((step) => step.agent)
-          .filter((record): record is AgentRecord => record !== undefined && record.success);
-        const scripted = withWorkflowScripts(testCase.flow, journeys);
-        if (scripted !== null) {
-          await writeFlowFile(testCase.flowPath, scripted)
-            .then(() => emitTagged(tag, `  scripted   agent journey recorded in the flow for $0 replay\n`))
-            .catch(() => undefined);
-        }
-      }
-      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, proofPath });
-      where.onCaseDone?.(testCase, collected[index]!);
+      await settle(bundle, { notify: true });
     } catch (error) {
       // The narrower case: something threw before there was a bundle at all —
       // a report that could not be written, an unexpected engine error.
@@ -972,6 +1201,82 @@ export async function runCases(
   }
   if (process.platform !== 'win32') process.off('SIGUSR2', onPause);
   if (pausePoll !== null) clearInterval(pausePoll);
+
+  // **Interference re-runs, alone, after the plan.** Nothing is in flight now,
+  // so each re-run is the clean proof the stamp asked for — one at a time, in
+  // the order the stamps landed. A pause raised meanwhile is honoured: the
+  // cases not yet re-run keep their provisional verdicts, note included.
+  if (pendingSoloReruns.length > 0) {
+    process.stdout.write(
+      `\n${pendingSoloReruns.length} case(s) flagged as possible cross-case interference now re-run alone, one at a time\n`,
+    );
+    for (const pending of pendingSoloReruns) {
+      if (pauseRequested(pauseFile)) {
+        process.stdout.write(`  paused before re-running "${pending.name}" — its provisional verdict stands, interference note included\n`);
+        break;
+      }
+      await pending.run();
+    }
+  }
+
+  // **What the plan did not predict.** The snapshot is taken from the sheet's
+  // words before authoring finishes, so a flow may end up naming a table the
+  // plan never mentioned. That table has no baseline row: its changes are not
+  // compared and a restore cannot put it back. Said out loud rather than left
+  // for someone to infer from a report with a gap in it.
+  if (activeBaseline !== null) {
+    const covered = new Set(activeBaseline.tables.map((t) => t.table.toLowerCase()));
+    const missed = new Set<string>();
+    for (const item of queue.items) {
+      for (const named of tablesNamedBySteps(item.flow)) {
+        if (!covered.has(named.toLowerCase())) missed.add(named);
+      }
+    }
+    if (missed.size > 0) {
+      process.stdout.write(
+        `  ! db baseline  ${missed.size} table(s) the authored flows name were not in the snapshot ` +
+          `(${[...missed].join(', ')}) — their changes are not compared, and a restore cannot put them back. ` +
+          'Name them with --db-baseline-tables to include them next run.\n',
+      );
+    }
+  }
+
+  // **Restore the database to the baseline** — the run is over (solo re-runs
+  // included), so nothing is mid-flight to disturb. Only in `restore` mode,
+  // only when a snapshot was taken, and only through the separate write
+  // connection; every statement is printed before it runs, and the result is
+  // verified against the baseline through the read-only client. Never a
+  // verdict about the application: a failed restore is an environment fact,
+  // and it is surfaced loudly on the ledger and in the report, not as a defect.
+  if (activeBaseline !== null && baselineResolved.mode === 'restore' && !pauseRequested(pauseFile)) {
+    const restoreConfig = restoreDbConfig();
+    if (restoreConfig === null) {
+      log?.('db restore: WOWLIDATOR_DB_RESTORE_URL is not set — the tables were left as the run left them');
+    } else if (baselineClient === null) {
+      log?.('db restore: the read-only client is gone — cannot verify a restore, so none was attempted');
+    } else {
+      let writable: DbClient | null = null;
+      try {
+        writable = await connectDbWritable(restoreConfig);
+        log?.(`db restore  ${maskDsn(restoreConfig.url ?? '')} — restoring ${activeBaseline.tables.filter((t) => t.restorable).length} table(s)`);
+        const result = await restoreBaseline(writable, baselineClient, activeBaseline, {
+          onStatement: (sql) => emitTagged('db', `  restore sql  ${sql}\n`, 'err'),
+        });
+        log?.(`db restore  ${result.detail}`);
+        if (ledger !== null && where.ledger !== undefined && ledger.dbBaseline !== undefined) {
+          ledger.dbBaseline.restored = { at: result.at, ok: result.ok, detail: result.detail };
+          await writeLedger(where.ledger.path, ledger).catch(() => undefined);
+        }
+      } catch (error) {
+        log?.(`db restore: failed — ${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}`);
+      } finally {
+        await writable?.close().catch(() => undefined);
+      }
+    }
+  } else if (activeBaseline !== null && baselineResolved.mode === 'restore' && pauseRequested(pauseFile)) {
+    log?.('db restore: run paused — the tables were left as they are; `wowlidator db restore` puts them back');
+  }
+  await baselineClient?.close().catch(() => undefined);
 
   const fresh: CaseOutcome[] = collected.filter((o): o is CaseOutcome => o !== undefined);
   for (const entry of indexed) if (entry !== undefined) entries.push(entry);
@@ -1170,64 +1475,23 @@ export async function runCases(
       `  progress   ${where.ledger.path}${left.length === 0 ? '' : ` — ${left.length} left; continue with --resume`}\n`,
     );
 
-    // **The catalog report** (2026-08-31): one self-contained HTML per catalog
-    // run in the local `reports/` folder — every planned case grouped by
-    // scenario, never-ran rows included, screenshots embedded, a two-pane
-    // case view (steps left, time record right), history explanations, and
-    // client-side export of one case or the whole file. Built from the
-    // LEDGER, so a resume regenerates the same file (stable per run key)
-    // with the carried verdicts in it. Never fatal — a report that cannot
-    // be written must not fail the suite that earned the verdicts.
-    try {
-      const history = options.history ? new RunHistory(options.historyPath) : null;
-      const scenarioOf = new Map<string, string>();
-      for (const item of queue.items) {
-        const id = item.name.split(/\s/)[0] ?? item.name;
-        scenarioOf.set(id, item.scenarioId ?? item.group ?? 'ungrouped');
+    // The final rewrite of the live catalog report (see `CatalogLiveReport`):
+    // every verdict this pass earned or carried, the page no longer marked as
+    // in progress. Printed here because this is where the roll-up names its
+    // artifacts; the file itself has existed since the run started.
+    if (liveReport !== null) {
+      await liveReport.settle();
+      const artifacts = await liveReport.refresh(true);
+      if (artifacts !== null) {
+        const { htmlPath, excel } = artifacts;
+        process.stdout.write(
+          `  catalog report ${htmlPath}\n` +
+            `  passed xlsx ${excel.xlsxPath} — ${excel.passedCases} passed case(s)` +
+            (excel.caseXlsxPaths.length > 0 ? `, one workbook per proved case in ${dirname(excel.caseXlsxPaths[0]!)}` : '') +
+            (excel.removed.length > 0 ? `, ${excel.removed.length} stale export(s) of cases that no longer pass removed` : '') +
+            '\n',
+        );
       }
-      const guessScenario = (id: string): string =>
-        scenarioOf.get(id) ?? (id.match(/^([A-Za-z]+_\d+)/)?.[1] ?? 'ungrouped');
-      const reportCases: CatalogReportCase[] = [];
-      for (const id of ledger.planned) {
-        const outcome = ledger.outcomes[id];
-        const bundleOutcome = outcomes.find((o) => o.name === (outcome?.name ?? id) && o.bundle !== null);
-        const bundle = bundleOutcome?.bundle ?? null;
-        let historyLines: string[] = [];
-        if (bundle !== null && history !== null) {
-          try {
-            const prior = await history.forFlow(bundle.name);
-            const trend = analyseTrend(bundle, prior.slice(0, -1));
-            historyLines = [formatTrend(trend)];
-            const heals = prior.reduce((sum, e) => sum + e.jitHeals, 0);
-            if (heals > 0) historyLines.push(`${heals} heal(s) paid across the recorded runs — the selectors are drifting`);
-          } catch {
-            historyLines = [];
-          }
-        }
-        reportCases.push({
-          id,
-          name: outcome?.name ?? id,
-          scenario: guessScenario(id),
-          verdict: outcome === undefined ? 'never-ran' : outcome.verdict,
-          status: outcome?.status ?? null,
-          reason: outcome?.reason ?? null,
-          bundle,
-          history: historyLines,
-        });
-      }
-      const path = catalogReportPath(ledger.runKey, ledger.title);
-      await writeCatalogReport(
-        path,
-        renderCatalogReport({
-          title: ledger.title,
-          runKey: ledger.runKey,
-          generatedAt: ledger.generatedAt,
-          cases: reportCases,
-        }),
-      );
-      process.stdout.write(`  catalog report ${path}\n`);
-    } catch (error) {
-      process.stderr.write(`  ! catalog report could not be written: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}\n`);
     }
   }
   return outcomes;

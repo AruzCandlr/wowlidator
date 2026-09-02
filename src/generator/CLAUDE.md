@@ -71,15 +71,15 @@ Every rail below exists because a prior run produced a **false claim** — a gre
 
 ## Negative testing (`MutationPolicy`)
 
-Three tiers on `TestGenerator`, default `forms` (`DEFAULT_MUTATION_POLICY` in `test-generator.ts` is the single source):
+Three tiers on `TestGenerator`, default `mutations` since 2026-09-02 (`DEFAULT_MUTATION_POLICY` in `test-generator.ts` is the single source):
 
 | Policy | May do | Never |
 |---|---|---|
 | `read-only` | navigate, read, assert | submit anything |
 | `forms` | submit **empty/invalid** input to exercise validation | submit valid data that writes |
-| `mutations` | create and update | delete, purchase, bulk ops |
+| `mutations` | fill, submit, create and update — like a human tester | delete, purchase, bulk ops |
 
-`forms` is the interesting tier and the reason it is now the default: submitting an empty required field is *not* destructive — validation is what stops the write, and verifying that is the entire negative-testing surface, which a `read-only` default silently excluded from every generated suite. `mutations` stays opt-in because an autonomous test writer that can mutate data is not something to opt *out* of; DELETE appears at no tier.
+`mutations` is the default by request: a human QA fills forms with real data and submits them, and the suite is expected to do the same out of the box. The knob stays — `--policy forms` narrows to validation-only negative testing (its own load-bearing tier: an empty-required-field submit is not destructive, and verifying validation is a real surface), `--policy read-only` to navigate-and-assert for a page where even an invalid submit is unwelcome. DELETE appears at no tier, and `mutations` still refuses purchases and bulk/irreversible ops. The filter is still structural (`REQUEST_VERBS_BY_POLICY`, `POLICY_RULES` + every step re-checked on the way out), not a prompt request.
 
 ## Boundary-value analysis (`fillEach`)
 
@@ -190,7 +190,11 @@ Five origins, each implying its own fix: `test-catalog` (the case or its TEST DA
 
 - **Roles are read from the tree, for every action** (`ungroundedSelectorRole`, S4): the generalisation of `ungroundedCountRole`. Sixteen dead-ends on one page came from `role=combobox`, `role=textbox`, native `select` written for filters the tree exposes as `button "Type:"` and `searchbox "Search benefit name"` — the roles a filter USUALLY has. A role no tree line starts with is refused with the tree's own line for that name; and a `fill`/`click`/`type`/`selectOption` on a line the tree marks `disabled` is refused too (the search box "starts disabled until a filter is chosen" — six flows filled it first). `expectHidden` and `expectCount 0` are exempt; after a `workflow` leg or on a truncated tree it declines.
 - **Test data is not an application fact** (`fixtureFacts` / `ungroundedFixtureAssertion`, S3): identifier-shaped values from the Test Data / Expected columns (`PL_07_01_02_03_04_05_06`, `BP-DENTAL-01`, `TH_MED_005`) may be TYPED freely but may be asserted to pre-exist — a DB where-clause, a row click scoped by them, an exact count — only after a step of the same flow typed them into a form (or an agent leg whose goal creates them). Thirteen be100 cases asserted fixtures the database never held and filed the misses against the app.
-- **The risk judge's evidence feeds the author** (S6): a `fail-fast` verdict with concrete reasons triggers ONE immediate re-ask with those reasons as `priorFeedback`; the re-authored flow replaces the first only when its re-judged likelihood is lower — feedback must never make the result worse. "The search box starts disabled" (0.78) and "no Start-date filter exists" (0.88) were each right and each spent on a full dead-ended run.
+- **The risk judge's evidence feeds the author** (S6): a `fail-fast` verdict with concrete reasons triggers ONE immediate re-ask with those reasons as `priorFeedback`; the re-authored flow replaces the first only when its re-judged likelihood is lower **AND it asserts at least as much about the claim** (`substantiveAssertions`, the vacuous lint's own predicate) — feedback must never make the result worse. "The search box starts disabled" (0.78) and "no Start-date filter exists" (0.88) were each right and each spent on a full dead-ended run. **The second gate is from 2026-09-02** (HIR-EC-006/HIR-EC-010, live): "lower risk alone" was gameable — a flow that asserts nothing about the claim cannot dead-end on it, so it always scored safer than the first draft that tried. The judge's own reasons named steps 8 and 11–12 of a first draft that reached the hire wizard; the re-ask, avoiding whatever it was told was risky, came back with four steps that never left the sign-in page — 0% risk, 0% proof — replaced the first, and passed green in 5 s about a hire it never attempted.
+
+## The vacuous lint counts the sign-in form's own controls as no proof (2026-09-02)
+
+`vacuous.ts`'s `substantiveAssertions` excluded only the sign-in PROOF (`expectHidden` of the submit control) and `expectUrl`. HIR-EC-006/HIR-EC-010's degenerate flows carried `expectVisible input[type="password"]` and `expectVisible role=button[name="Sign in" i]` — the sign-in form RENDERING its own fields — and those counted as substantive, so the fatal `vacuousClaim` lint in `FlowAuthor.author` never fired and the S6 swap saw "3 assertions". `isLoginFormSurface` now excludes `expectVisible`/`expectEnabled`/`expectDisabled` of the identity field, the password field, and a control literally named sign-in/log-in. **Deliberately narrower than `LOGIN_CONTROL`**: "next"/"continue"/"submit" are real wizard-step buttons far past sign-in and are NOT swept in; and it is selector-anchored (a `role=`/`input[type=` control locator, never `text=`), so a genuine login-validation claim — an error message that happens to contain "password" — is untouched. Because the predicate is shared, this lands in all three places at once: the fatal lint at authoring, the S6 swap gate, and `--rerun-vacuous` (which now marks both live cases blocked and re-authors them on the next resume).
 - **The Note column is a gate** (`sheetGate` in `commands/authoring.ts`, S7): a row whose Actual Result is Cancelled, or whose Note says cancelled/dropped, is refused before any model call — four be100 rows were authored against filters the requirement dropped on 6 Jul. A dated requirement change ("pop-up → page 4 Aug", "TBC wording") is prepended to the case card as its own line, so the author reads it before writing `role=dialog` for a page.
 
 ## Reconciliation claims and sheet-verbatim wording (EN-2 audit, 2026-08-31)
@@ -218,3 +222,253 @@ Five origins, each implying its own fix: `test-catalog` (the case or its TEST DA
   every disputed expected value quotes the case's own wording is marked a
   spec question — deliberate design vs the sheet, a BA call. 29 of 31 genuine
   QA fails in the EN-2 audit were this class; wowUI shows a `spec?` chip.
+
+## A refused row is recorded, authored leniently once, then left alone (2026-09-02)
+
+`authorEachRow` used to print `! X could not be written` and move on, and the
+row earned no ledger outcome — so `--resume` listed it as still to run,
+authored it again against the same captured trees, hit the same
+tree-grounding refusal (the page the row needs was never captured, so no tree
+renders its wording), and the run ended with the same rows "left". ec10n:
+two rows, every resume, two Opus calls each, no progress. Three changes, all
+in `cmdCatalog`/`suite-progress.ts`:
+
+- **Recorded.** A refusal (and a sheet gate) becomes a flow-less `SuiteCase`
+  with `refused: { reason, attempt }`; the runner records it `blocked` —
+  `authoring refused (attempt N): …` — with `LedgerOutcome.authoringRefused`
+  = N, so the catalog report's row says why instead of "never ran". Buffered
+  until the pipelined runner exists, flushed into its queue then; written
+  straight to the ledger (`persistRefusals`) when nothing authored at all.
+- **Lenient once.** A resume passes `refusedBefore` to the author; a row
+  refused before is authored with `lenientGrounding`, which makes the
+  `ungroundedTextExpectation` refusal `weak`: the flow is handed over with the
+  note and the RUN proves or dead-ends the wording against the real page.
+  Every other lint stays fatal.
+- **Capped.** `remaining()` drops a row at `AUTHORING_REFUSAL_CAP` (2)
+  refusals — strict, then lenient — so the third resume does not pay again; it
+  stays blocked with its reason. `--rerun-errors` (`markForRerun`) clears the
+  count, so an explicit ask authors it once more. A sheet-gated row (Cancelled)
+  is recorded at the cap outright.
+
+Tests: `tests/suite-progress.test.ts` ("authoring refusals").
+
+## Two lints that refused ec10 for the system's own reasons (2026-09-02)
+
+Confirmed against the sheet, row by row: of ten new-hire rows, four were
+refused by rules that were reading the wrong thing.
+
+**The wording classifier read the whole prompt, background included.**
+`WORDING_CLAIM` matches the Thai `ข้อความ` — "message" — and a catalog row's
+prompt carries the retrieved requirement documents as well as the row. Any Thai
+specification says `ข้อความ` many times, so *every* row was classified as a
+claim about the page's wording; `wordingClaimAssertsDataValue` then refused
+each one for asserting a value those documents happened not to quote — a new
+hire's own keyed name (HIR-EC-002 `HIREEC002`), a duplicate notice
+(HIR-EC-004), a success message (HIR-EC-008), a count (HIR-EC-001). Measured on
+the sheet, only three of the ten rows say `ข้อความ` themselves and none of the
+four refused ones is about wording at all. The lint now takes the case's own
+words (`extra.caseText`, the row as `describeCase` renders it) and classifies
+on those; the prompt still supplies the "is this value stated anywhere"
+haystack, and a caller with no case text behaves exactly as before.
+
+**An open question was treated as an expected value.** The sheet's convention
+is explicit — `ข้อความ Notice ที่แน่นอน = ? OQ-HIR-140`, "run it, record what
+the system shows, send it to BA/SA" — so `OQ-…`/`CF-…` is the NAME of an
+unanswered question. HIR-EC-009 asserted `expectVisible text=OQ-HIR-78` against
+the New Hire form, which can only fail and fails as though the application were
+missing something. `assertsOpenQuestion` refuses it with a message that says to
+assert the surrounding fact instead, and the procedure now carries the rule so
+the first ask rarely trips it. Deliberately narrow: only the id shape, and only
+where the flow ASSERTS it — a `fill` carrying one is the tester's own data, an
+intent naming one is a note to a reader.
+
+Tests: `tests/flow-author.test.ts` (`wordingClaimAssertsDataValue`,
+`assertsOpenQuestion`).
+
+## The Steps column is a script to perform, not background to read (2026-09-02)
+
+ec10 HIR-EC-001: the sheet's eight numbered steps key an identity, walk the
+Province → District → Sub-District cascade, fill position and compensation,
+press Submit, then verify the created profile. What was authored signed in,
+opened the form, and asserted that an `Employee ID` label and the words
+`Auto-generated by system` were on screen — fifteen steps, two `fill`s, both of
+them the login. It proved the form exists. It never ran the case, so nothing it
+asserted was evidence either way, and the Expected output it answered was not
+the sheet's.
+
+`describeCase` had always put the Steps column in the prompt, so the model was
+told the script; nothing told it to CARRY IT OUT, and the loudest instruction
+in the procedure pulls the other way — *the fewest steps that reach the claim*.
+For a key-in case the fewest steps that appear to reach it are to look at the
+empty form. Two changes:
+
+- **A procedure rule above the "fewest steps" one**: the Steps column is a
+  script to perform in order with the Test data's own values
+  (`กรอก`/`คีย์`/enter → fill, `เลือก` → selectOption or click, `กด` → click,
+  Submit → the submit control). Asserting a field EXISTS is not performing the
+  step that fills it, and the claim of a key-in case is what the system does
+  AFTER the data is entered. A step that genuinely cannot be performed is named
+  in its intent, never silently dropped.
+- **`skipsAuthoredScript`**, a fatal lint: the case's Steps ask for input
+  (`กรอก`, `คีย์`, `ระบุ`, `เลือก`, `กด Submit`, fill/key-in/enter/select/submit)
+  and the flow's BODY performs none — no `fill`, `fillRetry`, `type`,
+  `selectOption`, `check`, `uncheck`. Only the body is examined, so a sign-in's
+  own fills neither satisfy nor trip it, and a read-only case (a menu is
+  visible, a column list is complete) scripts no input and is never touched.
+
+Tests: `tests/flow-author.test.ts` (`skipsAuthoredScript`).
+
+## The control is the one the label points at, with the role the tree shows (2026-09-02)
+
+ec10 HIR-EC-001 authored `fill role=textbox[name="Select date" i]` with
+`1 Sep 2027`, and `selectOption role=combobox[name="Event Reason" i]`. All three
+choices were wrong about the page, and the tree had shown the right answers: a
+`textbox "Hire Date"` beside the placeholder-named read-only shell, and a
+`button "Event Reason"` with `aria-haspopup`. A textbox named by its PLACEHOLDER
+is usually a display over the real input; the real one is named by the field's
+label. A date input takes `YYYY-MM-DD`. A dropdown the tree lists as a button is
+a button — invent no role the tree did not show. One procedure rule now says so;
+the engine's read-only shell rung (`src/engine/CLAUDE.md`) rescues the flows
+already on disk.
+
+
+## A row that says it cannot be run is not authored; a script of actions is not answered by assertions (2026-09-02)
+
+ec10_2x CNS-EC-028: five steps — employee 1 signs in, opens the attachment,
+accepts; the admin publishes version 2.0; employee 2 does the same; the dev
+team reads the bound version codes; restore. The row supplies one account
+(`<HR_ADMIN_ACCOUNT>`), and its own Note, from a check of SIT on 31 Aug, says
+the admin consent register does not exist and *"ให้บันทึกผลเป็นยังทดสอบไม่ได้"* —
+record as not yet testable. Authored anyway, the model did the honest thing it
+could: three `expectVisible` on the one admin page that exists, each intent
+saying the step "cannot be performed". The case then read as green about a
+feature the sheet says is absent.
+
+Two rules. `sheetGate` now reads the Note's own verdict — `ยังรันไม่ได้`,
+`ยังทดสอบไม่ได้`, "cannot be run yet", "not testable" — and records the row
+blocked in the sheet's words, at the refusal cap, for no model calls.
+`skipsAuthoredScript` gained a second tier: a script that asks the tester to
+ACT (`กด`, `ยอมรับ`, `ประกาศ`, `เข้าสู่ระบบ`, click/accept/publish/sign in) is not
+performed by a body of assertions alone; a `click` or a `workflow` leg
+satisfies it, as a fill satisfies the input tier. What no rule can supply: the
+two employee accounts the script needs and the row never names. That is the
+sheet's to fix.
+
+Tests: `tests/retriever.test.ts` (`sheetGate`), `tests/flow-author.test.ts`
+(`skipsAuthoredScript`).
+
+## A token is not a value, and the script runs to its last step (2026-09-02, HIR-EC-012)
+
+Two more refusals from reading one authored flow against its sheet row.
+
+**`<NON_EXISTING_EMPLOYEE_ID>` was typed into the field.** The sheet's
+Test data says `Invalid Replaced Employee ID = <NON_EXISTING_EMPLOYEE_ID>` — an
+angle-bracket TOKEN for a value the tester supplies, the same convention as
+`<HR_ADMIN_ACCOUNT>`. The flow filled the token itself; the page URL-encoded it
+(`check-replaced-employee/%3CNON_EXIS…`), the API rejected malformed input, and
+the step "proved" a rejection the case never asked about. `typesPlaceholderToken`
+(fatal) refuses any `fill`/`type`/`selectOption` whose value still carries
+`<LIKE_THIS>`, and the procedure says how to resolve one: from the Test data
+when it names the real value, from the run's credentials for an account, and
+for a NON_EXISTING / INVALID token from the format the case states — a
+well-formed value that cannot exist (an 8-digit Employee ID such as 29999999).
+
+**The flow stopped at step 3 of 7.** It cited "Step 2" and "Step 3" in its
+intents and never reached the valid-replacement check, the identity data,
+Submit or the profile check — the case's actual claim. Because the author
+already cites the script step in each intent, coverage is checkable without
+reading Thai prose: `unperformedScriptSteps` parses the script's `N.` lines,
+collects the numbers the intents cite, and refuses (fatal) when numbered steps
+beyond the highest cited one are neither cited nor marked
+`skipped step N: <why>`. A flow that cites no step at all is left alone — there
+is nothing to reason from — and the procedure now asks for the citation and the
+skip marker explicitly, so a genuine gap is visible rather than silent.
+Measured on the live HIR-EC-012 flow: refused with `performedThrough 3 of 7`,
+naming steps 4–7; a flow citing every step, or naming its skips, passes.
+
+Both delivered on typecheck plus a scripted check against the live flow; the
+unit tests are owed.
+
+## Values the sheet left as tokens are resolved, and a stand-in is flagged (2026-09-02)
+
+`typesPlaceholderToken` refuses `<NON_EXISTING_EMPLOYEE_ID>` typed as data — honest,
+and useless to the tester, who still has no run. `value-resolution.ts` runs
+BEFORE the lints and resolves every input step whose value is a token or a
+description ("ของพนักงานที่มีอยู่จริง"), cheapest source first, recording which one
+answered on the step (`FlowStep.valueSource`), in its intent, and in every report:
+
+1. **test-data** — the case's own `Field = value` line; a NON_EXISTING need never
+   takes the valid id's line and vice versa. $0.
+2. **repo** — `selectRelevantContext` over the documents (or the prompt's own
+   paragraphs ranked by overlap), one structured question to the agent role;
+   accepted only when the value appears verbatim in a passage.
+3. **db** — read-only, only when `WOWLIDATOR_DB_URL` is set: the agent role names
+   `{table, column, where}` in `dbCount`'s shape, every identifier is checked
+   against the introspected schema (a wrong one is a refusal, not a query), one
+   `SELECT … LIMIT 1`, the value through `redactValue` (a sensitive column is
+   never used). A NON_EXISTING token is proved absent instead: a candidate from
+   the case's stated format (`8 หลัก`, `หลักแรกเป็น 2` → `29999999`), `count(*) = 0`,
+   stepping past up to five that exist.
+4. **generated** — the generator role invents a well-formed value (or
+   `candidateFor` does, deterministically, with no model), and the step is
+   FLAGGED: `valueSource.kind = 'generated'`, the intent says so, the proof
+   bundle gets a note, the CLI line prints `value generated — …`, both HTML
+   reports show a `value generated` badge (`GLOSSARY` entry) and a `value` fact,
+   the Excel Proof column a `value source:` line, wowUI's step panel a `value`
+   row. A generated value is a stand-in the reader must weigh, never evidence.
+
+Never fatal: a source that throws is a source that did not answer; the lint stays
+as the backstop for what nothing could resolve. `--no-value-resolution` /
+`WOWLIDATOR_VALUE_RESOLUTION=off` turns the stage off (`buildValueResolution` in
+`cli/runtime.ts`); with no agent key the model is null and sources 1 and 4 still
+work. Tests: `tests/value-resolution.test.ts`.
+
+## The token stays for the resolver, and a skip is not an escape hatch (2026-09-02, HIR-EC-012 again)
+
+Read against the sheet, the re-authored HIR-EC-012 covered steps 1–3, one field
+of step 5, and skipped 4, 6 and 7 — the case's claim untested — and it had
+resolved `<NON_EXISTING_EMPLOYEE_ID>` to `29999999` ITSELF, so the value carried
+no `valueSource` and a made-up id read as data. Two changes:
+
+- **The procedure now says to leave the token in place.** The resolution stage
+  runs after the model and records provenance (test data / repo / db / generated);
+  a model that resolves the token on its own destroys exactly that. The
+  non-existence proof (`count = 0` in the database) only happens on this path.
+- **A step skipped for want of a value is looked up, then re-asked.**
+  `#valuesForSkippedSteps` reads each `skipped step N: <why>`; when the reason
+  speaks of a missing id/value it extracts the field (`fieldNamesIn`) and asks
+  the test-data, repo and db sources. A value found becomes a `weak` refusal —
+  "step 4 skipped, but db has Replaced Employee ID = 20004512; author it, and
+  the steps skipped only because it was missing" — so the next attempt writes
+  step 4 (and, with it, 6 and 7), and the last attempt accepts the skip with a
+  note naming the value that was available. Steps skipped for other reasons
+  (another module, destructive) are left alone.
+
+What no lint can judge: how COMPLETELY a cited step was performed — step 5's
+"กรอกข้อมูล Identity ตามข้อมูลที่กำหนด" is one bullet and a dozen fields, and a
+flow that keys one of them has cited the step. That remains the reader's call,
+and the report's step list is where to make it.
+
+## "Only" means only (`src/generator/exclusivity.ts`, 2026-09-02)
+
+An Expected line that says ONLY / JUST / EXACTLY / เฉพาะ / แค่ / เพียง / เท่านั้น about an enumerated set ("แสดง 3 ค่า", "A / B / C") is a claim about the whole set, and the whole set is proved by counting it. Measured on ec10_3x HIR-EC-029: the flow proved three options visible and three named codes hidden and went green over a list nothing had counted. Three places share one detector (`exclusivityClaimIn` / `unprovedExclusivity`): the authoring prompt's procedure + self-check, a fatal lint in `FlowAuthor` (refuses a body with no `expectCount`, or one whose numeric count disagrees with the sheet's), and `runCases`, which blocks a flow already on disk the same way it blocks a vacuous one (re-authored on `--resume`). Conservative by design: the marker must be in the Expected block and the line must enumerate — a bare "เฉพาะบางกลุ่ม" is left alone.
+
+## "Only these three" is a count, not three presences (2026-09-02, HIR-EC-029)
+
+The Expected output read *dropdown แสดง 3 ค่า : Event Reason บนหน้า Key-in
+แสดงเฉพาะ New Hire / Replacement / Migration*. The page offered a dozen reasons
+(DATA MIGRATION, HIREDM, H_NEWHIRE, H_RPLMENT, MT_EMP_INFO …) — the defect the
+case exists to catch. The flow asserted `expectVisible` of each of the three:
+presences that pass on a dropdown of a hundred. The case went red only because
+one presence tripped on wording, so the report blamed a label and never
+mentioned the extra options — a fail for the wrong reason, which is a miss.
+
+`unboundedExclusivityClaim` (fatal): when the case text claims a closed set —
+a count (`แสดง 3 ค่า`, `exactly 3 options`) or an "only" (`เฉพาะ`, `only these`,
+`nothing else`) — the flow must carry an `expectCount`; presences alone are
+refused, and the message names the bound (`expectCount role=option = 3`). The
+numbered form is read first so the refusal can quote the number. The procedure
+carries the same rule, with the shape to write: open the control, count its
+options, then assert each named value; an `ไม่แสดง X` line is an `expectHidden`
+on top of the count, never instead of it. Tests: `tests/flow-author.test.ts`
+(`unboundedExclusivityClaim`).

@@ -85,6 +85,33 @@ const PAGES: Record<string, string> = {
   '/details': `<h1>Application details</h1>
     <input id="applicant" aria-label="Applicant name" placeholder="Applicant name">
     <p id="stage">Stage: details</p>`,
+  // A form the agent must fill the way a human does — a checkbox, a native
+  // select, and a per-keystroke field. Each control reflects its state into a
+  // visible text node so the test reads it back with a plain locator.
+  '/form': `<h1>Benefit enrolment</h1>
+    <label><input type="checkbox" id="paperless"> Go paperless</label>
+    <span id="cbstate">paperless:off</span>
+    <label for="plan">Plan</label>
+    <select id="plan" aria-label="Plan">
+      <option value="">Choose…</option>
+      <option value="std">Standard</option>
+      <option value="prm">Premium cover</option>
+    </select>
+    <span id="selstate">plan:none</span>
+    <input id="dependant" aria-label="Dependant" placeholder="Dependant">
+    <span id="typed">keystrokes: 0</span>
+    <script>
+      document.getElementById('paperless').addEventListener('change', function (e) {
+        document.getElementById('cbstate').textContent = 'paperless:' + (e.target.checked ? 'on' : 'off');
+      });
+      document.getElementById('plan').addEventListener('change', function (e) {
+        document.getElementById('selstate').textContent = 'plan:' + e.target.value;
+      });
+      var n = 0;
+      document.getElementById('dependant').addEventListener('keydown', function () {
+        document.getElementById('typed').textContent = 'keystrokes: ' + (++n);
+      });
+    </script>`,
 };
 
 function page(body: string): string {
@@ -1281,6 +1308,42 @@ describe('workflow agent (CDP)', { skip: skipBrowser }, () => {
     assert.match(model.seen[1]?.history[1] ?? '', /cleared a consent gate on turn 2/);
   });
 
+  it('fills a form like a human — check, selectOption by label, and per-keystroke type', async () => {
+    const script: AgentDecision[] = [
+      { action: 'check', selector: 'role=checkbox[name="Go paperless" i]', value: '', url: '', reasoning: 'opt in' },
+      { action: 'selectOption', selector: 'role=combobox[name="Plan" i]', value: 'Premium cover', url: '', reasoning: 'pick the plan' },
+      { action: 'type', selector: 'role=textbox[name="Dependant" i]', value: 'Rae', url: '', reasoning: 'name the dependant' },
+      { action: 'finish', selector: '', value: '', url: '', reasoning: 'the form is filled' },
+    ];
+    let turn = 0;
+    const model: AgentModel = {
+      id: 'form-filler',
+      async decide() {
+        return script[turn++] ?? { action: 'fail', selector: '', value: '', url: '', reasoning: 'script exhausted' };
+      },
+    };
+    const agent = new WorkflowAgent({ model, maxSteps: 8, actionTimeoutMs: 2_000 });
+
+    const state = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/form`, { waitUntil: 'domcontentloaded' });
+      const result = await agent.run(page, 'enrol the applicant — go paperless, choose Premium cover, and add dependant Rae');
+      assert.equal(result.success, true, result.summary);
+      assert.ok(result.actions.every((a) => a.ok), `every action landed: ${result.summary}`);
+      return {
+        cb: (await page.locator('#cbstate').textContent())?.trim(),
+        sel: (await page.locator('#selstate').textContent())?.trim(),
+        keystrokes: Number(((await page.locator('#typed').textContent()) ?? '').split(' ')[1]),
+      };
+    });
+
+    assert.equal(state.cb, 'paperless:on', 'check ticked the box and fired change');
+    assert.equal(state.sel, 'plan:prm', 'selectOption chose by visible label');
+    // "Rae" is 3 characters; a capital letter also fires a Shift keydown, so
+    // the count is per-character, not exactly the string length — `fill`
+    // would have fired none of these.
+    assert.ok(state.keystrokes >= 3, `type fired a real keydown per character (saw ${state.keystrokes})`);
+  });
+
   it('refuses to navigate off the starting origin', async () => {
     const model: AgentModel = {
       id: 'off-origin',
@@ -1386,6 +1449,47 @@ describe('generation → multi-page run → report (CDP)', { skip: skipBrowser }
       assert.equal(suite.cases.length, 1);
       assert.equal(suite.cases[0]?.name, 'validation shows');
       assert.equal(suite.rejected.length, 0, 'the better attempt is the one reported');
+    } finally {
+      await stopFixture(server);
+    }
+  });
+
+  it('re-asks when the model returns zero cases — an empty reply is a failed attempt, not a done one', async () => {
+    const { server, origin } = await startFixture();
+    try {
+      const good = {
+        name: 'validation shows',
+        kind: 'edge-case' as const,
+        rationale: 'second try',
+        steps: [
+          { action: 'goto', url: '/', value: '', selector: '', key: '', intent: 'open' },
+          { action: 'fill', selector: 'role=textbox[name="Applicant name" i]', value: 'x', url: '', key: '', intent: 'type' },
+          { action: 'click', selector: 'role=button[name="Start application" i]', value: '', url: '', key: '', intent: 'submit' },
+          { action: 'expectVisible', selector: 'role=heading[name="Consent required" i]', value: '', url: '', key: '', intent: 'real check' },
+        ],
+      };
+      const requests: GenerateRequest[] = [];
+      const model: GeneratorModel = {
+        id: 'stub:generator',
+        async generate(request) {
+          requests.push(request);
+          if (requests.length === 1) return { cases: [], defects: [] } as never;
+          return {
+            cases: [{ name: good.name, kind: good.kind, rationale: good.rationale, steps: good.steps as never }],
+            defects: [],
+          } as never;
+        },
+      };
+
+      const suite = await withPage(CDP_URL, async (page) => {
+        await page.goto(`${origin}/details`, { waitUntil: 'domcontentloaded' });
+        return new TestGenerator({ model }).generate(page);
+      });
+
+      assert.equal(requests.length, 2, 'zero cases must earn one informed re-ask');
+      assert.match(requests[1]?.feedback?.[0] ?? '', /returned NO cases/);
+      assert.equal(suite.cases.length, 1);
+      assert.equal(suite.cases[0]?.name, 'validation shows');
     } finally {
       await stopFixture(server);
     }

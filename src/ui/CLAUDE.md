@@ -183,3 +183,35 @@ media query now keeps navigation: the sidebar becomes a sticky, horizontally
 scrolling top bar (labels/footer hidden) instead of `display: none`, tables
 get `display: block; overflow-x: auto` so the page never scrolls sideways,
 and the evidence drawer takes the full viewport width.
+
+## The catalog report in the panel (2026-09-02)
+
+A catalog run's report exists from the run's first moment (see
+`src/reporter/CLAUDE.md`, "The report is live"), so the panel offers it
+wherever the run is named: a **Report** button on the proof group head beside
+the run-key chip, on the resumable-run banner, and on a running catalog job.
+`catalog-runs.ts` adds `reportFile` to each entry — the file's name under
+`reports/` when it exists on disk — and the button opens
+`/reports/<file>`, a route that serves the `reports/` folder AS a folder (one
+sub-folder deep, extension-typed: html, xlsx, webm). Not `/view?path=…`: the
+report links its per-case workbooks and recordings RELATIVELY so the folder can
+travel whole, and a relative link resolved against `/view` lands nowhere. The
+per-case `Export (Excel)` buttons inside the report therefore work from the
+panel exactly as they do from the file on disk.
+
+## A resume never runs without the account's password (2026-09-02)
+
+The `--as` password rides the job's env and is never written to the ledger. A
+resume in the SAME panel session inherits it from the prior job's `secretEnv`;
+after a panel restart there is no prior job, and the resume used to replay the
+argv alone — a run that authored login-only flows (every journey capture bounced
+to the sign-in page), refused six rows, and failed the rest at "Sign in".
+The ledger's `launch` now records the `persona` (email only); when a rebuilt
+resume has no `WOWLIDATOR_AS` from a prior job, the request or the panel's env,
+`/api/catalog-runs/resume` answers 409 `{ needsCredentials, persona }` instead
+of starting the job. wowUI's `resumeCatalog` catches that, asks for the
+password once (`window.prompt`, the panel's idiom for a spend decision) and
+re-posts with `as: "<persona>:<password>"`, which becomes the job's secret env.
+The resumable-run banner says which account the run signs in as. Test:
+`tests/resume-credentials.test.ts` (real server, temp cwd, the 409 path only —
+the 201 path spawns a real run).

@@ -106,17 +106,19 @@ import {
 } from '../artifacts.js';
 import { EXIT, exitCodeFor, suiteExit, type CaseOutcome } from '../exit.js';
 import {
+  AUTHORING_REFUSAL_CAP,
   isErrorOutcome,
   isFailedOutcome,
   ledgerPathFor,
   markForRerun,
   markVacuous,
   readLedger,
+  recordOutcome,
   remaining,
   summariseLedger,
   writeLedger,
 } from '../suite-progress.js';
-import { vacuousFlow } from '../../generator/vacuous.js';
+import { substantiveAssertions, vacuousFlow } from '../../generator/vacuous.js';
 import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, mapPool, orderScenariosFastestFirst } from '../case-plan.js';
 import { healHintsFrom } from '../../context/heal-hints.js';
 import type { CliOptions } from '../options.js';
@@ -127,6 +129,7 @@ import {
   buildCapturePilot,
   buildDataModel,
   buildFlowReviewer,
+  buildValueResolution,
   buildHealer,
   buildStepRepair,
   lineLogger,
@@ -549,6 +552,20 @@ export function sheetGate(row: TestCaseRow): string | null {
   if (/\b(cancel+ed|dropped|removed from (?:the )?req|out of scope)\b/i.test(note) && !/re-?test/i.test(actual)) {
     return `the sheet's Note says the case was cancelled: "${note.slice(0, 80)}"`;
   }
+  // The sheet's own verdict that the case CANNOT BE RUN YET — the screen it
+  // needs is not delivered, the tester is told to record "not yet testable".
+  // CNS-EC-028 (2026-09-02) carried exactly that in its Note; authored anyway,
+  // the model narrowed all five steps to three "the page exists" assertions
+  // and the case went green about a feature the sheet says is absent. A row
+  // that says so is recorded blocked with its own words, and costs no model.
+  const notYet =
+    /ยังรันไม่ได้|ยังทดสอบไม่ได้|ยังไม่สามารถทดสอบ|บันทึกผลเป็นยังทดสอบไม่ได้|cannot (?:be )?(?:run|tested) yet|not (?:yet )?testable|blocked until (?:dev|the team|delivery)/i.exec(
+      note,
+    );
+  if (notYet !== null) {
+    const line = note.split('\n').find((l) => l.includes(notYet[0])) ?? notYet[0];
+    return `the sheet's Note says the case cannot be run yet: "${line.trim().slice(0, 140)}"`;
+  }
   return null;
 }
 
@@ -628,6 +645,15 @@ async function authorEachRow(
      */
     onCase?: ((testCase: TableCase, first: AuthoredFlow) => Promise<void>) | undefined;
     /**
+     * Called when a row could not be written — a sheet gate, or authoring
+     * refused on its last attempt — with the reason and how many refusals
+     * this row now has. The seam that gets the refusal onto the ledger, so
+     * the report says why and a resume does not re-author it forever.
+     */
+    onRefused?: ((row: TestCaseRow, reason: string, attempt: number) => Promise<void>) | undefined;
+    /** Refusal counts from the prior ledger, by case id — what a resume authors leniently. */
+    refusedBefore?: ReadonlyMap<string, number> | undefined;
+    /**
      * Holds authoring to the scenario the runner is in (`ScenarioGate`).
      * Present only on the pipelined path — gating a run that starts after
      * the last row is authored would deadlock it by construction.
@@ -677,7 +703,15 @@ async function authorEachRow(
       context.gate?.authored(scenarioKey);
       refused.push(`${row.caseId}: ${gate}`);
       log?.(`  ${row.caseId}: skipped — ${gate}`);
+      // A gated row is final: recorded at the cap so a resume does not keep
+      // listing it among the cases "left".
+      await context.onRefused?.(row, gate, AUTHORING_REFUSAL_CAP);
       return;
+    }
+    const refusedBefore = context.refusedBefore?.get(row.caseId) ?? 0;
+    const lenientGrounding = refusedBefore > 0;
+    if (lenientGrounding) {
+      log?.(`  ${row.caseId}: refused ${refusedBefore}× before — authoring with the tree-grounding lint relaxed; the run decides`);
     }
     if (context.gate) {
       // Author no further than the scenario the runner is in: a row of a
@@ -786,6 +820,12 @@ async function authorEachRow(
     try {
       const one = await author.author(prompt, page, {
         journeyTree,
+        lenientGrounding,
+        // The ROW, not the prompt: the prompt also carries the retrieved
+        // requirement documents, and a Thai spec says `ข้อความ` on every other
+        // page — enough to classify every row as a wording claim and refuse
+        // its assertions (ec10, 2026-09-02).
+        caseText: described,
         ...(rowProjectContext === '' ? {} : { projectContext: rowProjectContext }),
       });
       first ??= one;
@@ -850,6 +890,8 @@ async function authorEachRow(
             try {
               const again = await author.author(prompt, page, {
                 journeyTree,
+                lenientGrounding,
+                caseText: described,
                 ...(rowProjectContext === '' ? {} : { projectContext: rowProjectContext }),
                 priorFeedback: risk.reasons.map((r) => `the pre-run risk judge found: ${r}`),
               });
@@ -860,11 +902,32 @@ async function authorEachRow(
                   ...(knownResult === undefined ? {} : { knownResult }) },
                 { model: context.risk, log: (line) => process.stderr.write(`${line}\n`) },
               );
-              // Only a genuinely better flow replaces the first — feedback must never make the result worse.
-              if (riskAgain && riskAgain.likelihood < risk.likelihood) {
+              // Only a genuinely better flow replaces the first — feedback must never make the
+              // result worse. "Better" used to mean only "scores a lower dead-end/fail
+              // likelihood," and that is gameable: a flow that asserts nothing about the
+              // claim cannot dead-end on it either, so it always looks safer than a flow that
+              // tried. Measured live (HIR-EC-006/HIR-EC-010, 2026-09-02): the risk judge's own
+              // reasons named steps 8 and 11-12 of a first draft that reached the hire wizard;
+              // the re-ask, avoiding whatever it was told was risky, came back with four steps
+              // that never leave the sign-in page — 0% risk, and 0% proof. `substantiveAssertions`
+              // (`generator/vacuous.ts`, the SAME predicate the fatal vacuous-claim lint uses) is
+              // the second gate: the swap also requires the re-authored flow to assert AT LEAST
+              // as much about the claim as the first did, not merely score better on risk alone.
+              const firstProof = substantiveAssertions([...(testCase.flow.setup ?? []), ...testCase.flow.steps]).length;
+              const againProof = riskAgain
+                ? substantiveAssertions([...(again.flow.setup ?? []), ...again.flow.steps]).length
+                : 0;
+              if (riskAgain && riskAgain.likelihood < risk.likelihood && againProof >= firstProof) {
                 testCase.flow = { ...again.flow, name: testCase.flow.name, ...(testCase.flow.polarity === undefined ? {} : { polarity: testCase.flow.polarity }), ...(card === undefined ? {} : { caseContext: card }) };
                 testCase.risk = riskAgain;
                 log?.(`  ${row.caseId}: re-authored — ${describeRisk(riskAgain)}`);
+              } else if (riskAgain && riskAgain.likelihood < risk.likelihood) {
+                log?.(
+                  `  ${row.caseId}: the re-authored flow scored lower risk (${riskAgain.likelihood}% vs ` +
+                    `${risk.likelihood}%) but proves less of the claim (${againProof} vs ${firstProof} ` +
+                    'substantive assertion(s)) — keeping the first; a flow that asserts nothing cannot ' +
+                    'dead-end, which is not the same as succeeding',
+                );
               } else {
                 log?.(`  ${row.caseId}: the re-authored flow was no better; keeping the first`);
               }
@@ -888,8 +951,14 @@ async function authorEachRow(
       // A refused row still advances the gate: a scenario that authors
       // nothing must clear, or every scenario after it waits forever.
       context.gate?.authored(scenarioKey);
-      refused.push(`${row.caseId}: ${error.message.split('\n')[0] ?? ''}`);
-      process.stderr.write(`  ! ${row.caseId} could not be written — ${error.message.split('\n')[0]}\n`);
+      // The WHOLE refusal, one bullet per lint. The first line alone reads
+      // "2 problems with the authored flow — fix all of them" and names none
+      // of them (ec10_2x HIR-EC-012/023, 2026-09-02: the ledger, the report and
+      // stderr all carried that line and nothing a person could act on).
+      const reason = refusalText(error);
+      refused.push(`${row.caseId}: ${reason}`);
+      process.stderr.write(`  ! ${row.caseId} could not be written — ${reason}\n`);
+      await context.onRefused?.(row, reason, refusedBefore + 1);
     }
   };
 
@@ -2075,12 +2144,14 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     catalogDescription,
   );
   const reviewer = buildFlowReviewer(options);
+  const valueResolution = buildValueResolution(options, contextDocs);
   const author = new FlowAuthor({
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     policy: options.policy,
     probe: options.probe,
     ...(options.authorAttempts === undefined ? {} : { attempts: options.authorAttempts }),
     ...(reviewer === null ? {} : { reviewer }),
+    ...(valueResolution === undefined ? {} : { valueResolution }),
     ...(tables.length > 0 ? { tables } : {}),
     ...(projectContext !== '' ? { projectContext } : {}),
     // The third grounding source for expectUrl. A route the application
@@ -2154,11 +2225,21 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
             ...(options.url === undefined ? {} : { url: options.url }),
             ...(options.repo === undefined ? {} : { repo: options.repo }),
             agent: options.agent,
+            // The email only — see `SuiteLedger.launch.persona`.
+            ...(options.credentials === undefined ? {} : { persona: options.credentials.email }),
           },
         };
   let rows = allRows;
+  // Rows authoring refused on an earlier pass, with their refusal counts —
+  // a resume authors those leniently once, then stops re-authoring them.
+  const refusedBefore = new Map<string, number>();
+  /** Refused rows for the non-pipelined path, appended to the run so they are recorded. */
+  let refusedForSerialRun: SuiteCase[] = [];
   if (options.resume) {
     const prior = ledgerSpec === undefined ? null : await readLedger(ledgerSpec.path);
+    for (const [id, outcome] of Object.entries(prior?.outcomes ?? {})) {
+      if (outcome.authoringRefused !== undefined && outcome.authoringRefused > 0) refusedBefore.set(id, outcome.authoringRefused);
+    }
     // A resume that dropped a role the pass was authored with is refused
     // here, once, with the fix — never nine per-step errors (S8).
     if (prior?.launch?.agent === true && !options.agent) {
@@ -2407,6 +2488,26 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         log?.('pre-run dead-end risk is not judged: the generator role does not resolve — every case runs with every retry path');
       }
       const queuedPaths: string[] = [];
+      // Rows authoring refused: each becomes a flow-less case the runner
+      // records as blocked, with the reason and the refusal count — that is
+      // how the refusal reaches the ledger, the report and the next resume
+      // (2026-09-02: ec10n's last two rows were refused and re-authored on
+      // every resume, unrecorded, so every resume ended with the same "2
+      // left"). Buffered until the runner exists; flushed into its queue
+      // then, or written straight to the ledger if nothing at all authored.
+      const pendingRefused: SuiteCase[] = [];
+      const refusedCaseOf = (row: TestCaseRow, reason: string, attempt: number): SuiteCase => ({
+        name: row.caseId,
+        flow: { name: row.caseId, steps: [] },
+        kind: 'catalog',
+        ...(row.scenarioId ? { scenarioId: row.scenarioId } : {}),
+        refused: { reason, attempt },
+      });
+      const enqueueRefused = (refusedCase: SuiteCase): void => {
+        if (queue === null) return;
+        if (refusedCase.scenarioId !== undefined) gate?.queued(refusedCase.scenarioId);
+        queue.push(refusedCase);
+      };
       try {
         const authoredRows = await authorEachRow(rows, author, options, {
           summary: claimsFile.summary,
@@ -2415,6 +2516,12 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           graph: repoContextGraph,
           gate,
           risk: riskModel,
+          refusedBefore,
+          onRefused: async (row, reason, attempt) => {
+            const refusedCase = refusedCaseOf(row, reason, attempt);
+            if (queue !== null && drain.value !== null) enqueueRefused(refusedCase);
+            else pendingRefused.push(refusedCase);
+          },
           onCase:
             queue === null
               ? undefined
@@ -2432,10 +2539,18 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
                     graphFacts: graphFactsOf(repoContextGraph),
                     ledger: ledgerSpec,
                     healHints: suiteHealHints,
+                    // The sheet's words for every planned row: what the
+                    // database baseline detects its tables from, so it can
+                    // snapshot before the first case instead of waiting for
+                    // the whole pass to author (which would disable the
+                    // pipelining this path exists for).
+                    planRows: rows.map(planRowText),
                     onCaseDone: (finished) => {
                       if (finished.scenarioId !== undefined) gate?.ran(finished.scenarioId);
                     },
                   });
+                  // Refusals that arrived before the runner existed join its queue now.
+                  for (const refusedCase of pendingRefused.splice(0)) enqueueRefused(refusedCase);
                   // Same stamp and same file the non-pipelined path writes
                   // below — built here because the run needs both now.
                   testCase.flow.authoredBy = {
@@ -2476,6 +2591,10 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         // or they are abandoned mid-run with their proofs half-written.
         queue?.close();
         if (drain.value !== null) await drain.value.catch(() => undefined);
+        // Nothing ran, so no runner wrote the ledger: the refusals go there
+        // directly, or the next resume re-authors the same rows for the same
+        // answer — the loop this exists to end.
+        if (pendingRefused.length > 0 && ledgerSpec !== undefined) await persistRefusals(ledgerSpec.path, pendingRefused);
         throw error;
       } finally {
         queue?.close();
@@ -2485,6 +2604,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         const outcomes = await drain.value;
         return suiteExit(outcomes);
       }
+      refusedForSerialRun = pendingRefused;
     } else {
       const approvedText = approvedClaims(claimsFile)
         .map((claim) => claim.claim)
@@ -2579,11 +2699,11 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // owed an answer about them. `runCases` also survives a case that *throws*,
   // which a failed case does not: see its note.
   const outcomes = await runCases(
-    cases.map((testCase, index) => ({
+    [...cases.map((testCase, index) => ({
       flowPath: flowPaths[index],
       name: testCase.name,
       flow: testCase.flow,
-      kind: 'catalog',
+      kind: 'catalog' as const,
       ...(testCase.scenarioId !== undefined && group !== undefined
         ? { group: `${group}/${slugify(testCase.scenarioId)}` }
         : {}),
@@ -2591,7 +2711,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       // and case title the run list groups and labels by.
       generatedBy: testCase.flow.authoredBy ?? catalogProvenance,
       ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
-    })),
+    })), ...refusedForSerialRun],
     options,
     {
       dir,
@@ -2601,6 +2721,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       graphFacts: graphFactsOf(repoContextGraph),
       ledger: ledgerSpec,
       healHints: healHintsFrom(repoContextGraph ?? null, contextDocs),
+      planRows: rows.map(planRowText),
     },
   );
 
@@ -2646,12 +2767,14 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
   // second tree is a constructor option, and there is no page to read one from
   // out here.
   const reviewer = buildFlowReviewer(options);
+  const valueResolution = buildValueResolution(options);
   const authorOptions = {
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     policy: options.policy,
     probe: options.probe,
     ...(options.authorAttempts === undefined ? {} : { attempts: options.authorAttempts }),
     ...(reviewer === null ? {} : { reviewer }),
+    ...(valueResolution === undefined ? {} : { valueResolution }),
     ...(tables.length > 0 ? { tables } : {}),
     ...(projectContext !== '' ? { projectContext } : {}),
     // The third grounding source for expectUrl. A route the application
@@ -2754,6 +2877,7 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
     cdpUrl: options.cdp,
     cachePath: options.cache,
     screenshots: options.screenshots,
+    highlightTarget: options.highlightTarget,
     video: options.video,
     agentAssist: options.agentAssist,
       backend: options.backend,
@@ -2802,4 +2926,59 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
   await openReport(reportPath, options);
   await cleanupChrome(options);
   return quarantine.quarantined ? EXIT.ok : exitCodeFor(bundle);
+}
+
+/**
+ * Refusals with no runner to carry them: written to the ledger directly, so
+ * the report says why each row has no verdict and a resume counts the refusal.
+ * Only when the ledger already exists — a first pass that authored nothing at
+ * all never opened one, and inventing it here would mint a run with no key.
+ */
+async function persistRefusals(ledgerPath: string, refused: readonly SuiteCase[]): Promise<void> {
+  const ledger = await readLedger(ledgerPath);
+  if (ledger === null) return;
+  for (const c of refused) {
+    if (c.refused === undefined) continue;
+    recordOutcome(
+      ledger,
+      { name: c.name, verdict: 'blocked', bundle: null, reason: `authoring refused (attempt ${c.refused.attempt}): ${c.refused.reason}` },
+      { authoringRefused: c.refused.attempt },
+    );
+  }
+  const left = remaining(ledger).length;
+  ledger.ended = {
+    at: new Date().toISOString(),
+    cause: left === 0 ? null : `${left} case(s) were never reached or never ran`,
+    complete: left === 0,
+  };
+  await writeLedger(ledgerPath, ledger).catch(() => undefined);
+}
+
+/**
+ * A sheet row as the database baseline reads it: the case id and every column
+ * that can name a table in prose. Never the Actual column — a recorded result
+ * describes a past run, not what this one will touch.
+ */
+function planRowText(row: TestCaseRow): { name: string; text: string } {
+  return {
+    name: row.caseId,
+    text: [row.testCase, row.preconditions, row.testData, row.steps, row.expected, row.note]
+      .filter((part) => typeof part === 'string' && part !== '')
+      .join('\n'),
+  };
+}
+
+/**
+ * An authoring refusal as a person needs to read it: the summary line, then
+ * every lint's complaint (`AuthoringError.messages`) as ` · ` bullets, capped so
+ * a ledger row stays a row. A non-authoring error keeps its first line.
+ */
+function refusalText(error: Error): string {
+  const first = error.message.split('\n')[0] ?? '';
+  if (!(error instanceof AuthoringError) || error.messages.length <= 1 && error.messages[0] === error.message) {
+    return first;
+  }
+  const bullets = error.messages.map((m) => m.split('\n')[0] ?? m).filter((m) => m !== '' && m !== first);
+  const text = bullets.length === 0 ? first : `${first} · ${bullets.join(' · ')}`;
+  return text.length > 1600 ? `${text.slice(0, 1597)}…` : text;
 }

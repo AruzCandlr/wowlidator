@@ -119,7 +119,7 @@ Four rules make it safe enough to exist:
 
 **Three zero-call rungs and plan-ahead cut the agent's turns** (measured before: 3.8 model turns per `workflow` step, ~3,350 input tokens a turn — the largest token sink in a run and the first role to trip a per-minute quota). In cost order, before any model turn: (1) **replay memory** — a goal solved on this origin+path is remembered in the healed-selector cache (`cacheAgentMemory`, `strategy: 'workflow-replay'`, key `replayKey(startUrl, goal)`; the runner passes it per call) and replayed deterministically, each selector re-grounded in the live tree, so the twelve cases that share "navigate to the plans page" pay the model once; a replay that fails is forgotten and the model asked, with the history saying so. (2) **Pre-flight** — a consent gate in front of the page is accepted and the page returned to (`consentGateShowing`/`acceptConsentGate`); a tree **link whose `url` is the goal's destination** is clicked as the route the goal describes; and a goal that names WHERE but no route word (`ROUTE_WORDS`: via, menu, sidebar, click, tile…) is met by a direct `goto`, the summary saying "by direct navigation" so a leg meant to exercise a menu is never silently passed by a URL. (3) **Plan-ahead** — `DecisionSchema.next` carries up to `AGENT_PLAN_AHEAD` (2) follow-ups the model is certain of (fill email → click Next); each is executed only while it still grounds in the tree *after* the previous action and is not already done, the first that does not hands control back, and follow-ups cost no turn. Every success path writes memory (`#remember`); `tests/agent-economy.test.ts` proves all three against a real page. A test whose fixture links straight to its destination is now solved without the model — which is the point, and why `agent-guards`' contradicted-finish test aims at an unlinked page.
 
-**The agent's vocabulary grew to match** (`AGENT_ACTIONS`): `press`, `scroll` and `wait` alongside `click`/`fill`/`goto`. They are what a *stuck* page actually needs — a listbox that only opens on Enter, a control below the fold, a view that has not hydrated — and a click-and-fill vocabulary can only keep clicking things that are not there yet. None of them can change data, which is what keeps the safety argument intact: the agent cannot express a purchase or a delete except through a `click` the goal explicitly asked for.
+**The agent's vocabulary grew to match** (`AGENT_ACTIONS`): first `press`, `scroll` and `wait` alongside `click`/`fill`/`goto` — what a *stuck* page needs, a listbox that only opens on Enter, a control below the fold, a view that has not hydrated — and then (2026-09-02) `check`/`uncheck`/`selectOption`/`type`, the same form verbs the engine ladder has, so a `workflow` leg drives a real form the way a human tester does rather than click-and-guess. None of them can change data beyond what a form submit does, which is what keeps the safety argument intact: the agent cannot express a purchase or a delete except through a `click` the goal explicitly asked for. See `src/orchestrator/CLAUDE.md` for the reveal-pass carve-out (`check`/`selectOption` may reveal a target; `fill`/`type` never write into an asserted field).
 
 ## Losing the session (`SessionLostError`)
 
@@ -355,3 +355,150 @@ pacing. Asked for universally: "View actual flow" in the report and wowUI now
 plays on every run, not only the ones that broke. The cost is bundle size —
 the film is embedded in the proof JSON — and `--video off` remains the
 opt-out (also the way to inherit the attached browser's own context).
+
+## The step's target, and the red rectangle (`src/engine/target.ts`, 2026-09-02)
+
+A step's evidence used to be a selector string and a picture of the whole
+page, reconciled by eye. Every step that resolved an element now records
+`ProofStep.target` — the selector that resolved, the element's tag, role
+(explicit or implied by the tag) and accessible name (aria-label, label, alt,
+title, placeholder, or text), and its box in **document** CSS px — read from
+the live element right before the shutter, so the record and the picture
+describe the same thing. Steps with no element (`goto`, `workflow`, HTTP and
+DB steps, the `#bareStep` absence assertions) have none. A failed step gets a
+short read of the AUTHORED selector: an assertion that found its element and
+disagreed with its content keeps a target (that IS the proof), a selector that
+matched nothing costs one bounded miss (750 ms) and records none.
+
+`captureEvidence` then draws a red rectangle around the target for the shutter
+(`drawTargetHighlight`): a `[data-wowlidator-highlight]` div appended to the
+document, `position:absolute` at the element's LIVE rectangle plus scroll —
+not `fixed`, because the still is full-page and a viewport-fixed box lands at
+the top of a tall image — `pointer-events:none`, top z-index, and removed in
+the `finally` around `page.screenshot`, so a failed shutter cannot leave it in
+the page, coverage never counts it, and the next step never sees it. Drawn
+only after `primeLazyContent`/`settleRendering`, since both move things.
+Every read is bounded (`TARGET_READ_BUDGET_MS`) and never throws: a target
+that cannot be read is absent, never a reason a step fails. `highlightTarget`
+(`SmartRunnerOptions`/`RunFlowOptions`, `--no-target-highlight` in the CLI
+and the panel) turns the rectangle off; the target is recorded either way.
+`describeTarget` is the one wording (`button "Sign in" · 120×40 at (30,200)`)
+the CLI line, both reports, the workbook and wowUI share.
+`tests/target.test.ts`: the pure half always, the browser half CDP-gated —
+what the role IS and whether the box is gone afterwards are browser facts.
+
+## Volatile greetings and the agent's tree notation (`src/engine/selector.ts`, 2026-09-02)
+
+Two free rungs added after one ec10 run put six identical false failures and
+four agent stalls on the board.
+
+**The greeting is not the fact.** Every flow asserted the sign-in proof as
+`text=Good afternoon, ผู้ดูแลระบบ`; every flow also pinned the clock with
+`setClock` to a date at midnight, so the chrome said "Good morning". The step
+dead-ended on every case about an admin who was signed in. `withoutGreeting`
+re-writes a text or role-name selector to the name after the greeting (English
+and Thai forms), and the ladder tries it right after the case rung, recorded as
+`narrow` with a bundle note. The generator applies the same rewrite as it
+writes (`withStableGreeting` in `toFlowStep`) and its procedure now says so, so
+new flows never carry one; the rung is what rescues the flows already on disk.
+
+**`region "Dependents Dependents"` is a tree line, not a selector.** The model
+copies the AX tree's `role "name"` notation back as a selector often enough that
+five such misses in a row ended a leg as a stall — while the same model had
+written the correct `role=region[name=… i]` two turns earlier.
+`fromAxNotation` rewrites the line to the role selector (and a bare `"name"` to
+`text="name"`); `normaliseAgentSelector` composes it with the bare-role and case
+rewrites and is applied to every decision and planned step in
+`LlmAgentModel.decide`, before the grounding guard sees it.
+
+**The still shows the section, not the page top.** `captureEvidence` scrolls
+the step's target into view before drawing the red box and firing the shutter:
+`fullPage` photographs the document, and an app shell that scrolls inside an
+inner panel is viewport-tall as a document, so a section the agent reached by
+scrolling was photographed at whatever position the panel was left in. An agent
+leg's target is the last control it acted on successfully, so a `workflow`
+step's evidence is outlined and in view like any other step's.
+
+## The entry rung: put the value in, then read it back (2026-09-02)
+
+Every rung of the ladder ends by re-running the AUTHOR'S OWN selector. That is
+the right rule while the selector is merely hard to reach, and useless when it
+names a control the page does not have. Live (ec10 HIR-EC-001): the flow keyed
+a Hire Date into `role=textbox[name="Select date" i] >> nth=0` and chose an
+Event Reason from `role=combobox[name="Event Reason" i]`. The agent's look
+reported — correctly — that no `combobox` role exists on that page at all; the
+control is a `button`. Three input steps burned 190 seconds, the case entered
+not one value, and everything after it was moot. The flow was right about WHAT
+to do and wrong about the selector, and no amount of re-running the selector
+could fix that.
+
+`#agentEnter` is the last rung, for `fill`/`fillRetry`/`type`/`selectOption`
+only. It asks for the OUTCOME rather than the action — *set this field to this
+value, with whatever the page really offers* — and what decides it is a
+**read-back of the value**, from the author's selector if it resolves now,
+otherwise from the control the agent last acted on successfully. `valueMatches`
+is tolerant in one direction only: a control renders what it holds its own way
+(`1 Sep 2027` for `01 Sep 2027`, a combobox label inside its row text), so the
+ask need only be PRESENT in what came back; an empty control never satisfies a
+non-empty ask. A step that passes here is recorded `agent` and files a
+medium usability defect naming the selector to rewrite, because paying a model
+to rediscover the same field every run is a cost, not a fix.
+
+Gated by `--agent-assist`, the same reason the repair stage is: it types into
+someone's application.
+
+**`paste` joins the agent's vocabulary** for this. A control that refuses
+`fill` (one assignment) and `type` (a keydown per character) usually has a
+listener that rejects both — a date picker that only accepts its own calendar,
+a masked input, a contenteditable. `paste` focuses, clears what it can, and
+delivers the whole string through `keyboard.insertText`, the same input path a
+real paste uses. It is in `INTERACTION_ACTIONS` (it engages a control, so it
+counts against a stall) and deliberately NOT in `REVEAL_ACTIONS` or
+`READ_ONLY_ACTIONS`: a claim an agent pasted into existence proves nothing.
+
+Tests: `tests/form-actions.test.ts`.
+
+## Where the fill actually failed, module by module (ec10 HIR-EC-001, 2026-09-02)
+
+Measured, not inferred — each point below was reproduced with a probe.
+
+- **The application**: Hire Date is TWO inputs (`HumiDatePicker`): a visible
+  `type="text" readOnly` with the placeholder "Select date", and a hidden
+  `type="date"` at `opacity:0` that the `<label for>` actually points at. Event
+  Reason is `HumiSearchableSelect`: a `<button aria-haspopup="listbox">`.
+- **Generator** (three faults): it took the textbox NAMED BY THE PLACEHOLDER
+  (`textbox "Select date"`, the read-only shell) although the tree also listed
+  `textbox "Hire Date"`, the real one; it wrote the date as the page displays it
+  (`1 Sep 2027`) where a date input accepts only `YYYY-MM-DD` (Playwright:
+  `Malformed value`); and it wrote `role=combobox` for a control the tree showed
+  as a `button`. The procedure now says all three, in one rule.
+- **Engine** (one fault, the expensive one): Playwright's `fill` on a read-only
+  input does not fail — it WAITS for editability until the timeout. The ladder
+  saw a timeout, which reads exactly like "not there", and walked every rung on
+  the same element: 56 s, 41 s and 93 s for the three inputs, nothing entered.
+  `#readOnlyShell` now asks the element whether it is read-only right after the
+  fast miss; if so it fills the single editable input beside it (as an ISO date
+  when it is a date input, `isoDateOf`), recorded `narrow` with a note, and when
+  there is none it goes straight to `#agentEnter` instead of timing out four
+  more times.
+- **Orchestrator**: the agent's look found the truth ("no combobox role exists
+  on this page") and was then barred from acting on it — fixed by the entry
+  rung, which is now NOT gated by `--agent-assist` (see above).
+- **Healer**: off under fail-fast (risk 80%), and it reads the same tree, so it
+  would have proposed the same shell. Not the cause.
+- **Provider, reporter**: every model call answered; the evidence (target box,
+  error, durations) was recorded exactly. Not the cause.
+
+Test: `tests/form-actions.test.ts` — the read-only shell fixture, filled as an
+ISO date, passing in seconds rather than a minute.
+
+**Follow-ups landed the same day** (`docs/readonly-input-spec.md` items 5–7):
+the tree prints `readonly` on a read-only textbox (`AxNode.readonly`), the
+generator refuses a fill aimed at one (`fillsReadOnlyNode`), the agent's
+`fill`/`type`/`paste` refuse a read-only, disabled or non-editable target in one
+turn (`#writable`) instead of reporting a success that changed nothing, and the
+shell rung tries the input named by the field the intent speaks of
+(`fieldNamesIn` → `role=textbox[name="Hire Date" i]`) before the positional
+sibling. Delivered on typecheck alone at the user's request; the CDP fixture in
+`tests/form-actions.test.ts` covers the rung, the rest is untested until the
+next run.

@@ -133,3 +133,44 @@ describe('rerun marking', () => {
     assert.equal(ledger.outcomes['A_1']?.verdict, 'passed');
   });
 });
+
+describe('authoring refusals', () => {
+  it('records a refusal as blocked with its count; a refused row is still "left" once, then is not', async () => {
+    const { AUTHORING_REFUSAL_CAP } = await import('../src/cli/suite-progress.js');
+    const ledger = newLedger('t', ['A_1', 'A_2']);
+    recordOutcome(ledger, { name: 'A_1 x', verdict: 'passed', bundle: null });
+    // First pass: strict authoring refused the row. It is on the ledger — the
+    // report says why — and a resume lists it, to author it leniently.
+    recordOutcome(
+      ledger,
+      { name: 'A_2', verdict: 'blocked', bundle: null, reason: 'authoring refused (attempt 1): asserts text no tree renders' },
+      { authoringRefused: 1 },
+    );
+    assert.equal(ledger.outcomes['A_2']?.authoringRefused, 1);
+    assert.deepEqual(remaining(ledger), ['A_2']);
+    // Second pass refused too: that is the cap. A third resume would spend
+    // the model twice for the same answer, so the row stops being "left".
+    recordOutcome(
+      ledger,
+      { name: 'A_2', verdict: 'blocked', bundle: null, reason: 'authoring refused (attempt 2): still ungrounded' },
+      { authoringRefused: AUTHORING_REFUSAL_CAP },
+    );
+    assert.deepEqual(remaining(ledger), []);
+    assert.equal(ledger.outcomes['A_2']?.verdict, 'blocked');
+    // The count survives a write, like every other field.
+    const dir = await mkdtemp(join(tmpdir(), 'wow-ledger-'));
+    const path = join(dir, 'x.progress.json');
+    await writeLedger(path, ledger);
+    assert.equal((await readLedger(path))?.outcomes['A_2']?.authoringRefused, AUTHORING_REFUSAL_CAP);
+  });
+
+  it('an explicit rerun of errors lifts the cap so the row is authored again', async () => {
+    const { AUTHORING_REFUSAL_CAP, markForRerun, isErrorOutcome } = await import('../src/cli/suite-progress.js');
+    const ledger = newLedger('t', ['A_1']);
+    recordOutcome(ledger, { name: 'A_1', verdict: 'blocked', bundle: null, reason: 'authoring refused (attempt 2): x' }, { authoringRefused: AUTHORING_REFUSAL_CAP });
+    assert.deepEqual(remaining(ledger), []);
+    assert.deepEqual(markForRerun(ledger, isErrorOutcome, 'rerun after error'), ['A_1']);
+    assert.equal(ledger.outcomes['A_1']?.authoringRefused, undefined);
+    assert.deepEqual(remaining(ledger), ['A_1']);
+  });
+});

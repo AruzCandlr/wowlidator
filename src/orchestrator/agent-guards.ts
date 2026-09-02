@@ -189,17 +189,16 @@ export function unscopedDestructiveClick(decision: DecisionLike, goal: string): 
 }
 
 /**
- * How many ok clicks on the SAME selector one run tolerates before the next
- * one is refused. Three, not two: a multi-select legitimately re-opens its
- * dropdown once per pick (be100 PL_03_17 needed three), and the page-changed
- * guard already lets those through — the pathology this exists for starts at
- * the fourth.
+ * How many ok activations (click or press) of the SAME selector one run
+ * tolerates before the next one is refused. Three, not two: a multi-select
+ * legitimately re-opens its dropdown once per pick (be100 PL_03_17 needed
+ * three), and the page-changed guard already lets those through — the
+ * pathology this exists for starts at the fourth.
  */
 export const TOGGLE_CLICK_LIMIT = 3;
 
 /**
- * Why a click that keeps re-pressing the same control must not run again, or
- * null.
+ * Why a control that keeps getting re-activated must not run again, or null.
  *
  * Live (PL_03_02, 2026-08-27): a filter button whose listbox options never
  * appeared in the truncated tree was clicked EIGHT times across 38 turns —
@@ -208,19 +207,36 @@ export const TOGGLE_CLICK_LIMIT = 3;
  * done-set restarted. 310 s of wall time on one leg, ok every time, learning
  * nothing. Counted per run and per selector, across URLs, exactly because
  * that is the shape the existing guards cannot see.
+ *
+ * **`press` counts too, since 2026-09-02** — the same reason, a second
+ * escape hatch. Live (HIR-EC-009): a Date of Birth calendar's "Previous
+ * year" stepper was PRESSED (not clicked) upward of thirty times hunting a
+ * decades-distant year — 15.6 minutes on one leg — because this guard
+ * counted `click` alone and a model that reaches for `press` on a focused
+ * button (both activate it identically) walked straight past a limit that
+ * exists for exactly this shape. A stepper genuinely needing four-plus
+ * presses to reach a distant value is real, but the fix for that is a
+ * faster route (type the year, jump via a year/month picker), never more of
+ * the same press — which is exactly what the refusal below tells the model
+ * to do.
  */
 export function repeatedToggleClick(
   decision: DecisionLike,
   okClicksThisRun: ReadonlyMap<string, number>,
 ): string | null {
-  if (decision.action !== 'click' || decision.selector.trim() === '') return null;
+  if (
+    (decision.action !== 'click' && decision.action !== 'press') ||
+    decision.selector.trim() === ''
+  )
+    return null;
   const count = okClicksThisRun.get(decision.selector.trim()) ?? 0;
   if (count < TOGGLE_CLICK_LIMIT) return null;
   return (
-    `circling: you have already clicked "${decision.selector}" ${count} times this run and it has not ` +
-    `produced what the goal needs — it likely toggles open and closed. Do something different: press a ` +
-    `key into it (ArrowDown/Enter), act on another control the tree shows, or call fail and say what ` +
-    `the page will not reveal`
+    `circling: you have already activated "${decision.selector}" ${count} times this run (click or press) ` +
+    `and it has not produced what the goal needs — it likely toggles open and closed, or is a stepper ` +
+    `too far from the target to reach one step at a time. Do something different: type the value directly ` +
+    `if the control accepts typed input, look for a faster jump (a month/year picker, a search box) instead ` +
+    `of stepping to it, act on another control the tree shows, or call fail and say what the page will not reveal`
   );
 }
 

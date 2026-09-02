@@ -25,7 +25,19 @@ import {
   TOGGLE_CLICK_LIMIT,
   unscopedDestructiveClick,
 } from '../src/orchestrator/agent-guards.js';
-import { AGENT_ACTIONS, AGENT_LOOK_ONLY_TURNS, AGENT_NO_PROGRESS_OFF_TURNS, AGENT_NO_PROGRESS_TURNS, WorkflowAgent, agentEarlyStopDefault, parseWherePairs, type AgentDecision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
+import {
+  AGENT_ACTIONS,
+  AGENT_LOOK_ONLY_TURNS,
+  AGENT_NO_PROGRESS_OFF_TURNS,
+  AGENT_NO_PROGRESS_TURNS,
+  AGENT_VALUE_HUNT_TURNS,
+  DEFAULT_AGENT_MAX_STEPS,
+  WorkflowAgent,
+  agentEarlyStopDefault,
+  parseWherePairs,
+  type AgentDecision,
+  type AgentObservation,
+} from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
 import type { AxNode } from '../src/healer/jit-healer.js';
 
@@ -160,9 +172,17 @@ describe('repeatedToggleClick', () => {
     assert.match(refusal ?? '', /Do something different/);
   });
 
+  it('refuses a PRESS past the limit too (2026-09-02, HIR-EC-009: a date-picker stepper pressed 30+ times escaped a click-only guard)', () => {
+    const counts = new Map([[click.selector, TOGGLE_CLICK_LIMIT]]);
+    const press = { ...click, action: 'press' as const };
+    const refusal = repeatedToggleClick(press, counts);
+    assert.match(refusal ?? '', /^circling:/);
+    assert.equal(repeatedToggleClick({ ...press, selector: '' }, counts), null, 'a bare keypress with no selector is not an activation of a control');
+  });
+
   it('says nothing about other actions, other selectors, or an empty selector', () => {
     const counts = new Map([[click.selector, 99]]);
-    assert.equal(repeatedToggleClick({ ...click, action: 'press' }, counts), null);
+    assert.equal(repeatedToggleClick({ ...click, action: 'scroll' }, counts), null);
     assert.equal(repeatedToggleClick({ ...click, selector: 'role=button[name="Other" i]' }, counts), null);
     assert.equal(repeatedToggleClick({ ...click, selector: '' }, counts), null);
   });
@@ -287,7 +307,16 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
           : path === '/en/rows'
             ? '<h1>Plans</h1><table><tr><td>TH_MED_001</td><td><button onclick="document.title=\'deleted TH_MED_001\'">Delete</button></td></tr>' +
               '<tr><td>PL_03_18</td><td><button onclick="document.title=\'deleted PL_03_18\'">Delete</button></td></tr></table>'
-            : '<h1>Start</h1><a id="go" href="/en/done">Continue</a><button>Only button</button>',
+            : path === '/en/stepper'
+              ? // A date-picker year stepper: pressing Enter on it decrements the
+                // shown year, so the tree genuinely changes every time (never
+                // reaching the far-off target) — the exact HIR-EC-009 shape,
+                // where the page-changed guard cannot see the repetition and
+                // only the circling guard can.
+                '<h1>Year: <span id="y">2026</span></h1><button id="prev">Previous year</button>' +
+                '<script>document.getElementById("prev").addEventListener("keydown", function (e) {' +
+                'if (e.key === "Enter") { var y = document.getElementById("y"); y.textContent = String(Number(y.textContent) - 1); } });</script>'
+              : '<h1>Start</h1><a id="go" href="/en/done">Continue</a><button>Only button</button>',
       );
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -338,12 +367,15 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     assert.equal(result.turns, 2, 'the budget is not spent on repeats');
   });
 
-  it('runs unbounded by default and stops itself after consecutive turns of no progress', async () => {
-    // No maxSteps: the fixed turn ceiling is gone (2026-08-24), and the judge
-    // that ends a going-nowhere loop is evidence — AGENT_NO_PROGRESS_TURNS
+  it('runs on the high backstop ceiling by default and stops itself well before it, on no-progress evidence', async () => {
+    // No maxSteps given: the FIXED low ceiling is gone (2026-08-24) and the
+    // judge that ends a going-nowhere loop is evidence — AGENT_NO_PROGRESS_TURNS
     // consecutive turns in which nothing succeeded. A FRESH failing action
     // every turn slips past the repeat guard (it only catches the same action
     // twice on an unchanged page); this is the stop that catches it.
+    // `DEFAULT_AGENT_MAX_STEPS` (2026-09-02) is a much higher backstop for a
+    // dead loop neither judge reaches, not a second competing ceiling: this
+    // leg stops on the judge, turns short of it.
     const { model, seen } = scripted(
       Array.from({ length: AGENT_NO_PROGRESS_TURNS + 2 }, (_, i) => ({
         action: 'goto' as const,
@@ -359,7 +391,7 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     assert.match(result.summary, new RegExp(`stalled: nothing advanced in ${AGENT_NO_PROGRESS_TURNS} consecutive turns`));
     assert.equal(result.turns, AGENT_NO_PROGRESS_TURNS, 'stopped by the judge, not a ceiling');
     assert.equal(seen.length, AGENT_NO_PROGRESS_TURNS, 'one ask per turn — a goto is refused in the act, never re-asked');
-    assert.equal(result.maxSteps, null, 'no ceiling was set, and the record says so');
+    assert.equal(result.maxSteps, DEFAULT_AGENT_MAX_STEPS, 'the backstop ceiling is recorded, but the judge stopped the leg first');
   });
 
   it('lets a repeated scroll or wait through, as a turn that advances nothing — never as a stall', async () => {
@@ -541,6 +573,27 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     assert.equal(result.turns, 3);
   });
 
+  it('refuses a PRESSED stepper past TOGGLE_CLICK_LIMIT, the same as a clicked toggle (2026-09-02, HIR-EC-009 live: 15.6 minutes hammering "Previous year" via press before this existed)', async () => {
+    // A single-entry script that always answers the same press: exactly the
+    // shape a model insisting on one control produces. The page genuinely
+    // changes every turn (the year decrements), so the repeated-on-unchanged
+    // -page guard cannot see this — only the circling guard, extended to
+    // `press`, can.
+    const { model } = scripted([{ action: 'press', selector: 'role=button[name="Previous year" i]', value: 'Enter' }]);
+    const agent = new WorkflowAgent({ model, maxSteps: 10 });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/stepper`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'press Previous year on the date picker until it reads 1995');
+    });
+    assert.equal(result.success, false);
+    assert.match(result.summary, /stalled/);
+    const landed = result.actions.filter((a) => a.ok && a.action === 'press');
+    assert.equal(landed.length, TOGGLE_CLICK_LIMIT, 'exactly the tolerated number of presses landed before the guard closed');
+    const refused = result.actions.find((a) => !a.ok && (a.error ?? '').startsWith('circling:'));
+    assert.ok(refused, 'a circling refusal was recorded — the press-shaped escape hatch is closed');
+    assert.ok(result.turns < 10, `stopped well short of the ceiling, at turn ${result.turns}`);
+  });
+
   it('refuses a goto off every known origin, and allows the goal\'s own', async () => {
     const { model } = scripted([
       { action: 'goto', url: 'https://example.com/' },
@@ -554,6 +607,101 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     assert.equal(result.actions[0]?.ok, false, 'the public internet is refused');
     assert.match(result.actions[0]?.error ?? '', /off-origin/);
     assert.equal(result.success, true, 'the origin the goal names is allowed, and arriving finishes');
+  });
+});
+
+describe('the value-hunt guard (CDP) — a set-X-to-Y goal whose value never appears', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+
+  before(async () => {
+    server = createServer((req, res) => {
+      const path = (req.url ?? '/').split('?')[0];
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      // Ten distinct, always-clickable buttons — none of their text, or
+      // anything else on the page, ever contains "G - Internship". Every
+      // click succeeds (genuine no-progress-judge "progress"), on a
+      // DIFFERENT selector each time, so neither the no-progress judge nor
+      // the toggle-circling guard ever fires — the live HIR-EC-010 shape.
+      if (path === '/en/found') {
+        const buttons = Array.from({ length: 10 }, (_, i) => `<button>Other section ${i}</button>`).join('');
+        res.end(
+          `<h1>Employee Group</h1><select aria-label="Employee Group"><option>1</option><option>G - Internship</option></select>${buttons}`,
+        );
+        return;
+      }
+      const buttons = Array.from({ length: 10 }, (_, i) => `<button>Open section ${i}</button>`).join('');
+      res.end(`<h1>Employee Group</h1><select aria-label="Employee Group"><option>1</option><option>2</option></select>${buttons}`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+
+  it('gives up once the value has appeared on NO tree over AGENT_VALUE_HUNT_TURNS, without wasting a decide call on the tripping turn', async () => {
+    const { model, seen } = scripted(
+      Array.from({ length: AGENT_VALUE_HUNT_TURNS + 3 }, (_, i) => ({
+        action: 'click' as const,
+        selector: `text="Open section ${i}"`,
+      })),
+    );
+    const agent = new WorkflowAgent({ model });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'set Employee Group to "G - Internship"');
+    });
+    assert.equal(result.success, false);
+    assert.match(result.summary, /the goal's value "G - Internship" never appeared/);
+    assert.ok(result.actions.every((a) => a.ok), 'every click genuinely landed — this is not the no-progress stall');
+    assert.equal(seen.length, AGENT_VALUE_HUNT_TURNS, 'the tripping turn cost no model call — the guard fires before asking');
+    assert.equal(result.turns, AGENT_VALUE_HUNT_TURNS + 1);
+  });
+
+  it('never fires again once the value has appeared once, however many turns follow', async () => {
+    // Turn 1 reaches the page that renders the value — the guard's
+    // `huntedValueSeenAtTurn` latches there — then MORE turns than
+    // `AGENT_VALUE_HUNT_TURNS` follow, each a genuine click on a still-wrong
+    // control, exactly like the trip test above. The only difference is the
+    // one turn where the value was visible, and that alone must be enough to
+    // silence the guard for the rest of the leg.
+    const clicks = Array.from({ length: AGENT_VALUE_HUNT_TURNS + 3 }, (_, i) => ({
+      action: 'click' as const,
+      selector: `text="Other section ${i}"`,
+    }));
+    const { model, seen } = scripted([{ action: 'goto' as const, url: `${origin}/en/found` }, ...clicks]);
+    // Capped exactly to the script's length: nothing here is meant to test
+    // termination, only that the value-hunt guard stays quiet throughout.
+    const agent = new WorkflowAgent({ model, maxSteps: clicks.length + 1 });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'set Employee Group to "G - Internship"');
+    });
+    assert.doesNotMatch(result.summary, /never appeared/);
+    // The leg ran well past AGENT_VALUE_HUNT_TURNS without the guard ending
+    // it — proof it stayed silent, not merely that it hadn't looked yet.
+    assert.ok(seen.length > AGENT_VALUE_HUNT_TURNS, `expected more than ${AGENT_VALUE_HUNT_TURNS} turns, saw ${seen.length}`);
+  });
+
+  it('never fires on a goal `goalOutcome` cannot parse — no value to hunt for', async () => {
+    const { model, seen } = scripted(
+      Array.from({ length: AGENT_VALUE_HUNT_TURNS + 3 }, (_, i) => ({
+        action: 'click' as const,
+        selector: `text="Open section ${i}"`,
+      })),
+    );
+    const agent = new WorkflowAgent({ model, maxSteps: AGENT_VALUE_HUNT_TURNS + 2 });
+    const result = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'explore the Employee Group section');
+    });
+    assert.doesNotMatch(result.summary, /never appeared/);
+    assert.equal(seen.length, AGENT_VALUE_HUNT_TURNS + 2, 'the instance ceiling ended it, not the value-hunt guard');
   });
 });
 

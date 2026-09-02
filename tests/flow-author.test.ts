@@ -53,6 +53,9 @@ import {
   loginProofAssertsLoginPage,
   ungroundedGoto,
   unindexedRequestMethod,
+  assertsOpenQuestion,
+  skipsAuthoredScript,
+  unboundedExclusivityClaim,
   wordingClaimAssertsDataValue,
   type AuthorRequest,
   type AuthorResult,
@@ -194,14 +197,14 @@ describe('FlowAuthor', () => {
     assert.equal(model.seen?.policy, 'read-only');
   });
 
-  it('defaults to the forms policy — validation is the negative-testing surface', async () => {
+  it('defaults to the mutations policy — the suite acts like a human tester out of the box', async () => {
     const model = stubModel({
       steps: [{ action: 'expectVisible', selector: 'role=alert', intent: 'validation error' }],
     });
 
     await new FlowAuthor({ model }).author('submit the form empty and check validation');
 
-    assert.equal(model.seen?.policy, 'forms');
+    assert.equal(model.seen?.policy, 'mutations');
   });
 
   it('repairs a stranded persona switch mechanically instead of refusing the case', async () => {
@@ -1505,6 +1508,61 @@ describe('wordingClaimAssertsDataValue', () => {
   it('never fires for a claim that is not about wording', () => {
     const steps: FlowStep[] = [{ action: 'expectVisible', selector: 'text=Medical Reimbursement' }];
     assert.equal(wordingClaimAssertsDataValue('PL_04_03 filter by benefit name shows the matching plan', steps, tree), null);
+  });
+
+  it('reads the CASE, not the retrieved background, to decide it is a wording claim', () => {
+    // ec10, 2026-09-02: a new-hire creation row whose own words never mention
+    // wording, authored from a prompt whose Thai requirement documents say
+    // `ข้อความ` many times. Every row of the catalog was classified a wording
+    // claim from the background alone, and four were refused for asserting a
+    // value the documents happened not to quote.
+    const backgroundHeavyPrompt =
+      'HIR-EC-008 ตรวจสอบการจ้างพนักงานใหม่แบบ Key-in สำเร็จ\n' +
+      'BACKGROUND: ระบบแสดงข้อความแจ้งเตือนเมื่อบันทึกสำเร็จ และตรวจสอบการสะกดของข้อความทุกหน้า';
+    const caseOwnWords = 'HIR-EC-008 ตรวจสอบการจ้างพนักงานใหม่แบบ Key-in สำเร็จ';
+    const steps: FlowStep[] = [{ action: 'expectVisible', selector: 'text=New Employee Added Successfully' }];
+    // The old behaviour, still what a prompt-only caller gets.
+    assert.ok(wordingClaimAssertsDataValue(backgroundHeavyPrompt, steps, tree) !== null);
+    // With the case's own words the lint stands down — this row is not about wording.
+    assert.equal(wordingClaimAssertsDataValue(backgroundHeavyPrompt, steps, tree, undefined, caseOwnWords), null);
+  });
+
+  it('still fires when the CASE itself is about wording, background or no background', () => {
+    const steps: FlowStep[] = [{ action: 'expectVisible', selector: 'text=Medical Reimbursement' }];
+    assert.deepEqual(wordingClaimAssertsDataValue('anything', steps, tree, undefined, claim), {
+      index: 0,
+      value: 'Medical Reimbursement',
+    });
+  });
+});
+
+describe('assertsOpenQuestion', () => {
+  it('refuses an assertion on the sheet\'s open-question id — it is a question, not page text', () => {
+    // ec10 HIR-EC-009, live: the sheet says "ตาราง DVT Project Name / Type และ
+    // รูปแบบ Course of Time = ? OQ-HIR-78" and the flow asserted the id itself.
+    assert.deepEqual(
+      assertsOpenQuestion([
+        { action: 'goto', url: '/en/admin/hire' },
+        { action: 'expectVisible', selector: 'text=OQ-HIR-78' },
+      ]),
+      { index: 1, value: 'OQ-HIR-78', marker: 'OQ-HIR-78' },
+    );
+    assert.equal(
+      assertsOpenQuestion([{ action: 'expectText', selector: 'role=alert', value: 'see CF-SIT-19 for the rule' }])?.marker,
+      'CF-SIT-19',
+    );
+  });
+
+  it('leaves the tester\'s own data and a reader\'s note alone', () => {
+    // A value typed in is data, and an intent naming the question is a note.
+    assert.equal(assertsOpenQuestion([{ action: 'fill', selector: 'role=textbox', value: 'OQ-HIR-78' }]), null);
+    assert.equal(
+      assertsOpenQuestion([
+        { action: 'expectVisible', selector: 'role=button[name="Submit" i]', intent: 'records the answer to OQ-HIR-50' },
+      ]),
+      null,
+    );
+    assert.equal(assertsOpenQuestion([{ action: 'expectVisible', selector: 'text=Employee Group' }]), null);
   });
 });
 
@@ -3406,5 +3464,136 @@ describe('the suite\'s refusal memory', () => {
 
   it('is bounded, so the request itself is never crowded out', () => {
     assert.equal(SUITE_REFUSAL_MEMORY, 6);
+  });
+});
+
+describe('skipsAuthoredScript', () => {
+  // The ec10 HIR-EC-001 shape, verbatim in structure: eight numbered steps that
+  // key an identity, walk the address cascade and submit.
+  const keyInCase = [
+    'HIR-EC-001: ตรวจสอบการจ้างพนักงานใหม่แบบ Key-in สำเร็จ',
+    'Menu path:',
+    '  EC > Hire & Onboard (New Hire)',
+    'Steps:',
+    '  1. Login ด้วย <HR_ADMIN_ACCOUNT>',
+    '  2. กรอกข้อมูล Identity ตาม Test Data',
+    '  - กรอก Salutation, First Name / Last Name, Date of Birth, National ID',
+    '  3. กรอกและตรวจสอบ Home Address',
+    '  - เลือก Province = กรุงเทพมหานคร และตรวจสอบรายการ District',
+    '  7. กด Submit เพื่อสร้างพนักงานใหม่',
+    'Expected output:',
+    '  - ระบบสร้าง Employee ID เป็นตัวเลข 8 หลัก',
+  ].join('\n');
+
+  it('refuses a flow that only inspects the form the case tells it to fill (HIR-EC-001)', () => {
+    // Exactly what was authored: open the page, assert labels, never type.
+    const body: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/hire?step=1' },
+      { action: 'expectVisible', selector: 'text="Employee ID"' },
+      { action: 'expectVisible', selector: 'text="Auto-generated by system"' },
+      { action: 'click', selector: 'role=button[name="ข้อมูลติดต่อ" i]' },
+    ];
+    const skipped = skipsAuthoredScript(keyInCase, body);
+    assert.ok(skipped !== null);
+    assert.equal(skipped.performed, 0);
+    assert.match(skipped.demanded, /กรอก|เลือก|Submit/);
+  });
+
+  it('accepts a flow that performs the entry, however few the fields', () => {
+    const body: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/hire?step=1' },
+      { action: 'fill', selector: 'role=textbox[name="First Name (EN)" i]', value: 'Somchai' },
+      { action: 'click', selector: 'role=button[name="Submit" i]' },
+      { action: 'expectVisible', selector: 'text=Employee ID' },
+    ];
+    assert.equal(skipsAuthoredScript(keyInCase, body), null);
+    // selectOption / check count too — a cascade is chosen, not typed.
+    assert.equal(
+      skipsAuthoredScript(keyInCase, [
+        { action: 'selectOption', selector: 'role=combobox[name="Province" i]', value: 'กรุงเทพมหานคร' },
+      ]),
+      null,
+    );
+  });
+
+  it('refuses a script of actions with no typing answered by assertions alone (CNS-EC-028)', () => {
+    const consentCase = [
+      'CNS-EC-028: เมื่อมีเวอร์ชันใหม่ ไฟล์แนบที่เปิดอ่านต้องเป็นชุดของเวอร์ชันที่กำลังจะยอมรับ',
+      'Steps:',
+      '  1. ให้พนักงานคนที่ 1 เข้าสู่ระบบ กดเปิดไฟล์แนบ แล้วจดข้อความในย่อหน้าแรก จากนั้นกดยอมรับ',
+      '  2. ผู้ดูแลประกาศเวอร์ชัน 2.0 พร้อมไฟล์แนบชุดที่ 2',
+      '  3. ให้พนักงานคนที่ 2 เข้าสู่ระบบ กดเปิดไฟล์แนบ แล้วจดข้อความในย่อหน้าแรก จากนั้นกดยอมรับ',
+      'Expected output:',
+      '  1.1 ไฟล์แนบที่เปิดคือชุดที่ 1',
+    ].join('\n');
+    // What was authored: three "the page exists" assertions and not one action.
+    const body: FlowStep[] = [
+      { action: 'expectVisible', selector: 'text="Consent Form"' },
+      { action: 'expectVisible', selector: 'text="รายการ Consent Form"' },
+      { action: 'expectVisible', selector: 'text="ประเภท Consent"' },
+    ];
+    const skipped = skipsAuthoredScript(consentCase, body);
+    assert.ok(skipped !== null);
+    assert.equal(skipped.performed, 0);
+    // A click or an agent leg performs "กด" — either satisfies it.
+    assert.equal(skipsAuthoredScript(consentCase, [...body, { action: 'click', selector: 'role=button[name="ยอมรับ" i]' }]), null);
+    assert.equal(skipsAuthoredScript(consentCase, [{ action: 'workflow', goal: 'open the attachment and accept' } as never]), null);
+  });
+
+  it('never fires for a read-only case, which scripts no input at all', () => {
+    const readOnly = [
+      'PL_01_01: การมองเห็นและเข้าถึงเมนู Benefit Plans',
+      'Steps:',
+      '  1. ไปที่ HR > Benefits Admin',
+      '  2. ตรวจสอบว่าเมนู Benefit Plans แสดง',
+      'Expected output:',
+      '  - เมนู Benefit Plans แสดงและกดได้',
+    ].join('\n');
+    const body: FlowStep[] = [
+      { action: 'goto', url: '/en/admin/benefits' },
+      { action: 'expectVisible', selector: 'text="Benefit Plans"' },
+    ];
+    assert.equal(skipsAuthoredScript(readOnly, body), null);
+  });
+
+  it('says nothing when the case carries no Steps column, and ignores setup fills by construction', () => {
+    assert.equal(skipsAuthoredScript('HIR-EC-001: a case with no script', []), null);
+    // Only the BODY is passed in, so a sign-in's own fills can never satisfy
+    // the rule — the caller hands `result.steps`, never `result.setup`.
+    assert.ok(skipsAuthoredScript(keyInCase, [{ action: 'expectVisible', selector: 'text=x' }]) !== null);
+  });
+});
+
+describe('unboundedExclusivityClaim', () => {
+  // ec10_3x HIR-EC-029: "dropdown แสดง 3 ค่า : Event Reason … แสดงเฉพาะ New Hire / Replacement / Migration".
+  const claim = 'HIR-EC-029: ตรวจสอบว่า Event Reason บนหน้า Key-in แสดงเฉพาะ New Hire / Replacement / Migration\nExpected output:\n  - dropdown แสดง 3 ค่า : Event Reason บนหน้า Key-in แสดงเฉพาะ New Hire / Replacement / Migration\n  - ไม่แสดง Event Reason : H_CORENTRY, H_INENTRY, H_TEMPASG';
+  const presences: FlowStep[] = [
+    { action: 'click', selector: 'role=button[name="Event Reason" i]' },
+    { action: 'expectVisible', selector: 'text="New Hire"' },
+    { action: 'expectVisible', selector: 'text="Replacement"' },
+    { action: 'expectVisible', selector: 'text="Migration"' },
+    { action: 'expectHidden', selector: 'text="H_CORENTRY"' },
+  ];
+
+  it('refuses three presences standing in for "exactly 3" — they pass on a dropdown of a hundred', () => {
+    const r = unboundedExclusivityClaim(presences, claim);
+    assert.ok(r !== null);
+    assert.equal(r.wanted, 3);
+    assert.match(r.claim, /3 ค่า/);
+  });
+
+  it('is satisfied by a count, which is what closes the set', () => {
+    const bounded: FlowStep[] = [...presences, { action: 'expectCount', selector: 'role=option', count: 3 } as FlowStep];
+    assert.equal(unboundedExclusivityClaim(bounded, claim), null);
+  });
+
+  it('never fires for a case that makes no exclusivity or count claim', () => {
+    assert.equal(unboundedExclusivityClaim(presences, 'HIR-EC-001: the New Hire option is offered in Event Reason'), null);
+  });
+
+  it('reads "only" and "เฉพาะ" without a number too', () => {
+    const r = unboundedExclusivityClaim(presences, 'Expected: the filter offers only Active and Inactive');
+    assert.ok(r !== null);
+    assert.equal(r.wanted, null);
   });
 });

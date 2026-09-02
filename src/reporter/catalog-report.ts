@@ -25,10 +25,19 @@
  *   how long it has been broken, whether the same step shape failed before);
  *   RIGHT the time record — one bar per step against the fast-path budget,
  *   with the slowest steps called out.
- * - **Export from the page itself**: every case has an Export button that
- *   downloads a standalone HTML of just that case (styles and evidence
- *   included), and the header exports the whole catalog file. Client-side
- *   Blob + anchor download — no server involved.
+ * - **Export from the page itself**: every PROVED case has an `Export (Excel)`
+ *   button that downloads the case's own workbook — one row per step, the
+ *   step's log in a Proof column, its screenshot in a Photo column, the
+ *   recording linked under every step (`excel-export.ts` writes it beside
+ *   this file as the run goes). A case that did not pass has the button
+ *   DISABLED: the export is the proof, and a failed case has none to hand
+ *   over. The header exports the whole catalog file (client-side Blob +
+ *   anchor, no server) and links the run's all-passed workbook.
+ * - **It is written when the run STARTS and rewritten after every case**
+ *   (2026-09-02, `cli/catalog-live-report.ts`): the file exists — every
+ *   planned case a `never ran` row — before the first case has a verdict,
+ *   and each finished case replaces its row in place. A rerun of the same
+ *   catalog run (same run key) updates the same file, never a new one.
  *
  * Pure render (`renderCatalogReport`) + one writer (`writeCatalogReport`), the
  * `html-reporter.ts` split, so `tests/catalog-report.test.ts` runs at the
@@ -39,7 +48,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
 import type { ProofBundle, ProofStep } from '../engine/proof-bundle.js';
-import { verdictFamily } from '../engine/proof-bundle.js';
+import { describeDbChanges, describeTarget, describeValueSource, verdictFamily } from '../engine/proof-bundle.js';
 import { grimTheme } from './theme.js';
 import { slugify } from './html-reporter.js';
 
@@ -85,6 +94,11 @@ export interface CatalogReportInput {
   runKey: string | null;
   generatedAt: string | null;
   cases: readonly CatalogReportCase[];
+  /**
+   * True while the run that produces this report is still going: the page
+   * says so and reloads itself, since rows are still being filled in.
+   */
+  live?: boolean | undefined;
 }
 
 function esc(value: unknown): string {
@@ -131,7 +145,15 @@ function stepDetail(step: ProofStep, budget: ShotBudget): string {
   row('selector', step.selector);
   if (step.resolvedSelector && step.resolvedSelector !== step.selector) row('resolved as', step.resolvedSelector);
   row('resolution', step.resolution ?? undefined);
+  // What the selector WAS: role, name, where it sat — and the red rectangle
+  // in the still below is drawn around exactly this box.
+  row('target', describeTarget(step.target), false);
+  // Where the typed value came from when the sheet did not say — `generated`
+  // is the one a reader must weigh.
+  row('value', describeValueSource(step), false);
   row('url', step.url);
+  for (const line of describeDbChanges(step.dbChanges)) row('db', line, false);
+  if (step.dbProbeError) row('db probe', step.dbProbeError, false);
   if (step.error) rows.push(`<div class="kv err"><span>error</span><code>${esc(step.error)}</code></div>`);
   if (step.heal) {
     rows.push(
@@ -293,7 +315,27 @@ function timePane(steps: readonly ProofStep[]): string {
   );
 }
 
-function caseSection(c: CatalogReportCase, budget: ShotBudget, embeddedVideo: boolean): string {
+/**
+ * The per-case export: a download link to the case's own workbook when the
+ * case PASSED, a disabled button otherwise. Relative to this file, so it works
+ * wherever the reports folder travels — and via wowUI's `/reports/` route,
+ * which serves the folder as a folder for exactly this reason.
+ */
+function exportControl(c: CatalogReportCase, input: CatalogReportInput): string {
+  if (c.verdict !== 'passed') {
+    return (
+      `<button class="btn export-case" type="button" disabled` +
+      ` title="Only a proved case exports — this one ${c.verdict === 'never-ran' ? 'never ran' : 'did not pass'}, so there is no proof to hand over">Export (Excel)</button>`
+    );
+  }
+  const href = `${catalogMediaDirName(input.runKey, input.title)}/${catalogCaseExportName(c.id)}.xlsx`;
+  return (
+    `<a class="btn export-case" download href="${esc(href)}" onclick="event.stopPropagation()"` +
+    ` title="This case as a workbook: one row per step, the step's log in the Proof column, its screenshot in the Photo column, the recording linked under every step">Export (Excel)</a>`
+  );
+}
+
+function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: ShotBudget, embeddedVideo: boolean): string {
   const chip = verdictChipOf(c);
   const anchor = `case-${slugify(c.id)}`;
   const bundle = c.bundle;
@@ -326,7 +368,7 @@ function caseSection(c: CatalogReportCase, budget: ShotBudget, embeddedVideo: bo
     `<summary><span class="chip ${chip.cls}">${esc(chip.label)}</span>` +
     `<span class="cname">${esc(c.name)}</span>` +
     (bundle ? `<span class="cms">${esc(fmtMs(bundle.caseDurationMs ?? bundle.durationMs))}</span>` : '') +
-    `<button class="btn export-case" data-case="${anchor}" onclick="exportCase(event,'${anchor}')">Export case</button>` +
+    exportControl(c, input) +
     '</summary>' +
     `<div class="split"><div class="steps-pane">${film}${historyBlock(c.history)}${left}` +
     (notes === '' ? '' : `<div class="history"><div class="cap">Run notes</div>${notes}</div>`) +
@@ -401,23 +443,6 @@ function download(name, html) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
 }
-/* One case as its own standalone page: this document's <style> plus the
-   case's own section, open, with the export buttons stripped. */
-function exportCase(event, anchor) {
-  event.preventDefault(); event.stopPropagation();
-  var node = document.getElementById(anchor).cloneNode(true);
-  node.setAttribute('open', '');
-  /* Only the export control goes; the seek buttons are evidence controls and
-     the exported file carries the player that makes them work. */
-  node.querySelectorAll('button.export-case').forEach(function (b) { b.remove(); });
-  wowStripBlobs(node);
-  var styles = Array.prototype.map.call(document.querySelectorAll('style'), function (s) { return s.outerHTML; }).join('');
-  var title = node.getAttribute('data-name') || anchor;
-  download(anchor + '.html',
-    '<!doctype html><html><head><meta charset="utf-8"><title>' + title.replace(/</g, '&lt;') +
-    '</title>' + styles + '</head><body class="single">' + node.outerHTML +
-    '<scr' + 'ipt>' + WOW_PLAYER + '</scr' + 'ipt></body></html>');
-}
 /* A Blob URL is scoped to THIS document, so it must never be written into an
    exported one; the base64 on data-webm is what travels. */
 function wowStripBlobs(root) {
@@ -451,7 +476,9 @@ details.case { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0
 details.case > summary { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; list-style: none; }
 details.case > summary .cname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 details.case > summary .cms { color: var(--muted); font-variant-numeric: tabular-nums; }
-.btn { font: inherit; font-size: 12px; border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 7px; padding: 3px 10px; cursor: pointer; }
+.btn { font: inherit; font-size: 12px; border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 7px; padding: 3px 10px; cursor: pointer; text-decoration: none; }
+.btn[disabled] { opacity: .45; cursor: not-allowed; }
+.meta.live { color: var(--warn, #b8860b); }
 .split { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 18px; padding: 4px 14px 16px; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
 .cap { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 10px 0 6px; }
@@ -517,7 +544,7 @@ export function renderCatalogReport(input: CatalogReportInput): string {
       return (
         `<section class="scenario"><div class="shead">${esc(scenario)}` +
         `<span class="scount">${passed} of ${cases.length} passed</span></div>` +
-        cases.map((c) => caseSection(c, budget, embeddedVideos.has(c.id))).join('') +
+        cases.map((c) => caseSection(c, input, budget, embeddedVideos.has(c.id))).join('') +
         '</section>'
       );
     })
@@ -532,30 +559,58 @@ export function renderCatalogReport(input: CatalogReportInput): string {
     omittedVideos <= 0
       ? ''
       : `<div class="meta">${omittedVideos} recording(s) left out to keep this file portable — cases that did not pass keep theirs first; every one stays in its proof bundle.</div>`;
+  const finished = input.cases.filter((c) => c.verdict !== 'never-ran').length;
+  // A live report reloads itself: its rows are still being filled in, and a
+  // reader who opened it from the panel mid-run should not have to know that.
+  const liveNote = input.live
+    ? `<div class="meta live">▶ in progress — ${finished} of ${input.cases.length} case(s) finished · this page refreshes itself every 60s</div>`
+    : '';
   return (
     '<!doctype html><html lang="en"><head><meta charset="utf-8"/>' +
     `<meta name="viewport" content="width=device-width, initial-scale=1"/>` +
+    (input.live ? '<meta http-equiv="refresh" content="60"/>' : '') +
     `<title>${esc(input.title)}</title>` +
     `<style>${grimTheme()}</style><style>${STYLE}</style></head><body>` +
     `<h1>${esc(input.title)}</h1>` +
     `<div class="meta">${esc(input.runKey ?? '')}${input.generatedAt ? ` · authored ${esc(input.generatedAt)}` : ''} · ${input.cases.length} case(s)` +
-    ` <button class="btn" onclick="exportCatalog()">Export catalog</button></div>` +
+    ` <button class="btn" onclick="exportCatalog()">Export catalog</button>` +
+    // The run writes this workbook beside the report (see `excel-export.ts`):
+    // only the passed cases, one row per step, the screenshot in a Photo
+    // column and a video row under every step. A relative link, so it works
+    // wherever the reports folder travels as a whole.
+    ` <a class="btn" download href="${esc(`${catalogReportBase(input.runKey, input.title)}-passed.xlsx`)}"` +
+    ` title="Written beside this report: passed cases only, one step per row, photos embedded, video linked under every step">Passed cases (Excel)</a></div>` +
+    liveNote +
     `<div class="tally">${[...tally.entries()].map(([label, n]) => `<span>${esc(label)}: <b>${n}</b></span>`).join('')}</div>` +
     omittedNote +
     videoNote +
     sections +
-    // The player source is also a VALUE in the page, because `exportCase`
-    // writes it into the file it downloads — see `PLAYER_SCRIPT`.
+    // The player source is also a VALUE in the page so a copy of it can carry
+    // the player into another document — see `PLAYER_SCRIPT`.
     `<script>var WOW_PLAYER = ${JSON.stringify(PLAYER_SCRIPT)};</script>` +
     `<script>${EXPORT_SCRIPT}</script>` +
     `<script>${PLAYER_SCRIPT}</script></body></html>`
   );
 }
 
+/** The file-name stem a run's report artifacts share (`<runKey slug>`). */
+export function catalogReportBase(runKey: string | null, title: string): string {
+  return slugify((runKey ?? title).replace(/@/g, '-')) || 'catalog-report';
+}
+
+/** `<runKey slug>-media` — the folder beside the report holding per-case workbooks and recordings. */
+export function catalogMediaDirName(runKey: string | null, title: string): string {
+  return `${catalogReportBase(runKey, title)}-media`;
+}
+
+/** `PL_06_05` → `pl-06-05` — the file-name stem a case's export artifacts share. */
+export function catalogCaseExportName(caseId: string): string {
+  return slugify(caseId) || 'case';
+}
+
 /** `reports/<runKey slug>.html` — stable per run key, so a resume overwrites its own file. */
 export function catalogReportPath(runKey: string | null, title: string, cwd = process.cwd()): string {
-  const base = slugify((runKey ?? title).replace(/@/g, '-')) || 'catalog-report';
-  return resolve(cwd, CATALOG_REPORT_DIR, `${base}.html`);
+  return resolve(cwd, CATALOG_REPORT_DIR, `${catalogReportBase(runKey, title)}.html`);
 }
 
 export async function writeCatalogReport(path: string, html: string): Promise<string> {

@@ -68,6 +68,17 @@ ${GRIM_BASE}
 html, body { height: 100%; }
 .app { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 100vh; align-items: start; }
 
+@media (max-width: 768px) {
+  .app { display: flex; flex-direction: column; }
+  .side { position: relative; min-height: auto; border-right: none; border-bottom: 1px solid var(--line); padding: var(--s3); }
+  .side-footer { display: none; }
+  .main { padding: var(--s4) var(--s4) 40px; }
+  .stats { grid-template-columns: 1fr 1fr; }
+  .row { grid-template-columns: 54px minmax(0, 1fr); row-gap: 8px; flex-wrap: wrap; }
+  .counts, .when { text-align: left; }
+  .tbl { display: block; overflow-x: auto; white-space: nowrap; }
+}
+
 .side {
   position: sticky; top: 0; align-self: stretch;
   background: var(--panel); border-right: 1px solid var(--line);
@@ -956,7 +967,14 @@ function byId(id) { return document.getElementById(id); }
 function api(path, options) {
   return fetch(path, options).then(function (r) {
     return r.json().then(function (body) {
-      if (!r.ok) throw new Error(body && body.error ? body.error : 'request failed');
+      if (!r.ok) {
+        var error = new Error(body && body.error ? body.error : 'request failed');
+        /* The server's whole answer rides the error, so a caller can act on a
+           structured refusal (a resume that needs the password) and not only
+           read its sentence. */
+        error.body = body || {};
+        throw error;
+      }
       return body;
     });
   });
@@ -1593,6 +1611,10 @@ function renderRuns(main) {
         ? (/^paused\b/.test(cause || '') ? 'Paused — ' : 'Stopped — ') + run.title + ' has ' + run.left + ' of ' + run.summary.planned + ' case(s) still to run'
         : run.title + ' finished — ' + run.errors + ' runtime error(s), ' + run.failed + ' failed';
       var acts = [];
+      // The catalog report first: it has existed since the run started and
+      // holds every case's verdict and evidence — what a person reads before
+      // deciding which of the buttons after it to press.
+      if (run.reportFile) acts.push(catalogReportButton(run, 'md'));
       if (run.resumable) acts.push(el('button', { type: 'button', class: 'btn md accent', text: 'Continue testing (' + run.left + ' left)', onclick: function () { resumeCatalog(run.ledgerPath, 'continue'); } }));
       if (run.errors > 0) acts.push(el('button', { type: 'button', class: 'btn md', title: 'A runtime error is the harness, not a verdict — those cases run again (plus anything still unfinished).', text: 'Rerun all errors (' + run.errors + ')', onclick: function () { resumeCatalog(run.ledgerPath, 'errors'); } }));
       if (run.failed > 0) acts.push(el('button', { type: 'button', class: 'btn md', title: 'Failed and dead-end cases run again with autoheal on (plus anything still unfinished).', text: 'Heal all failed (' + run.failed + ')', onclick: function () { resumeCatalog(run.ledgerPath, 'failed'); } }));
@@ -1614,6 +1636,7 @@ function renderRuns(main) {
         el('div', {}, [
           el('b', { text: head }),
           run.runKey ? el('span', { class: 'fix mono', text: 'run key: ' + run.runKey }) : null,
+          run.persona ? el('span', { class: 'fix mono', text: 'signs in as ' + run.persona + ' — a resume from a restarted panel asks for the password once' }) : null,
           el('span', { class: 'fix mono', text: 'cause: ' + (cause || (run.resumable ? 'the run never recorded how it ended' : 'the run completed')) }),
           el('span', { class: 'fix', text: 'Every button continues this catalog run under the same key: cases already tested are pulled in as finished tests unless the button says otherwise, and the resumed cases join the original group.' }),
           el('div', { class: 'acts' }, acts)
@@ -1650,6 +1673,7 @@ function renderRuns(main) {
              progress ledger. It is instant — in-flight cases are interrupted
              and keep no verdict; Continue testing re-runs them from their
              first step and keeps every finished verdict. */
+          job.commandId === 'catalog-run' ? catalogReportButtonForJob(job) : null,
           job.commandId === 'catalog-run' ? el('button', {
             type: 'button', class: 'btn',
             title: 'Pause immediately: in-flight cases are interrupted and keep no verdict. Continue testing later re-runs them from their first step and keeps everything already finished — on whatever the code says then, not a pre-pause copy.',
@@ -1744,6 +1768,11 @@ function renderGroup(group) {
     // eye. Only catalog passes mint one.
     if (group.generated.runKey) {
       head.appendChild(el('span', { class: 'chip plain mono', title: 'catalog run key — a resume continues under the same key', text: group.generated.runKey }));
+      // The catalog report, at the catalog's name: one document with every
+      // planned case on it — never-ran rows included — written when the run
+      // started and rewritten after every case, so it is current mid-run too.
+      var catalogRun = catalogRunByKey(group.generated.runKey);
+      if (catalogRun && catalogRun.reportFile) head.appendChild(catalogReportButton(catalogRun, ''));
     }
     // Which pass this is. Two groups can carry the same document name — that is
     // the same catalog run twice — so the time is what tells them apart.
@@ -1817,6 +1846,36 @@ function renderGroup(group) {
   });
   section.appendChild(rows);
   return section;
+}
+
+/* ---- the catalog report ------------------------------------------------ */
+/* One document per catalog run, under reports/, written when the run starts
+   and rewritten after every case. Served by the panel AS a folder
+   (/reports/<file>), so the report's relative links — the per-case Excel
+   exports, the recordings — land on their sibling files. */
+function catalogRunByKey(runKey) {
+  var runs = S.catalogRuns || [];
+  for (var i = 0; i < runs.length; i++) if (runs[i].runKey === runKey) return runs[i];
+  return null;
+}
+function catalogReportUrl(run) {
+  return '/reports/' + encodeURIComponent(run.reportFile);
+}
+function catalogReportButton(run, size) {
+  return el('button', {
+    type: 'button', class: 'btn' + (size ? ' ' + size : ''),
+    title: 'Open the catalog report — every planned case with its verdict and evidence, grouped by scenario; each proved case exports to Excel from there. Updated after every case while the run is going.',
+    text: 'Report',
+    onclick: function (e) { e.stopPropagation(); window.open(catalogReportUrl(run), '_blank'); }
+  });
+}
+/* A running catalog job is matched to its run by the ledger the server marks
+   as running; the report exists from the first moment of the run. */
+function catalogReportButtonForJob(job) {
+  var runs = (S.catalogRuns || []).filter(function (r) { return r.running && r.reportFile; });
+  if (runs.length === 0) return null;
+  var run = runs.length === 1 ? runs[0] : runs.filter(function (r) { return job.title && job.title.indexOf(r.title) !== -1; })[0] || runs[0];
+  return catalogReportButton(run, '');
 }
 
 function taskRow(task) {
@@ -2881,18 +2940,66 @@ function evidenceError(panel, bundle, step) {
     ['action', step.action],
     ['selector as written', step.selector || '—'],
     ['selector that resolved', step.resolvedSelector || '—'],
+    /* What the selector WAS on the page — role, name, box — read live at the
+       step; the step's screenshot outlines exactly this box in red. */
+    ['target', describeTarget(step.target)],
+    /* Where the typed value came from when the sheet did not state it; a
+       GENERATED value is the author's stand-in and the reader must know. */
+    ['value', describeValueSource(step)],
     ['rung', step.resolution || 'no selector to resolve'],
     ['took', fmtMs(step.durationMs)],
     ['page', step.url || '—']
   ].forEach(function (pair) {
+    /* A fact the step does not have is left out, not printed as "null". */
+    if (pair[1] === null || pair[1] === undefined) return;
     kv.appendChild(el('div', { class: 'kv' }, [el('b', { text: pair[0] + ': ' }), document.createTextNode(String(pair[1]))]));
   });
   panel.appendChild(kv);
+
+  var dbLines = describeDbChanges(step.dbChanges);
+  if (dbLines.length > 0 || step.dbProbeError) {
+    panel.appendChild(el('div', { class: 'cap', text: 'What this step did to the database (vs the baseline)' }));
+    var dbBox = el('div', {});
+    dbLines.forEach(function (line) { dbBox.appendChild(el('div', { class: 'kv' }, [document.createTextNode(line)])); });
+    if (step.dbProbeError) dbBox.appendChild(el('div', { class: 'kv muted' }, [document.createTextNode('probe failed: ' + step.dbProbeError)]));
+    panel.appendChild(dbBox);
+  }
 
   if (step.detail && Object.keys(step.detail).length > 0) {
     panel.appendChild(el('div', { class: 'cap', text: 'What the step recorded' }));
     panel.appendChild(el('div', { class: 'repro', text: JSON.stringify(step.detail, null, 2) }));
   }
+}
+
+/* The same wording as describeDbChanges() in engine/proof-bundle.ts. */
+function describeDbChanges(changes) {
+  if (!changes) return [];
+  return changes.filter(function (c) { return c.changed; }).map(function (c) {
+    var parts = [];
+    if (c.inserted) parts.push('+' + c.inserted + ' inserted');
+    if (c.deleted) parts.push('\u2212' + c.deleted + ' deleted');
+    if (c.updated) parts.push('~' + c.updated + ' updated');
+    var delta = parts.length > 0 ? parts.join(', ') : (c.baselineRows + ' \u2192 ' + c.rows + ' rows');
+    return 'db ' + c.table + ': ' + delta + ' vs baseline';
+  });
+}
+/* The same wording as describeValueSource() in engine/proof-bundle.ts. */
+function describeValueSource(step) {
+  var raw = step && step.detail && step.detail.valueSource;
+  if (!raw || typeof raw.kind !== 'string') return null;
+  var detail = typeof raw.detail === 'string' ? raw.detail : '';
+  if (raw.kind === 'generated') return 'generated — ' + (detail || 'a stand-in the author invented');
+  return 'from ' + raw.kind + (detail ? ': ' + detail : '');
+}
+/* The same wording as describeTarget() in engine/proof-bundle.ts:
+   button "Sign in" · 120×40 at (30,200). */
+function describeTarget(t) {
+  if (!t) return '—';
+  var what = t.role || t.tag || 'element';
+  var label = t.name || t.text;
+  var out = label ? what + ' ' + JSON.stringify(label) : what;
+  if (t.box) out += ' \u00b7 ' + t.box.width + '\u00d7' + t.box.height + ' at (' + t.box.x + ',' + t.box.y + ')';
+  return out;
 }
 
 function webmObjectUrl(base64) {
@@ -4035,6 +4142,31 @@ function renderGatesBlock(card) {
         })
       ]));
     });
+    /* Selects: reasoning effort per role. Written on change (no Save button —
+       there are only three values and nothing to mistype), applied from the
+       next run. Only bites when the role is on a Claude provider. */
+    (b.selects || []).forEach(function (sel) {
+      var pick = el('select', { class: 'sel', 'aria-label': sel.label });
+      (sel.options || []).forEach(function (opt) {
+        pick.appendChild(el('option', { value: opt, text: opt, selected: opt === sel.value }));
+      });
+      pick.onchange = function () {
+        var chosen = pick.value;
+        api('/api/gates', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ env: sel.env, value: chosen })
+        }).then(function () { toast(sel.label + ' = ' + chosen + ' — applies from the next run'); })
+          ['catch'](function (e) { toast(e.message); pick.value = sel.value; });
+      };
+      host.appendChild(el('div', { style: 'display:flex; align-items:flex-start; gap:8px; margin:10px 0 6px' }, [
+        pick,
+        el('label', {}, [
+          el('span', { text: sel.label + ' ' }),
+          el('span', { class: 'mono', style: 'color:var(--muted); font-size:var(--fs-xs)', text: '(' + sel.env + ')' }),
+          el('div', { class: 'picker-note', text: sel.help })
+        ])
+      ]));
+    });
     host.appendChild(el('div', { class: 'picker-note', text: 'A change applies from the next run the panel starts — a suite already in flight keeps the gates it launched with.' }));
   })['catch'](function (e) {
     while (host.firstChild) host.removeChild(host.firstChild);
@@ -4472,7 +4604,7 @@ function openLauncher() {
     advanced: false,
     video: 'on',
     screenshots: 'auto',
-    policy: 'forms',
+    policy: 'mutations',
     waitFor: '',
     error: '',
     busy: false
@@ -5066,7 +5198,7 @@ function launcherBox(M) {
         policy.appendChild(el('option', { value: mode, selected: mode === M.policy, text: mode }));
       });
       adv.appendChild(formField('What the written test may do', false, policy,
-        'read-only never submits. forms submits invalid input to exercise validation. Nothing deletes, at any tier.'));
+        'mutations (default) fills, submits, creates and updates like a human tester. forms submits only invalid input to exercise validation. read-only never submits. Nothing deletes, at any tier.'));
 
       var wait = el('input', { type: 'text', class: 'mono', placeholder: 'http://localhost:3000', value: M.waitFor,
         oninput: function (e) { M.waitFor = e.target.value; } });
@@ -5167,7 +5299,7 @@ function submitLauncher() {
     var go = { target: M.describe.trim() };
     if (M.url.trim()) go.url = M.url.trim();
     if (M.focus.trim()) go.target = go.target + ' — ' + M.focus.trim();
-    if (M.policy !== 'forms') go.policy = M.policy;
+    if (M.policy !== 'mutations') go.policy = M.policy;
     /* Sent only when it is not the default, exactly as policy is: the argv a
        run announces should carry what was chosen, not what was left alone. */
     if (M.scope !== 'unit') go.scope = M.scope;
@@ -5202,7 +5334,7 @@ function submitLauncher() {
       'context-doc': attachedContext(M)
     };
     if (M.url.trim()) values.url = M.url.trim();
-    if (M.policy !== 'forms') values.policy = M.policy;
+    if (M.policy !== 'mutations') values.policy = M.policy;
     fire('catalog-run', Object.assign(values, extras), null);
   })['catch'](function (error) { M.busy = false; M.error = error.message; renderLauncher(); });
 }
@@ -5375,16 +5507,31 @@ function suiteRunButtons(items) {
    restart too, because the ledger (not the in-memory job) is the record.
    The resumed run keeps the catalog's unique run key, so cases already
    tested under it are pulled into the resumed roll-up as finished tests. */
-function resumeCatalog(ledgerPath, mode, caseId, caseIds) {
+function resumeCatalog(ledgerPath, mode, caseId, caseIds, as) {
   var body = { ledgerPath: ledgerPath, mode: mode || 'continue' };
   if (caseId) body.caseId = caseId;
   if (caseIds && caseIds.length) body.caseIds = caseIds;
+  if (as) body.as = as;
   api('/api/catalog-runs/resume', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body)
   })
     .then(function () { toast(mode === 'failed' ? 'healing failed cases' : mode === 'errors' ? 'rerunning errored cases' : mode === 'vacuous' ? 're-authoring vacuous cases' : mode === 'from' ? 'rerunning from ' + caseId + ' on current config' : mode === 'cases' ? 're-authoring ' + caseIds.length + ' case(s) from their sheet rows' : 'continuing where it stopped'); refresh(); })
-    ['catch'](function (error) { toast(error.message); });
+    ['catch'](function (error) {
+      /* The run signed in as an account whose password this panel process
+         never saw (it was restarted). Ask once, then resume with it — the
+         password travels as env to the job and is masked in every record.
+         Never resume without it: a credential-less resume authors login-only
+         flows and fails every case at "Sign in" (ec10, 2026-09-02). */
+      var b = error.body || {};
+      if (b.needsCredentials && !as) {
+        var pw = window.prompt('This run signs in as ' + b.persona + '. Password? (not stored — asked once per panel session)', '');
+        if (pw === null || pw === '') { toast('not resumed — the run needs its sign-in password'); return; }
+        resumeCatalog(ledgerPath, mode, caseId, caseIds, b.persona + ':' + pw);
+        return;
+      }
+      toast(error.message);
+    });
 }
 
 /* ---- Re-authoring one case, and the work queue of cases to re-author. ----

@@ -51,8 +51,21 @@ export interface LedgerOutcome {
    * full evidence rather than a bare verdict line.
    */
   proofPath?: string | null | undefined;
+  /**
+   * How many times authoring REFUSED to write this case (the flow lints:
+   * ungrounded text, no assertion, …). Recorded so the row reads "authoring
+   * refused: …" on the report instead of "never ran", and so a resume knows
+   * to author it leniently once — and to stop re-authoring it after
+   * `AUTHORING_REFUSAL_CAP` (2026-09-02: two rows of ec10n were refused on
+   * every resume, each time spending the model twice and ending the run
+   * with the same two "left").
+   */
+  authoringRefused?: number | undefined;
   at: string;
 }
+
+/** Refusals after which a resume stops re-authoring a row (an explicit rerun resets it). */
+export const AUTHORING_REFUSAL_CAP = 2;
 
 export interface SuiteLedger {
   version: number;
@@ -95,6 +108,33 @@ export interface SuiteLedger {
          * none is configured" on a resume that had silently dropped it.
          */
         agent?: boolean | undefined;
+        /**
+         * The account the run signed in as (`--as`) — the EMAIL only, never
+         * the password, which rides env and is deliberately not recorded. A
+         * resume rebuilt from this record (the panel restarted, the job's
+         * env gone) can then ask for the password rather than run without
+         * one: measured 2026-09-02 on ec10, a credential-less resume had
+         * every journey capture bounce to the sign-in page, six rows refused
+         * as login-only flows, and the four that ran fail at "Sign in".
+         */
+        persona?: string | undefined;
+      }
+    | undefined;
+  /**
+   * The database baseline taken before this run's first case (see
+   * `src/db/baseline.ts`): where the snapshot file is, which tables, when,
+   * and — once it has happened — the restore's outcome. A resume reads it
+   * rather than snapshotting again: the state BEFORE the run is the baseline,
+   * whatever the cases since have done. `wowlidator db restore` reads it too,
+   * for a run that was paused or killed before its own restore could run.
+   */
+  dbBaseline?:
+    | {
+        path: string;
+        tables: string[];
+        takenAt: string;
+        mode: 'snapshot' | 'restore';
+        restored?: { at: string; ok: boolean; detail: string } | undefined;
       }
     | undefined;
   outcomes: Record<string, LedgerOutcome>;
@@ -159,9 +199,15 @@ export function caseIdOf(name: string): string {
 export function recordOutcome(
   ledger: SuiteLedger,
   outcome: CaseOutcome,
-  extra: { flowPath?: string | undefined; vacuous?: boolean | undefined; proofPath?: string | undefined } = {},
+  extra: {
+    flowPath?: string | undefined;
+    vacuous?: boolean | undefined;
+    proofPath?: string | undefined;
+    authoringRefused?: number | undefined;
+  } = {},
 ): void {
   ledger.outcomes[caseIdOf(outcome.name)] = {
+    ...(extra.authoringRefused === undefined ? {} : { authoringRefused: extra.authoringRefused }),
     verdict: outcome.verdict,
     status: outcome.bundle?.status ?? null,
     reason: outcome.reason ?? null,
@@ -211,9 +257,13 @@ export function markForRerun(
 ): string[] {
   const marked: string[] = [];
   for (const [id, outcome] of Object.entries(ledger.outcomes)) {
-    if (outcome.verdict === 'blocked' || !pick(outcome, id)) continue;
+    // A row authoring refused is blocked already and still a rerun candidate:
+    // the explicit ask lifts the refusal cap so it is authored again.
+    const refused = (outcome.authoringRefused ?? 0) >= AUTHORING_REFUSAL_CAP;
+    if ((outcome.verdict === 'blocked' && !refused) || !pick(outcome, id)) continue;
     outcome.verdict = 'blocked';
     outcome.reason = `${label}: ${outcome.reason ?? outcome.status ?? 'no reason recorded'}`;
+    delete outcome.authoringRefused;
     marked.push(id);
   }
   return marked;
@@ -221,7 +271,12 @@ export function markForRerun(
 
 /** The cases the harness ended, not the application: an `error` bundle or no bundle at all. */
 export function isErrorOutcome(outcome: LedgerOutcome): boolean {
-  return outcome.status === 'error' || (outcome.verdict === 'failed' && outcome.status === null);
+  return (
+    outcome.status === 'error' ||
+    (outcome.verdict === 'failed' && outcome.status === null) ||
+    // Authoring refused to write it: the harness's gap, never the application's.
+    (outcome.authoringRefused ?? 0) > 0
+  );
 }
 
 /** A real failure about the application: failed or dead-end. */
@@ -236,7 +291,12 @@ export function isFailedOutcome(outcome: LedgerOutcome): boolean {
 export function remaining(ledger: SuiteLedger, planned: readonly string[] = ledger.planned): string[] {
   return planned.filter((id) => {
     const done = ledger.outcomes[id];
-    return done === undefined || done.verdict === 'blocked' || done.vacuous === true;
+    if (done === undefined) return true;
+    // Refused by authoring twice (strict, then lenient): re-authoring a third
+    // time is the same two model calls for the same answer. It stays blocked
+    // with its reason on the report; `--rerun-errors` resets the count.
+    if ((done.authoringRefused ?? 0) >= AUTHORING_REFUSAL_CAP) return false;
+    return done.verdict === 'blocked' || done.vacuous === true;
   });
 }
 

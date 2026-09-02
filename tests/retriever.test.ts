@@ -217,4 +217,16 @@ describe('sheetGate (S7 — the Note/Actual columns are a gate)', () => {
     const card = caseCard({ ...row('Passed', '4-Aug New req. update pop-up to page'), caseId: 'PL_06_01', testCase: 'Create plan', expected: '2.1 dialog opens' } as never) ?? '';
     assert.match(card, /Requirement note .*pop-up to page/);
   });
+
+  it('gates a row whose Note says the case cannot be run yet (CNS-EC-028)', () => {
+    const note =
+      'ผลตรวจหน้าจอจริงบนระบบทดสอบ SIT วันที่ 31 ส.ค. 2026\n' +
+      '- ระบบทดสอบยังไม่มีหน้าจอทะเบียนหนังสือให้ความยินยอมฝั่งผู้ดูแล\n' +
+      '- เคสกลุ่มนี้จึงยังรันไม่ได้จนกว่าทีมพัฒนาจะส่งมอบหน้าจอทะเบียน ให้บันทึกผลเป็นยังทดสอบไม่ได้';
+    const why = sheetGate(row('', note));
+    assert.match(why ?? '', /cannot be run yet/);
+    assert.match(why ?? '', /ยังรันไม่ได้/);
+    // An ordinary note is not a gate.
+    assert.equal(sheetGate(row('', 'ตัดจากเคส E2E-01 ไฟล์ HR_SIT_E2E_V.0.1 (28).xlsx')), null);
+  });
 });

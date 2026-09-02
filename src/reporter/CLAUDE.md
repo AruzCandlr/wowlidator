@@ -171,10 +171,61 @@ not in its body — measured in a browser, in the body it is inside a collapsed
 the handler's `preventDefault` is what stops a button inside a `<summary>`
 from toggling the step open as a side effect.
 
-Export is client-side (`Blob` + anchor): per-case (clones the section with this
-document's styles, strips only the export button, strips Blob `src`s, and
-writes `WOW_PLAYER` in alongside — without the player an exported case is a
-dead video in a file said to hold the evidence) and whole-catalog. A resume
+Whole-catalog export is client-side (`Blob` + anchor, Blob `src`s stripped so
+the base64 on `data-webm` is what travels). Per-case export is the case's
+Excel workbook — see below — not an HTML clone.
+
+**The report is live (`cli/catalog-live-report.ts`, 2026-09-02).** It is
+written when the run STARTS — every planned case a `never ran` row, or the
+verdict an earlier pass under the same run key recorded — and rewritten after
+every case, so wowUI's Report button (on the catalog's name in the proof
+groups, on the resumable-run banner, on the running job) opens the current
+state of the catalog at any point of the run; while the run is going the page
+says `in progress — N of M` and reloads itself every 60 s. `CatalogLiveReport`
+reads bundles from memory for cases this process ran and from the ledger's
+`proofPath` for carried ones; writes are serialised and coalesced (cases finish
+concurrently and the file embeds every recording — two writers on one path is a
+torn report), and never fatal. The roll-up's final `refresh(true)` drops the
+in-progress marker. A rerun (same run key) updates the SAME file — the path has
+always been stable per key; now the rows are too, each case replacing its own.
+`wowlidator report` rebuilds through the same `buildCatalogReportCases` +
+`writeCatalogArtifacts`, so the two can never disagree on shape.
+
+**The Excel exports (`excel-export.ts`, 2026-09-02; per case the same day).**
+Beside every catalog report the run writes `<runKey slug>-passed.xlsx` — ONLY
+the cases whose verdict is `passed` (`pass**` included — it IS a pass, and the
+Result column says which) — and under `<runKey slug>-media/` **one workbook per
+proved case**, `<case id slug>.xlsx`, beside that case's recording. The
+per-case workbook is what the report's `Export (Excel)` button on each case
+downloads (a relative `<a download>`, `event.stopPropagation()` so the case
+does not toggle); a case that did NOT pass — failed, blocked, review, never ran
+— has the button **disabled** with the reason in its title, because the export
+is the proof and a failed case has none to hand over. Both shapes: one row per
+step (superseded attempts excluded, same rule as the HTML), a **Proof column**
+carrying the step's own log (`stepProof`: expected vs actual, how the selector
+resolved, a heal, an agent summary, the URL, the first line of an error), the
+step's screenshot embedded in a Photo column, and under every step a video row
+hyperlinking into the case's recording with the step's own `videoOffsetMs`
+named. **A rerun updates, never accumulates**: names derive from the run key and
+the case id, so a re-run case overwrites its own workbook, and
+`writePassedCasesExcel` REMOVES the workbook and recording of any case on the
+report that is not passed — a case that passed once and failed on the rerun
+must not keep a "proof" file the report contradicts. Excel cannot play an embedded webm, so each passed
+case's recording is written out as a real file under `<runKey slug>-media/`
+and the rows link it RELATIVELY — the reports folder travels as a whole. A
+step with no still says "see the video row below" rather than sitting blank
+(filming drops stills to on-failure, so passing steps mostly have none); a run
+with no passed cases still gets a workbook that says so, never a dead link.
+The container is hand-written (`node:zlib` deflate + crc32, inline strings, no
+sharedStrings), the `extract.ts` decision pointed the other way — and it is
+tested against `extract.ts`'s own independent zip READER plus validated with
+openpyxl, on the same "a writer tested only against its own reader proves
+nothing" rule. The report's header carries a relative `Passed cases (Excel)`
+link to the sibling file. `wowlidator report [<ledger>|<dir>]`
+(`cmdCatalogReport` in `cli/commands/maintenance.ts`) rebuilds report + Excel
+from ledgers on disk without re-running anything — with one guard: a ledger
+whose EVERY recorded proof bundle is gone is skipped rather than overwriting a
+report that may still carry the evidence. Tests: `tests/excel-export.test.ts`. A resume
 still shows evidence: carried outcomes re-read their bundle from the ledger's
 `proofPath`, so the report answers for the whole catalog rather than for the
 subset this process ran. Tests: `tests/catalog-report.test.ts` — pure for
@@ -182,3 +233,16 @@ everything above, plus one CDP-gated test that the recording ACTUALLY PLAYS
 (against `tests/fixtures/recording.webm`), because a markup assertion would
 pass on a report whose every player spins forever, which is the bug this
 exists to fix.
+
+## The target on every step (2026-09-02)
+
+`ProofStep.target` (see `src/engine/CLAUDE.md`, "The step's target") is shown
+wherever a step is: the CLI step line (`target: …`), the per-case report
+(beside the selector on the step's sub-line and as a `target` fact, with
+"(outlined in red in the screenshot)" only when there IS a screenshot), the
+catalog report's step detail (`target` kv row), wowUI's "How this step
+resolved" panel, and the workbooks — a **Target** column between Selector and
+Result plus a `target: …` line in the Proof column. One wording everywhere,
+`describeTarget`: `button "Sign in" · 120×40 at (30,200)`; no target, no row,
+and never a placeholder that reads like a fact. Application text in a name is
+escaped like every other string.

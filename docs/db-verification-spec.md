@@ -150,3 +150,21 @@ DB findings file under category **`backend`** with detail naming the table — a
 5. **D10** — traces: "called as planned", causal tier; unlocks the sequence spec's remaining lanes in the same release.
 
 **Acceptance:** with `WOWLIDATOR_DB_URL` set and a schema indexed, a checkout flow that clicks through the UI, saves `{{orderId}}` from the API's response, and asserts `expectDbRow orders where id={{orderId}} values status=pending` goes green with the matched row (redacted) in the report and `users` proven count-unchanged; the same flow with the driver uninstalled reports **blocked** with the install command, exit 3, filing nothing against the application; and a deliberately broken backend that returns 201 without writing turns exactly one check red — the DB row — with the failure filed as `backend`, worded "while this flow ran", and the API's 201 still recorded as passing, because which side is broken is the question this whole tier exists to answer.
+
+---
+
+## Addendum: the database baseline (2026-09-02)
+
+A layer above the per-step DB checks, asked for directly: own the *fixture*, not
+just the assertion. `src/db/baseline.ts` detects the tables a run is about,
+snapshots them before the first case, records on every backend step what the run
+did to them (against that snapshot, not the previous step — `ProofStep.dbChanges`),
+and restores them after. Detection is deterministic (DB-step tables, grounded
+prose matches, one FK hop, operator override); the snapshot keeps real values in
+a local file and a server-side content hash; the restore is the only writer in
+`src/db/`, fenced behind a separate `WOWLIDATOR_DB_RESTORE_URL` write credential,
+a per-baseline table allowlist, statement logging, transactional child-first
+delete / parent-first insert, and hash verification through the read-only client
+(a mismatch is environment, never an app defect). `--db-baseline
+off|snapshot|restore|auto`; a resume reuses the original snapshot; `wowlidator db
+restore` puts a paused/killed run's tables back. See `src/api/CLAUDE.md`.

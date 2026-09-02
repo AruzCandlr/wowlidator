@@ -28,7 +28,7 @@ import type { ScreenshotMode, VideoMode } from './engine/runner.js';
 export const LLM_ROLES = ['healer', 'generator', 'agent', 'data', 'governor'] as const;
 export type LlmRole = (typeof LLM_ROLES)[number];
 
-export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli', 'claude-tty', 'claude-cloud'] as const;
+export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli', 'claude-tty', 'claude-cloud', 'airforce', 'cerebras', 'requesty'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 /** Which env var carries each provider's key, and where to get one. */
@@ -111,6 +111,24 @@ export const PROVIDER_META: Record<
     label: 'DeepSeek',
     consoleUrl: 'https://platform.deepseek.com/api_keys',
     freeTier: 'paid API, low per-token price; deepseek-chat / deepseek-reasoner',
+  },
+  airforce: {
+    envKey: 'AIRFORCE_API_KEY',
+    label: 'Airforce',
+    consoleUrl: 'https://api.airforce',
+    freeTier: 'OpenAI-compatible /v1 API',
+  },
+  cerebras: {
+    envKey: 'CEREBRAS_API_KEY',
+    label: 'Cerebras',
+    consoleUrl: 'https://cloud.cerebras.ai',
+    freeTier: 'Fast AI Inference',
+  },
+  requesty: {
+    envKey: 'REQUESTY_API_KEY',
+    label: 'Requesty',
+    consoleUrl: 'https://requesty.ai',
+    freeTier: 'OpenAI-compatible /v1 API',
   },
   // A model served on this machine — mlx_lm.server, llama.cpp, vLLM, LM Studio:
   // anything speaking the OpenAI-compatible /v1 API. Default base URL is
@@ -237,6 +255,9 @@ export const DEFAULT_PROVIDER_MODELS: Record<ProviderName, string> = {
   emmiedev: 'default',
   zai: 'glm-4.5-flash',
   deepseek: 'deepseek-chat',
+  airforce: 'default',
+  cerebras: 'llama3.1-8b',
+  requesty: 'default',
   local: 'default_model',
   // An alias, not a dated id: the CLI resolves `fable` to whatever the
   // current Fable is. A DEFAULT and not a fixed model — each role keeps its
@@ -393,6 +414,9 @@ const envSchema = z.object({
   EMMIEDEV_API_KEY: z.string().min(1).optional(),
   ZAI_API_KEY: z.string().min(1).optional(),
   DEEPSEEK_API_KEY: z.string().min(1).optional(),
+  AIRFORCE_API_KEY: z.string().min(1).optional(),
+  CEREBRAS_API_KEY: z.string().min(1).optional(),
+  REQUESTY_API_KEY: z.string().min(1).optional(),
   LOCAL_LLM_API_KEY: z.string().min(1).optional(),
   LOCAL_LLM_BASE_URL: z.string().url().optional(),
 
@@ -585,12 +609,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
   const emmiedevKeys = parseApiKeys(e.EMMIEDEV_API_KEY);
   const zaiKeys = parseApiKeys(e.ZAI_API_KEY);
   const deepseekKeys = parseApiKeys(e.DEEPSEEK_API_KEY);
+  const airforceKeys = parseApiKeys(e.AIRFORCE_API_KEY);
+  const cerebrasKeys = parseApiKeys(e.CEREBRAS_API_KEY);
+  const requestyKeys = parseApiKeys(e.REQUESTY_API_KEY);
   if (googleKeys.length > 0) apiKeys.google = googleKeys;
   if (groqKeys.length > 0) apiKeys.groq = groqKeys;
   if (openrouterKeys.length > 0) apiKeys.openrouter = openrouterKeys;
   if (emmiedevKeys.length > 0) apiKeys.emmiedev = emmiedevKeys;
   if (zaiKeys.length > 0) apiKeys.zai = zaiKeys;
   if (deepseekKeys.length > 0) apiKeys.deepseek = deepseekKeys;
+  if (airforceKeys.length > 0) apiKeys.airforce = airforceKeys;
+  if (cerebrasKeys.length > 0) apiKeys.cerebras = cerebrasKeys;
+  if (requestyKeys.length > 0) apiKeys.requesty = requestyKeys;
   // A local server needs no key; the placeholder keeps the role-readiness gates honest.
   const localKeys = parseApiKeys(e.LOCAL_LLM_API_KEY);
   apiKeys.local = localKeys.length > 0 ? localKeys : [LOCAL_LLM_PLACEHOLDER_KEY];

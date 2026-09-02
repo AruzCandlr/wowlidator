@@ -28,6 +28,21 @@ export interface CliOptions {
    * (the crawler) read it as `?? 'all'`, which is what it always was.
    */
   screenshots: ScreenshotMode | undefined;
+  /**
+   * Draw a red rectangle around each step's target in its screenshot
+   * (`--no-target-highlight` disables). The target itself is recorded on the
+   * step either way — see `ProofStep.target`.
+   */
+  highlightTarget: boolean;
+  /**
+   * The database baseline (`src/db/baseline.ts`): `off`, `snapshot` (detect the
+   * tables under test, snapshot them, compare on every backend step),
+   * `restore` (and put them back after the run), or `auto` — as much as the
+   * configured connections allow. `--db-baseline`, else WOWLIDATOR_DB_BASELINE.
+   */
+  dbBaseline: string | undefined;
+  /** Tables the operator adds to the detected set (`--db-baseline-tables a,b`, WOWLIDATOR_DB_BASELINE_TABLES). */
+  dbBaselineTables: string[];
   video: VideoMode;
   agentAssist: boolean;
   /**
@@ -46,6 +61,13 @@ export interface CliOptions {
    * run of the case. Degrades silently when the agent role has no key.
    */
   authorReview: boolean;
+  /**
+   * Resolve the values a sheet leaves as tokens or descriptions before the
+   * lints — from the case, the documents/repository, the database (read-only),
+   * or, flagged, the generator (`generator/value-resolution.ts`). Default on;
+   * `--no-value-resolution` / `WOWLIDATOR_VALUE_RESOLUTION=off` disables.
+   */
+  valueResolution: boolean;
   /**
    * In-run step reconstruction: a failed step is rebuilt by the repair model
    * against the live page and retried, up to 3 total tries, before final

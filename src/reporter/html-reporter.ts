@@ -17,10 +17,14 @@ import type { RequestRecord } from '../api/api-client.js';
 import type { DbCheckRecord } from '../db/db-actions.js';
 import { classifyCall, isBlockingFailure, type NetworkCall } from '../api/network-observer.js';
 import { BACKEND_TIER_ACTIONS,
+  describeValueSource,
+  valueWasGenerated,
+  describeTarget,
   familyLabel,
   meaningfulCoverage,
 } from '../engine/proof-bundle.js';
 import { buildVerdict, escalationTrace, type Verdict } from './verdict.js';
+import { describeDbChanges } from '../engine/proof-bundle.js';
 import type {
   AgentRecord,
   StepDecision,
@@ -264,6 +268,8 @@ const RESOLUTION_LABEL: Record<string, string> = {
  * exactly the failure this section exists to fix.
  */
 export const GLOSSARY: Record<string, string> = {
+  'value generated':
+    'The sheet left this value as a placeholder or a description, and no test data, document, repository or database source named a real one — so the author invented a well-formed stand-in. The step ran with it; judge the result knowing the input was not the sheet\'s.',
   'matched ignoring letter-case':
     'The selector matched once letter-case was ignored. Chrome and Playwright compute accessible names differently when CSS changes text case.',
   'matched as exact text':
@@ -395,6 +401,10 @@ function stepBadges(step: ProofStep, afterFailure = false): string {
   // this one says a model was asked to JUDGE something the flow never
   // mentioned. A reader needs to know a decision was taken on their behalf.
   if (step.decision) badges.push('<span class="badge res-agent">agent decided</span>');
+  // A value the author INVENTED went into this field. Not a takeover and not a
+  // decision — the run did exactly what the flow said — but the flow's data
+  // here is a stand-in, and a verdict built on it reads differently.
+  if (valueWasGenerated(step)) badges.push(`<span class="badge res-generated">${term('value generated')}</span>`);
   if (step.snapshot) {
     badges.push(
       `<span class="badge ${step.snapshot.outcome === 'matched' ? 'res-fast' : 'res-jit'}">visual: ${esc(step.snapshot.outcome)}</span>`,
@@ -996,7 +1006,7 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
       <span class="time">${ms(step.durationMs)}</span>
       <span class="chev" aria-hidden="true">&#9662;</span>
     </button>
-    <p class="step-sub"><span class="action">${esc(step.action)}</span> <code class="target">${captured(target ?? '—')}</code></p>
+    <p class="step-sub"><span class="action">${esc(step.action)}</span> <code class="target">${captured(target ?? '—')}</code>${step.target ? ` <span class="target-what" title="what the selector resolved to, read from the live element">→ ${captured(describeTarget(step.target) ?? '')}</span>` : ''}</p>
     ${compare}
     <div class="step-body" hidden>
       ${step.unsure ? `<div class="callout unsure"><div class="callout-title">Proved-? — a human must rule on this step</div><pre>${captured(step.unsure)}</pre></div>` : ''}
@@ -1030,6 +1040,10 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
         <div><dt>url</dt><dd><code>${esc(step.url ?? '—')}</code></dd></div>
         <div><dt>authored selector</dt><dd><code>${esc(step.selector ?? '—')}</code></dd></div>
         <div><dt>resolved selector</dt><dd><code>${esc(step.resolvedSelector ?? '—')}</code></dd></div>
+        ${step.target ? `<div><dt>target</dt><dd>${captured(describeTarget(step.target) ?? '')}${step.screenshot ? ' <span class="muted">(outlined in red in the screenshot)</span>' : ''}</dd></div>` : ''}
+        ${describeValueSource(step) ? `<div><dt>value</dt><dd>${esc(describeValueSource(step) ?? '')}</dd></div>` : ''}
+        ${describeDbChanges(step.dbChanges).map((line) => `<div><dt>db</dt><dd>${esc(line)}</dd></div>`).join('')}
+        ${step.dbProbeError ? `<div><dt>db probe</dt><dd class="muted">${esc(step.dbProbeError)}</dd></div>` : ''}
         <div><dt>started</dt><dd>${esc(step.startedAt)}</dd></div>
         ${detail.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd><code>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</code></dd></div>`).join('')}
       </dl>
@@ -1135,7 +1149,7 @@ ol.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
 .badge.res-cache{color:var(--cache);background:var(--cache-bg)}
 .badge.res-jit{color:var(--jit);background:var(--jit-bg)}
 .badge.res-dialog{color:var(--dialog);background:var(--dialog-bg)}
-.badge.res-agent{color:var(--agent);background:var(--agent-bg)}
+.badge.res-generated, .badge.res-agent{color:var(--agent);background:var(--agent-bg)}
 .time{font-size:12px;color:var(--muted);min-width:56px;text-align:right}
 .chev{color:var(--muted);transition:transform .15s;font-size:11px}
 .step-head[aria-expanded=true] .chev{transform:rotate(180deg)}
@@ -1301,6 +1315,15 @@ footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);color:v
 dialog.lightbox{border:0;padding:0;background:transparent;max-width:94vw;max-height:94vh}
 dialog.lightbox::backdrop{background:rgba(0,0,0,.78)}
 dialog.lightbox img{max-width:94vw;max-height:94vh;border-radius:8px;display:block}
+@media (max-width:768px) {
+  .wrap { max-width: 100%; padding: 20px 16px; }
+  .stats, .cards { grid-template-columns: 1fr; }
+  .proof-grid { grid-template-columns: 1fr; }
+  .kv { grid-template-columns: 1fr; }
+  .verdict-actions { flex-direction: column; align-items: flex-start; }
+  .film { overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+  .agent-trace { display: block; overflow-x: auto; white-space: nowrap; }
+}
 @media (max-width:640px){.target,.time{display:none}.action{min-width:0}}
 `;
 
@@ -1661,6 +1684,7 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
       <div class="sub">
         run <code>${esc(bundle.runId)}</code> &middot; ${esc(bundle.startedAt)}
         ${bundle.cdpUrl ? ` &middot; ${esc(bundle.cdpUrl)}` : ''}
+        ${bundle.caseStartedAt ? `<br/>case started <code>${esc(bundle.caseStartedAt)}</code> &middot; took ${ms(bundle.caseDurationMs ?? bundle.durationMs)}` : ''}
       </div>
     </div>
     <div class="status-group">${polarityPill(bundle)}<span class="status ${esc(bundle.status)}" title="machine status: ${esc(bundle.status)}">${esc(familyLabel(bundle.status))}</span></div>
@@ -1700,6 +1724,33 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
 
   <details class="diagnostics">
     <summary>Diagnostics — how wowlidator resolved each step, traffic, model cost</summary>
+    ${
+      bundle.dbBaseline
+        ? `<div class="prov"><div class="callout-title">Database baseline</div>
+           <p class="reason">Snapshotted before the run and compared on every backend step: <code>${esc(bundle.dbBaseline.tables.join(', '))}</code> · taken ${esc(bundle.dbBaseline.takenAt)}.</p></div>`
+        : ''
+    }
+    ${
+      bundle.notes && bundle.notes.length > 0
+        ? `<div class="prov"><div class="callout-title">Run notes (${bundle.notes.length})</div>
+           ${bundle.notes.map(n => `<p class="reason">${esc(n)}</p>`).join('')}</div>`
+        : ''
+    }
+    ${
+      bundle.status === 'needs-review'
+        ? `<div class="prov trend-newly-broken" style="border-left-color:var(--warn)">
+             <div class="callout-title">Proved-? — needs a human ruling</div>
+             <p class="reason">Every broken step failed only on wording, and closely: the page produced the right kind of thing under a name the claim does not quite match. Whether that is a spec violation or an acceptable rendering is your call, not the machine's.</p>
+             ${bundle.review ? `<p class="reason"><strong>Ruling:</strong> ${esc(bundle.review.verdict)} by ${esc(bundle.review.by || 'human')} at ${esc(bundle.review.at)}</p>` : ''}
+           </div>`
+        : ''
+    }
+    ${
+      bundle.variables && Object.keys(bundle.variables).length > 0
+        ? `<div class="prov"><div class="callout-title">Variables</div>
+           <dl class="kv wide">${Object.entries(bundle.variables).map(([k, v]) => `<div><dt>${esc(k)}</dt><dd><code>${esc(v)}</code></dd></div>`).join('')}</dl></div>`
+        : ''
+    }
     ${trend}
     ${provenance}
     <section class="cards">

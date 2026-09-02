@@ -351,3 +351,174 @@ export async function cmdContext(
       return 2;
   }
 }
+
+/**
+ * `wowlidator report [<ledger.progress.json> | <dir>]` — rebuild the catalog
+ * report and its passed-cases Excel export from a suite ledger on disk,
+ * without re-running anything. Exists so the exports added after a run can be
+ * applied to the runs already in the folders: the ledger names every planned
+ * case and where its proof bundle landed, which is all the report is built
+ * from at the suite roll-up too.
+ *
+ * Defaults to every ledger under `.wowlidator/catalogs/`. A proof bundle that
+ * no longer exists is reported, never fatal — its case renders without
+ * evidence, exactly as a never-ran row does.
+ */
+export async function cmdCatalogReport(target: string | undefined, _options: CliOptions): Promise<number> {
+  const { readFile } = await import('node:fs/promises');
+  const { readLedger } = await import('../suite-progress.js');
+  const { buildCatalogReportCases, writeCatalogArtifacts } = await import('../catalog-live-report.js');
+  type Bundle = import('../../engine/proof-bundle.js').ProofBundle;
+
+  const ledgerPaths: string[] = [];
+  const chosen = target === undefined ? resolve('.wowlidator', 'catalogs') : resolve(target);
+  if (chosen.endsWith('.progress.json')) {
+    ledgerPaths.push(chosen);
+  } else {
+    const names = await readdir(chosen).catch(() => [] as string[]);
+    for (const name of names) if (name.endsWith('.progress.json')) ledgerPaths.push(join(chosen, name));
+    if (ledgerPaths.length === 0) {
+      process.stderr.write(`wowlidator report: no *.progress.json ledgers found in ${chosen}\n`);
+      return 2;
+    }
+  }
+
+  let failures = 0;
+  for (const ledgerPath of ledgerPaths) {
+    const ledger = await readLedger(ledgerPath);
+    if (ledger === null) {
+      process.stderr.write(`  ! ${ledgerPath} is not a readable suite ledger\n`);
+      failures += 1;
+      continue;
+    }
+    let missingProofs = 0;
+    const cases = await buildCatalogReportCases(ledger, async (id) => {
+      const proofPath = ledger.outcomes[id]?.proofPath;
+      if (typeof proofPath !== 'string' || proofPath === '') return null;
+      try {
+        return JSON.parse(await readFile(proofPath, 'utf8')) as Bundle;
+      } catch {
+        missingProofs += 1;
+        return null;
+      }
+    });
+    const recorded = ledger.planned.filter((id) => ledger.outcomes[id] !== undefined).length;
+    if (recorded > 0 && missingProofs === recorded) {
+      // Every recorded case's evidence is gone: regenerating would OVERWRITE a
+      // report that may still hold it, with one that holds nothing.
+      process.stderr.write(
+        `  ! ${ledger.runKey ?? ledger.title}: all ${recorded} proof bundle(s) are gone — skipped rather than ` +
+          'overwriting a report that may still carry the evidence\n',
+      );
+      failures += 1;
+      continue;
+    }
+    try {
+      const { htmlPath, excel } = await writeCatalogArtifacts({
+        title: ledger.title,
+        runKey: ledger.runKey,
+        generatedAt: ledger.generatedAt,
+        cases,
+        // A ledger still marked running keeps the page reloading itself.
+        live: ledger.ended === null,
+      });
+      process.stdout.write(
+        `  catalog report ${htmlPath}\n` +
+          `  passed xlsx ${excel.xlsxPath} — ${excel.passedCases} passed case(s), ${excel.caseXlsxPaths.length} per-case workbook(s), ${excel.videoPaths.length} recording(s)` +
+          (excel.removed.length > 0 ? ` · ${excel.removed.length} stale export(s) removed` : '') +
+          (missingProofs > 0 ? ` · ${missingProofs} proof bundle(s) no longer exist; those cases carry no evidence` : '') +
+          '\n',
+      );
+    } catch (error) {
+      process.stderr.write(
+        `  ! ${ledger.runKey ?? ledger.title}: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}\n`,
+      );
+      failures += 1;
+    }
+  }
+  return failures === 0 ? 0 : 1;
+}
+
+/**
+ * `wowlidator db restore [<baseline.json> | <runKey> | <ledger.progress.json>]`
+ * — put the tables back for a run whose own restore never ran (it was paused
+ * or killed, or it ran in snapshot mode and the operator decided to restore
+ * afterwards). Reads the baseline the run wrote, connects the WRITE credential
+ * (`WOWLIDATOR_DB_RESTORE_URL`) and the read-only one for verification, and
+ * runs the same `restoreBaseline` the end of a run does. Never touches a table
+ * outside the baseline; every statement is printed before it runs.
+ *
+ * With no argument it restores the newest baseline under `.wowlidator/db-baselines/`.
+ */
+export async function cmdDb(sub: string | undefined, target: string | undefined, _options: CliOptions): Promise<number> {
+  if (sub !== 'restore') {
+    process.stderr.write(`wowlidator db: unknown subcommand ${sub ?? '(none)'} (expected: restore)\n`);
+    return 2;
+  }
+  const { readdir } = await import('node:fs/promises');
+  const { readLedger } = await import('../suite-progress.js');
+  const { readBaseline, restoreBaseline, BASELINE_DIR } = await import('../../db/baseline.js');
+  const { connectDb, connectDbWritable, defaultDbConfig, maskDsn, restoreDbConfig } = await import('../../db/client.js');
+
+  // Resolve the baseline file from what was given: a .json baseline, a ledger
+  // (its `dbBaseline.path`), a run key, or nothing (newest baseline on disk).
+  let baselinePath: string | null = null;
+  if (target === undefined) {
+    const dir = resolve(BASELINE_DIR);
+    const names = (await readdir(dir).catch(() => [] as string[])).filter((n) => n.endsWith('.json'));
+    if (names.length === 0) {
+      process.stderr.write(`wowlidator db restore: no baselines under ${dir}\n`);
+      return 2;
+    }
+    const withTimes = await Promise.all(
+      names.map(async (n) => ({ n, t: (await stat(join(dir, n)).catch(() => null))?.mtimeMs ?? 0 })),
+    );
+    withTimes.sort((a, b) => b.t - a.t);
+    baselinePath = join(dir, withTimes[0]!.n);
+  } else if (target.endsWith('.progress.json')) {
+    const ledger = await readLedger(resolve(target));
+    baselinePath = ledger?.dbBaseline?.path ?? null;
+    if (baselinePath === null) {
+      process.stderr.write(`wowlidator db restore: ${target} records no database baseline\n`);
+      return 2;
+    }
+  } else if (target.endsWith('.json')) {
+    baselinePath = resolve(target);
+  } else {
+    baselinePath = resolve(BASELINE_DIR, `${target.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}.json`);
+  }
+
+  const restoreConfig = restoreDbConfig();
+  const readConfig = defaultDbConfig();
+  if (restoreConfig === null) {
+    process.stderr.write('wowlidator db restore: WOWLIDATOR_DB_RESTORE_URL is not set — nothing to restore through\n');
+    return 3;
+  }
+  if (readConfig === null) {
+    process.stderr.write('wowlidator db restore: WOWLIDATOR_DB_URL is not set — the restore is verified through it\n');
+    return 3;
+  }
+  let baseline;
+  try {
+    baseline = await readBaseline(baselinePath);
+  } catch (error) {
+    process.stderr.write(`wowlidator db restore: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 2;
+  }
+  const reader = await connectDb(readConfig);
+  const writable = await connectDbWritable(restoreConfig);
+  try {
+    process.stdout.write(
+      `restoring ${baseline.tables.filter((t) => t.restorable).length} table(s) from ${baselinePath}\n` +
+        `  write  ${maskDsn(restoreConfig.url ?? '')}\n`,
+    );
+    const result = await restoreBaseline(writable, reader, baseline, {
+      onStatement: (sql) => process.stderr.write(`  sql  ${sql}\n`),
+    });
+    process.stdout.write(`  ${result.detail}\n`);
+    return result.ok ? 0 : 3;
+  } finally {
+    await writable.close().catch(() => undefined);
+    await reader.close().catch(() => undefined);
+  }
+}

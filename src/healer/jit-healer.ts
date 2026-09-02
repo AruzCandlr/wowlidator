@@ -552,6 +552,15 @@ export interface AxNode {
   disabled: boolean;
   checked: boolean;
   /**
+   * A field the user cannot type into. Surfaced (2026-09-02) because the
+   * commonest date-picker idiom is a read-only display named by its
+   * placeholder drawn over the real `type="date"` input the label points at —
+   * four `textbox "Select date"` lines on one form, and nothing told the
+   * generator or the agent which of them could take a value. Optional so
+   * hand-built nodes and older captures keep their shape.
+   */
+  readonly?: boolean | undefined;
+  /**
    * Where a link points, when Chrome reports one.
    *
    * Captured because it is the difference between a generated navigation
@@ -596,6 +605,7 @@ export async function captureAxNodes(
         description: asText(node.description),
         disabled: propertyFlag(node, 'disabled'),
         checked: propertyFlag(node, 'checked'),
+        ...(propertyFlag(node, 'readonly') ? { readonly: true } : {}),
         url: propertyText(node, 'url'),
       });
     }
@@ -618,6 +628,9 @@ export function formatAxNode(node: AxNode): string {
   }
   if (node.disabled) parts.push('disabled');
   if (node.checked) parts.push('checked');
+  // Printed so a reader of the tree — model or lint — can tell the shell from
+  // the input: `textbox "Select date" readonly` beside `textbox "Hire Date"`.
+  if (node.readonly) parts.push('readonly');
   return parts.join(' ');
 }
 

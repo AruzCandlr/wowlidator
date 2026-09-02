@@ -11,6 +11,7 @@ import { describe, it } from 'node:test';
 
 import { failFastRunOptions } from '../src/cli/run-cases.js';
 import type { RunFlowOptions } from '../src/engine/runner.js';
+import { AGENT_FAIL_FAST_MAX_STEPS } from '../src/orchestrator/workflow-agent.js';
 import {
   DEFAULT_RISK_THRESHOLD,
   LlmRiskModel,
@@ -218,5 +219,16 @@ describe('the fail-fast run', () => {
     assert.equal(fast.backend, true);
     assert.equal(fast.video, 'on');
     assert.equal(fast.cdpUrl, base.cdpUrl);
+    assert.equal(
+      fast.agentMaxSteps,
+      AGENT_FAIL_FAST_MAX_STEPS,
+      'the one shot the agent still gets is on a shorter leash, not an unbounded one (2026-09-02, HIR-EC-010)',
+    );
+  });
+
+  it('never loosens an explicit tighter cap the caller already set', () => {
+    const base = { cdpUrl: 'http://localhost:9222', agentMaxSteps: 6 } as RunFlowOptions;
+    const fast = failFastRunOptions(base);
+    assert.equal(fast.agentMaxSteps, 6, 'the caller already asked for something tighter — Math.min keeps it');
   });
 });

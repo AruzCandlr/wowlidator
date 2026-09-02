@@ -61,14 +61,50 @@ export function isLoginProof(step: FlowStep): boolean {
   return step.action === 'expectHidden' && LOGIN_CONTROL.test(step.selector);
 }
 
+/**
+ * The sign-in FORM's own controls appearing or becoming interactive — the
+ * identity field, the password field, the literal "Sign in"/"Log in" submit
+ * button — proof the login page rendered its own inputs, not that anything
+ * the case asked about happened.
+ *
+ * Deliberately narrower than `LOGIN_CONTROL`: that regex's "next" / "continue"
+ * / "submit" are legitimate wizard-step button names far past sign-in (a
+ * multi-page hire form has its own "Next"), so they are excluded HERE on
+ * purpose — only selectors this precise are checked, control-shaped and
+ * naming the identity/password field or the sign-in button by exact role.
+ * Never matched against `text=`/free-text selectors, so a genuine claim
+ * about login VALIDATION — an error message that happens to contain the
+ * word "password" — is never caught here; only the control rendering is.
+ *
+ * Closes the exact shape measured live (HIR-EC-006/HIR-EC-010, 2026-09-02):
+ * a case about creating a new hire, re-authored down to `goto /en/login`,
+ * fill the email, click Next, `expectVisible input[type="password"]`,
+ * `expectVisible role=button[name="Sign in" i]` — three assertions, all of
+ * them "the sign-in form is there," none of them about the hire it never
+ * attempted. The narrower `isLoginProof` (expectHidden only) let all three
+ * count as substantive, so the flow sailed past this module's own lint.
+ */
+const LOGIN_FORM_CONTROL = /work email|username|sign[ -]?in|log[ -]?in|เข้าสู่ระบบ|อีเมล/i;
+
+function isLoginFormSurface(step: FlowStep): boolean {
+  if (step.action !== 'expectVisible' && step.action !== 'expectEnabled' && step.action !== 'expectDisabled') {
+    return false;
+  }
+  const selector = step.selector.trim();
+  if (/^input\[type=["']password["']\]/i.test(selector)) return true;
+  const role = /^role=(?:textbox|button)\[name=["']([^"']*)["']/i.exec(selector);
+  return role !== null && LOGIN_FORM_CONTROL.test(role[1] ?? '');
+}
+
 function isAssertionStep(step: FlowStep): boolean {
   return ASSERTIONS.has(step.action);
 }
 
 /**
  * The assertions that say something about the claim itself: everything that
- * asserts, minus the sign-in proof and `expectUrl` (which says which page is
- * open, not that anything on it is right).
+ * asserts, minus the sign-in proof, the sign-in form's own controls
+ * rendering, and `expectUrl` (which says which page is open, not that
+ * anything on it is right).
  */
 export function substantiveAssertions(steps: readonly FlowStep[]): FlowStep[] {
   const out: FlowStep[] = [];
@@ -77,7 +113,13 @@ export function substantiveAssertions(steps: readonly FlowStep[]): FlowStep[] {
       out.push(...substantiveAssertions(step.then), ...substantiveAssertions(step.else ?? []));
       continue;
     }
-    if (!isAssertionStep(step) || step.action === 'expectUrl' || isLoginProof(step)) continue;
+    if (
+      !isAssertionStep(step) ||
+      step.action === 'expectUrl' ||
+      isLoginProof(step) ||
+      isLoginFormSurface(step)
+    )
+      continue;
     out.push(step);
   }
   return out;
@@ -92,7 +134,13 @@ export function vacuousClaim(steps: readonly FlowStep[]): string | null {
   const asserting = steps.filter((s) => isAssertionStep(s) || s.action === 'when');
   if (asserting.length === 0) return 'the flow contains no assertion';
   if (substantiveAssertions(steps).length > 0) return null;
-  const kinds = [...new Set(steps.filter(isAssertionStep).map((s) => (isLoginProof(s) ? 'the sign-in proof' : s.action)))];
+  const kinds = [
+    ...new Set(
+      steps
+        .filter(isAssertionStep)
+        .map((s) => (isLoginProof(s) ? 'the sign-in proof' : isLoginFormSurface(s) ? 'the sign-in form rendering' : s.action)),
+    ),
+  ];
   return `the flow's only assertions are ${kinds.join(' and ')} — neither checks the claim; a run passes whether or not the feature works`;
 }
 

@@ -575,9 +575,8 @@ export function createServer(config: ServerConfig = configFromEnv()): McpServer 
           .enum(MUTATION_POLICIES)
           .optional()
           .describe(
-            "How much the suite may change. 'forms' (default) submits only empty/invalid input to exercise validation; 'read-only' never submits; " +
-              "'forms' submits empty/invalid input to exercise validation (negative testing); " +
-              "'mutations' may also create or update. None ever delete.",
+            "How much the suite may change. 'mutations' (default) fills, submits, creates and updates like a human tester; " +
+              "'forms' narrows that to empty/invalid submits only (negative testing); 'read-only' never submits. None ever delete.",
           ),
         context: z
           .boolean()

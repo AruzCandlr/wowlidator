@@ -16,8 +16,8 @@
  * picks from what the server itself discovered.
  */
 
-import { readdir } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { readdir, stat } from 'node:fs/promises';
+import { basename, join, resolve } from 'node:path';
 
 import {
   readLedger,
@@ -28,6 +28,7 @@ import {
   type LedgerSummary,
   type SuiteLedger,
 } from '../cli/suite-progress.js';
+import { catalogReportPath } from '../reporter/catalog-report.js';
 import { CATALOG_DIR } from './uploads.js';
 
 export interface CatalogRunEntry {
@@ -54,6 +55,15 @@ export interface CatalogRunEntry {
   launch: SuiteLedger['launch'] | null;
   /** Every planned case id, in plan order — what maps a case row to its run. */
   planned: readonly string[];
+  /**
+   * The catalog report's file name under `reports/`, when the file exists —
+   * what the panel's Report button opens (via `/reports/<file>`, so the
+   * report's relative links to its workbooks resolve). Written at run start
+   * and after every case, so it is there for a running catalog too.
+   */
+  reportFile: string | null;
+  /** The account the run signed in as (email only), when the ledger recorded it. */
+  persona: string | null;
 }
 
 const LEDGER_SUFFIX = '.progress.json';
@@ -64,9 +74,11 @@ function catalogRunRoots(reportDir: string): string[] {
   return [...new Set([resolve(CATALOG_DIR), join(resolve(reportDir), 'catalogs')])];
 }
 
-function toEntry(ledgerPath: string, ledger: SuiteLedger): CatalogRunEntry {
+async function toEntry(ledgerPath: string, ledger: SuiteLedger): Promise<CatalogRunEntry> {
   const outcomes = Object.values(ledger.outcomes);
   const left = remaining(ledger).length;
+  const reportPath = catalogReportPath(ledger.runKey, ledger.title);
+  const reportFile = (await stat(reportPath).catch(() => null))?.isFile() ? basename(reportPath) : null;
   return {
     ledgerPath,
     title: ledger.title,
@@ -82,6 +94,8 @@ function toEntry(ledgerPath: string, ledger: SuiteLedger): CatalogRunEntry {
     resumable: left > 0,
     launch: ledger.launch ?? null,
     planned: ledger.planned,
+    reportFile,
+    persona: ledger.launch?.persona ?? null,
   };
 }
 
@@ -101,7 +115,7 @@ export async function listCatalogRuns(reportDir: string): Promise<CatalogRunEntr
       seen.add(path);
       const ledger = await readLedger(path);
       if (ledger === null) continue;
-      entries.push(toEntry(path, ledger));
+      entries.push(await toEntry(path, ledger));
     }
   }
   return entries

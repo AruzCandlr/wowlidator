@@ -25,10 +25,15 @@ import { after, before, describe, it } from 'node:test';
 import type { AddressInfo } from 'node:net';
 
 import {
+  fromAxNotation,
   isRoleSelector,
+  normaliseAgentSelector,
   qualifyBareRole,
   relaxRoleName,
+  stripGreeting,
   withRelaxedRoleName,
+  withStableGreeting,
+  withoutGreeting,
 } from '../src/engine/selector.js';
 import { parseRoleSelector } from '../src/coverage/ax-coverage.js';
 import { toFlowStep } from '../src/generator/test-generator.js';
@@ -48,6 +53,7 @@ const TRANSFORM_FIXTURE_HTML = `<!doctype html>
     <style>.tab { text-transform: uppercase; }</style>
   </head>
   <body>
+    <h1 id="greeting">Good morning, ผู้ดูแลระบบ</h1>
     <button type="button" class="tab" id="due-soon">Due soon 1 15–29 days</button>
     <button type="button" id="plain">Search</button>
     <p id="status">idle</p>
@@ -161,6 +167,70 @@ describe('relaxRoleName', () => {
   });
 });
 
+describe('volatile greetings', () => {
+  it('strips a time-of-day greeting and keeps the name — English and Thai', () => {
+    assert.equal(stripGreeting('Good afternoon, ผู้ดูแลระบบ'), 'ผู้ดูแลระบบ');
+    assert.equal(stripGreeting('Good Morning ผู้ดูแลระบบ'), 'ผู้ดูแลระบบ');
+    assert.equal(stripGreeting('good evening: Jane Doe'), 'Jane Doe');
+    assert.equal(stripGreeting('สวัสดีตอนบ่าย ผู้ดูแลระบบ'), 'ผู้ดูแลระบบ');
+  });
+
+  it('leaves text with no greeting, or nothing but a greeting, alone', () => {
+    assert.equal(stripGreeting('Add New Employee'), null);
+    assert.equal(stripGreeting('Good morning'), null);
+    assert.equal(stripGreeting('Goodwill ledger'), null);
+  });
+
+  it('re-writes text and role selectors to assert the name alone', () => {
+    // The live case: six ec10 flows asserted the afternoon greeting on a clock
+    // pinned to midnight — the page said "Good morning, ผู้ดูแลระบบ".
+    assert.equal(withoutGreeting('text=Good afternoon, ผู้ดูแลระบบ'), 'text=ผู้ดูแลระบบ');
+    assert.equal(withoutGreeting('text="Good afternoon, ผู้ดูแลระบบ"'), 'text=ผู้ดูแลระบบ');
+    assert.equal(withoutGreeting('text=Good afternoon, ผู้ดูแลระบบ >> nth=0'), 'text=ผู้ดูแลระบบ >> nth=0');
+    // A quoted role name is an EXACT match in Playwright's role engine, so
+    // the name goes in as a regex — it has to match with the greeting around it.
+    assert.equal(
+      withoutGreeting('role=heading[name="Good afternoon, ผู้ดูแลระบบ" i]'),
+      'role=heading[name=/ผู้ดูแลระบบ/i]',
+    );
+    assert.equal(withoutGreeting("role=heading[name='Good evening, Jane (HR)']"), 'role=heading[name=/Jane \\(HR\\)/i]');
+  });
+
+  it('returns null when there is nothing to change, so the ladder pays no extra attempt', () => {
+    assert.equal(withoutGreeting('text=Add New Employee'), null);
+    assert.equal(withoutGreeting('role=button[name="Sign in" i]'), null);
+    assert.equal(withoutGreeting('text=/Good (morning|afternoon)/'), null);
+    assert.equal(withoutGreeting('input[type="password"]'), null);
+    assert.equal(withStableGreeting('text=Add New Employee'), 'text=Add New Employee');
+    assert.equal(withStableGreeting('text=Good afternoon, ผู้ดูแลระบบ'), 'text=ผู้ดูแลระบบ');
+  });
+});
+
+describe('AX-tree notation from the agent', () => {
+  it('turns the tree line the model copied into the role selector it meant', () => {
+    // Live, ec10 HIR-EC-003: each of these cost a turn as a CSS miss.
+    assert.equal(fromAxNotation('region "Dependents Dependents"'), 'role=region[name="Dependents Dependents" i]');
+    assert.equal(fromAxNotation('spinbutton "Day Day"'), 'role=spinbutton[name="Day Day" i]');
+    assert.equal(fromAxNotation('heading "National ID / Tax ID"'), 'role=heading[name="National ID / Tax ID" i]');
+    assert.equal(fromAxNotation('textbox "Search options" >> nth=1'), 'role=textbox[name="Search options" i] >> nth=1');
+    assert.equal(fromAxNotation('"Add Dependent"'), 'text="Add Dependent"');
+  });
+
+  it('leaves real selectors and unknown roles alone', () => {
+    assert.equal(fromAxNotation('role=button[name="Save" i]'), null);
+    assert.equal(fromAxNotation('text=A - Permanent'), null);
+    assert.equal(fromAxNotation('div "not a role"'), null);
+    assert.equal(fromAxNotation('.card button'), null);
+  });
+
+  it('normaliseAgentSelector composes notation, bare role and case', () => {
+    assert.equal(normaliseAgentSelector('region "Dependents Dependents"'), 'role=region[name="Dependents Dependents" i]');
+    assert.equal(normaliseAgentSelector('button[name="Save"]'), 'role=button[name="Save" i]');
+    assert.equal(normaliseAgentSelector('role=button[name="Save" i]'), 'role=button[name="Save" i]');
+    assert.equal(normaliseAgentSelector('text=A - Permanent'), 'text=A - Permanent');
+  });
+});
+
 describe('generated steps carry the flag', () => {
   it('narrows a generated click into a case-insensitive selector', () => {
     const step = toFlowStep({
@@ -175,6 +245,25 @@ describe('generated steps carry the flag', () => {
       selector: 'role=button[name="DUE SOON" i]',
       intent: 'Click the Due soon filter.',
     });
+  });
+
+  it('writes a sign-in proof that quotes a greeting against the name alone', () => {
+    const step = toFlowStep({
+      action: 'expectVisible',
+      selector: 'text=Good afternoon, ผู้ดูแลระบบ',
+      value: '',
+      url: '',
+      intent: 'Assert who is signed in.',
+    });
+    assert.equal((step as { selector: string }).selector, 'text=ผู้ดูแลระบบ');
+    const heading = toFlowStep({
+      action: 'expectVisible',
+      selector: 'role=heading[name="Good afternoon, ผู้ดูแลระบบ"]',
+      value: '',
+      url: '',
+      intent: '',
+    });
+    assert.equal((heading as { selector: string }).selector, 'role=heading[name=/ผู้ดูแลระบบ/i]');
   });
 
   it('leaves selectorless and non-role steps alone', () => {
@@ -271,6 +360,32 @@ describe('case-relaxed resolution (CDP)', { skip: skipBrowser }, () => {
     assert.equal(click?.resolution, 'case');
     assert.match(click?.resolvedSelector ?? '', / i\]/);
     assert.equal(bundle.summary.caseRetries, 1);
+    assert.equal(bundle.summary.jitHeals, 0);
+  });
+
+  it('matches a greeting proof on the name when the page greets a different time of day', async () => {
+    // The ec10 shape verbatim: the flow says afternoon, the page says morning.
+    const flow: Flow = {
+      name: 'greeting proof',
+      baseUrl: origin,
+      steps: [
+        { action: 'goto', url: '/' },
+        { action: 'expectVisible', selector: 'text=Good afternoon, ผู้ดูแลระบบ' },
+        { action: 'expectVisible', selector: 'role=heading[name="Good evening, ผู้ดูแลระบบ" i]' },
+      ],
+    };
+    const bundle = await runFlow(flow, {
+      cdpUrl: CDP_URL,
+      cachePath: join(dir, 'greeting.json'),
+      healer: null,
+    });
+    assert.equal(bundle.status, 'passed', bundle.error ?? 'the greeting rung should resolve both proofs');
+    const [, text, heading] = bundle.steps;
+    assert.equal(text?.resolution, 'narrow');
+    assert.equal(text?.resolvedSelector, 'text=ผู้ดูแลระบบ');
+    assert.equal(heading?.resolution, 'narrow');
+    assert.equal(heading?.resolvedSelector, 'role=heading[name=/ผู้ดูแลระบบ/i]');
+    assert.ok((bundle.notes ?? []).some((n) => n.includes('greets by time of day')));
     assert.equal(bundle.summary.jitHeals, 0);
   });
 

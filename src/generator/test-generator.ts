@@ -25,7 +25,7 @@ import {
   type ModelSource,
 } from '../providers/llm-factory.js';
 import { hasAssertion } from '../engine/runner.js';
-import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
+import { withQualifiedRole, withRelaxedRoleName, withStableGreeting } from '../engine/selector.js';
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
 import type { Defect, DefectCategory, DefectSeverity } from '../engine/proof-bundle.js';
 import type { Flow, FlowStep } from '../engine/runner.js';
@@ -45,18 +45,18 @@ export type TestKind = (typeof TEST_KINDS)[number];
 /**
  * How much the generator is allowed to change.
  *
- * `forms` is the default: submitting an *empty or invalid* form is not
- * destructive — the validation under test is exactly what stops the write —
- * and it is the entire negative-testing surface, which a `read-only` default
- * silently excluded from every generated suite. `read-only` remains for
- * pages where even an invalid submit is unwelcome; `mutations` additionally
- * permits create and update, and stays opt-in because an autonomous test
- * writer that can change your data is not something to opt *out* of. DELETE
- * appears at no tier.
+ * `mutations` is the default (2026-09-02, by request): a human QA fills forms
+ * with real data, submits them, creates and updates records, and the suite is
+ * expected to do the same out of the box. `forms` narrows that to empty/invalid
+ * submits only — the validation-focused negative-testing surface — and
+ * `read-only` narrows it further to navigate-and-assert, for a page where even
+ * an invalid submit is unwelcome. The knob stays: a run that must not write
+ * still passes `--policy forms` / `--policy read-only`. DELETE appears at no
+ * tier, and `mutations` still refuses purchases and bulk/irreversible ops.
  */
 export const MUTATION_POLICIES = ['read-only', 'forms', 'mutations'] as const;
 export type MutationPolicy = (typeof MUTATION_POLICIES)[number];
-export const DEFAULT_MUTATION_POLICY: MutationPolicy = 'forms';
+export const DEFAULT_MUTATION_POLICY: MutationPolicy = 'mutations';
 
 const POLICY_RULES: Record<MutationPolicy, string> = {
   'read-only':
@@ -501,7 +501,9 @@ export function toFlowStep(raw: z.infer<typeof GeneratedStepSchema>): FlowStep |
   // see `src/engine/selector.ts`. Relaxing case here, at the one point every
   // generated step is narrowed, means the flow written to disk is a selector
   // that actually resolves rather than one the runner has to rescue.
-  const selector = raw.selector === '' ? '' : withRelaxedRoleName(withQualifiedRole(raw.selector));
+  // And a time-of-day greeting is written as the name after it: the page
+  // chooses the greeting by the clock, so it is never the fact a step proves.
+  const selector = raw.selector === '' ? '' : withStableGreeting(withRelaxedRoleName(withQualifiedRole(raw.selector)));
   switch (raw.action) {
     case 'goto':
       return raw.url === '' ? null : { action: 'goto', url: raw.url };
@@ -691,11 +693,29 @@ export class TestGenerator {
       }
 
       attempts.push({ cases, rejected, result });
-      if (rejected.length === 0) break;
+      // Stop only when this attempt produced usable cases AND nothing was
+      // rejected. Zero usable cases is a failed attempt, not a finished one:
+      // the informed re-ask exists for exactly this, but an empty
+      // `result.cases` also leaves `rejected` empty, so the old
+      // `rejected.length === 0` check mistook "the model returned nothing" for
+      // "the model got it right" and broke without ever re-asking.
+      if (cases.length > 0 && rejected.length === 0) break;
+      if (cases.length === 0 && rejected.length === 0) {
+        feedback.push(
+          'Your previous attempt returned NO cases. If the page exposes any usable control, form or link, ' +
+            'return at least one runnable case with an assertion that would fail if that feature were broken.',
+        );
+      }
       feedback.push(...rejected.map((r) => `"${r.name}": ${r.reason}`));
     }
 
-    const best = attempts.reduce((a, b) => (b.cases.length > a.cases.length ? b : a));
+    // The better attempt wins — a re-ask must never make the result worse:
+    // more usable cases first, then fewer rejected on a tie, then the earlier
+    // attempt (reduce keeps `a` when neither is strictly better).
+    const best = attempts.reduce((a, b) => {
+      if (b.cases.length !== a.cases.length) return b.cases.length > a.cases.length ? b : a;
+      return b.rejected.length < a.rejected.length ? b : a;
+    });
     const { cases, rejected, result } = best;
 
     const defects: Defect[] = result.defects.map((defect, index) => ({

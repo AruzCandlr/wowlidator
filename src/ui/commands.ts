@@ -181,6 +181,27 @@ const AUTOHEAL_FIELD: Field = {
  * would prove better carries a note saying so (`ProofStep.backendHint`),
  * which is the honest form of "we did not check that half".
  */
+
+/**
+ * The database baseline (`src/db/baseline.ts`): snapshot the tables under test
+ * before the run, compare on every backend step, and optionally restore them
+ * after. Shown on the catalog form because that is the run that writes to the
+ * app's database case after case.
+ */
+const DB_BASELINE_FIELD: Field = {
+  name: 'db-baseline',
+  label: 'Database baseline',
+  type: 'enum',
+  choices: ['auto', 'off', 'snapshot', 'restore'],
+  default: 'auto',
+  advanced: true,
+  help:
+    'auto: as much as the connections allow — nothing without WOWLIDATOR_DB_URL, snapshot-and-compare with it, ' +
+    'restore too when WOWLIDATOR_DB_RESTORE_URL (a write credential) is also set. snapshot: detect the tables the ' +
+    'flows are about, snapshot them, and record on every backend step what it did to them — no restore. restore: ' +
+    'also put the tables back after the run. off: none of it.',
+};
+
 const BACKEND_FIELD: Field = {
   name: 'backend',
   label: 'Include backend steps',
@@ -361,6 +382,13 @@ const COMMON_BROWSER_FIELDS: readonly Field[] = [
     advanced: true,
   },
   {
+    name: 'no-target-highlight',
+    label: 'Leave screenshots unmarked',
+    type: 'boolean',
+    help: 'By default each step\'s screenshot draws a red rectangle around the element the step acted on or checked — the proof of WHAT was tested, not only the page it sat on. The target (selector, role, name, position) is recorded on the step either way. Tick to leave the stills unmarked.',
+    advanced: true,
+  },
+  {
     name: 'junit',
     label: 'JUnit XML path',
     type: 'text',
@@ -392,8 +420,8 @@ const POLICY_FIELD: Field = {
   label: 'Mutation policy',
   type: 'enum',
   choices: ['read-only', 'forms', 'mutations'],
-  default: 'forms',
-  help: 'read-only: never submits. forms: submits empty/invalid input to exercise validation. mutations: creates and updates. Never deletes, at any tier.',
+  default: 'mutations',
+  help: 'mutations (default): fills, submits, creates and updates — like a human tester. forms: only empty/invalid submits, to exercise validation. read-only: never submits. Never deletes, at any tier.',
 };
 
 export const COMMANDS: readonly CommandSpec[] = [
@@ -543,6 +571,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         advanced: true,
       },
       {
+        name: 'no-value-resolution',
+        label: 'Leave placeholder values unresolved',
+        type: 'boolean',
+        help: "By default a value the sheet leaves as a token (<NON_EXISTING_EMPLOYEE_ID>) or a description (\"an existing employee\") is resolved before the flow is written: from the case's own test data, then the documents and repository index, then the database (read-only, only when WOWLIDATOR_DB_URL is set), and as a last resort the generator invents a well-formed value and the step is FLAGGED as generated — on the step, in every report, and in the run notes. Tick to skip this and have such a step refused instead.",
+        advanced: true,
+      },
+      {
         name: 'no-agent-capture',
         label: 'Capture without the agent pilot',
         type: 'boolean',
@@ -622,6 +657,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         label: 'Skip the authoring review',
         type: 'boolean',
         help: 'By default every authored flow gets a second look before it is written: steps with nothing behind them (a control named in no captured tree, a path no route declares) are checked by the agent role against the codebase index and the documents, repointed only when the evidence supports it, and reported either way. Tick to write the flow exactly as authored.',
+        advanced: true,
+      },
+      {
+        name: 'no-value-resolution',
+        label: 'Leave placeholder values unresolved',
+        type: 'boolean',
+        help: "By default a value the sheet leaves as a token (<NON_EXISTING_EMPLOYEE_ID>) or a description (\"an existing employee\") is resolved before the flow is written: from the case's own test data, then the documents and repository index, then the database (read-only, only when WOWLIDATOR_DB_URL is set), and as a last resort the generator invents a well-formed value and the step is FLAGGED as generated — on the step, in every report, and in the run notes. Tick to skip this and have such a step refused instead.",
         advanced: true,
       },
       {
@@ -853,6 +895,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         advanced: true,
       },
       {
+        name: 'no-value-resolution',
+        label: 'Leave placeholder values unresolved',
+        type: 'boolean',
+        help: "By default a value the sheet leaves as a token (<NON_EXISTING_EMPLOYEE_ID>) or a description (\"an existing employee\") is resolved before the flow is written: from the case's own test data, then the documents and repository index, then the database (read-only, only when WOWLIDATOR_DB_URL is set), and as a last resort the generator invents a well-formed value and the step is FLAGGED as generated — on the step, in every report, and in the run notes. Tick to skip this and have such a step refused instead.",
+        advanced: true,
+      },
+      {
         name: 'no-agent-capture',
         label: 'Capture without the agent pilot',
         type: 'boolean',
@@ -872,6 +921,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       },
       CREDENTIALS_FIELD,
       BACKEND_FIELD,
+        DB_BASELINE_FIELD,
       DB_URL_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],

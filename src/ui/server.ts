@@ -53,7 +53,15 @@ import { DbStatus } from './db-status.js';
 import { KeySelection, KeySelectionError } from './keys.js';
 import { ClaudeSettingsError, describeClaudeSettings, persistClaudeRunScript } from './claude-settings.js';
 import { UsageCapGuard, persistUsageCap } from './usage-cap.js';
-import { describeDials, describeGates, persistDial, persistGate } from './gates.js';
+import {
+  SELECTS,
+  describeDials,
+  describeGates,
+  describeSelects,
+  persistDial,
+  persistGate,
+  persistSelect,
+} from './gates.js';
 import { ModelSelection, ModelSelectionError, persistRoleModel } from './models.js';
 import { RoleCheckError, RoleChecks } from './checks.js';
 import {
@@ -66,6 +74,7 @@ import {
 import { ARCHIVED_DIR, readProof, readProofIndex, readProofWithPath, groupRuns } from './proofs.js';
 import { listCatalogRuns } from './catalog-runs.js';
 import { ledgerPathFor } from '../cli/suite-progress.js';
+import { CATALOG_REPORT_DIR } from '../reporter/catalog-report.js';
 import { buildVerdict } from '../reporter/verdict.js';
 import { renderApp } from './app-html.js';
 import { renderWowUi } from './wow-ui-html.js';
@@ -151,6 +160,15 @@ function jobLedgerPath(job: { argv: string[] }): string | null {
   const claims = at >= 0 ? job.argv[at + 1] : undefined;
   return claims === undefined ? null : ledgerPathFor(resolve(claims));
 }
+
+/** What the reports folder holds, by extension — anything else is a download. */
+const REPORT_FILE_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.webm': 'video/webm',
+  '.json': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+};
 
 /** The directories a file request may resolve inside, for one config. */
 function rootsFor(config: WowlidatorConfig): string[] {
@@ -551,7 +569,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   // flag the person chose), else it is rebuilt from the ledger's own `launch`
   // record through the command whitelist.
   if (path === '/api/catalog-runs/resume' && req.method === 'POST') {
-    let body: { ledgerPath?: string; mode?: string; caseId?: string; caseIds?: string[] };
+    let body: { ledgerPath?: string; mode?: string; caseId?: string; caseIds?: string[]; as?: string };
     try {
       body = ((await readBody(req)) as typeof body) ?? {};
     } catch (error) {
@@ -623,14 +641,36 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
           : mode === 'cases'
             ? [...base, ...caseIds.flatMap((id) => [flag, id])]
             : [...base, flag];
+      // The secrets the interrupted run was given. A secret is carried by
+      // env and never by argv, so replaying argv alone starts a run
+      // without its credentials — measured as 25 sign-in failures reported
+      // as findings about the application (be100, 2026-08-26). When this
+      // panel process never saw the job (it was restarted), the ledger still
+      // says WHICH account the run signed in as; the password has to come
+      // from the request, or the resume is refused rather than run blind
+      // (ec10, 2026-09-02: six rows refused, four sign-in failures, for
+      // want of one password).
+      const inherited = priorJobs[priorJobs.length - 1]?.secretEnv;
+      const supplied = typeof body.as === 'string' && body.as.includes(':') ? body.as : null;
+      const secretEnv: Record<string, string> =
+        supplied !== null ? { WOWLIDATOR_AS: supplied } : inherited ?? {};
+      const persona = launch?.persona;
+      if (persona !== undefined && secretEnv['WOWLIDATOR_AS'] === undefined && process.env['WOWLIDATOR_AS'] === undefined) {
+        json(
+          res,
+          {
+            error: `this run signs in as ${persona}; the password is not kept between panel sessions — enter it to continue`,
+            needsCredentials: true,
+            persona,
+          },
+          409,
+        );
+        return;
+      }
       const next = ctx.jobs.start(spec, argv, {
         ...ctx.keys.envOverlay(ctx.config),
         ...ctx.models.envOverlay(),
-        // The secrets the interrupted run was given. A secret is carried by
-        // env and never by argv, so replaying argv alone starts a run
-        // without its credentials — measured as 25 sign-in failures reported
-        // as findings about the application (be100, 2026-08-26).
-        ...(priorJobs[priorJobs.length - 1]?.secretEnv ?? {}),
+        ...secretEnv,
       });
       json(res, { job: summariseJob(next) }, 201);
     } catch (error) {
@@ -887,7 +927,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   // gates it started with. The allowlist lives in `gates.ts` — the endpoint
   // edits those vars and no others.
   if (path === '/api/gates' && req.method === 'GET') {
-    json(res, { gates: describeGates(), dials: describeDials() });
+    json(res, { gates: describeGates(), dials: describeDials(), selects: describeSelects() });
     return;
   }
 
@@ -899,18 +939,26 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
       json(res, { error: error instanceof Error ? error.message : String(error) }, 400);
       return;
     }
-    const asDial = (body as { value?: unknown }).value;
-    if (typeof body.env !== 'string' || (typeof body.on !== 'boolean' && asDial === undefined)) {
-      json(res, { error: 'a gate edit is { env, on } for a toggle or { env, value } for a dial' }, 400);
+    const asValue = (body as { value?: unknown }).value;
+    if (typeof body.env !== 'string' || (typeof body.on !== 'boolean' && asValue === undefined)) {
+      json(
+        res,
+        { error: 'a gate edit is { env, on } for a toggle or { env, value } for a dial or a select' },
+        400,
+      );
       return;
     }
+    const all = () => ({ gates: describeGates(), dials: describeDials(), selects: describeSelects() });
     try {
       if (typeof body.on === 'boolean') {
         const gate = await persistGate(body.env, body.on);
-        json(res, { gate, gates: describeGates(), dials: describeDials() });
+        json(res, { gate, ...all() });
+      } else if (SELECTS.some((s) => s.env === body.env)) {
+        const select = await persistSelect(body.env, asValue);
+        json(res, { select, ...all() });
       } else {
-        const dial = await persistDial(body.env, asDial);
-        json(res, { dial, gates: describeGates(), dials: describeDials() });
+        const dial = await persistDial(body.env, asValue);
+        json(res, { dial, ...all() });
       }
     } catch (error) {
       const status = error instanceof ClaudeSettingsError ? 400 : 500;
@@ -1237,6 +1285,32 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
       json(res, { saved: resolve(target) });
       return;
     }
+  }
+
+  // ---- the catalog reports folder, served AS a folder ---------------------
+  // A catalog report links its workbooks and recordings RELATIVELY
+  // (`<run>-media/<case>.xlsx`), so the folder can travel whole. Opened via
+  // `/view?path=…` those links would resolve against `/view`, so the folder
+  // gets a route of its own where a relative link lands on the sibling file.
+  // Confined to `reports/` under the working directory, one level of
+  // sub-folder deep — exactly the shape the writer produces.
+  if (path.startsWith('/reports/') && req.method === 'GET') {
+    const root = resolve(CATALOG_REPORT_DIR);
+    const rel = decodeURIComponent(path.slice('/reports/'.length));
+    const target = resolve(root, rel);
+    if (rel === '' || rel.includes('\0') || !isAllowed(target, [root]) || rel.split('/').length > 2) {
+      text(res, 'not a file under the reports folder', 403);
+      return;
+    }
+    const info = await stat(target).catch(() => null);
+    if (!info?.isFile()) {
+      text(res, 'no such report file', 404);
+      return;
+    }
+    const type = REPORT_FILE_TYPES[extname(target).toLowerCase()] ?? 'application/octet-stream';
+    res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store', 'content-length': info.size });
+    createReadStream(target).pipe(res);
+    return;
   }
 
   // ---- serving a rendered report -----------------------------------------

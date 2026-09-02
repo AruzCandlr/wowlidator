@@ -179,3 +179,83 @@ Two capabilities, one boundary rule, specified in `docs/sequence-testing-spec.md
 
 The wording was already right and reached nobody: it was prose inside the error message (*"check the spec before filing one"*), and be100 PL_03_03 filed a `high` `backend` defect and a `high` `functional` one anyway, scoring the case a failure against an app behaving exactly as written. As a NAME it reaches `classifyStepFailure` (scored `error`, so every broken step being `error` lets `harnessOnly` record the case **blocked** — no verdict) and `reconstructionFutile` (no rewrite gives a handler a method it does not export). Both halves of the request path are covered: `expectStatus` throws it, and a `save` that missed on a 405 body throws it too — the body was never going to hold the path, and the reason is the verb. The record carries the same wording, because the record is what a reader sees.
 
+## The database baseline: snapshot → compare → restore (`src/db/baseline.ts`, 2026-09-02)
+
+Asked for in so many words: *before a run, detect the tables that need testing,
+snapshot them, compare on every backend step, and restore the database to that
+snapshot after.* One module, four pieces, wired into `runCases`:
+
+- **Detect** (`detectBaselineTables`, pure, no model): a table is under test
+  when a DB step names its `table`, when its exact name appears as a whole word
+  in a case's own text (schema-grounded — `employee_grade` or an 8+-letter name,
+  never `user`), when it is one FK hop from such a table (the live schema's
+  `references` and the indexed graph's FK pairs, both directions — a child's
+  rows are what block a parent's restore), or when the operator names it
+  (`--db-baseline-tables`, `WOWLIDATOR_DB_BASELINE_TABLES`). Each table carries
+  its `why`, printed at run start.
+- **Snapshot** (`takeBaseline`): every row of every detected table, bounded by
+  `WOWLIDATOR_DB_BASELINE_MAX_ROWS` (50k; a bigger table is compared but not
+  snapshotted/restored, by name, never waited on), plus a server-side content
+  hash (`md5(string_agg(row_to_json …))`). Real values, in a LOCAL file
+  (`.wowlidator/db-baselines/<runKey>.json`) that never enters a report;
+  report-facing rows go through `redact-row.ts`. The ledger records where it is,
+  so a **resume never re-snapshots** — the state before the original run is the
+  baseline — and `wowlidator db restore` can find it later.
+- **Compare** (`baselineProbe` → `diffAgainstBaseline`, injected into the runner
+  as `RunFlowOptions.dbBaselineProbe`): after every HTTP or DB step, one cheap
+  probe per table (`count` + hash); a changed table gets a bounded, redacted
+  row-level diff keyed on the PK, recorded as `ProofStep.dbChanges` — against
+  the BASELINE, not the previous step. Evidence only, never a verdict or a
+  defect; a failed probe is `dbProbeError` and the step is untouched. Surfaced
+  in `formatStepLine`, both HTML reports, the Excel Proof column and wowUI's
+  step panel.
+- **Restore** (`restoreBaseline`, the only writer in `src/db/`): opt-in by a
+  SEPARATE credential `WOWLIDATOR_DB_RESTORE_URL` (`connectDbWritable` — the
+  default session stays structurally read-only), touches the baseline's tables
+  and nothing else, prints every statement before it runs (spec defect #14). One
+  transaction, `SET CONSTRAINTS ALL DEFERRED`, children deleted before parents,
+  parents inserted before children with `OVERRIDING SYSTEM VALUE`, rolled back
+  on the first error, sequences reset, then re-probed through the READ-ONLY
+  client and each hash compared to the baseline. A mismatch is an ENVIRONMENT
+  fact, never an application defect. Runs at the end of `runCases` (after the
+  interference solo re-runs) in `restore` mode, and from `wowlidator db restore`
+  for a run that was paused or killed before its own restore could run.
+
+**Mode** — `--db-baseline off|snapshot|restore|auto` / `WOWLIDATOR_DB_BASELINE`.
+`auto` (default) is off with no DB URL, `snapshot` with the read-only URL,
+`restore` when the restore URL is also set. `--no-backend` does NOT disable it —
+the comparison is about the data, not the API plane — but a run with zero
+detected tables prints one line and does nothing. Everything is never-fatal for
+the suite. **Streaming caveat:** a pipelined catalog authors while it runs, so
+with the baseline on the run waits for authoring to finish before snapshotting
+(the tables cannot be known otherwise); non-streaming suites are unaffected.
+Tests: `tests/db-baseline.test.ts` (unit), and the gated `WOWLIDATOR_DB_TESTS=1`
+tier for real Postgres.
+
+## The baseline is detected from the PLAN, never by waiting for authoring (2026-09-02)
+
+The first version of the snapshot waited for the authoring pass to close the
+case queue before it read the schema, because a flow's own DB steps are the
+surest source of table names. Measured on ec10 that silently disabled the
+pipelining the streaming path exists for: a case sat authored and queued while
+the engine polled `!queue.closed` every 200 ms for ten minutes, and nothing in
+the log said why. A baseline must never cost the parallelism policy.
+
+Detection now runs immediately, over the plan rows in the sheet's own words
+(`planRows`, passed by `cmdCatalog` from every text column but Actual) plus
+whatever has authored so far, and the snapshot is taken before the first case
+is dispatched. Source (a) — a DB step naming its table — still needs a flow and
+is used for the rows already authored; sources (b) the schema's names as whole
+words in the case text, (c) one FK hop and (d) the operator's
+`--db-baseline-tables` all work from a plan row alone.
+
+The honest cost is stated rather than hidden: a flow may end up naming a table
+the sheet never mentioned, and that table has no baseline row, so its changes
+are not compared and a restore cannot put it back. The run prints exactly which
+tables that happened to and names the flag that includes them next time.
+
+**Authoring-time value lookup is read-only and grounded like `dbCount`** (2026-09-02,
+`generator/value-resolution.ts`): the agent role may name a table, a column and
+an equality filter; all three must exist in the introspected schema or nothing
+runs; the statement is a parameterised `SELECT … LIMIT 1` (or `count(*)` to prove a
+candidate absent) on the read-only client; values pass through `redactValue`.

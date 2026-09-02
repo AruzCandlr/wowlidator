@@ -22,7 +22,7 @@
  *   DSN stays the person's own act, in `.env`, with their eyes on it.
  */
 
-import { connectDb, defaultDbConfig, maskDsn } from '../db/client.js';
+import { connectDb, defaultDbConfig, maskDsn, restoreDbConfig } from '../db/client.js';
 import type { DbHint } from '../context/db-hint.js';
 import { listRepos } from '../context/repo-registry.js';
 
@@ -54,6 +54,8 @@ export interface DbStatusView {
   checking: boolean;
   /** What scanned repositories say their database is. */
   hints: RepoDbHint[];
+  /** Whether a WRITE credential for the baseline restore is configured, masked. */
+  restore: { configured: boolean; maskedUrl: string | null };
 }
 
 export class DbStatus {
@@ -89,6 +91,10 @@ export class DbStatus {
       probe: this.#last,
       checking: this.#inFlight !== null,
       hints,
+      restore: (() => {
+        const rc = restoreDbConfig();
+        return { configured: rc !== null, maskedUrl: rc?.url ? maskDsn(rc.url) : null };
+      })(),
     };
   }
 

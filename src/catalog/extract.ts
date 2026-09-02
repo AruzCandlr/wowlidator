@@ -289,7 +289,7 @@ function decodeEntities(value: string): string {
 
 // --- ZIP (the container .xlsx is) -------------------------------------------
 
-interface ZipEntry {
+export interface ZipEntry {
   name: string;
   data: Buffer;
 }
@@ -303,7 +303,7 @@ interface ZipEntry {
  * middle of a compressed stream. The central directory always has the true
  * sizes.
  */
-function readZip(bytes: Buffer): ZipEntry[] {
+export function readZip(bytes: Buffer): ZipEntry[] {
   const eocd = findEndOfCentralDirectory(bytes);
   if (eocd === -1) throw new UnsupportedDocumentError('this file is not a readable .xlsx (no ZIP directory)');
 

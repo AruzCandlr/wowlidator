@@ -143,6 +143,109 @@ export async function persistDial(
   return { ...spec, value: n, raw: String(n) };
 }
 
+/**
+ * A pick-one-of-N machinery setting — same persistence contract as a gate or
+ * a dial, for a value that is an enum rather than a switch or a number.
+ *
+ * The reason it exists: reasoning effort. A role pointed at a Claude provider
+ * (claude-cli / claude-tty / claude-cloud) is launched with `--effort <level>`,
+ * resolved from `WOWLIDATOR_<ROLE>_EFFORT` (see `role()` in `config.ts`).
+ * `high` on the generator is where authoring earns its thinking; `low`
+ * everywhere the call is small and latency-sensitive. Non-Claude providers
+ * ignore the value, and an explicit `--effort` on a run still wins — so this
+ * is the default a run inherits, said out loud on the panel.
+ */
+export interface SelectSpec {
+  env: string;
+  label: string;
+  help: string;
+  /** The allowed values, in the order the panel offers them. */
+  options: readonly string[];
+  /** The value an ABSENT var resolves to — the role's own default effort. */
+  defaultValue: string;
+}
+
+/** Claude's `--effort` ladder, low → high. */
+const EFFORT_OPTIONS: readonly string[] = ['low', 'medium', 'high'];
+
+export const SELECTS: readonly SelectSpec[] = [
+  {
+    env: 'WOWLIDATOR_GENERATOR_EFFORT',
+    label: 'Generator effort',
+    help:
+      'Reasoning effort (--effort) for the generator role on a Claude provider — authoring is one large call per row and is where high pays off; ' +
+      'medium roughly halves the think time, low is fastest and thinnest. Non-Claude providers ignore this; an explicit --effort on a run still wins.',
+    options: EFFORT_OPTIONS,
+    defaultValue: 'high',
+  },
+  {
+    env: 'WOWLIDATOR_HEALER_EFFORT',
+    label: 'Healer effort',
+    help: 'Reasoning effort for the healer role on a Claude provider. Repair is small and latency-sensitive — low is the default and usually right.',
+    options: EFFORT_OPTIONS,
+    defaultValue: 'low',
+  },
+  {
+    env: 'WOWLIDATOR_AGENT_EFFORT',
+    label: 'Agent effort',
+    help: 'Reasoning effort for the agent role on a Claude provider. One small structured decision per turn — the loop owns the reasoning, so low is the default.',
+    options: EFFORT_OPTIONS,
+    defaultValue: 'low',
+  },
+  {
+    env: 'WOWLIDATOR_DATA_EFFORT',
+    label: 'Data effort',
+    help: 'Reasoning effort for the data role on a Claude provider — regenerating one rejected field value. Low is the default.',
+    options: EFFORT_OPTIONS,
+    defaultValue: 'low',
+  },
+  {
+    env: 'WOWLIDATOR_GOVERNOR_EFFORT',
+    label: 'Governor effort',
+    help: 'Reasoning effort for the queue governor when it runs as a model (WOWLIDATOR_GOVERNOR=model) on a Claude provider. Low is the default.',
+    options: EFFORT_OPTIONS,
+    defaultValue: 'low',
+  },
+];
+
+export interface SelectView extends SelectSpec {
+  /** The resolved value: the env value if it is one of `options`, else `defaultValue`. */
+  value: string;
+  /** The raw value the environment holds, '' when unset. */
+  raw: string;
+}
+
+export function describeSelects(env: NodeJS.ProcessEnv = process.env): SelectView[] {
+  return SELECTS.map((spec) => {
+    const raw = (env[spec.env] ?? '').trim();
+    const value = spec.options.includes(raw) ? raw : spec.defaultValue;
+    return { ...spec, value, raw };
+  });
+}
+
+/**
+ * Set one select: `.env` first, then this process — the next spawned job
+ * inherits it. Unknown vars and values outside the option list are refused.
+ */
+export async function persistSelect(
+  envVar: string,
+  value: unknown,
+  envPath = '.env',
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<SelectView> {
+  const spec = SELECTS.find((s) => s.env === envVar);
+  if (spec === undefined) {
+    throw new ClaudeSettingsError(`"${envVar}" is not a machinery select this panel edits`);
+  }
+  const v = String(value ?? '').trim();
+  if (!spec.options.includes(v)) {
+    throw new ClaudeSettingsError(`"${spec.label}" must be one of ${spec.options.join(', ')}`);
+  }
+  await upsertEnv([[spec.env, v]], envPath);
+  env[spec.env] = v;
+  return { ...spec, value: v, raw: v };
+}
+
 export interface GateView {
   env: string;
   label: string;

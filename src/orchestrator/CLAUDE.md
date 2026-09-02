@@ -30,7 +30,13 @@ cache alone: the script survives a cleared cache and travels with the flow.
 
 ## A control clicked past its limit is circling (`repeatedToggleClick`)
 
-Live (PL_03_02, 2026-08-27): a filter button whose listbox options never appeared in the truncated tree was clicked EIGHT times across 38 turns and 310 s — each toggle changed the tree (open ↔ closed) so the repeated-on-unchanged-page guard never fired, and a mid-thrash URL change reset the per-URL done-set too. `repeatedToggleClick` (`agent-guards.ts`, pure) counts ok clicks per selector for the WHOLE run: past `TOGGLE_CLICK_LIMIT` (3 — a multi-select legitimately re-opens once per pick, PL_03_17 needed three) the next click on that selector is refused with the count and alternatives (key into it, another control, or fail). Second insistence is `circling:` — recorded REFUSED like the destructive guard, never acted on, counts as no progress, and the no-progress counter ends a model that keeps insisting.
+Live (PL_03_02, 2026-08-27): a filter button whose listbox options never appeared in the truncated tree was clicked EIGHT times across 38 turns and 310 s — each toggle changed the tree (open ↔ closed) so the repeated-on-unchanged-page guard never fired, and a mid-thrash URL change reset the per-URL done-set too. `repeatedToggleClick` (`agent-guards.ts`, pure) counts ok activations per selector for the WHOLE run: past `TOGGLE_CLICK_LIMIT` (3 — a multi-select legitimately re-opens once per pick, PL_03_17 needed three) the next activation of that selector is refused with the count and alternatives (type the value directly, a faster jump control, another control the tree shows, or fail). Second insistence is `circling:` — recorded REFUSED like the destructive guard, never acted on, counts as no progress, and the no-progress counter ends a model that keeps insisting.
+
+**`press` counts exactly as `click` does, since 2026-09-02.** Live (HIR-EC-009): a Date of Birth calendar's "Previous year" stepper was PRESSED — not clicked — upward of thirty times chasing a decades-distant year, 15.6 minutes on one workflow step (of a 45-minute case), because the guard counted `click` alone: a targeted `press` (a selector given, distinct from a bare key sent to whatever has focus) activates its control identically and is exactly the same pathology wearing a different action name. The one-step goal itself was a giant natural-language sentence ("Complete the new-hire key-in form... born in 1995... employee category \"F - DVT\"...") that `goalOutcome`'s narrow `set X to Y` parse cannot read at all, so the value-hunt guard (`AGENT_VALUE_HUNT_TURNS`, below) never engaged either — this fix is the one that is genuinely universal for that shape of goal, because it counts activations, not values. `DEFAULT_AGENT_MAX_STEPS` (60, also 2026-09-02) is the remaining backstop for a goal neither guard can parse.
+
+## The agent fills forms like a human (`check` / `uncheck` / `selectOption` / `type`, 2026-09-02)
+
+`AGENT_ACTIONS` gained the four form verbs the generator and the engine already had, so a `workflow` leg drives a real form instead of click-and-guess: `check`/`uncheck` set a checkbox, radio or ARIA toggle and confirm the state changed (native `setChecked` first, then read `aria-checked`/`aria-pressed`, click only if it differs, re-read); `selectOption` picks by visible label from a native `<select>` or, on failure, opens a custom listbox and clicks the option by accessible name — never fill a dropdown, never guess its items; `type` fires a real keydown per character for autocomplete/typeahead/masked fields, with no read-back guard because such a field is expected to transform what it holds. `fill` keeps its hydration read-back-and-refill. **The safety argument is unchanged**: none of the four is destructive — the vocabulary still cannot express a purchase or a delete except through a `click` the goal explicitly named. `REVEAL_ACTIONS` (the assertion-repair reveal pass) gained `check`/`uncheck`/`selectOption` — a human revealing a target does tick a gating box or pick a dropdown — but **not** `fill`/`type`: a claim an agent *typed* into existence still proves nothing, so text may never be written into the asserted field on that path. `READ_ONLY_ACTIONS` (the Stage-1 triage look) is untouched.
 
 ## The agent's read-only database access (`dbCount`)
 
@@ -119,3 +125,14 @@ make it "set" the state burns a turn by construction — and the triage look's
 verdict travels IN its finish. Found live: the look's goal text parses as an
 outcome, the settlement refused the verdict once, and every `fail` verdict
 cost two model calls instead of one (tests/smoke.test.ts pins one call).
+
+## The model copies the tree's notation back as a selector (2026-09-02)
+
+`region "Dependents Dependents"`, `spinbutton "Day Day"`, `heading "National ID
+/ Tax ID"` — the AX tree's own line shape, handed back as a selector and read by
+Playwright as a CSS tag with a stray string. Live (ec10 HIR-EC-003) five such
+misses in a row ended a leg as a stall while the same model had written the
+correct `role=…[name=… i]` two turns earlier. `normaliseAgentSelector`
+(`src/engine/selector.ts`) rewrites the line to the role selector before the
+grounding guard sees it, in `LlmAgentModel.decide`, for the decision and every
+planned step alike — see the engine CLAUDE.md for the rule and its siblings.

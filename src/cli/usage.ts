@@ -34,6 +34,20 @@ Usage:
                                            every launch is saved before it can
                                            fail, so a run that died before any
                                            test executed is still recallable
+  wowlidator report [<ledger.progress.json> | <dir>]
+                                           rebuild each catalog run's HTML report
+                                           and its passed-cases Excel export
+                                           (one step per row, photos embedded,
+                                           video linked under every step) from
+                                           the ledgers on disk — no re-run
+                                           (default: .wowlidator/catalogs/)
+  wowlidator db restore [<baseline.json> | <runKey> | <ledger.progress.json>]
+                                           put the tables back to the snapshot a
+                                           run took before it started — for a run
+                                           paused or killed before its own restore
+                                           ran. Needs WOWLIDATOR_DB_RESTORE_URL, a
+                                           write credential. Newest baseline if no
+                                           argument is given
   wowlidator doctor
   wowlidator mcp
 
@@ -105,6 +119,11 @@ Options:
                        slower and more thorough. Env: WOWLIDATOR_AGENT_EARLY_STOP=off.
   --no-heal            Disable the JIT healer
   --no-agent           Disable multi-page agentic navigation
+  --db-baseline <mode> off | snapshot | restore | auto (default). Before a run,
+                       snapshot the tables the flows are about; compare on every
+                       backend step; restore them after (restore mode, needs
+                       WOWLIDATOR_DB_RESTORE_URL). See .env.example. Also
+                       --db-baseline-tables <a,b> to add tables to the set.
   --no-backend         Author no HTTP or database step: every claim is proved
                        through the page, and a step a backend check could prove
                        better is marked as visual-only in the report
@@ -213,13 +232,24 @@ catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mm
                        elided reads as absent. A document under the budget, or
                        one the case does not distinguish, is still sent whole.
   --max-claims <n>     Cap on claims read from one catalog (default 40)
-  --policy <p>         read-only | forms | mutations      (default forms)
+  --policy <p>         read-only | forms | mutations      (default mutations)
   --no-author-review   Skip the authoring review. By default every authored
                        flow gets a second look before it is written: steps
                        with nothing behind them (a name in no captured tree, a
                        path no route declares) are checked by the agent role
                        against the codebase index and the documents, repointed
                        when the evidence supports it, and reported either way.
+  --no-value-resolution  Leave a sheet's placeholder tokens (<NON_EXISTING_EMPLOYEE_ID>)
+                       unresolved. By default a token or a described value is resolved
+                       before the lints — from the case's own test data, the documents
+                       and repository, the database (read-only), or, flagged as
+                       GENERATED on the step and in every report, the generator itself.
+                       WOWLIDATOR_VALUE_RESOLUTION=off does the same.
+  --no-target-highlight
+                       Leave step screenshots unmarked. By default a red
+                       rectangle is drawn around the element each step acted
+                       on or checked (its selector, role, name and box are
+                       recorded on the step as "target" either way).
   --no-agent-capture   Capture the page immediately instead of letting the
                        agent steady it first (wait out spinners, dismiss
                        overlays, prime lazy content). The pilot is on by

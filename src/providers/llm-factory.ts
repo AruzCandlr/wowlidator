@@ -208,6 +208,24 @@ const FACTORIES: Record<ProviderName, ModelBuilder> = {
       baseURL: 'https://api.deepseek.com/v1',
       apiKey,
     })(modelId),
+  airforce: (apiKey, modelId) =>
+    createOpenAICompatible({
+      name: 'airforce',
+      baseURL: 'https://api.airforce/v1',
+      apiKey,
+    })(modelId),
+  cerebras: (apiKey, modelId) =>
+    createOpenAICompatible({
+      name: 'cerebras',
+      baseURL: 'https://api.cerebras.ai/v1',
+      apiKey,
+    })(modelId),
+  requesty: (apiKey, modelId) =>
+    createOpenAICompatible({
+      name: 'requesty',
+      baseURL: 'https://router.requesty.ai/v1',
+      apiKey,
+    })(modelId),
   local: (apiKey, modelId, options) =>
     createOpenAICompatible({
       name: 'local',

@@ -252,3 +252,111 @@ export function withQualifiedRole(selector: string): string {
   return qualifyBareRole(sanitized) ?? sanitized;
 }
 
+
+/* ------------------------------------------------------- volatile greetings */
+
+/**
+ * A time-of-day greeting at the head of a text: "Good afternoon, X",
+ * "สวัสดีตอนบ่าย X". The page chrome renders whichever fits the clock — and
+ * the clock is frequently the flow's own `setClock`, pinned to midnight for a
+ * date-dependent claim, so an authored "Good afternoon, ผู้ดูแลระบบ" met a
+ * page saying "Good morning, ผู้ดูแลระบบ" on every case of a catalog
+ * (ec10, 2026-09-02: six cases, one identical false failure each). The
+ * greeting is never the fact a sign-in proof is about; the name after it is.
+ */
+const GREETING_PREFIX =
+  /^\s*(?:good\s+(?:morning|afternoon|evening|night)|สวัสดีตอน(?:เช้า|บ่าย|เย็น|ค่ำ)|สวัสดี)\s*[,:!\-–—]?\s*/i;
+
+/**
+ * The text with its greeting removed, or `null` when there is no greeting to
+ * remove or nothing would be left — a bare "Good morning" stays as written,
+ * since stripping it would assert the empty string.
+ */
+export function stripGreeting(text: string): string | null {
+  const match = GREETING_PREFIX.exec(text);
+  if (match === null || match[0] === '') return null;
+  const rest = text.slice(match[0].length).trim();
+  return rest === '' ? null : rest;
+}
+
+/**
+ * The selector re-written to assert what follows the greeting, or `null` when
+ * there is nothing to change:
+ *
+ * - `text=Good afternoon, X` → `text=X` (substring, so it matches whichever
+ *   greeting the page chose); a quoted `text="Good afternoon, X"` becomes the
+ *   unquoted form too, because the exact form could match only the full line;
+ * - `role=heading[name="Good afternoon, X" i]` → `role=heading[name=/X/i]`:
+ *   the role engine's quoted name is an EXACT match (measured: `[name="X" i]`
+ *   finds nothing on a heading reading "Good morning, X"), so the name goes
+ *   in as a regex, which matches wherever the greeting lands.
+ *
+ * Same `null`-rather-than-input contract as `relaxRoleName`.
+ */
+export function withoutGreeting(selector: string): string | null {
+  const text = /^(\s*text=)(.*)$/s.exec(selector);
+  if (text !== null) {
+    const chain = /\s*>>.*$/.exec(text[2]!);
+    const body = chain === null ? text[2]! : text[2]!.slice(0, chain.index);
+    const tail = chain === null ? '' : text[2]!.slice(chain.index);
+    const quoted = /^\s*(["'])(.*)\1\s*$/s.exec(body);
+    const raw = quoted === null ? body : quoted[2]!.replace(/\\(["\\])/g, '$1');
+    if (/^\s*\//.test(raw)) return null; // a regex is the author's own business
+    const rest = stripGreeting(raw);
+    if (rest === null || /["'/>]/.test(rest.slice(0, 1)) || rest.includes('>>')) return null;
+    return `${text[1]}${rest}${tail}`;
+  }
+  if (isRoleSelector(selector)) {
+    const match = ROLE_NAME_ATTR.exec(selector);
+    if (match === null) return null;
+    const quoted = match[1]!;
+    const inner = quoted.slice(1, -1);
+    const rest = stripGreeting(inner);
+    if (rest === null) return null;
+    const escaped = rest.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+    return selector.replace(ROLE_NAME_ATTR, () => `[name=/${escaped}/i]`);
+  }
+  return null;
+}
+
+/** `withoutGreeting` applied where a selector is being written — input untouched when nothing changes. */
+export function withStableGreeting(selector: string): string {
+  return withoutGreeting(selector) ?? selector;
+}
+
+/* --------------------------------------------------------- AX-tree notation */
+
+/**
+ * The accessibility tree the agent reads is printed one node per line as
+ * `role "name"`, and the model copies that line back as a selector often
+ * enough to matter: live (ec10 HIR-EC-003, 2026-09-02) `region "Dependents
+ * Dependents"`, `spinbutton "Day Day"`, `heading "National ID / Tax ID"`,
+ * `textbox "Search options"` — each read by Playwright as a CSS tag with a
+ * stray string, each a guaranteed "no element matches" that burned a turn,
+ * until five of them in a row ended the leg as a stall. The same model wrote
+ * the correct `role=region[name="Dependents Dependents" i]` two turns earlier.
+ *
+ * Rewrites `role "name"` → `role=role[name="name" i]` and a bare `"name"` →
+ * `text="name"`; anything else returns `null`. A chained tail rides along.
+ */
+export function fromAxNotation(selector: string): string | null {
+  const trimmed = selector.trim();
+  const chain = /\s*>>.*$/.exec(trimmed);
+  const head = chain === null ? trimmed : trimmed.slice(0, chain.index).trim();
+  const tail = chain === null ? '' : trimmed.slice(chain.index);
+  const roleName = /^([A-Za-z]+)\s+"((?:[^"\\]|\\.)+)"$/.exec(head);
+  if (roleName !== null && ARIA_ROLES.has(roleName[1]!.toLowerCase())) {
+    return `role=${roleName[1]!.toLowerCase()}[name="${roleName[2]}" i]${tail}`;
+  }
+  const bare = /^"((?:[^"\\]|\\.)+)"$/.exec(head);
+  if (bare !== null) return `text="${bare[1]}"${tail}`;
+  return null;
+}
+
+/**
+ * Every free, deterministic repair a model-written selector gets before it
+ * reaches Playwright: tree notation, the `role=` it forgot, the case flag.
+ */
+export function normaliseAgentSelector(selector: string): string {
+  return withRelaxedRoleName(withQualifiedRole(fromAxNotation(selector) ?? selector));
+}
