@@ -175,3 +175,21 @@ test('WOWLIDATOR_DATA_LOCKS=off restores case-level flagging', () => {
   assert.equal(dataLocksEnabled({ WOWLIDATOR_DATA_LOCKS: 'off' }), false);
   assert.equal(dataLocksEnabled({ WOWLIDATOR_DATA_LOCKS: 'on' }), true);
 });
+
+test('a Thai create/approve goal opens a window and a Thai delete takes the global section (CG-16)', () => {
+  const create = { action: 'workflow', goal: 'สร้าง Plan ใหม่ แล้วบันทึก' } as FlowStep;
+  const created = dataWindows(
+    flowOf([create, { action: 'expectVisible', selector: 'text="PL_06_21"' } as FlowStep], [
+      { action: 'goto', url: 'http://x/en/admin/benefits/plans' } as FlowStep,
+    ]),
+  );
+  assert.equal(created.length, 1, 'a Thai write is a change');
+  assert.deepEqual(created[0]!.sections, ['route:admin/benefits']);
+
+  const del = { action: 'workflow', goal: 'ลบ Plan PL_06_21' } as FlowStep;
+  const deleting = dataWindows(flowOf([del], [{ action: 'goto', url: 'http://x/en/admin/benefits/plans' } as FlowStep]));
+  assert.ok(deleting[0]!.sections.includes('*'), 'a Thai delete is exclusive for its window');
+
+  const read = { action: 'workflow', goal: 'บันทึกค่าที่ระบบแสดงในช่อง Employee ID' } as FlowStep;
+  assert.deepEqual(dataWindows(flowOf([read], [{ action: 'goto', url: 'http://x/en/admin/benefits/plans' } as FlowStep])), [], 'recording what the page shows changes nothing');
+});

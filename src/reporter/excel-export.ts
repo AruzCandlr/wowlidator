@@ -44,6 +44,7 @@ import { crc32, deflateRawSync } from 'node:zlib';
 
 import { describeDbChanges, describeTarget, describeValueSource, expectedActual, type ProofStep } from '../engine/proof-bundle.js';
 import { catalogCaseExportName, type CatalogReportCase, type CatalogReportInput } from './catalog-report.js';
+import { describeAgentAction, describeResolution, observedEvidence, stepKindFacts, stepTarget } from './step-facts.js';
 
 /* ------------------------------------------------------------- zip writer */
 
@@ -206,14 +207,32 @@ export function stepProof(step: ProofStep): string {
   const lines: string[] = [];
   const comparison = expectedActual(step);
   if (comparison !== null) lines.push(comparison);
+  // The kind's own facts — the alternatives of an either/or, an upload's
+  // file NAMES, a sign-in's persona LABEL, the author's timeout. A workbook
+  // is handed over as the proof; it must carry what the step WAS and never
+  // a credential (see `step-facts.ts`).
+  for (const fact of stepKindFacts(step)) lines.push(`${fact.label}: ${fact.value.replace(/\n/g, '; ')}`);
   const target = describeTarget(step.target);
   if (target !== null) lines.push(`target: ${target}`);
   const valueFrom = describeValueSource(step);
   if (valueFrom !== null) lines.push(`value source: ${valueFrom}`);
-  if (step.resolution && step.resolution !== 'fast') lines.push(`resolved via ${step.resolution}`);
+  // `resolved via <rung>` stays the first words (pinned) — the plain-language
+  // label follows, so `reveal` and `scroll` explain themselves in the cell.
+  const how = describeResolution(step.resolution);
+  if (how !== null) lines.push(`resolved via ${step.resolution} — ${how.label}`);
   if (step.resolvedSelector && step.resolvedSelector !== step.selector) lines.push(`resolved as ${step.resolvedSelector}`);
   if (step.heal) lines.push(`healed → ${step.heal.to} (${step.heal.strategy}, ${(step.heal.confidence * 100).toFixed(0)}%)`);
-  if (step.agent) lines.push(`agent: ${step.agent.summary ?? ''} (${step.agent.turns} turn(s))`.trim());
+  if (step.agent) {
+    lines.push(`agent: ${step.agent.summary ?? ''} (${step.agent.turns} turn(s))`.trim());
+    // The turns that carry meaning beyond a click: what was saved for later
+    // steps and where the session ended. Every other turn is in the bundle.
+    for (const a of step.agent.actions ?? []) {
+      if (a.action !== 'save' && a.action !== 'signOut') continue;
+      const { target: aimed, note } = describeAgentAction(a);
+      lines.push(`agent ${a.action}: ${aimed}${note ? ` — ${note}` : ''}`);
+    }
+  }
+  for (const o of observedEvidence(step)) lines.push(`observed: ${JSON.stringify(o.text)}${o.selector ? ` from ${o.selector}` : ''}`);
   for (const line of describeDbChanges(step.dbChanges)) lines.push(line);
   if (step.dbProbeError) lines.push(`db baseline probe failed: ${step.dbProbeError}`);
   if (step.url) lines.push(`at ${step.url}`);
@@ -234,7 +253,9 @@ function stepRows(
     numberCell(`B${r}`, step.index, S.wrap) +
     textCell(`C${r}`, step.action, S.wrap) +
     textCell(`D${r}`, step.intent ?? '', S.wrap) +
-    textCell(`E${r}`, step.resolvedSelector ?? step.selector ?? '', S.wrap) +
+    // The Selector column says what the step was aimed at — for a kind with
+    // no single selector, the record's own account (`stepTarget`), never blank.
+    textCell(`E${r}`, stepTarget(step) ?? '', S.wrap) +
     textCell(`F${r}`, describeTarget(step.target) ?? '', S.wrap) +
     textCell(`G${r}`, step.status + (step.heal ? ' (healed)' : ''), S.wrap) +
     textCell(`H${r}`, fmtMs(step.durationMs), S.wrap) +

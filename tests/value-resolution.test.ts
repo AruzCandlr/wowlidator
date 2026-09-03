@@ -17,11 +17,19 @@ import { describeValueSource, formatStepLine, valueWasGenerated, type ProofStep 
 import { typesPlaceholderToken } from '../src/generator/flow-author.js';
 import {
   PLACEHOLDER_TOKEN,
+  absoluteDateOf,
   candidateFor,
+  fieldLabelOf,
   findUnresolvedValues,
   formatStatedFor,
+  fromRelativeDate,
   fromTestData,
+  fromUniquePerRun,
+  isDatePhrase,
+  isReusedKeyValue,
+  resolveDatePhrase,
   resolveValues,
+  testDataPairsOf,
   type ValueResolverModel,
 } from '../src/generator/value-resolution.js';
 
@@ -284,5 +292,226 @@ describe('the flag in the proof', () => {
     const line = formatStepLine(proofStep({ kind: 'generated', detail: 'GENERATED from 8 digits' }));
     assert.match(line, /value generated — GENERATED from 8 digits/);
     assert.ok(!formatStepLine(proofStep(undefined)).includes('value generated'));
+  });
+});
+
+// --- CG-02: the Test data reaches the resolver one pair at a time ------------------
+
+describe('test data pairs', () => {
+  it('unpacks packed lines, phase headers, the folded describeCase form, and a draft correction', () => {
+    const folded = 'Test data: --Create--; Position = 40106337 Job Code = MKB12.12; Effective Start Date = Today; --Insert R1--; Effective Start Date = Next day';
+    assert.deepEqual(testDataPairsOf(folded), [
+      { phase: 'Create', key: 'Position', value: '40106337' },
+      { phase: 'Create', key: 'Job Code', value: 'MKB12.12' },
+      { phase: 'Create', key: 'Effective Start Date', value: 'Today' },
+      { phase: 'Insert R1', key: 'Effective Start Date', value: 'Next day' },
+    ]);
+    const corrected = testDataPairsOf('- Benefit plan ID = TH_MED_001\n- Note: ดราฟต์เดิมระบุ TH_MED_001 ใช้ TH_MED_002');
+    assert.equal(corrected[0]!.value, 'TH_MED_002');
+    // A bullet is stripped; a phase header is not a bullet.
+    assert.deepEqual(testDataPairsOf('- --Delete--\n- Name = QA-Delete'), [{ phase: 'Delete', key: 'Name', value: 'QA-Delete' }]);
+  });
+
+  it('fromTestData takes pre-split pairs, matches a key after `*` and parentheticals, and reads a Thai label off the intent', () => {
+    const need = findUnresolvedValues([], [tokenStep({ value: '<POSITION>', intent: 'Step 2: กรอก Position = <POSITION>', selector: 'role=textbox[name="Position *" i]' })], CASE)[0]!;
+    assert.equal(need.field, 'Position *');
+    const pairs = [{ phase: 'Create', key: 'Position (SAP code)', value: '40106337' }];
+    const r = fromTestData(need, 'nothing here', pairs);
+    assert.equal(r?.value, '40106337');
+    assert.match(r!.source.detail, /\[Create\] Position \(SAP code\) = 40106337/);
+    // The packed line, read straight from the case text.
+    const packed = fromTestData({ ...need, field: 'Job Code' }, 'Test data: Position = 40106337 Job Code = MKB12.12');
+    assert.equal(packed?.value, 'MKB12.12');
+    // A Thai label after the sheet's verb, when the selector has no name.
+    assert.equal(fieldLabelOf({ action: 'fill', selector: '#plan-name', value: '', intent: 'กรอก ชื่อแผน = ประกันสุขภาพ' } as FlowStep), 'ชื่อแผน');
+    const thai = fromTestData({ ...need, field: 'ชื่อแผน' }, 'Test data: ชื่อแผน = ประกันสุขภาพ');
+    assert.equal(thai?.value, 'ประกันสุขภาพ');
+  });
+});
+
+// --- CG-06: relative dates, deterministic from an injected now -----------------------
+
+const NOW = new Date(2026, 8, 3, 12); // 3 Sep 2026, local
+const env = (known: Record<string, string> = {}) => ({ now: NOW, lookup: (l: string) => known[l.toLowerCase()] ?? null });
+
+describe('relative dates', () => {
+  it('the sheet\'s English and Thai anchors', () => {
+    const at = (p: string, k: Record<string, string> = {}) => resolveDatePhrase(p, env(k))?.iso ?? null;
+    assert.equal(at('Today'), '2026-09-03');
+    assert.equal(at('วันนี้'), '2026-09-03');
+    assert.equal(at('Next day'), '2026-09-04');
+    assert.equal(at('Next Day'), '2026-09-04');
+    assert.equal(at('Tomorrow'), '2026-09-04');
+    assert.equal(at('วันถัดไป'), '2026-09-04');
+    assert.equal(at('Next day+1'), '2026-09-05');
+    assert.equal(at('Next day + 1'), '2026-09-05');
+    assert.equal(at('Today + 30 Days'), '2026-10-03');
+    assert.equal(at('ย้อนหลัง 3 วัน'), '2026-08-31');
+    assert.equal(at('3 วันก่อน'), '2026-08-31');
+    assert.equal(at('วันที่ 25 ของเดือนปัจจุบัน'), '2026-09-25');
+    assert.equal(at('วันที่ 5 ของเดือนถัดไป'), '2026-10-05');
+    assert.equal(at('วันสุดท้ายของเดือน'), '2026-09-30');
+    assert.equal(at('วันสุดท้ายของเดือนถัดไป'), '2026-10-31');
+    assert.equal(at('last day of next month'), '2026-10-31');
+    assert.equal(at('01/01 ของปีก่อนหน้า'), '2025-01-01');
+    assert.equal(at('31 Dec 9999'), '9999-12-31');
+    assert.equal(at('31/12/9999'), '9999-12-31');
+    assert.equal(at('Dec 31, 9999'), '9999-12-31');
+    assert.equal(at('today พอดี'), '2026-09-03');
+  });
+
+  it('Thai month names and Buddhist years', () => {
+    assert.deepEqual(absoluteDateOf('25 ธันวาคม 2569'), { y: 2026, m: 12, d: 25 });
+    assert.deepEqual(absoluteDateOf('25 ธ.ค. 69'), { y: 2026, m: 12, d: 25 });
+    assert.deepEqual(absoluteDateOf('1 Sep 2027'), { y: 2027, m: 9, d: 1 });
+    assert.equal(absoluteDateOf('01/09/2027'), null, 'day/month order is the writer\'s, so it is left alone');
+    assert.equal(absoluteDateOf('31 Feb 2026'), null);
+  });
+
+  it('a later field leans on an earlier one by label, and month arithmetic clamps', () => {
+    const r = resolveDatePhrase('Hire Date + 119 Day', env({ 'hire date': '2026-09-03' }));
+    assert.equal(r?.iso, '2026-12-31');
+    assert.equal(r?.detail, 'Hire Date + 119 Day = 2026-12-31 (Hire Date = 2026-09-03)');
+    assert.equal(resolveDatePhrase('Hire Date + 1 Year - 1 Day', env({ 'hire date': '2026-09-03' }))?.iso, '2027-09-02');
+    assert.equal(resolveDatePhrase('Hire Date + 119 Day', env())?.iso ?? null, null, 'an unknown label is a refusal, not today');
+    assert.equal(resolveDatePhrase('Today + 1 Month', { now: new Date(2026, 0, 31, 12), lookup: () => null })?.iso, '2026-02-28');
+    assert.equal(resolveDatePhrase('Effective Start Date', env()), null, 'a bare label with no date behind it is nothing');
+    assert.equal(resolveDatePhrase('Somchai', env()), null);
+  });
+
+  it('an age is a date of birth at the hire date, half a year inside a strict bound, exact on a boundary', () => {
+    const k = { 'hire date': '2026-09-03' };
+    assert.equal(resolveDatePhrase('Age < 60', env(k))?.iso, '1967-03-03');
+    assert.match(resolveDatePhrase('Age < 60', env(k))!.detail, /age 59 y 6 m at hire date 2026-09-03/);
+    assert.equal(resolveDatePhrase('อายุน้อยกว่า 60 ปี', env(k))?.iso, '1967-03-03');
+    assert.equal(resolveDatePhrase('Age >= 60', env(k))?.iso, '1966-09-03');
+    assert.equal(resolveDatePhrase('อายุ 60 ปีขึ้นไป', env(k))?.iso, '1966-09-03');
+    assert.equal(resolveDatePhrase('อายุพอดี 60 ปีเป๊ะ', env(k))?.iso, '1966-09-03');
+    assert.equal(resolveDatePhrase('Age > 60', env(k))?.iso, '1966-03-03');
+    assert.equal(resolveDatePhrase('35 ปี 6 เดือน', env(k))?.iso, '1991-03-03');
+    // No hire date resolved: today is the anchor, and the detail says so.
+    assert.match(resolveDatePhrase('Age < 60', env())!.detail, /at today 2026-09-03/);
+  });
+
+  it('isDatePhrase gates on shape, and `N ปี M เดือน` only on a birth-date field', () => {
+    for (const p of ['Today', 'Next day', 'Age < 60', 'Hire Date + 119 Day', 'วันที่ 25 ของเดือนปัจจุบัน', '31 Dec 9999', '25 ธ.ค. 69']) assert.equal(isDatePhrase(p), true, p);
+    for (const p of ['Somchai', '20001234', '2026-09-03', 'A - Permanent', 'Effective Start Date', '']) assert.equal(isDatePhrase(p), false, p);
+    assert.equal(isDatePhrase('6 เดือน', 'Claim Period'), false);
+    assert.equal(isDatePhrase('35 ปี 6 เดือน', 'Date of Birth'), true);
+  });
+
+  it('is the FIRST source, and needs no model: a phrase typed as written, or stated in the Test data', async () => {
+    const calls: string[] = [];
+    const db = new StubDb();
+    const caseText = [
+      'HIR-EC-001: New hire',
+      'Test data: Hire Date = Today; Date of Birth = Age < 60; Period End Date* = Hire Date + 119 Day; Replaced Employee ID = 20001234',
+    ].join('\n');
+    const out = await resolveValues(
+      [],
+      [
+        { action: 'fill', selector: 'role=textbox[name="Hire Date" i]', value: 'Today', intent: 'Step 2: key Hire Date = Today' } as FlowStep,
+        { action: 'fill', selector: 'role=textbox[name="Date of Birth" i]', value: 'Age < 60', intent: 'Step 3: key Date of Birth' } as FlowStep,
+        { action: 'fill', selector: 'role=textbox[name="Period End Date" i]', value: '<PERIOD_END>', intent: 'Step 4: key Period End Date' } as FlowStep,
+        tokenStep({ value: '<VALID_EMPLOYEE_ID>', intent: 'Step 5: กรอก Replaced Employee ID = <VALID_EMPLOYEE_ID>' }),
+      ],
+      { caseText, model: model({ calls }), db: async () => db, now: NOW },
+    );
+    const steps = out.steps as { value: string; intent: string; valueSource?: { kind: string; detail: string } }[];
+    assert.equal(steps[0]!.value, '2026-09-03');
+    assert.deepEqual(steps[0]!.valueSource, { kind: 'relative-date', detail: 'Today = 2026-09-03' });
+    assert.match(steps[0]!.intent, /value from relative-date: Today = 2026-09-03/);
+    assert.equal(steps[1]!.value, '1967-03-03', 'the DOB is relative to the Hire Date resolved just before');
+    assert.equal(steps[2]!.value, '2026-12-31', 'a token whose Test data line is a phrase is computed too');
+    assert.equal(steps[2]!.valueSource?.kind, 'relative-date');
+    assert.equal(steps[3]!.value, '20001234', 'a plain value still comes from test data');
+    assert.equal(steps[3]!.valueSource?.kind, 'test-data');
+    assert.deepEqual(calls, [], 'no model was consulted');
+    assert.equal(db.queries.length, 0);
+    assert.equal(out.resolved.length, 4);
+  });
+
+  it('a phrase in the Test data resolves the field even when the sheet lists it after the one that leans on it', () => {
+    const caseText = 'Test data: Period End Date = Hire Date + 119 Day; Hire Date = Today';
+    const need = { section: 'steps' as const, index: 0, field: 'Period End Date', token: null, nonExisting: false, format: null };
+    assert.equal(fromRelativeDate(need, caseText, NOW)?.value, '2026-12-31');
+  });
+
+  it('a phrase nothing understands is left as written — never a stand-in', async () => {
+    const log: string[] = [];
+    const out = await resolveValues([], [{ action: 'fill', selector: 'role=textbox[name="Hire Date" i]', value: 'Nonexistent Label + 3 Day', intent: 'x' } as FlowStep], {
+      caseText: 'nothing',
+      model: model({}),
+      now: NOW,
+      onLog: (l) => log.push(l),
+    });
+    assert.equal(out.resolved.length, 0);
+    assert.equal((out.steps[0] as { value: string }).value, 'Nonexistent Label + 3 Day');
+    assert.ok(log.some((l) => /was not understood — left as written/.test(l)));
+  });
+
+  it('a selectOption whose option label reads like a phrase is not a need', () => {
+    const needs = findUnresolvedValues([], [{ action: 'selectOption', selector: 'role=combobox[name="Repeat" i]', value: 'Next day' } as FlowStep], '');
+    assert.equal(needs.length, 0);
+  });
+});
+
+// --- CG-13: a key that IS the case id becomes unique per run ---------------------------
+
+describe('unique per run', () => {
+  const BE = [
+    'PL_06_21: ตรวจสอบการสร้าง Benefit Plan',
+    'Test data: Benefit Plan ID = PL_06_21; Benefit name = QA-Create Plan Success/History; Country = TH',
+    'Expected output:',
+    '  1.1 ระบบสร้าง Plan สำเร็จ',
+  ].join('\n');
+  const planStep = (value: string, intent = 'Step 2: key Benefit Plan ID'): FlowStep =>
+    ({ action: 'fill', selector: 'role=textbox[name="Benefit Plan ID" i]', value, intent }) as FlowStep;
+
+  it('recognises the case id in any spelling, the sheet\'s _R1 tail, and QA-/SIT_ names — on key fields only', () => {
+    assert.equal(isReusedKeyValue('PL_06_21', 'Benefit Plan ID', 'PL_06_21'), true);
+    assert.equal(isReusedKeyValue('pl-06-21', 'Benefit Plan ID', 'PL_06_21'), true);
+    assert.equal(isReusedKeyValue('PL_06_21_R3', 'Benefit Plan ID', 'PL_06_21'), true);
+    assert.equal(isReusedKeyValue('QA-Insert', 'Benefit name', 'PL_08_19'), true);
+    assert.equal(isReusedKeyValue('SIT_CNS_01', 'Document Code', 'CNS-EC-003'), true);
+    assert.equal(isReusedKeyValue('TH_MED_001', 'Benefit Plan ID', 'PL_10_05'), false, 'a value chosen for its meaning stays');
+    assert.equal(isReusedKeyValue('PL_06_21', 'Description', 'PL_06_21'), false, 'not a key field');
+    assert.equal(isReusedKeyValue('PL_06_21', 'Benefit Plan ID', undefined), false, 'no case id, only QA-/SIT_ qualify');
+  });
+
+  it('rewrites the typed value with the run suffix and flags the source', async () => {
+    const out = await resolveValues([], [planStep('PL_06_21')], { caseText: BE, model: null, runKey: 'be100@2026-08-31t07-20-25-957z', caseId: 'PL_06_21' });
+    const step = out.steps[0] as { value: string; intent: string; valueSource?: { kind: string; detail: string } };
+    assert.equal(step.value, 'PL_06_21_25957z');
+    assert.deepEqual(step.valueSource, { kind: 'unique-per-run', detail: 'unique per run: PL_06_21 → PL_06_21_25957z' });
+    assert.match(step.intent, /value unique per run: PL_06_21 → PL_06_21_25957z/);
+    assert.equal(out.resolved[0]!.source.kind, 'unique-per-run');
+  });
+
+  it('a value reached through the Test data gets the suffix too, and the detail keeps the sheet line', async () => {
+    const out = await resolveValues([], [planStep('<PLAN_ID>')], { caseText: BE, model: null, runKey: 'be100@2026-08-31t07-20-25-957z', caseId: 'PL_06_21' });
+    const step = out.steps[0] as { value: string; valueSource?: { kind: string; detail: string } };
+    assert.equal(step.value, 'PL_06_21_25957z');
+    assert.equal(step.valueSource?.kind, 'unique-per-run');
+    assert.match(step.valueSource!.detail, /the case states "Benefit Plan ID = PL_06_21"/);
+  });
+
+  it('a duplicate case keeps the value: the text says it already exists', async () => {
+    const dup = `${BE}\n- Benefit plan ID = PL_06_21 (มีอยู่แล้วในระบบ)\n  1.2 แสดง Error: Plan ID นี้มีอยู่แล้วในระบบ`;
+    const log: string[] = [];
+    const out = await resolveValues([], [planStep('PL_06_21')], { caseText: dup, model: null, runKey: 'be100@x', caseId: 'PL_06_21', onLog: (l) => log.push(l) });
+    assert.equal((out.steps[0] as { value: string }).value, 'PL_06_21');
+    assert.equal(out.resolved.length, 0);
+    assert.ok(log.some((l) => /kept as written \(the case says it already exists\)/.test(l)));
+    // The intent alone can say so.
+    const need = findUnresolvedValues([], [planStep('PL_06_21', 'Step 3: key the existing Plan ID again')], BE, { caseId: 'PL_06_21' })[0]!;
+    assert.equal(fromUniquePerRun(need, BE, 'be100@x', 'Step 3: key the existing Plan ID again'), null);
+  });
+
+  it('without a run key nothing is rewritten, and a value that is not a key is never a need', async () => {
+    const out = await resolveValues([], [planStep('PL_06_21')], { caseText: BE, model: null, caseId: 'PL_06_21' });
+    assert.equal((out.steps[0] as { value: string }).value, 'PL_06_21');
+    assert.equal(out.resolved.length, 0);
+    assert.equal(findUnresolvedValues([], [planStep('TH_MED_001')], BE, { caseId: 'PL_06_21' }).length, 0);
   });
 });

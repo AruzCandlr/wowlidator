@@ -180,6 +180,13 @@ export interface CliOptions {
   headless: boolean | undefined;
   /** Stop the browser afterwards, but only if this process started it. */
   stopChrome: boolean;
+  /**
+   * How many Chromes a parallel run spreads its lanes over (`--browsers`,
+   * env `WOWLIDATOR_BROWSERS`). Undefined or 1 is the single browser on the
+   * CDP port; n starts n-1 more on the ports after it, headless unless a
+   * window was explicitly asked for. See `src/browser/pool.ts`.
+   */
+  browsers: number | undefined;
   /** Wait for this URL to answer before starting. */
   waitFor: string | undefined;
   /** Open the HTML report when the run finishes. */
@@ -227,6 +234,31 @@ export interface CliOptions {
    * to invent one, which it does badly — see `parseCredentials`.
    */
   credentials: { email: string; password: string } | undefined;
+  /**
+   * Credentials by persona LABEL (`HR_ADMIN_ACCOUNT`, `MANAGER_ACCOUNT`,
+   * `SPD_ADMIN`) — `--persona LABEL=email:password`, repeatable, and the
+   * `WOWLIDATOR_PERSONAS` JSON map. A workbook row names its actors as
+   * `<X_ACCOUNT>` tokens and role words; the label is what a flow file
+   * carries, the credentials live only here and in the environment. `--as`
+   * stays the unlabelled default a single-persona row falls back to. See
+   * `parsePersonas`.
+   */
+  personas: Record<string, { email: string; password: string }>;
+  /**
+   * Author and run rows the sheet records as Blocked / Pending deploy /
+   * Pending confirm — with their bug ticket — instead of refusing them at the
+   * gate (`--include-blocked`). Off by default: a case the sheet's own testers
+   * could not run fails against a known defect and files it again.
+   */
+  includeBlocked: boolean;
+  /**
+   * Slice a workbook catalog to these worksheets (`--sheet EC`, repeatable,
+   * case-insensitive) — the module, in a QA tracker's terms. Empty = every
+   * sheet. The claims file, the ledger and the report are then per slice.
+   */
+  sheets: string[];
+  /** The same slice one level down: the sheet's Category column (`--category Hiring`). */
+  categories: string[];
   /**
    * Characters of `--context-doc` background allowed in one prompt. `0` — the
    * default — sends every context document whole, which is what this did
@@ -282,6 +314,15 @@ export interface CliOptions {
  * place the provider keys and report paths live; the `grimval` wrapper needs no
  * variable of its own, because the engine owns its config.
  */
+/** `--browsers` if given, otherwise `WOWLIDATOR_BROWSERS`, otherwise none. */
+export function resolveBrowsers(flag: string | undefined): number | undefined {
+  const raw = flag ?? process.env['WOWLIDATOR_BROWSERS'];
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 1) return undefined;
+  return n;
+}
+
 export function resolveHeadless(flag: boolean, negated: boolean): boolean | undefined {
   if (flag) return true;
   if (negated) return false;
@@ -380,6 +421,101 @@ export function parseCredentials(
   const password = value.slice(at + 1);
   if (email === '' || password === '') return null;
   return { email, password };
+}
+
+/** A persona label as the map keys it: trimmed, the `<…>` of a sheet token stripped, upper-cased, spaces to `_`. */
+export function personaLabelOf(raw: string): string {
+  return raw.trim().replace(/^<|>$/g, '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+}
+
+/**
+ * `--persona LABEL=email:password` (repeatable), then the `WOWLIDATOR_PERSONAS`
+ * JSON map (`{"HR_ADMIN_ACCOUNT":{"email":…,"password":…}}`), merged — a flag
+ * outranks the environment for the same label. The same discipline as
+ * `parseCredentials`: a malformed entry is refused with the reason, never
+ * silently dropped, because a dropped persona puts the author straight back
+ * to inventing the second account's password (CG-05: 98 rows hand off between
+ * two people — an employee submits, a manager or HRBP approves — and until
+ * now every second persona was a guessed password).
+ *
+ * Labels are normalised through `personaLabelOf`, so `--persona hr_admin_account=…`
+ * and the sheet's `<HR_ADMIN_ACCOUNT>` meet. The split is on the FIRST `=`
+ * (a label never contains one) and then the first `:` (an email never does).
+ */
+export function parsePersonas(
+  raw: readonly string[] | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): { ok: true; personas: Record<string, { email: string; password: string }> } | { ok: false; error: string } {
+  const personas: Record<string, { email: string; password: string }> = {};
+  const json = env['WOWLIDATOR_PERSONAS'];
+  if (json !== undefined && json.trim() !== '') {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      return { ok: false, error: 'WOWLIDATOR_PERSONAS must be a JSON object: {"LABEL":{"email":"…","password":"…"}}' };
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, error: 'WOWLIDATOR_PERSONAS must be a JSON object keyed by persona label' };
+    }
+    for (const [label, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const entry = value as { email?: unknown; password?: unknown } | string | null;
+      let email = '';
+      let password = '';
+      if (typeof entry === 'string') {
+        const at = entry.indexOf(':');
+        email = at < 0 ? '' : entry.slice(0, at).trim();
+        password = at < 0 ? '' : entry.slice(at + 1);
+      } else if (entry !== null && typeof entry === 'object') {
+        email = typeof entry.email === 'string' ? entry.email.trim() : '';
+        password = typeof entry.password === 'string' ? entry.password : '';
+      }
+      if (email === '' || password === '') {
+        return { ok: false, error: `WOWLIDATOR_PERSONAS["${label}"] needs both "email" and "password"` };
+      }
+      personas[personaLabelOf(label)] = { email, password };
+    }
+  }
+  for (const item of raw ?? []) {
+    const eq = item.indexOf('=');
+    if (eq <= 0) return { ok: false, error: `--persona must be LABEL=<email>:<password> (got "${item.split(':')[0] ?? item}")` };
+    const label = personaLabelOf(item.slice(0, eq));
+    const pair = parseCredentials(item.slice(eq + 1));
+    if (pair === null || pair === undefined || label === '') {
+      // Named by label only — never echo a value that may be a password.
+      return { ok: false, error: `--persona ${label || '?'}=… must be LABEL=<email>:<password>, both halves present` };
+    }
+    personas[label] = pair;
+  }
+  return { ok: true, personas };
+}
+
+/**
+ * The persona map as a record may carry it: labels to EMAILS. The password
+ * rides the environment on purpose, the same rule as `SuiteLedger.launch.persona`.
+ */
+export function personaEmails(
+  personas: Readonly<Record<string, { email: string; password: string }>>,
+): Record<string, string> {
+  return Object.fromEntries(Object.entries(personas).map(([label, p]) => [label, p.email]));
+}
+
+/**
+ * A label looked up tolerantly: as given, then with/without the sheet's
+ * `_ACCOUNT` suffix (`<HR_ADMIN_ACCOUNT>` against `--persona HR_ADMIN=…`), so a
+ * person is not made to spell the workbook's token to the letter.
+ */
+export function lookupPersona(
+  personas: Readonly<Record<string, { email: string; password: string }>>,
+  label: string,
+): { email: string; password: string } | undefined {
+  const key = personaLabelOf(label);
+  return (
+    personas[key] ??
+    personas[key.replace(/_ACCOUNT$/, '')] ??
+    personas[`${key}_ACCOUNT`] ??
+    personas[key.replace(/_ACCOUNT$/, '').replace(/_/g, '')]
+  );
 }
 
 /**

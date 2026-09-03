@@ -17,7 +17,8 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { basename, dirname, relative, resolve } from 'node:path';
 
 import type { ProofBundle } from '../engine/proof-bundle.js';
-import { isPassing } from '../engine/proof-bundle.js';
+import { effectiveStatus, isPassing, verdictFamily } from '../engine/proof-bundle.js';
+import { displayCaseId, provenanceExtras, sheetLabel } from './step-facts.js';
 import { buildVerdict } from './verdict.js';
 
 export const DEFAULT_INDEX_FILENAME = 'index.html';
@@ -105,6 +106,15 @@ tr.passed td:first-child{box-shadow:inset 3px 0 0 var(--ok)}
 /* Blocked is its own colour: not the green of a pass, and not the red of a
    failure either, because nothing was proved about the application. */
 .pill.blocked{color:var(--muted);background:var(--line)}
+/* Awaiting review (proved-? or recorded only) and no verdict (the harness
+   alone broke) are each their own colour for the same reason: neither is a
+   product failure, and painting them red files the harness's gap as a bug. */
+.pill.review{color:#6a5acd;background:color-mix(in srgb,#6a5acd 14%,transparent);border:1px dashed #6a5acd}
+.pill.error,.pill.no-verdict{color:var(--warn);background:var(--warn-bg)}
+.pill.sheet{color:var(--muted);border:1px solid var(--line);margin-left:6px}
+.sheet-id{color:var(--muted);font-size:12px;margin-left:6px}
+.chip.review .v{color:#6a5acd}
+.chip.warn .v{color:var(--warn)}
 a.case{color:inherit;font-weight:600;text-decoration:none;border-bottom:1px solid var(--line)}
 a.case:hover{border-bottom-color:currentColor}
 .why{color:var(--muted);font-size:12.5px;margin-top:3px;max-width:70ch}
@@ -133,7 +143,15 @@ export function renderSuiteIndex(
   // reader has no way to catch.
   const total = ranked.length + blocked.length;
 
-  const failed = ranked.filter((e) => !isPassing(e.bundle.status) && !e.bundle.quarantined).length;
+  // The acted-on status (a ruling outranks proved-?), bucketed APART: a
+  // wording near-miss awaiting a human and a harness that fell over are not
+  // product failures, and counting them under "failed" — as the first cut
+  // did — filed the harness's own gap as defects in the application.
+  const acted = (e: IndexEntry): string => effectiveStatus(e.bundle);
+  const counted = ranked.filter((e) => !e.bundle.quarantined);
+  const failed = counted.filter((e) => verdictFamily(acted(e)) === 'test-failed').length;
+  const review = counted.filter((e) => acted(e) === 'needs-review').length;
+  const noVerdict = counted.filter((e) => acted(e) === 'error').length;
   const quarantined = ranked.filter((e) => e.bundle.quarantined).length;
   const defects = ranked.reduce((n, e) => n + e.bundle.summary.defects, 0);
   const high = ranked.reduce(
@@ -176,19 +194,32 @@ export function renderSuiteIndex(
       const verdict = buildVerdict(bundle);
       // Relative, always: this folder gets zipped and moved.
       const href = relative(indexDir, resolve(entry.reportPath)) || basename(entry.reportPath);
-      const state = bundle.quarantined ? 'quarantined' : bundle.status;
+      const status = acted(entry);
+      const state = bundle.quarantined ? 'quarantined' : status === 'needs-review' ? 'review' : status;
+      const stateLabel = state === 'review' ? 'proved-?' : state === 'error' ? 'no verdict' : state;
       const trend =
         bundle.trend && bundle.trend.verdict !== 'stable'
           ? `<span class="pill ${esc(bundle.trend.verdict === 'flaky' ? 'flaky' : '')}">${esc(bundle.trend.verdict.replace(/-/g, ' '))}</span>`
           : '';
+      // What the sheet itself recorded for the row (passed / failed / blocked)
+      // beside what the run found, and the sheet's own case id when the run
+      // qualified it — so a reader can grade the row without the truth table.
+      const extras = provenanceExtras(bundle);
+      const caseId = displayCaseId(bundle.name.split(/\s+/)[0] ?? bundle.name, extras.sheetCaseId);
+      const sheet = sheetLabel(extras);
+      const sheetPill = extras.sheetVerdict
+        ? `<span class="pill sheet" title="what the sheet's own Actual Result column recorded for this row">sheet: ${esc(extras.sheetVerdict)}</span>`
+        : '';
       return `
-      <tr class="${esc(bundle.status)}">
-        <td><span class="pill ${esc(state)}">${esc(state)}</span></td>
+      <tr class="${esc(status)}">
+        <td><span class="pill ${esc(state)}" title="machine status: ${esc(bundle.status)}">${esc(stateLabel)}</span></td>
         <td>
-          <a class="case" href="${esc(href)}">${esc(bundle.name)}</a>
+          <a class="case" href="${esc(href)}">${esc(bundle.name)}</a>${
+            caseId.qualified ? `<span class="sheet-id" title="the sheet's own spelling; the run qualified it">sheet id ${esc(caseId.shown)}</span>` : ''
+          }${sheet ? `<span class="pill sheet">${esc(sheet)}</span>` : ''}
           <div class="why">${esc(verdict.what)}</div>
         </td>
-        <td>${trend}${verdict.owner ? `<span class="pill">${esc(verdict.owner)}</span>` : ''}</td>
+        <td>${trend}${verdict.owner ? `<span class="pill">${esc(verdict.owner)}</span>` : ''}${sheetPill}</td>
         <td class="num">${bundle.summary.passed}/${bundle.summary.totalSteps}</td>
         <td class="num">${bundle.summary.defects || ''}</td>
         <td class="num">${esc(ms(bundle.durationMs))}</td>
@@ -210,7 +241,10 @@ export function renderSuiteIndex(
   <div class="sub">${total} case${total === 1 ? '' : 's'} &middot; ${blocked.length > 0 ? 'blocked and failing' : 'failures'} listed first</div>
 
   <section class="rollup">
-    <div class="chip ${failed > 0 ? 'bad' : 'ok'}"><div class="v">${ranked.length - failed}/${total}</div><div class="k">cases passed</div></div>
+    <div class="chip ${failed > 0 ? 'bad' : 'ok'}"><div class="v">${ranked.length - failed - review - noVerdict}/${total}</div><div class="k">cases passed</div></div>
+    ${failed > 0 ? `<div class="chip bad"><div class="v">${failed}</div><div class="k">test failed</div></div>` : ''}
+    ${review > 0 ? `<div class="chip review"><div class="v">${review}</div><div class="k">awaiting review</div></div>` : ''}
+    ${noVerdict > 0 ? `<div class="chip warn"><div class="v">${noVerdict}</div><div class="k">no verdict</div></div>` : ''}
     ${blocked.length > 0 ? `<div class="chip bad"><div class="v">${blocked.length}</div><div class="k">never ran</div></div>` : ''}
     <div class="chip"><div class="v">${defects}</div><div class="k">${high > 0 ? `findings (${high} high)` : 'findings'}</div></div>
     ${quarantined > 0 ? `<div class="chip"><div class="v">${quarantined}</div><div class="k">quarantined</div></div>` : ''}

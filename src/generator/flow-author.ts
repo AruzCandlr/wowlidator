@@ -40,6 +40,7 @@ import {
   fromRepo,
   fromTestData,
   resolveValues,
+  type TestDataPair,
   type ValueNeed,
   type ValueResolutionContext,
   type ValueResolverModel,
@@ -55,8 +56,15 @@ import {
   type ModelSource,
 } from '../providers/llm-factory.js';
 import { hasAssertion } from '../engine/runner.js';
-import { vacuousClaim } from './vacuous.js';
-import { describeUnprovedExclusivity, unprovedExclusivity } from './exclusivity.js';
+import { observationSteps, vacuousClaim } from './vacuous.js';
+import { describeUnprovedExclusivity, optionSetsIn, unprovedExclusivity } from './exclusivity.js';
+// The sheet grammar (CG-15): one regex names every heading `describeCase`
+// writes, so the lints that cut the described row — the Steps script, the
+// Expected block, the Test data pairs — cut on the same list the parser does.
+// The parser imports nothing of the generator, so the dependency runs one way.
+import { expectedLines, sectionOf } from '../catalog/test-case-table.js';
+import { isFixtureSpec } from '../data/fixtures.js';
+import { multiPersonaGoal } from '../orchestrator/agent-guards.js';
 import type { Flow, FlowStep } from '../engine/runner.js';
 import { DEFAULT_MUTATION_POLICY, type MutationPolicy } from './test-generator.js';
 import type { FlowReviewer, ReviewRecord } from './flow-review.js';
@@ -160,6 +168,20 @@ export const AUTHOR_ACTIONS = [
   // End the session through the application's own sign-out control — the
   // persona-switch step. Deterministic engine procedure, no selector needed.
   'signOut',
+  // Sign in as a PERSONA LABEL (`HR_ADMIN_ACCOUNT`, `MANAGER_ACCOUNT`), the
+  // credentials held by the harness, never typed by the author (CG-05,
+  // EH-10, OA-15). A `<X_ACCOUNT>` token in the sheet, "Login ด้วย SPD
+  // Admin", "Manager กด Approve" each name one; a hand-off in the numbered
+  // steps (PRB-EC: "2. Login ด้วย <MANAGER_ACCOUNT> … 4. Login ด้วย
+  // <HRBP_ACCOUNT> แล้วกด Approve") is a signIn as the OTHER persona in the
+  // middle of the same case. 271 rows carry tokens, 98 hand off.
+  'signIn',
+  // Attach a deterministic fixture file — `pdf:medical-certificate`,
+  // `csv:benefit-plans@template!blank=Country` — written by
+  // `src/data/fixtures.ts` under the run's own folder (CG-19). 95 rows attach,
+  // import or upload something; before this every one became an agent leg the
+  // agent could not perform either.
+  'upload',
   'back',
   'forward',
   'scrollTo',
@@ -177,6 +199,18 @@ export const AUTHOR_ACTIONS = [
   'expectText',
   'expectVisible',
   'expectHidden',
+  // Either/or: the Expected line offers alternatives ("ระบบประมวลผลสำเร็จหรือ
+  // แสดง error ตามเงื่อนไข ไม่ crash", "กรณีสร้างสำเร็จ … / กรณีปฏิเสธ …")
+  // and the flow accepts whichever the page shows (CG-08). 95 rows; before
+  // this the author picked one branch and the other branch failed a correct
+  // application. Selectors ride ";"-separated in `value`, the expectCalls
+  // precedent, one per acceptable outcome.
+  'expectAnyVisible',
+  // The validation message shown FOR a named field — "ระบบแสดง Error
+  // message "…" ด้านล่าง Field X", "error ใต้ช่องนั้นทันทีเมื่อกด Save" —
+  // read from the field's own aria-errormessage/describedby/container, so a
+  // message under the WRONG field cannot pass a page-wide expectText (EH-12).
+  'expectFieldError',
   'expectEnabled',
   'expectDisabled',
   'expectCount',
@@ -254,9 +288,13 @@ const AuthoredStepFields = {
         'For expectStatus: the expected status as digits. For expectJson: the expected value ' +
         '(empty asserts the path merely exists). For expectDbCount: the exact row count — ' +
         'digits or a saved {{variable}}. For setClock: the ISO date or date-time to pin the ' +
-        'page clock to. Else empty.',
+        'page clock to. For expectAnyVisible: two or more selectors, ";"-separated, one per ' +
+        'acceptable outcome. For expectFieldError: the exact message the case quotes, or empty ' +
+        'for "any error under this field". For upload: the fixture spec kind:name[@template]' +
+        '[!mutation] (pdf:medical-certificate, csv:benefit-plans@template!blank=Country). ' +
+        'Else empty.',
     ),
-  url: z.string().describe('URL or path for goto. Else empty.'),
+  url: z.string().describe('URL or path for goto, or the sign-in page for signIn when the case names one. Else empty.'),
   key: z
     .string()
     .describe(
@@ -273,10 +311,34 @@ const AuthoredStepFields = {
       'Snapshot name, attribute name for expectAttribute, or the table name for DB checks ' +
         '(comma-separated tables for dbSnapshot/expectDbUnchanged; single table for ' +
         'expectDbRow/expectDbCount). For request: "METHOD /path", e.g. "POST /api/db/seed". ' +
-        'For expectModal: the dialog\'s accessible name, or empty for any. Else empty.',
+        'For expectModal: the dialog\'s accessible name, or empty for any. For signIn: the ' +
+        'persona LABEL exactly as the PERSONAS section lists it (HR_ADMIN_ACCOUNT). Else empty.',
+    ),
+  // A declared wait, in milliseconds as digits, for the six steps the engine
+  // can wait on (expectText, expectVisible, expectHidden, expectCount,
+  // waitFor, expectModal) — "สถานะเปลี่ยนเป็น Complete" after Run Payroll
+  // (TC_PY_REC_*: minutes), import progress "100%" / "Status = Completed"
+  // (PL_10_24/26/57), a toast that "หายไปอัตโนมัติ 5-6 วินาที" (RU_05_02).
+  // EH-07: a declared wait that expires is a verdict about time, never a
+  // selector to heal, and the fast ladder cannot await a payroll run.
+  // Empty for every other step; capped at MAX_STEP_TIMEOUT_MS on narrowing.
+  timeoutMs: z
+    .string()
+    .describe(
+      'For expectText / expectVisible / expectHidden / expectCount / waitFor / expectModal ONLY: ' +
+        'how long to keep waiting, in milliseconds as digits (e.g. 300000), when the case says to ' +
+        'wait until a status changes, a job completes, progress reaches 100% or a toast disappears. ' +
+        'Empty for an ordinary check and for every other action.',
     ),
   intent: z.string().describe('What this step is for, in plain language. Always fill this in.'),
 };
+
+/**
+ * The longest wait an authored step may declare (EH-07). Ten minutes covers a
+ * payroll run and an import of thousands of rows; anything longer is a case
+ * the sheet marks "รอวันที่" and the harness refuses before authoring.
+ */
+export const MAX_STEP_TIMEOUT_MS = 600_000;
 
 /**
  * `case` is required *on the wire* and optional *in what we accept back*, and
@@ -400,6 +462,17 @@ export interface AuthorRequest {
    * sign in proves nothing about anything behind the login.
    */
   credentials?: { email: string; password: string } | undefined;
+  /**
+   * The personas the run holds credentials for, by LABEL — the sheet's own
+   * `<HR_ADMIN_ACCOUNT>` / `<MANAGER_ACCOUNT>` / `<HRBP_ACCOUNT>` tokens and
+   * the role words the CLI maps onto them (`SPD Admin` → `SPD_ADMIN`). Its
+   * own labelled section in the prompt, listing the label and the email and
+   * NEVER the password: with this present every sign-in is a `signIn` step
+   * naming the label, and the engine types the secret (CG-05, EH-10). A
+   * prompt that carried four passwords for four personas was the model's
+   * invitation to type them — and to invent the fifth.
+   */
+  personas?: Readonly<Record<string, { email: string; password: string }>> | undefined;
   /**
    * How far the test should reach — see `TestScope`. Absent means `unit`,
    * and an absent scope leaves the prompt byte-for-byte what it was before
@@ -563,19 +636,30 @@ ${DETERMINISM_RULES}
 ${procedure('HOW TO BUILD THE FLOW', [
   'Read the request and write down, for yourself: the persona and its exact credentials; the page or route under test; each CLAIM the request makes (one per line of its Expected output, or one per sentence that asserts something); any date the claim depends on; anything the request says is already true.',
   'setup = sign in (SIGNING IN, below), reach the page under test, and assert WHO is signed in — by the persona\'s NAME as the chrome renders it (text=ผู้ดูแลระบบ), NEVER by a time-of-day greeting: "Good morning/afternoon" follows the clock, and setClock moves the clock. Nothing else goes in setup. If a date matters, setClock is the FIRST step of setup, before the first goto.',
+  'THE FIRST LEG IS THE MENU PATH. When the case gives "Menu path: HR > Benefits Admin > Benefit Plans", reach the page the way the sheet says: after the sign-in, click each crumb in order, each as the tree names it (role=link / role=button / role=menuitem with that name); a crumb that is a collapsed group ("เข้าสู่เมนูที่กำหนด", "กด Menu > ME > …") is opened by clicking its header first, then the entry under it. When the case gives "Destination: <url> (tab "X")", goto that URL and then click role=tab[name="X" i] — the URL first, the tab second. Never derive a route from a label and never goto a path the sheet does not state.',
   'EVERY TEST CASE HAS SOMETHING TO TEST — always. A body step that runs against the sign-in page is YOUR error, never a fact about the feature: the sign-in in setup must be complete (fill every field the form has, submit, prove it took) and the flow must have navigated to the page under test before the first body step. And never conclude a case cannot be tested: when the exact expected value is out of reach, assert the closest observable fact the page offers — the named element exists, the count reads as a number, the label the spec owns is rendered — and say in "notes" what was narrowed and why. A flow that tests nothing is not an answer.',
   'One case per claim. The case name is the request\'s own case id VERBATIM (TC_01_01, API_02_03 …); when the request lists several independent claims under one id, suffix them " / 1", " / 2" in the order the request states them. Never invent a case name when the request has an id, and never merge two claims into one case.',
   'THE CASE\'S "Steps" COLUMN IS A SCRIPT TO PERFORM, NOT BACKGROUND TO READ. When the request carries one, carry out its numbered steps IN ORDER with the Test data\'s own values: กรอก/คีย์/enter → fill, เลือก → selectOption or click, กด/click → click, Submit → the submit control. Asserting that a field EXISTS is not performing the step that fills it, and a flow that inspects the empty form has not run the case. The claim of a key-in case is what the system does AFTER the data is entered and submitted — you cannot reach it without entering the data. Only where a step is genuinely impossible here (a value no tree and no document supplies) do you skip it, and then the step\'s intent says which numbered step was skipped and why.',
   'For each case: the fewest steps that reach the claim, then the assertion(s) that would FAIL if the claim were false — nothing that passes either way. The sign-in proof and an expectUrl are PREPARATION, never the claim: EVERY numbered line of the Expected output (6.1, 6.2, …) gets its own assertion in the page terms that line names — the very element the line speaks of (the count box it names, the message it quotes, the option list it lists) — and the step\'s intent cites that line\'s number. A backend check may CORROBORATE a line, never replace it: a line about an on-screen number is proved by reading that number on screen. A case whose only assertions are the sign-in proof and a URL is refused.',
   '"ONLY" MEANS ONLY. When an Expected line says the page shows ONLY / JUST / EXACTLY / NOTHING BUT the items it lists — English "only", "just", "exactly", "solely", "no other"; Thai "เฉพาะ", "แสดงเฉพาะ", "แค่", "เพียง", "เท่านั้น" — it is a claim about the WHOLE set, and the whole set is proved by COUNTING it: open the list, then expectCount on the ITEM role the opened list exposes in the tree or probe report (role=option, role=menuitem, the buttons inside the listbox …) with "value" = the number the line enumerates ("3 ค่า" → 3; "New Hire / Replacement / Migration" → 3), PLUS expectVisible of each listed item, PLUS expectHidden of any item the line names as absent. expectVisible of the listed items and expectHidden of the named absentees ALONE are refused: they pass when a fourth, unlisted item appears, which is exactly what the line forbids. When no tree or probe shows the item role, count what it does show for one open item and say so in "notes" — never drop the count.',
+  'AN OPTION SET IS CHECKED WITH THE LIST OPEN ONCE. When the case carries "Option set for <field> (exact, N): a | b | c; forbidden: x, y" (Thai "แสดงตัวเลือก … ครบถ้วน ดังนี้", "dropdown มีแค่ N ค่า", "แสดงเฉพาะ …", "ไม่มี X และไม่มี Y"): click the field ONCE, then expectCount on the item role the opened list exposes (role=option) with "value" = N for an exact set, then one expectVisible role=option[name="<member>" i] per member, then one expectHidden role=option[name="<forbidden>" i] per forbidden name, then press Escape. Never re-click the trigger between checks — a second click closes the list and the next check fails on a closed dropdown. A set marked "examples" is proved by its listed members only; no count.',
   'THE CONTROL IS THE ONE THE LABEL POINTS AT, WITH THE ROLE THE TREE SHOWS. A textbox whose name is a PLACEHOLDER ("Select date", "เลือกวันที่", "Search…") is usually a read-only display drawn over the real input — fill the textbox named by the field\'s LABEL instead (textbox "Hire Date", not textbox "Select date"). A date input takes its value as YYYY-MM-DD (2027-09-01), never as the page displays it. And a dropdown that the tree lists as a button (aria-haspopup) is a button: selectOption on role=button[name="Event Reason" i], never role=combobox — invent no role the tree did not show.',
   'Every selector comes from a tree you were given, in the canonical form. When the control appears in NO tree but WHAT THE REPOSITORY DECLARES names its rendered string (a component\'s words, a message catalog\'s value), write the step deterministically against that string — role + declared label, e.g. role=button[name="Create Plan" i], expectText quoting the declared value. Only when neither a tree nor the repository declares the control may the leg be a workflow step (WORKFLOW GOALS, below) — deterministic steps cost $0 and run in milliseconds; an agent leg costs model calls per turn.',
   'AN OPEN QUESTION IS NOT AN EXPECTED VALUE: a case that writes "= ?" followed by an id (OQ-HIR-140, CF-SIT-19) is saying NOBODY KNOWS YET and asking the tester to read the answer off the run. Never assert the id, and never invent the answer. Assert the fact around it that the case does state — the field is there, the notice appears, the record was created — and let the run record the rest.',
+  'AN EXPECTED LINE MARKED [RECORD ONLY] IS OBSERVED, NEVER ASSERTED. The sheet says "ยังไม่มีคำตอบ ให้รันจริงแล้วบันทึกค่าที่ระบบแสดง", "= ? OQ-…", "บันทึก … ที่ระบบให้", "ส่งให้ BA/SA" — or the oracle is an email/SMS the browser cannot see. For each such line: saveText the element the line points at into a variable named record_<lineNo> (record_3_2 for line 3.2; snapshot the region when it is a state, not a value), cite the line in the intent, and write NO expect* for it. A case whose Expected lines are ALL [RECORD ONLY] is authored as the script plus those observations and nothing else — its verdict is "review", read by a person; do not manufacture an assertion to give it one.',
+  'TEST DATA ARRIVES ONE PAIR PER LINE — USE IT AS WRITTEN. The "Test data:" block is already split for you: one "[phase] Field = value" per line, the phase in brackets ("[Insert R1] Effective Start Date = Next day", "[Create] Country = TH", "[TD-21] Company = C013") saying which round, phase or data set the pair belongs to. Take each pair for the field it names, in that phase; never re-split, re-derive or merge lines, and never take a value from another phase\'s pair when this phase has its own. A "ดราฟต์เดิมระบุ X ใช้ Y" line has already been applied — the pair carries Y.',
   'AN ANGLE-BRACKET TOKEN IS A PLACEHOLDER, NEVER A VALUE — AND NOT YOURS TO INVENT. <HR_ADMIN_ACCOUNT>, <NON_EXISTING_EMPLOYEE_ID>, <VALID_EMPLOYEE_ID> stand for something the tester supplies. Write the step with the TOKEN LEFT IN PLACE as its value: the harness resolves it after you — from the Test data, from the repository and documents, from the database (proving a NON_EXISTING id really is absent), or by generating one — and records on the step where the value came from. If you resolve it yourself the provenance is lost and a made-up id is reported as if it were data. Never type the token\'s text into a field as if it were the value, and never invent a replacement.',
+  'A PERSONA IS SIGNED IN BY ITS LABEL, NEVER BY TYPING ITS PASSWORD. When a PERSONAS section is present, every sign-in — the first one in setup and every hand-off after it — is ONE signIn step with the persona LABEL in "name" (signIn, name: HR_ADMIN_ACCOUNT): the harness signs out if a session is live, opens the sign-in page, types the credentials it holds and proves the login took. Do not goto the login page, do not fill an email or a password, do not signOut by hand and do not assert the login yourself. "Login ด้วย <HR_ADMIN_ACCOUNT>", "<MANAGER_ACCOUNT> ผู้ประเมิน", "Login เข้าระบบด้วย SPD Admin", "Login web humi" (the employee), "Manager กด Approve", "HRBP Approve", "หัวหน้าอนุมัติ" each name a persona: signIn as that label. A hand-off inside the numbered steps ("2. Login ด้วย <MANAGER_ACCOUNT> … 4. Login ด้วย <HRBP_ACCOUNT> แล้วกด Approve") is a signIn as the OTHER label in the middle of the same case, followed by that persona\'s own steps — two legs with a signIn between them, never one workflow goal that names two people (one session cannot be both).',
+  'A DATE PHRASE IS LEFT AS WRITTEN; A REUSED KEY IS TYPED AS WRITTEN. "Today", "Next day", "Next day+1", "Today + 30 Days", "Hire Date + 119 Day", "วันที่ 25 ของเดือนปัจจุบัน", "วันสุดท้ายของเดือนถัดไป", "Age < 60", "31 Dec 9999" go into "value" exactly as the Test data spells them: the harness computes the date after you, records how, and the report says so — a date you compute yourself is a guess with no provenance, and setClock is not needed for a value the harness derives from the run\'s own day. Likewise a Benefit Plan ID / Rule ID / name that IS the case id (PL_06_21, QA-Delete, SIT_DUP_DOC) is typed as the sheet writes it; the run makes it unique to itself.',
+  'A CASE ID IN THE TEST DATA IS A CROSS-REFERENCE, NEVER A VALUE. "ข้อมูลทดสอบเดียวกับ E2E-01 ทุกค่า" / "same test data as E2E-01" points at ANOTHER case whose data applies here — it is not something to type, click, search for or assert; the application has no row called E2E-01. Likewise a route in parentheses — "EC > New Hire (Manual Key-in)" — names the page to open, and its words are not steps to perform: a case whose Steps are navigate and verify types nothing.',
   'EVERY NUMBERED STEP OF THE SCRIPT IS PERFORMED, THROUGH THE LAST ONE. The claim of a key-in case lives in its final steps — Submit, then the profile check — so a flow that stops after step 3 of 7 has verified a form and proved nothing about the hire. Cite the step in each intent ("Step 5: …"); if a step truly cannot be performed here, write a step whose intent says "skipped step N: <why>" so the gap is visible, never silent.',
   'EXPECTED VALUES ARE QUOTED, NEVER INVENTED: every value an assertion carries comes verbatim from the case (its Expected output, Test data or Note), from a document section, or from WHAT THE REPOSITORY DECLARES — in that order of authority. When the Expected output is too vague to assert (no value, no label, no message), take the anchor from the Note or the documents; when none of them holds one, say so in "notes" and assert the observable shape (the named element exists and holds a number) rather than inventing a value.',
   'A CLAIM OF "ONLY" OR OF AN EXACT COUNT IS A COUNT, NOT A LIST OF PRESENCES. "dropdown แสดง 3 ค่า", "แสดงเฉพาะ A / B / C", "only these options", "exactly 3" means: A, B and C are offered AND NOTHING ELSE IS. Three expectVisible steps pass whether or not a fourth option exists — they cannot fail on the defect the claim is about. Author it as: open the control, expectCount of its options (role=option, 3), then expectVisible of each named value; an "ไม่แสดง X" line is an expectHidden of X on top of the count, never instead of it.',
   'A CLAIM THAT TWO READINGS AGREE IS TWO READINGS, COMPARED: "the tile matches the table", "the summary equals the column count", "the number does not change after the action" is NEVER proved by asserting one side exists. Author it as saveCount (or saveText) of one surface into a named variable — the variable NAME goes in the step\'s "value" field — then expectCount/expectText on the other surface carrying {{that-name}} — and for a no-change claim, save BEFORE the action and compare the same reading AFTER. A number printed in the Expected output ("1-15 of 43") is an illustration from the sheet-writer\'s data, never a value to assert; the saved reading is the value.',
+  'A CLAIM OF +1 / -1 / NO CHANGE IS A READING TAKEN BEFORE AND AFTER. "จำนวนเพิ่มขึ้น +1 ใน Total Plans", "จำนวนรายการค้างลดลง 1 รายการ", "จำนวนใน Total Plans ไม่เปลี่ยนแปลง", "Pending 1D → 2D", "Used = 1 (relative to the balance shown)": saveText (or saveCount) the very box the line names BEFORE the action into before_<name> ("value": before_total_plans), perform the action, then expectText the same box with {{before_total_plans+1}} / {{before_total_plans-1}} / {{before_total_plans}} — the arithmetic is written INSIDE the braces and the harness computes it from the saved reading. Never assert the sheet\'s illustrative number ("75 → 76") and never expectVisible the box as proof that it moved.',
+  'EITHER/OR IS ONE expectAnyVisible, NEVER A GUESS AT ONE BRANCH. When an Expected line accepts alternatives — "ระบบประมวลผลสำเร็จหรือแสดง error ตามเงื่อนไข ไม่ crash", "กรณีสร้างสำเร็จ … / กรณีปฏิเสธ …", "A หรือ B", "success or a validation message" — write expectAnyVisible with one selector per acceptable outcome in "value", ";"-separated (text="Completed"; role=alert), so the flow passes on whichever the page shows and fails on neither-nor (a crash, a blank page). Never use it to hedge a line that states ONE outcome, and never list a selector for an outcome the line does not name.',
+  'A WAIT-UNTIL CLAIM DECLARES ITS WAIT. "สถานะเปลี่ยนเป็น Complete", "Status = Completed", "100%", "ระบบประมวลผลสำเร็จ", "ป็อปอัพปิดลง", "Warning หายไปอัตโนมัติ 5-6 วินาที", "ระบบ direct ไปหน้า My Request": the expectText / expectVisible / expectHidden / expectCount / waitFor / expectModal that checks it carries "timeoutMs" — digits, as long as the job really takes (a payroll run: 300000; an import: 120000; a toast that auto-dismisses: 10000), never more than 600000. Without it the check gives up in seconds and reports a working batch as a defect; with it, a wait that expires is a verdict about time.',
+  'AN ERROR UNDER A FIELD IS expectFieldError ON THAT FIELD. "ระบบแสดง Error message "X" ด้านล่าง Field Y", "error ใต้ช่องนั้นทันทีเมื่อกด Save", "error ของแต่ละ field แสดงแยกกัน", "ระบบแสดงข้อความที่ช่อง Personal Grade": the selector is the FIELD\'s control as the tree names it (role=textbox[name="Effective Start Date" i]) and "value" is the message the case quotes (or empty for "any error here"). A page-wide expectText of the message passes when the message sits under the wrong field, which is exactly what those cases exist to catch; "ทุกช่องที่ปล่อยว่าง" / "ว่างทีละช่อง" is one expectFieldError per field, each in its own case.',
   'Run the checklist at the end of these instructions and fix what fails.',
 ])}
 
@@ -669,9 +753,43 @@ WORKFLOW GOALS — a workflow goal is judged by evidence, so write one the
                   to the sign-in page — never fill a login form while still
                   signed in, and never fake a sign-out with clearStorage: a
                   cookie-backed session survives the wipe.
+- signIn          sign in as a PERSONA the harness holds credentials for. The
+                  persona LABEL in "name", exactly as the PERSONAS section
+                  lists it (HR_ADMIN_ACCOUNT, MANAGER_ACCOUNT, SPD_ADMIN);
+                  optional sign-in URL in "url" when the case names one. No
+                  selector, no email, no password: the engine signs out any
+                  live session, opens the sign-in page, types the secret it
+                  holds and proves the login. THE step for "Login ด้วย
+                  <X_ACCOUNT>" and for every hand-off to another person.
+- upload          attach a file to a file input, a dropzone, or the control
+                  that opens the chooser ("Attach", "แนบเอกสาร", "Browse",
+                  "Import"). "selector" is that control as the tree names it;
+                  "value" is a fixture spec the harness writes for this run:
+                  kind:name — pdf:medical-certificate, csv:benefit-plans,
+                  xlsx:employees, txt:note; "@template" takes the header from
+                  the case, a document or the page's sample; "!mutation" makes
+                  ONE named defect for a negative case — !blank=Country,
+                  !bad-enum=Status, !bad-date=Effective Start Date,
+                  !extra-column, !rows=5000, !encoding=tis-620, !delimiter=;,
+                  !no-header, !empty, !too-long=Plan Name, !duplicate.
 - snapshot        visual regression baseline. Name in "name", optional selector.
-- expectText      element's text CONTAINS "value".
-- expectVisible / expectHidden      element is / is not visible.
+- expectText      element's text CONTAINS "value". For a wait-until claim,
+                  "timeoutMs" holds the wait in milliseconds (see the procedure).
+- expectVisible / expectHidden      element is / is not visible. Both take
+                  "timeoutMs" the same way; so do expectCount, waitFor and
+                  expectModal.
+- expectAnyVisible  ANY of several elements is visible — "value" holds two or
+                  more selectors, ";"-separated, one per acceptable outcome
+                  the Expected line names (… หรือ …, success OR a handled
+                  error, กรณีสำเร็จ / กรณีปฏิเสธ). Passes on the first one
+                  shown; fails naming every one that was not. Never to hedge
+                  a single stated outcome.
+- expectFieldError  the validation message shown FOR the field in "selector"
+                  (aria-errormessage / aria-describedby / the field's own
+                  container) equals "value" — or, with "value" empty, that
+                  some error is shown there. The step for "Error message "…"
+                  ด้านล่าง Field X" and "error ใต้ช่อง"; a page-wide expectText
+                  cannot tell which field the message belongs to.
 - expectEnabled / expectDisabled    control is / is not interactive.
 - expectCount     exactly "value" matches. "value" must be digits, or a
                   {{variable}} a saveCount/saveText step recorded.
@@ -893,7 +1011,19 @@ the wipe and the login form never appears. A flow that switches personas is
 an END-TO-END test and is marked so, whatever scope was asked for. One case
 that switches identity three times mid-stream is how a whole verification
 dies on its second login.
+PERSONAS: when the request carries a PERSONAS section, the rules above about
+filling a login form do not apply — the harness holds every password and
+NONE is in this prompt. Each sign-in is one signIn step naming the LABEL
+(setup: signIn name: HR_ADMIN_ACCOUNT, then the goto to the page under test).
+A case that hands off between two people (the employee submits, the manager
+approves; the manager submits, the HRBP approves) is TWO legs in one case
+with a signIn as the second label between them — the engine ends the first
+session itself. A persona the section does not list cannot be signed in as:
+say so in "notes" and in the first affected step's intent, never invent an
+account, never type a placeholder password.
 WHICH CREDENTIALS, in this order of precedence:
+  0. When a PERSONAS section is present: signIn by label, always — the rest
+     of this list is for requests that carry no such section.
   1. The credentials the request ITSELF states for the persona it names (a
      "Login / persona" line, "sign in as X, password Y") — verbatim, character
      for character. A catalog names its own personas, and a case about one
@@ -993,6 +1123,9 @@ ${selfCheck([
   'setClock is the first setup step whenever a claim depends on today\'s date or a date is typed.',
   'No workflow step exists for a leg whose controls a given tree contains; every workflow goal names its concrete values and, when it changes page, ends with the destination path.',
   'No expect* step asserts a bare number the request does not state.',
+  'With a PERSONAS section present, no step fills an email or a password and no goto targets the sign-in page: every sign-in is a signIn step naming a listed label, and a hand-off is a second signIn in the same case.',
+  'Every [RECORD ONLY] Expected line is a saveText/snapshot named record_<line>, and no expect* step asserts it; every +1 / -1 / ไม่เปลี่ยนแปลง line saves the reading first and compares {{before_<name>±N}} after.',
+  'Every wait-until claim (status changes, job completes, 100%, a toast disappears) carries "timeoutMs" on its check; every "Error message … ด้านล่าง Field" / "error ใต้ช่อง" line is an expectFieldError on that field; every either/or line is one expectAnyVisible.',
   'Every unused field is an empty string, and every step has an intent.',
 ])}`;
 
@@ -1054,6 +1187,19 @@ export function buildUserPrompt(request: AuthorRequest): string {
         'never a variation and never an invention):',
       `  email: ${request.credentials.email}`,
       `  password: ${request.credentials.password}`,
+    );
+  }
+  // The personas, by label and email only — the password never leaves the
+  // harness (CG-05). Its own section for the same reason SIGN IN AS is: what
+  // the run holds is a different kind of fact from what the sheet says, and
+  // a label the model must copy verbatim is not something to improve on.
+  const personaLabels = Object.keys(request.personas ?? {});
+  if (personaLabels.length > 0) {
+    lines.push(
+      '',
+      'PERSONAS (the harness holds the password for each — sign in with a signIn step naming ' +
+        'the LABEL exactly; never type these credentials, never invent an account):',
+      ...personaLabels.map((label) => `  ${label}: ${request.personas![label]!.email}`),
     );
   }
   if (request.axTree) lines.push('', 'Accessibility tree:', request.axTree);
@@ -1378,7 +1524,16 @@ export function dropReasonFor(
   }
   if (raw.action === 'goto' && raw.url === '') return 'goto needs a url';
   if (raw.action === 'workflow' && raw.value === '' && raw.intent === '') return 'workflow needs a goal in "value"';
-  if (noSelector && !/^(goto|workflow|setLocalStorage|clearStorage|signOut|back|forward|expectUrl|snapshot|expectScrollable|dbSnapshot|expectDb|request|expectStatus|expectJson|expectCalls|setClock|press)/.test(raw.action)) {
+  if (raw.action === 'signIn' && personaLabelOf(raw) === '') {
+    return 'signIn needs the persona LABEL in "name" (HR_ADMIN_ACCOUNT, MANAGER_ACCOUNT, … — exactly as the PERSONAS section lists it)';
+  }
+  if (raw.action === 'expectAnyVisible' && splitSelectorList(raw.value).length < 2) {
+    return 'expectAnyVisible needs two or more selectors in "value", ";"-separated — one per acceptable outcome the Expected line names (a single outcome is an expectVisible)';
+  }
+  if (raw.action === 'upload' && !noSelector && !isFixtureSpec(raw.value)) {
+    return 'upload needs a fixture spec in "value" — kind:name[@template][!mutation], e.g. pdf:medical-certificate, csv:benefit-plans@template!blank=Country (kinds: csv, pdf, xlsx, txt)';
+  }
+  if (noSelector && !/^(goto|workflow|setLocalStorage|clearStorage|signOut|signIn|back|forward|expectUrl|snapshot|expectScrollable|dbSnapshot|expectDb|request|expectStatus|expectJson|expectCalls|setClock|press)/.test(raw.action)) {
     return raw.selector.trimStart().startsWith('/*')
       ? 'the selector is a comment, not a selector — name a control from the tree'
       : 'the step names no selector — copy the control from the tree';
@@ -1391,12 +1546,57 @@ export function dropReasonFor(
   return 'the step could not be narrowed to a runnable form (a field it needs is missing or malformed)';
 }
 
+/**
+ * A saved-variable reference as `expectCount`/`expectText` may carry it:
+ * `{{rows}}`, and since CG-07 the delta form `{{rows+1}}` / `{{rows - 1}}` the
+ * variable store computes from the saved reading. Group 1 is the NAME —
+ * what a save must have written for the reference to resolve.
+ */
+export const VARIABLE_REF = /^\{\{\s*([\w.-]+?)\s*(?:[+-]\s*\d+)?\s*\}\}$/;
+
+/**
+ * The persona label a `signIn` step names — `name` first (where the field
+ * description puts it), `value` as the fallback a smaller model reaches for,
+ * the sheet's own `<HRBP_ACCOUNT>` token form accepted with its brackets
+ * stripped. Empty when the step names nothing.
+ */
+function personaLabelOf(raw: { name: string; value: string }): string {
+  const candidate = (raw.name.trim() || raw.value.trim()).replace(/^<\s*|\s*>$/g, '').trim();
+  return candidate;
+}
+
+/** `value` of an expectAnyVisible: the `;`-separated selectors, the expectCalls convention. */
+function splitSelectorList(value: string): string[] {
+  return value
+    .split(/[;\n]/)
+    .map((part) => part.trim())
+    .filter((part) => part !== '' && !part.startsWith('/*'));
+}
+
+/**
+ * A declared wait (EH-07): digits in `timeoutMs`, capped at
+ * `MAX_STEP_TIMEOUT_MS`, absent for anything else. A model that writes "5
+ * minutes" or "300s" has declared no wait — the field description says
+ * digits, and inventing a conversion here would hand the engine a number the
+ * author never wrote.
+ */
+function timeoutOf(raw: { timeoutMs?: string | undefined }): number | undefined {
+  const digits = (raw.timeoutMs ?? '').trim();
+  if (!/^\d{1,7}$/.test(digits)) return undefined;
+  const ms = Number(digits);
+  if (ms <= 0) return undefined;
+  return Math.min(ms, MAX_STEP_TIMEOUT_MS);
+}
+
 function toFlowStep(
   raw: z.infer<typeof AuthoredStepSchema>,
   allowDb: boolean,
   policy: MutationPolicy = DEFAULT_MUTATION_POLICY,
 ): FlowStep | null {
   const intent = raw.intent === '' ? undefined : raw.intent;
+  // Spread onto the six waitable steps only; `undefined` is never written.
+  const timeoutMs = timeoutOf(raw);
+  const wait = timeoutMs === undefined ? {} : { timeoutMs };
   // A CSS comment is not a selector, and a model that cannot find a control
   // sometimes "declines" by emitting one — `/* selector for X not found */` —
   // which then reaches Playwright as a parse error and burns the whole
@@ -1432,7 +1632,7 @@ function toFlowStep(
             intent: intent ?? `click ${selector} if it is shown`,
           };
     case 'waitFor':
-      return needsSelector ? null : { action: 'waitFor', selector, intent };
+      return needsSelector ? null : { action: 'waitFor', selector, intent, ...wait };
     case 'fill':
       return needsSelector
         ? null
@@ -1466,6 +1666,20 @@ function toFlowStep(
       return { action: 'clearStorage' };
     case 'signOut':
       return { action: 'signOut', intent };
+    case 'signIn': {
+      // The LABEL, never the credentials: `RunFlowOptions.personas` resolves
+      // it at run time, so a flow file carries no password (CG-05, EH-10).
+      const as = personaLabelOf(raw);
+      if (as === '') return null;
+      return { action: 'signIn', as, ...(raw.url === '' ? {} : { url: raw.url }), intent };
+    }
+    case 'upload': {
+      // `files` carries the SPEC; the run writes the file
+      // (`src/data/fixtures.ts` `writeFixture`) and hands the engine the path.
+      // A value that is not a spec is not a file the harness can make.
+      if (needsSelector || !isFixtureSpec(raw.value)) return null;
+      return { action: 'upload', selector, files: [raw.value.trim()], intent };
+    }
     case 'back':
       return { action: 'back', intent };
     case 'forward':
@@ -1487,9 +1701,9 @@ function toFlowStep(
     case 'expectText':
       return needsSelector || raw.value === ''
         ? null
-        : { action: 'expectText', selector, value: raw.value, intent };
+        : { action: 'expectText', selector, value: raw.value, intent, ...wait };
     case 'expectVisible':
-      return needsSelector ? null : { action: 'expectVisible', selector, intent };
+      return needsSelector ? null : { action: 'expectVisible', selector, intent, ...wait };
     case 'expectHidden': {
       if (needsSelector) return null;
       // The prompt's own quoting rule, applied mechanically where ignoring it
@@ -1506,6 +1720,7 @@ function toFlowStep(
         action: 'expectHidden',
         selector: bareWord !== null ? `text="${bareWord[1]}"` : selector,
         intent,
+        ...wait,
       };
     }
     case 'expectEnabled':
@@ -1514,17 +1729,33 @@ function toFlowStep(
       return needsSelector ? null : { action: 'expectDisabled', selector, intent };
     case 'expectFocused':
       return needsSelector ? null : { action: 'expectFocused', selector, intent };
+    case 'expectAnyVisible': {
+      // Two or more, each through the same rewrites a single selector gets —
+      // one alternative written in tree notation would otherwise resolve
+      // nothing and silently narrow the claim to the other branch.
+      const selectors = splitSelectorList(raw.value).map((one) =>
+        withStableGreeting(withRelaxedRoleName(withQualifiedRole(fromTreeNotation(one.replace(/‑/g, '-'))))),
+      );
+      if (selectors.length < 2) return null;
+      return { action: 'expectAnyVisible', selectors, intent, ...wait };
+    }
+    case 'expectFieldError':
+      return needsSelector
+        ? null
+        : { action: 'expectFieldError', selector, ...(raw.value.trim() === '' ? {} : { value: raw.value.trim() }), intent };
     case 'expectCount': {
       // Digits, or a `{{variable}}` a saveCount/saveText step recorded — the
-      // compare half of a reconciliation claim. Anything else is unusable
-      // rather than something to guess at.
-      if (/^\{\{[\w.-]+\}\}$/.test(raw.value.trim())) {
-        return needsSelector ? null : { action: 'expectCount', selector, count: raw.value.trim(), intent };
+      // compare half of a reconciliation claim — including the delta form
+      // `{{rows-before+1}}` / `{{rows-before - 1}}` the variable store
+      // computes (CG-07). Anything else is unusable rather than something to
+      // guess at.
+      if (VARIABLE_REF.test(raw.value.trim())) {
+        return needsSelector ? null : { action: 'expectCount', selector, count: raw.value.trim(), intent, ...wait };
       }
       const count = Number(raw.value);
       return needsSelector || !Number.isInteger(count) || count < 0
         ? null
-        : { action: 'expectCount', selector, count, intent };
+        : { action: 'expectCount', selector, count, intent, ...wait };
     }
     case 'saveCount':
       // `value` names the variable the reading lands in.
@@ -1692,7 +1923,7 @@ function toFlowStep(
         ? null
         : { action: 'setClock', time: raw.value, intent };
     case 'expectModal':
-      return { action: 'expectModal', ...(raw.name === '' ? {} : { name: raw.name }), intent };
+      return { action: 'expectModal', ...(raw.name === '' ? {} : { name: raw.name }), intent, ...wait };
     case 'closeModal':
       return { action: 'closeModal', ...(selector === '' ? {} : { button: selector }), intent };
     default:
@@ -1727,6 +1958,15 @@ export interface AuthoredFlow {
   latencyMs: number;
   /** What the authoring review did, when one ran — see `flow-review.ts`. */
   review?: ReviewRecord | undefined;
+  /**
+   * The case's Expected lines are ALL `[RECORD ONLY]` (CG-09): the flow is
+   * the script plus saveText/snapshot observations and asserts nothing,
+   * because the sheet has no oracle — its honest verdict is `review` with the
+   * captures, never a pass and never a block. The catalog path stamps this
+   * onto the flow's provenance (`authoredBy.recordOnly`) so `runCases` maps
+   * the vacuous shape to `review` instead of blocking it.
+   */
+  recordOnly?: boolean | undefined;
 }
 
 /**
@@ -1877,6 +2117,13 @@ export interface FlowAuthorOptions {
   projectContext?: string | undefined;
   /** The account to sign in as — see `AuthorRequest.credentials`. */
   credentials?: { email: string; password: string } | undefined;
+  /**
+   * Every persona the run holds credentials for, by label — see
+   * `AuthorRequest.personas`. With this set the author writes `signIn` steps
+   * by label and the lints refuse a login typed by hand; the same map must
+   * reach `RunFlowOptions.personas` for the steps to resolve at run time.
+   */
+  personas?: Readonly<Record<string, { email: string; password: string }>> | undefined;
   /** A further page's tree — see `AuthorRequest.journeyTree`. */
   journeyTree?: string | undefined;
   /** How far the test must reach — see `TestScope`. Absent means `unit`. */
@@ -1947,6 +2194,7 @@ export class FlowAuthor {
   readonly #tables: readonly TableInventoryEntry[] | undefined;
   readonly #projectContext: string | undefined;
   readonly #credentials: { email: string; password: string } | undefined;
+  readonly #personas: Readonly<Record<string, { email: string; password: string }>> | undefined;
   readonly #journeyTree: string | undefined;
   readonly #scope: TestScope | undefined;
   /** Route patterns the selected repository declares — grounding for expectUrl. */
@@ -1979,6 +2227,7 @@ export class FlowAuthor {
     this.#tables = options.tables;
     this.#projectContext = options.projectContext;
     this.#credentials = options.credentials;
+    this.#personas = options.personas;
     this.#journeyTree = options.journeyTree;
     this.#scope = options.scope;
     this.#declaredRoutes = options.declaredRoutes ?? [];
@@ -2111,10 +2360,35 @@ export class FlowAuthor {
        * `wordingClaimAssertsDataValue`.
        */
       caseText?: string | undefined;
+      /**
+       * The row's Test data already split one pair per line by the parser
+       * (`testDataPairs` in `catalog/test-case-table.ts`, CG-02), handed to
+       * the value resolver so it never re-splits a packed line itself. Absent,
+       * the pairs are read back out of the described case's own `Test data:`
+       * block, which the parser rendered one per line for exactly this.
+       */
+      testDataPairs?: readonly TestDataPair[] | undefined;
+      /** The row's case id — a typed value equal to it is a key the run makes unique (CG-13). */
+      caseId?: string | undefined;
+      /** The catalog run's key, the source of that uniqueness suffix. */
+      runKey?: string | undefined;
+      /**
+       * What "today" is for the relative-date source (CG-06). Decided once per
+       * run by the caller so a resume computes the same dates; the wall clock
+       * when absent.
+       */
+      now?: Date | undefined;
+      /** This row's personas, overriding the author-wide map — see `AuthorRequest.personas`. */
+      personas?: Readonly<Record<string, { email: string; password: string }>> | undefined;
     } = {},
   ): Promise<AuthoredFlow> {
     const trimmed = prompt.trim();
     if (trimmed === '') throw new AuthoringError('prompt is empty — describe the test you want');
+    const personas = extra.personas ?? this.#personas;
+    // A case whose Expected lines are all `[RECORD ONLY]` has no oracle: the
+    // no-assertion and vacuity refusals below stand down for it, and the flow
+    // is handed over as observations marked for a person's review (CG-09).
+    const observeOnly = extra.caseText !== undefined && recordOnlyCase(extra.caseText);
     // The journey capture ranked against THIS row's request. It is per-row
     // evidence already (each case captures its own destination), so unlike the
     // start tree there is no shared prompt prefix to preserve — and a dense
@@ -2202,6 +2476,9 @@ export class FlowAuthor {
           ? { projectContext: extra.projectContext ?? this.#projectContext }
           : {}),
         ...(this.#credentials ? { credentials: this.#credentials } : {}),
+        // Per call first (a catalog row names its own personas), the author-wide
+        // map otherwise. Labels and emails only reach the prompt.
+        ...(personas === undefined ? {} : { personas }),
         ...(journeyTree ? { journeyTree } : {}),
         ...(this.#scope ? { scope: this.#scope } : {}),
         ...(feedback.length > 0 ? { feedback } : {}),
@@ -2264,6 +2541,30 @@ export class FlowAuthor {
           result.notes =
             `${result.notes}${result.notes ? ' ' : ''}wowlidator replaced ${corrected} ` +
             'credential value(s) the model invented with the supplied sign-in password.';
+        }
+      }
+
+      // $0 repair, the same move for a PERSONA the run holds (CG-05, EH-10): a
+      // sign-in the model typed for a known account becomes one `signIn` by
+      // label — the email names the label, so the fix is a lookup, and the
+      // password the model typed (invented or not) leaves the flow file.
+      if (personas !== undefined && Object.keys(personas).length > 0) {
+        const setupFix = groundPersonaSignIns(result.setup ?? [], personas);
+        const bodyFix = groundPersonaSignIns(result.steps, personas);
+        const replaced = setupFix.replaced + bodyFix.replaced;
+        if (replaced > 0) {
+          result.setup = setupFix.steps;
+          result.steps = bodyFix.steps;
+          if (result.cases?.length) {
+            result.cases = result.cases.map((one) => ({ ...one, steps: groundPersonaSignIns(one.steps, personas).steps }));
+          }
+          this.#onLog?.(
+            `replaced ${replaced} typed sign-in block(s) with signIn by persona label — the run holds ` +
+              'those credentials, and a flow file must never carry a password',
+          );
+          result.notes =
+            `${result.notes}${result.notes ? ' ' : ''}wowlidator replaced ${replaced} typed sign-in ` +
+            'block(s) with signIn steps naming the persona label.';
         }
       }
 
@@ -2338,6 +2639,10 @@ export class FlowAuthor {
       const skippedStepComplaints: Violation[] = [];
       if (this.#valueResolution !== undefined && result.steps.length > 0) {
         try {
+          // The parser's pairs when the caller has them, else the described
+          // case's own one-per-line block (CG-02) — either way the resolver
+          // never re-splits a packed `Position = 40106337 Job Code = MKB12.12`.
+          const pairs = extra.testDataPairs ?? testDataPairsOfCaseText(extra.caseText ?? trimmed);
           const ctx: ValueResolutionContext = {
             caseText: extra.caseText ?? trimmed,
             promptText: trimmed,
@@ -2345,6 +2650,10 @@ export class FlowAuthor {
             ...(this.#valueResolution.db === undefined ? {} : { db: this.#valueResolution.db }),
             ...(this.#valueResolution.documents === undefined ? {} : { documents: this.#valueResolution.documents }),
             ...((extra.projectContext ?? this.#projectContext) === undefined ? {} : { projectContext: extra.projectContext ?? this.#projectContext }),
+            ...(pairs.length > 0 ? { testDataPairs: pairs } : {}),
+            ...(extra.caseId === undefined ? {} : { caseId: extra.caseId }),
+            ...(extra.runKey === undefined ? {} : { runKey: extra.runKey }),
+            ...(extra.now === undefined ? {} : { now: extra.now }),
             onLog: (line) => this.#onLog?.(line),
           };
           const outcome = await resolveValues(result.setup ?? [], result.steps, ctx);
@@ -2419,7 +2728,16 @@ export class FlowAuthor {
               'or ground it with --url so it can see the real controls.',
           );
         }
-        if (!hasAssertion(result.steps)) {
+        // A record-only case is the one shape a flow with no assertion is
+        // right to be (CG-09): the sheet asks for values to be READ, not
+        // checked, so the observations ARE the answer, and a manufactured
+        // assertion would be a claim about a value nobody knows.
+        const observed = observeOnly ? observationSteps(result.steps).length : 0;
+        if (observeOnly && observed > 0 && claimsNothing(result.steps)) {
+          const note = `record-only case — the sheet has no oracle; ${observed} observation(s) saved for a person's review`;
+          result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
+          this.#onLog?.(note);
+        } else if (!hasAssertion(result.steps)) {
           refuse(
             `the authored flow "${result.name}" contains no assertion, so it would pass ` +
               'without proving anything. Restate the request in terms of what should be ' +
@@ -2932,6 +3250,123 @@ export class FlowAuthor {
           );
         }
 
+        // Personas (CG-05, EH-10, OA-15): with the run holding the accounts,
+        // a login typed by hand is an invention, a label the run lacks is a
+        // guaranteed failure at the step, and a goal naming two people is a
+        // leg no one session can perform. All fatal — each is a flow that
+        // would report something untrue about the sign-in.
+        if (personas !== undefined && Object.keys(personas).length > 0) {
+          const typed = handTypedPersonaSignIn([...(result.setup ?? []), ...result.steps], personas);
+          if (typed !== null) {
+            refuse(
+              `the authored flow "${result.name}" types a sign-in by hand (step ${typed.index}, value ` +
+                `${JSON.stringify(typed.value)}) although the run holds the personas' credentials. Never fill an ` +
+                'email or a password and never goto the sign-in page: write ONE signIn step with the persona LABEL ' +
+                `in "name" — one of ${Object.keys(personas).join(', ')} — and the harness signs in with the ` +
+                'credentials it holds.',
+            );
+          }
+          const unknown = signInAsUnknownPersona([...(result.setup ?? []), ...result.steps], personas);
+          if (unknown !== null) {
+            refuse(
+              `the authored flow "${result.name}" signs in as ${JSON.stringify(unknown.as)} (step ${unknown.index}), ` +
+                `a persona the run holds no credentials for. The labels available are: ${unknown.available.join(', ')} — ` +
+                'use one of them exactly; when the case needs an account none of them is, say so in "notes" and in ' +
+                "the first affected step's intent instead of inventing one.",
+            );
+          }
+        }
+        const twoPeople = multiPersonaWorkflow(result.steps);
+        if (twoPeople !== null) {
+          refuse(
+            `the authored flow "${result.name}" hands a workflow step (step ${twoPeople.index}) a goal that names ` +
+              `${twoPeople.personas.map((p) => JSON.stringify(p)).join(' and ')} — one session cannot be both people. ` +
+              'Author it as two legs in the same case: the first persona\'s steps, then a signIn step naming the ' +
+              'second label, then that persona\'s own steps (and its assertion); never one goal for both.',
+          );
+        }
+
+        const delta = unmeasuredDeltaClaim(result.steps, extra.caseText ?? trimmed);
+        if (delta !== null) {
+          refuse(
+            `the case's Expected output claims a number MOVES by a stated amount (${JSON.stringify(delta)}), and the ` +
+              'authored flow never measures it. Author it as: saveText (or saveCount) of the very box the line names ' +
+              'BEFORE the action into a variable — the NAME in the step\'s "value" (e.g. before_total_plans) — then, after ' +
+              'the action, expectText/expectCount on the same box carrying {{before_total_plans+1}} (or -1); the ' +
+              'harness computes the arithmetic from the saved reading. The sheet\'s illustrative number is never the value.',
+          );
+        }
+
+        const recordAsserted = assertsRecordOnlyLine(result.steps, extra.caseText ?? trimmed);
+        if (recordAsserted !== null) {
+          refuse(
+            `the authored flow "${result.name}" asserts Expected line ${recordAsserted.line} (step ${recordAsserted.index}), ` +
+              'but that line is marked [RECORD ONLY] — the sheet asks for the value to be READ off the run and sent to ' +
+              `BA/SA, not checked. Replace the assertion with saveText into record_${recordAsserted.line.replace(/\./g, '_')} ` +
+              '(or a snapshot of the region), cite the line in the intent, and assert only the lines that state a value.',
+            {
+              severity: 'weak',
+              note: `Expected line ${recordAsserted.line} is record-only and was asserted at step ${recordAsserted.index}`,
+            },
+          );
+        }
+
+        const hedged = hedgedAlternatives(result.steps, extra.caseText ?? trimmed);
+        if (hedged !== null) {
+          refuse(
+            `the authored flow "${result.name}" uses expectAnyVisible (step ${hedged}) although the case's Expected output ` +
+              'names ONE outcome — no "หรือ", no "or", no กรณี…/กรณี…. Either/or is for a line that accepts alternatives; ' +
+              'on a single stated outcome it is a hedge that passes on the defect. Assert the one outcome the line states ' +
+              'with expectVisible / expectText.',
+            { severity: 'weak', note: `step ${hedged} hedges a single stated outcome with expectAnyVisible` },
+          );
+        }
+
+        const pageWideError = fieldErrorAssertedPageWide(result.steps, extra.caseText ?? trimmed);
+        if (pageWideError !== null) {
+          refuse(
+            `the case says the error belongs to a FIELD (${JSON.stringify(pageWideError)}), and the authored flow "${result.name}" ` +
+              'has no expectFieldError. A page-wide expectText of the message passes when it sits under the wrong field. ' +
+              'Write expectFieldError with the field\'s control as the tree names it in "selector" and the quoted message ' +
+              'in "value" (or empty for "any error here"); one per field for "ทุกช่อง" / "ว่างทีละช่อง".',
+            { severity: 'weak', note: `field-scoped error claim (${pageWideError}) asserted page-wide, no expectFieldError` },
+          );
+        }
+
+        const unbudgeted = unbudgetedStatusWait(result.steps, extra.caseText ?? trimmed);
+        if (unbudgeted !== null) {
+          refuse(
+            `the case waits for the application to finish something (${JSON.stringify(unbudgeted)}), and no check in the ` +
+              `authored flow "${result.name}" declares a wait. Put "timeoutMs" (digits, up to ${MAX_STEP_TIMEOUT_MS}) on the ` +
+              'expectText / expectVisible / expectHidden / expectCount / waitFor / expectModal that checks it — as long as the job ' +
+              'really takes — or the check gives up in seconds and reports a working batch as a defect.',
+            { severity: 'weak', note: `wait-until claim (${unbudgeted}) with no timeoutMs on any check` },
+          );
+        }
+
+        const route = ignoresMenuPath(result.steps, extra.caseText ?? trimmed);
+        if (route !== null) {
+          refuse(
+            route.kind === 'destination'
+              ? `the case names its page outright — Destination: ${route.wanted} — and the authored flow "${result.name}" never ` +
+                'navigates there. After the sign-in, goto that URL (then click the tab the case names) before the first body step.'
+              : `the case gives the route to its page — Menu path: ${route.wanted} — and the authored flow "${result.name}" ` +
+                'neither clicks a crumb of it, navigates, nor hands the leg to a workflow. Reach the page the way the sheet says: ' +
+                'click each crumb in order as the tree names it (a collapsed group by its header first).',
+            { severity: 'weak', note: `the sheet's ${route.kind === 'destination' ? 'Destination' : 'Menu path'} (${route.wanted}) is not followed` },
+          );
+        }
+
+        const forbiddenOption = unassertedForbiddenOption(result.steps, extra.caseText ?? trimmed);
+        if (forbiddenOption !== null) {
+          refuse(
+            `the case says the ${forbiddenOption.field} list must NOT offer ${JSON.stringify(forbiddenOption.name)}, and the ` +
+              `authored flow "${result.name}" never asserts its absence. With the list open once, add expectHidden ` +
+              `role=option[name="${forbiddenOption.name}" i] (never re-click the trigger between checks).`,
+            { severity: 'weak', note: `forbidden option ${forbiddenOption.name} of ${forbiddenOption.field} has no expectHidden` },
+          );
+        }
+
         const unreconciled = unreconciledMatchClaim(result.steps, trimmed);
         if (unreconciled !== null) {
           refuse(
@@ -3195,6 +3630,8 @@ export class FlowAuthor {
       outputTokens: result.outputTokens,
       latencyMs: Date.now() - startedMs,
       ...(review === undefined ? {} : { review }),
+      // Observations only, by the sheet's own request — see `recordOnly`.
+      ...(observeOnly && claimsNothing(result.steps) ? { recordOnly: true } : {}),
     };
   }
 }
@@ -3611,6 +4048,9 @@ const INPUT_ACTIONS: ReadonlySet<string> = new Set([
   'check',
   'uncheck',
   'setValue',
+  // An attached file is data entered (CG-19): "กดแนบเอกสาร (Attach)" is
+  // performed by an upload, not by a click that opens a chooser nobody fills.
+  'upload',
 ]);
 
 /**
@@ -3630,12 +4070,35 @@ const INPUT_ACTIONS: ReadonlySet<string> = new Set([
  * excluded, so a sign-in's own fills never satisfy it and never trip it.
  * A read-only case scripts no input and is never touched.
  */
+/**
+ * A route is not an instruction. "ไปที่เมนู EC > New Hire (Manual Key-in)"
+ * names the page to open, and the word Key-in inside it is the page's NAME —
+ * yet `SCRIPT_DEMANDS_INPUT` read it as "key in" and refused HIR-EC-029
+ * (2026-09-03), a negative enumeration case whose steps are navigate and
+ * verify and whose correct flow types nothing. Route lines (ไปที่/Go to/
+ * Navigate/Menu/เมนู, or a `>` breadcrumb) and parenthesised labels are cut
+ * before the demand words are looked for; a real "กรอก"/"Key-in ..." step
+ * on a line of its own is untouched.
+ */
+function withoutRouteLabels(script: string): string {
+  return script
+    .split('\n')
+    .filter(
+      (line) =>
+        !/^\s*[-•\d.)\s]*(?:ไปที่|ไปยัง|เข้า(?:ไป)?ที่|เปิดเมนู|เมนู|Menu\b|Go to\b|Navigate\b|Open the\b)/i.test(line) &&
+        !/\S\s*>\s*\S/.test(line),
+    )
+    .map((line) => line.replace(/\([^)]*\)/g, ' '))
+    .join('\n');
+}
+
 export function skipsAuthoredScript(
   caseText: string,
   bodySteps: readonly FlowStep[],
 ): { demanded: string; performed: number } | null {
-  const scripted = /Steps:\n([\s\S]*?)(?:\n[A-Z][a-z]+(?: output)?:|$)/.exec(caseText);
-  const script = scripted?.[1] ?? '';
+  // The parser's cut (CG-15): the block used to run on into `Note (from the
+  // sheet):` and `Test data:`, so a Note saying "กด Submit" counted as script.
+  const script = withoutRouteLabels(sectionOf(caseText, 'steps') ?? '');
   if (script.trim() === '') return null;
   const demandedInput = SCRIPT_DEMANDS_INPUT.exec(script);
   if (demandedInput !== null) {
@@ -3732,8 +4195,7 @@ export function unperformedScriptSteps(
   caseText: string,
   steps: readonly FlowStep[],
 ): { performedThrough: number; total: number; missing: { n: number; text: string }[] } | null {
-  const scripted = /Steps:\n([\s\S]*?)(?:\n[A-Z][a-z]+(?: output)?(?: \(from the sheet\))?:|$)/.exec(caseText);
-  const script = scripted?.[1] ?? '';
+  const script = sectionOf(caseText, 'steps') ?? '';
   const numbered: { n: number; text: string }[] = [];
   for (const line of script.split('\n')) {
     const m = /^\s*(\d{1,2})[.)]\s*(.+)$/.exec(line);
@@ -4141,11 +4603,11 @@ export function countPinnedName(
   steps: readonly FlowStep[],
 ): { index: number; name: string } | null {
   for (const [index, step] of steps.entries()) {
-    const selector = (step as { selector?: string }).selector;
-    if (selector === undefined) continue;
-    const named = /\[name\s*=\s*"([^"]*)"/.exec(selector);
-    const name = named?.[1];
-    if (name !== undefined && COUNT_SUFFIX.test(name)) return { index, name };
+    for (const selector of selectorsOf(step)) {
+      const named = /\[name\s*=\s*"([^"]*)"/.exec(selector);
+      const name = named?.[1];
+      if (name !== undefined && COUNT_SUFFIX.test(name)) return { index, name };
+    }
   }
   return null;
 }
@@ -4327,6 +4789,12 @@ export function unpinnedDateEntry(
   if (setup.some((step) => step.action === 'setClock')) return null;
   for (const [index, step] of steps.entries()) {
     if (step.action !== 'fill' && step.action !== 'type') continue;
+    // A date the resolver computed from the run's own day (`Today`, `Hire
+    // Date + 119 Day` → `relative-date`) is pinned by construction: it moves
+    // WITH the window, which is the whole reason the source exists (CG-06).
+    // Without this exemption every converted flow was refused for the very
+    // thing the conversion fixed.
+    if (step.valueSource?.kind === 'relative-date') continue;
     const value = String((step as { value?: unknown }).value ?? '').trim();
     if (ISO_DATE.test(value)) return { index, value };
   }
@@ -4484,29 +4952,34 @@ export function ungroundedTextExpectation(
     const step = steps[i]!;
     // The page after an agent leg was never captured — nothing to ground on.
     if (step.action === 'workflow') return null;
-    if (step.action !== 'expectVisible' && step.action !== 'expectText') continue;
-    const head = (step.selector.split('>>')[0] ?? '').trim();
-    const named =
-      /^role=[a-z]+\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/i.exec(head) ??
-      /^text=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(.+))$/s.exec(head);
-    const text = (named?.[1] ?? named?.[2] ?? named?.[3] ?? '').replace(/\\(.)/g, '$1').trim();
-    if (text === '') continue;
-    const needle = text.toLowerCase();
-    // The sheet's own words ARE the claim — exempt, run it, and an exact-miss
-    // over text the page holds becomes a near-miss needs-review (the right
-    // verdict for a wording dispute), instead of this lint rewriting the
-    // claim into whatever the page renders, which then passes vacuously.
-    if (prompt !== undefined && prompt.toLowerCase().includes(needle)) continue;
-    if (hay.some((n) => n.includes(needle))) continue;
-    // The nearest real renderings: most shared words, ties in tree order.
-    const want = tokens(text);
-    const nearest = names
-      .map((n, at) => ({ n, at, hits: [...tokens(n)].filter((t) => want.has(t)).length }))
-      .filter((c) => c.hits > 0)
-      .sort((a, b) => b.hits - a.hits || a.at - b.at)
-      .slice(0, 3)
-      .map((c) => c.n);
-    return { index: i, text, nearest: [...new Set(nearest)] };
+    if (step.action !== 'expectVisible' && step.action !== 'expectText' && step.action !== 'expectAnyVisible') continue;
+    // Every alternative of an either/or step is a presence claim of its own
+    // (CG-08): a branch quoting the sheet's wording is a branch that can
+    // never be the one shown, and the step then narrows to the other.
+    for (const one of selectorsOf(step)) {
+      const head = (one.split('>>')[0] ?? '').trim();
+      const named =
+        /^role=[a-z]+\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/i.exec(head) ??
+        /^text=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(.+))$/s.exec(head);
+      const text = (named?.[1] ?? named?.[2] ?? named?.[3] ?? '').replace(/\\(.)/g, '$1').trim();
+      if (text === '') continue;
+      const needle = text.toLowerCase();
+      // The sheet's own words ARE the claim — exempt, run it, and an exact-miss
+      // over text the page holds becomes a near-miss needs-review (the right
+      // verdict for a wording dispute), instead of this lint rewriting the
+      // claim into whatever the page renders, which then passes vacuously.
+      if (prompt !== undefined && prompt.toLowerCase().includes(needle)) continue;
+      if (hay.some((n) => n.includes(needle))) continue;
+      // The nearest real renderings: most shared words, ties in tree order.
+      const want = tokens(text);
+      const nearest = names
+        .map((n, at) => ({ n, at, hits: [...tokens(n)].filter((t) => want.has(t)).length }))
+        .filter((c) => c.hits > 0)
+        .sort((a, b) => b.hits - a.hits || a.at - b.at)
+        .slice(0, 3)
+        .map((c) => c.n);
+      return { index: i, text, nearest: [...new Set(nearest)] };
+    }
   }
   return null;
 }
@@ -4540,9 +5013,12 @@ export function ungroundedSelectorRole(
   for (let i = 0; i < steps.length; i += 1) {
     const step = steps[i]!;
     if (step.action === 'workflow') return null; // the page after a leg was never captured
-    if (!('selector' in step) || typeof step.selector !== 'string') continue;
     if (step.action === 'expectHidden' || (step.action === 'expectCount' && (step as { count?: number }).count === 0)) continue;
-    const head = (step.selector.split('>>')[0] ?? '').trim();
+    // An either/or step carries several selectors; each alternative is judged
+    // as a selector of its own (CG-08) — a phantom role in one branch is a
+    // branch that can never be the one shown.
+    for (const one of selectorsOf(step)) {
+    const head = (one.split('>>')[0] ?? '').trim();
     // Three spellings, resolved to one (role, name) pair: the role engine
     // with an optional name, the CSS attribute form anywhere in the head
     // (`main [role="combobox"]`), and a native `select` element.
@@ -4577,6 +5053,7 @@ export function ungroundedSelectorRole(
       ? []
       : lines.filter((l) => l.toLowerCase().includes(needle)).slice(0, 3);
     return { index: i, role, name, nearest, disabled: false };
+    }
   }
   return null;
 }
@@ -4611,11 +5088,16 @@ export function unboundedExclusivityClaim(
   steps: readonly FlowStep[],
   caseText: string,
 ): { claim: string; wanted: number | null } | null {
+  // The Expected block when the case has one (CG-15), with the parser's
+  // `[RECORD ONLY]` marks removed first: "ONLY" inside the mark read as the
+  // exclusivity word and refused every record-only row (HIR-EC-060) for a
+  // closed set it never claimed.
+  const text = (sectionOf(caseText, 'expected') ?? caseText).replace(/\[RECORD ONLY\]/g, '');
   // The numbered form first, wherever it sits: "แสดง 3 ค่า" carries the bound
   // the refusal can name, while "เฉพาะ …" only says there is one.
   const counted_ =
-    /(?:แสดง|มี|shows?|displays?|offers?|lists?|contains?|exactly|มีแค่|เพียง)\s*(\d{1,3})\s*(?:ค่า|รายการ|ตัวเลือก|options?|values?|items?|entries|rows?|choices)/i.exec(caseText);
-  const only_ = /(?:แสดงเฉพาะ|เฉพาะ|only(?: these| the following)?|nothing else|no other|ไม่มีค่าอื่น|เท่านั้น)[^.\n]{0,120}/i.exec(caseText);
+    /(?:แสดง|มี|shows?|displays?|offers?|lists?|contains?|exactly|มีแค่|เพียง)\s*(\d{1,3})\s*(?:ค่า|รายการ|ตัวเลือก|options?|values?|items?|entries|rows?|choices)/i.exec(text);
+  const only_ = /(?:แสดงเฉพาะ|เฉพาะ|only(?: these| the following)?|nothing else|no other|ไม่มีค่าอื่น|เท่านั้น)[^.\n]{0,120}/i.exec(text);
   const m = counted_ ?? only_;
   if (m === null) return null;
   const wanted = counted_ !== null ? Number(counted_[1]) : null;
@@ -4650,7 +5132,8 @@ export function unreconciledMatchClaim(
   const compared = steps.some((step) => {
     if (!step.action.startsWith('expect')) return false;
     const text = JSON.stringify(step);
-    return [...saved].some((name) => text.includes(`{{${name}}}`));
+    // `{{rows}}` or the delta form `{{rows+1}}` — both compare the reading.
+    return [...saved].some((name) => new RegExp(`\\{\\{\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?:[+-]\\s*\\d+)?\\s*\\}\\}`).test(text));
   });
   // A dbSnapshot + expectDbDelta/Unchanged pair is the DB spelling of the
   // same comparison and satisfies the claim too.
@@ -4713,7 +5196,9 @@ export function undefinedVariableRef(
     // is exactly as broken as a name nothing saved, and is the shape this lint
     // was written for.
     for (const m of JSON.stringify(read).matchAll(/\{\{([^}]*)\}\}/g)) {
-      const name = (m[1] ?? '').trim();
+      // `{{before+1}}` reads `before` — the arithmetic is the store's (CG-07),
+      // and the name is what a save must have written.
+      const name = (m[1] ?? '').trim().replace(/\s*[+-]\s*\d+\s*$/, '').trim();
       if (name !== '' && saved.has(name)) continue;
       return { index, name, available: [...saved] };
     }
@@ -4723,9 +5208,29 @@ export function undefinedVariableRef(
 
 export function fixtureFacts(caseText: string): string[] {
   const block = /(?:Test data|TEST DATA|ข้อมูลทดสอบ)\s*:?\s*([\s\S]{0,1200}?)(?=\n\s*(?:Expected|Steps|Note|Menu|Persona|Preconditions)\b|$)/i.exec(caseText)?.[1] ?? '';
+  // A case id is never a fixture (2026-09-03, HIR-EC-029): the case's own
+  // ids (HIR-EC-029, E2E-29) sit in the text, and "ข้อมูลทดสอบเดียวกับ E2E-01
+  // ทุกค่า" — same test data as E2E-01 — is a cross-reference to ANOTHER
+  // case, not a value the tester types. Both were returned as facts, and the
+  // fixture lint refused a flow for naming them. Ids of the catalog's own
+  // shape, and any id that follows a same-as word, are left out; a Plan ID
+  // that happens to be the case id (PL_06_21) is still typed as written by
+  // the rule at the author's prompt, and still a fact here.
+  const referenced = new Set<string>();
+  for (const m of caseText.matchAll(
+    /(?:เดียวกับ|เหมือน(?:กับ)?|ตาม|อ้างอิง|same as|as in|refer(?:s|ring)? to|per|from case|of case)\s+([A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+)/gi,
+  )) {
+    if (m[1]) referenced.add(m[1]);
+  }
+  for (const m of caseText.matchAll(/(?:Test Case ID|Scenario ID|Case|Scenario)\s*:?\s*([A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+)/gi)) {
+    if (m[1]) referenced.add(m[1]);
+  }
+  const caseIdShape = /^(?:E2E|[A-Z]{2,4}-(?:EC|BE|TM|PY|E2E))-\d+$/;
   const ids = new Set<string>();
   for (const m of `${block}\n${caseText}`.matchAll(/\b([A-Z][A-Z0-9]*(?:[_-][A-Za-z0-9]+){1,}|[A-Z]{2,}[-_]\d{2,})\b/g)) {
-    if (m[1] && /\d/.test(m[1])) ids.add(m[1]);
+    if (!m[1] || !/\d/.test(m[1])) continue;
+    if (referenced.has(m[1]) || caseIdShape.test(m[1])) continue;
+    ids.add(m[1]);
   }
   return [...ids];
 }
@@ -4806,11 +5311,99 @@ export function ungroundedCountRole(
  * free-text requests) yield nothing and the lint stays silent.
  */
 export function expectedItemsIn(prompt: string): string[] {
-  const at = prompt.search(/^\s*Expected(?: output)?\s*:/im);
-  if (at === -1) return [];
-  const block = prompt.slice(at).split(/^\s*(?:Note|Test data|Steps|Menu path|Login \/ persona|Preconditions)\b/im)[0] ?? '';
-  const items = [...block.matchAll(/(?:^|\s)(\d+\.\d+)(?=\s)/g)].map((m) => m[1]!);
+  // The parser's own cut (CG-15): every heading `describeCase` writes ends
+  // the block, including the ones this used to run into — `Note (from the
+  // sheet):`, `Option set for …:`, `Rounds (N):`.
+  const block = sectionOf(prompt, 'expected');
+  if (block === null) return [];
+  const items: string[] = [];
+  for (const line of block.split('\n')) {
+    // A record-only line is owed an observation, not an assertion (CG-09) —
+    // the coverage lint must not demand one, and `assertsRecordOnlyLine`
+    // refuses one.
+    if (RECORD_ONLY_MARK.test(line)) continue;
+    // Decimal ids anywhere on the line (`6.1 +1 in Total Plans`), plus a
+    // bare `3.` at the line's head — the EC Hiring / Probation / TM sheets
+    // number their Expected lines `1.` `2.` `3.` (~600 rows), which the
+    // decimal-only read left uncounted.
+    for (const m of line.matchAll(/(?:^|\s)(\d+\.\d+)(?=\s)/g)) items.push(m[1]!);
+    const bare = /^\s*(\d+)\.(?!\d)\s*\S/.exec(line);
+    if (bare !== null) items.push(bare[1]!);
+  }
   return [...new Set(items)];
+}
+
+/** The parser's prefix on an Expected line that is observed, never asserted. */
+const RECORD_ONLY_MARK = /\[RECORD ONLY\]/;
+
+/**
+ * The `[RECORD ONLY]` Expected lines of a described case: their ids (when
+ * numbered) and their text, for the lints that must treat them as
+ * observations (CG-09).
+ */
+export function recordOnlyLines(caseText: string): { no: string | null; text: string }[] {
+  const block = sectionOf(caseText, 'expected');
+  if (block === null) return [];
+  const out: { no: string | null; text: string }[] = [];
+  for (const raw of block.split('\n')) {
+    if (!RECORD_ONLY_MARK.test(raw)) continue;
+    const line = raw.replace(RECORD_ONLY_MARK, '').trim().replace(/^[-•*]\s*/, '');
+    const numbered = /^(\d+(?:\.\d+)*)[.)]?\s+(.*)$/.exec(line);
+    out.push({ no: numbered?.[1] ?? null, text: (numbered?.[2] ?? line).trim() });
+  }
+  return out;
+}
+
+/**
+ * Every Expected line of the case is record-only — the row has no oracle the
+ * browser can contradict (CG-09; HIR-EC-060/085/092/094/095 on the sheet).
+ * The parser's `expectedLines` decides what is record-only; this only asks
+ * whether anything else is left.
+ */
+export function recordOnlyCase(caseText: string): boolean {
+  const block = sectionOf(caseText, 'expected');
+  if (block === null || block.trim() === '') return false;
+  const lines = expectedLines(block.replace(/\[RECORD ONLY\]\s*/g, ''));
+  return lines.length > 0 && lines.every((line) => line.observeOnly);
+}
+
+/**
+ * A body that asserts nothing beyond a visual baseline: `snapshot` records a
+ * region (an observation, CG-09) even though the runner files it among the
+ * assertions, so a record-only case authored as snapshots still claims
+ * nothing about the sheet's Expected output.
+ */
+function claimsNothing(steps: readonly FlowStep[]): boolean {
+  return !hasAssertion(steps.filter((step) => step.action !== 'snapshot'));
+}
+
+/**
+ * An assertion whose only cited Expected line is `[RECORD ONLY]` — the sheet
+ * asked for the value to be READ ("ยังไม่มีคำตอบ ให้รันจริงแล้วบันทึกค่าที่ระบบ
+ * แสดง", "= ? OQ-HIR-91"), and an expect* against a value nobody knows can
+ * only fail, as though the application were wrong (CG-09; 179 rows carry
+ * such a line). `assertsOpenQuestion` catches the id typed into the
+ * assertion; this catches the assertion that cites the line and asserts
+ * something else. Returns the step and the line, or null.
+ */
+export function assertsRecordOnlyLine(
+  steps: readonly FlowStep[],
+  caseText: string,
+): { index: number; line: string } | null {
+  const recordIds = new Set(recordOnlyLines(caseText).map((l) => l.no).filter((n): n is string => n !== null));
+  if (recordIds.size === 0) return null;
+  const assertable = new Set(expectedItemsIn(caseText));
+  for (const [index, step] of steps.entries()) {
+    if (!step.action.startsWith('expect')) continue;
+    const intent = (step as { intent?: unknown }).intent;
+    if (typeof intent !== 'string') continue;
+    const cited = [...intent.matchAll(/(?:^|[^\d.])(\d+(?:\.\d+)?)(?![\d.])/g)].map((m) => m[1]!);
+    const recordCited = cited.filter((id) => recordIds.has(id));
+    if (recordCited.length === 0) continue;
+    if (cited.some((id) => assertable.has(id))) continue;
+    return { index, line: recordCited[0]! };
+  }
+  return null;
 }
 
 /**
@@ -4874,12 +5467,13 @@ export function inventedControlInternals(
 ): { index: number; selector: string; fragment: string } | null {
   for (let i = 0; i < steps.length; i += 1) {
     const step = steps[i]!;
-    const selector = (step as { selector?: string }).selector;
-    if (typeof selector !== 'string' || selector === '') continue;
-    const unquoted = selector.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""');
-    if (/:checked\b/.test(unquoted)) return { index: i, selector, fragment: ':checked' };
-    const element = /(^|[^\w=-])(select|option)(?=$|[^\w-])/.exec(unquoted);
-    if (element !== null) return { index: i, selector, fragment: `<${element[2]}>` };
+    for (const selector of selectorsOf(step)) {
+      if (selector === '') continue;
+      const unquoted = selector.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""');
+      if (/:checked\b/.test(unquoted)) return { index: i, selector, fragment: ':checked' };
+      const element = /(^|[^\w=-])(select|option)(?=$|[^\w-])/.exec(unquoted);
+      if (element !== null) return { index: i, selector, fragment: `<${element[2]}>` };
+    }
   }
   return null;
 }
@@ -5193,6 +5787,15 @@ export function switchesPersona(
       lastGoto = step.url;
       continue;
     }
+    // A `signIn` by label IS an identity (CG-05): a flow that signs in as
+    // MANAGER_ACCOUNT and then HRBP_ACCOUNT switches persona exactly as one
+    // that typed two emails, and is marked e2e for the same reason.
+    if (step.action === 'signIn') {
+      flush();
+      const identity = step.as.trim().toLowerCase();
+      if (identity !== '' && identities[identities.length - 1] !== identity) identities.push(identity);
+      continue;
+    }
     if ((step.action === 'fill' || step.action === 'type') && step.value.trim() !== '') {
       fills.push({ value: step.value.trim(), credential: isCredentialFill(step) });
     }
@@ -5313,4 +5916,384 @@ function originOf(url: string | undefined): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+// --- wave 2 (2026-09-03): the sheet's own shapes, authored honestly ---------
+
+/**
+ * Every selector a step carries — the one `selector`, or an either/or step's
+ * `selectors` (CG-08). The grounding lints read this so an alternative is
+ * judged exactly as a single selector would be.
+ */
+export function selectorsOf(step: FlowStep): string[] {
+  const one = (step as { selector?: unknown }).selector;
+  const many = (step as { selectors?: unknown }).selectors;
+  const out: string[] = [];
+  if (typeof one === 'string') out.push(one);
+  if (Array.isArray(many)) for (const s of many) if (typeof s === 'string') out.push(s);
+  return out;
+}
+
+/**
+ * The Test data pairs as `describeCase` rendered them — one `[phase] Key =
+ * value` per line under `Test data:` (CG-02). The parser already unpacked
+ * `Position = 40106337 Job Code = MKB12.12` and applied every
+ * `ดราฟต์เดิมระบุ` correction; this reads the result back, never re-splits,
+ * and is the resolver's source when the caller has no row to hand.
+ */
+export function testDataPairsOfCaseText(caseText: string): TestDataPair[] {
+  const block = sectionOf(caseText, 'test data');
+  if (block === null) return [];
+  const pairs: TestDataPair[] = [];
+  for (const raw of block.split('\n')) {
+    // A correction line is kept verbatim as prose by the parser; its `=` is
+    // not a pair.
+    if (/ดราฟต์เดิมระบุ/u.test(raw)) continue;
+    const m = /^\s*(?:\[([^\]]+)\]\s*)?([^=\n]+?)\s=\s(.+?)\s*$/.exec(raw);
+    if (m === null) continue;
+    pairs.push({ phase: m[1]?.trim() ?? null, key: m[2]!.trim(), value: m[3]!.trim() });
+  }
+  return pairs;
+}
+
+/**
+ * An Expected block that offers alternatives — "ระบบประมวลผลสำเร็จหรือแสดง
+ * error ตามเงื่อนไข ไม่ crash" (TC_PY_* negatives, 44 rows), "กรณีสร้างสำเร็จ
+ * … / กรณีปฏิเสธ …" (HIR-EC), "A หรือ B", "success or an error". The only
+ * shape `expectAnyVisible` is for.
+ */
+const ALTERNATIVE_CLAIM = /หรือ|\bor\b|\beither\b|กรณี[^\n]{0,120}กรณี/iu;
+
+/**
+ * An `expectAnyVisible` in a flow whose case names ONE outcome (CG-08). The
+ * step exists for either/or lines; used elsewhere it is a hedge — "the page
+ * shows the success message OR anything at all" — and a hedge passes on the
+ * defect. Returns the step's index, or null.
+ */
+export function hedgedAlternatives(steps: readonly FlowStep[], caseText: string): number | null {
+  const block = sectionOf(caseText, 'expected') ?? caseText;
+  if (ALTERNATIVE_CLAIM.test(block)) return null;
+  const at = steps.findIndex((step) => step.action === 'expectAnyVisible');
+  return at === -1 ? null : at;
+}
+
+/**
+ * A delta claim: a number the case says moves by a stated amount —
+ * "จำนวนเพิ่มขึ้น +1 ใน Total Plans" (PL_03_*), "จำนวนรายการค้างลดลง 1 รายการ"
+ * (PRB-EC), "Pending 1D → 2D" (TM quota). The count word and the movement
+ * word within one clause, either order; a bare `-N` glued to a digit or a
+ * word (a date, a range "1-15") is not a delta.
+ */
+const DELTA_CLAIM =
+  /(?:จำนวน|รายการ|count|total|number|balance|pending|used|remaining|quota|plans?|rows?|items?|records?)[^.\n]{0,60}(?:เพิ่มขึ้น|ลดลง|\+\s?\d+|(?<![\w\-/])[-−]\s?\d+(?!\s?[\d/-])|increases?|decreases?|goes (?:up|down))|(?:เพิ่มขึ้น|ลดลง|\+\s?\d+|increases?|decreases?)[^.\n]{0,60}(?:จำนวน|รายการ|count|total|number|balance|pending|used|remaining|plans?|rows?|items?|records?)/iu;
+
+/**
+ * A delta claim the flow never measures (CG-07). "+1 in Total Plans" is
+ * proved by reading the box before, acting, and comparing `{{before+1}}`
+ * after; a presence check of the box, or the sheet's illustrative "76",
+ * passes whether or not it moved — PL_03_07 shipped exactly that green.
+ * Satisfied by a saved reading a later expect compares (delta form or plain),
+ * or by the DB spelling (`dbSnapshot` + `expectDbDelta`). Returns the claim
+ * phrase, or null.
+ */
+export function unmeasuredDeltaClaim(steps: readonly FlowStep[], caseText: string): string | null {
+  const block = sectionOf(caseText, 'expected');
+  if (block === null) return null;
+  const m = DELTA_CLAIM.exec(block.replace(/\[RECORD ONLY\][^\n]*/g, ''));
+  if (m === null) return null;
+  const saved = new Set<string>();
+  for (const step of steps) {
+    if (step.action === 'saveCount' || step.action === 'saveText') saved.add(step.as);
+  }
+  const compared = steps.some((step) => {
+    if (!step.action.startsWith('expect')) return false;
+    const text = JSON.stringify(step);
+    return [...saved].some((name) =>
+      new RegExp(`\\{\\{\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?:[+-]\\s*\\d+)?\\s*\\}\\}`).test(text),
+    );
+  });
+  const dbCompared = steps.some((s) => s.action === 'dbSnapshot') && steps.some((s) => s.action === 'expectDbDelta');
+  return compared || dbCompared ? null : m[0].trim().slice(0, 120);
+}
+
+/**
+ * "ระบบแสดง Error message "…" ด้านล่าง Field X" (PL_06_*, RU_05_*), "error
+ * ใต้ช่องนั้นทันทีเมื่อกด Save" (TC_SSO_*, TC_TAX_*), "ระบบแสดงข้อความที่ช่อง
+ * Personal Grade" (HIR-EC-049): the message belongs to a FIELD.
+ */
+const FIELD_ERROR_CLAIM =
+  /(?:error|ข้อความ(?:เตือน)?|message|validation)[^\n]{0,80}(?:ด้านล่าง(?:สุด)?(?:ของ)?\s*(?:field|ช่อง)|ใต้\s*(?:ช่อง|field)|under(?:neath)?\s+(?:the\s+)?field|below\s+(?:the\s+)?field|ที่ช่อง|แต่ละ\s*field\s*แสดงแยกกัน|per\s+field)/iu;
+
+/**
+ * A field-scoped error claim proved page-wide (EH-12): the case says the
+ * message sits under a named field and the flow has no `expectFieldError` —
+ * an `expectText` of the message passes when it sits under the WRONG field,
+ * which is what those cases exist to catch. Returns the claim line, or null.
+ */
+export function fieldErrorAssertedPageWide(steps: readonly FlowStep[], caseText: string): string | null {
+  const block = sectionOf(caseText, 'expected');
+  if (block === null) return null;
+  const m = FIELD_ERROR_CLAIM.exec(block);
+  if (m === null) return null;
+  if (steps.some((step) => step.action === 'expectFieldError')) return null;
+  return m[0].trim().slice(0, 120);
+}
+
+/**
+ * A claim that is settled only after the application has WORKED for a
+ * while: "สถานะเปลี่ยนเป็น Complete" after Run Payroll (TC_PY_REC_*), import
+ * progress "100%" / "Status = Completed" (PL_10_24), a toast that "หายไป
+ * อัตโนมัติ 5-6 วินาที" (RU_05_02), "ระบบ direct ไปหน้า My Request" (ML_01_*).
+ */
+const WAIT_UNTIL_CLAIM =
+  /สถานะเปลี่ยนเป็น|เปลี่ยนสถานะเป็น|status\s+(?:changes|becomes|turns)\s+to|status\s*=\s*(?:completed|complete|success|done|finished)|100\s?%|ประมวลผลสำเร็จ|(?:ป็อปอัพ|popup|pop-up|toast|warning)[^\n]{0,30}(?:ปิดลง|หายไป)|หายไป(?:อัตโนมัติ|เอง)|auto-?dismiss|disappears?\s+(?:automatically|after|by itself)|direct\s*ไปหน้า|redirect(?:s|ed)?\s+to/iu;
+
+/**
+ * A wait-until claim with no declared wait (EH-07): every check runs at the
+ * fast ladder's few seconds, so a payroll run of minutes can never be awaited
+ * and the step dead-ends with an unrelated heal. The author declares the
+ * wait on the check (`timeoutMs`); this is the guarantee. Returns the claim
+ * phrase when no waitable step carries one, else null.
+ */
+export function unbudgetedStatusWait(steps: readonly FlowStep[], caseText: string): string | null {
+  const block = sectionOf(caseText, 'expected') ?? '';
+  const m = WAIT_UNTIL_CLAIM.exec(block);
+  if (m === null) return null;
+  const declared = steps.some((step) => typeof (step as { timeoutMs?: unknown }).timeoutMs === 'number');
+  return declared ? null : m[0].trim().slice(0, 100);
+}
+
+type PersonaMap = Readonly<Record<string, { email: string; password: string }>>;
+
+/** The label whose email a typed value is, case-insensitively, or null. */
+function personaOfEmail(value: string, personas: PersonaMap): string | null {
+  const wanted = value.trim().toLowerCase();
+  if (wanted === '' || !wanted.includes('@')) return null;
+  for (const [label, account] of Object.entries(personas)) {
+    if (account.email.trim().toLowerCase() === wanted) return label;
+  }
+  return null;
+}
+
+/** Steps that belong to a typed sign-in block, from its first fill to its proof. */
+const LOGIN_BLOCK_STEPS: ReadonlySet<string> = new Set(['fill', 'type', 'click', 'press', 'expectHidden', 'expectUrl', 'waitFor', 'when']);
+
+/**
+ * Replace every sign-in the model typed for a KNOWN persona with one
+ * `signIn` by label (CG-05, EH-10) — the `groundCredentialFills` move: the
+ * fix is unambiguous (the email names the label), so the system applies it,
+ * disclosed, rather than paying a re-ask to be told what a lookup knows.
+ *
+ * A block is the run from a sign-in `goto` (or the first fill of a
+ * segment) through the contiguous fills, the Next/Sign in clicks and the
+ * login proof (`expectHidden`/`expectUrl`), inside one `goto`-delimited
+ * segment; a consent `when` inside it is kept after the signIn, because the
+ * gate may still show. The password fill is dropped with the block — the
+ * engine types the secret it holds. A block whose email matches no persona
+ * is left alone for `handTypedPersonaSignIn` to refuse.
+ */
+export function groundPersonaSignIns(
+  steps: readonly FlowStep[],
+  personas: PersonaMap,
+): { steps: FlowStep[]; replaced: number } {
+  if (Object.keys(personas).length === 0) return { steps: [...steps], replaced: 0 };
+  const out: FlowStep[] = [];
+  let replaced = 0;
+  let i = 0;
+  while (i < steps.length) {
+    const step = steps[i]!;
+    // The block starts at a sign-in goto, or at a fill (the page was the login screen).
+    const startsBlock =
+      (step.action === 'goto' && LOGIN_URL_PATTERN.test(step.url)) || step.action === 'fill' || step.action === 'type';
+    if (!startsBlock) {
+      out.push(step);
+      i += 1;
+      continue;
+    }
+    let end = step.action === 'goto' ? i + 1 : i;
+    while (end < steps.length && LOGIN_BLOCK_STEPS.has(steps[end]!.action)) end += 1;
+    const block = steps.slice(i, end);
+    const emailFill = block.find(
+      (s) => (s.action === 'fill' || s.action === 'type') && personaOfEmail(s.value, personas) !== null,
+    );
+    const label = emailFill === undefined ? null : personaOfEmail((emailFill as { value: string }).value, personas);
+    // The block must be a sign-in that MEANS TO SUCCEED: a persona's email
+    // typed, a credential fill or a sign-in goto around it, and the canonical
+    // login proof (`expectHidden` of the submit) at its tail — the
+    // `groundCredentialValues` gate. A business form that happens to take the
+    // manager's email is not a login, and a negative sign-in case (a wrong
+    // password, an error asserted) is left exactly as written.
+    const isSignIn =
+      label !== null &&
+      (step.action === 'goto' || block.some((s) => (s.action === 'fill' || s.action === 'type') && isCredentialFill(s))) &&
+      block.some((s) => s.action === 'expectHidden');
+    if (!isSignIn) {
+      out.push(step);
+      i += 1;
+      continue;
+    }
+    const url = step.action === 'goto' ? step.url : undefined;
+    out.push({
+      action: 'signIn',
+      as: label,
+      ...(url === undefined ? {} : { url }),
+      intent: `sign in as ${label} — the harness holds the credentials (was a typed sign-in block of ${block.length} step(s))`,
+    });
+    // A consent accept inside the block still belongs right after the sign-in.
+    for (const kept of block) if (kept.action === 'when' && isConsentAccept(kept)) out.push(kept);
+    replaced += 1;
+    i = end;
+  }
+  return { steps: out, replaced };
+}
+
+/**
+ * A sign-in still typed by hand while the run holds personas (CG-05): a
+ * credential fill (`isCredentialFill`), or a fill on a sign-in page, that
+ * `groundPersonaSignIns` could not map to a label — the model invented an
+ * account, or typed a persona's email with a password of its own. Returns
+ * the step's index and the value, or null.
+ */
+export function handTypedPersonaSignIn(
+  steps: readonly FlowStep[],
+  personas: PersonaMap,
+): { index: number; value: string } | null {
+  if (Object.keys(personas).length === 0) return null;
+  // Segments between gotos, the `switchesPersona` cut: a segment that types
+  // a credential AND carries the login proof means to sign in; one that
+  // asserts an error instead is a negative sign-in case and is the author's.
+  let from = 0;
+  const segments: [number, number][] = [];
+  for (const [index, step] of steps.entries()) {
+    if (step.action === 'goto') {
+      segments.push([from, index]);
+      from = index + 1;
+    }
+  }
+  segments.push([from, steps.length]);
+  let lastGoto: string | null = null;
+  for (const [start, end] of segments) {
+    const before = start === 0 ? null : steps[start - 1];
+    if (before !== undefined && before !== null && before.action === 'goto') lastGoto = before.url;
+    const onSignIn = lastGoto !== null && LOGIN_URL_PATTERN.test(lastGoto);
+    const segment = steps.slice(start, end);
+    if (!segment.some((s) => s.action === 'expectHidden')) continue;
+    for (const [offset, step] of segment.entries()) {
+      if (step.action !== 'fill' && step.action !== 'type') continue;
+      if (onSignIn || isCredentialFill(step)) return { index: start + offset, value: step.value };
+    }
+  }
+  return null;
+}
+
+/**
+ * A `signIn` naming a label the run does not hold (CG-05) — `<EMPLOYEE_2>`
+ * invented for CNS-EC-028's second employee, a role word the CLI never
+ * mapped. The run would fail at the step with "persona X has no
+ * credentials"; refusing here names the labels that exist. A literal email
+ * equal to a held persona's is accepted (the engine resolves it). Returns
+ * the step, its label and the labels available, or null.
+ */
+export function signInAsUnknownPersona(
+  steps: readonly FlowStep[],
+  personas: PersonaMap,
+): { index: number; as: string; available: string[] } | null {
+  const labels = Object.keys(personas);
+  if (labels.length === 0) return null;
+  const known = new Set(labels.map((l) => l.toLowerCase()));
+  const emails = new Set(labels.map((l) => personas[l]!.email.toLowerCase()));
+  for (const [index, step] of steps.entries()) {
+    if (step.action !== 'signIn') continue;
+    const as = step.as.trim().toLowerCase();
+    if (known.has(as) || emails.has(as)) continue;
+    return { index, as: step.as, available: labels };
+  }
+  return null;
+}
+
+/**
+ * A workflow goal that names two people (OA-15, author half): "submit as the
+ * employee, then the manager approves". One session cannot be both, so the
+ * agent either stalls on the sign-in page or is refused a finish; the
+ * authored form is two legs with a `signIn` between them. The reading is the
+ * agent guard's own (`multiPersonaGoal`), so the author refuses exactly what
+ * the agent would. Returns the step and the personas named, or null.
+ */
+export function multiPersonaWorkflow(
+  steps: readonly FlowStep[],
+): { index: number; personas: string[] } | null {
+  for (const [index, step] of steps.entries()) {
+    if (step.action !== 'workflow') continue;
+    const personas = multiPersonaGoal(step.goal);
+    if (personas !== null) return { index, personas };
+  }
+  return null;
+}
+
+/**
+ * The sheet's route to the page, ignored (CG-11). A row with `Destination:
+ * <url> (tab "X")` (every PY row) must goto that URL; a row with `Menu path:
+ * A > B > C` (1,218 rows) must click a crumb, goto a page, or hand the leg
+ * to a workflow that names one — a flow that reaches the page some other
+ * way, or never reaches it, tests a page the sheet did not name. Returns
+ * what the sheet asked for, or null when the flow honours it or the sheet
+ * gives no route.
+ */
+export function ignoresMenuPath(
+  steps: readonly FlowStep[],
+  caseText: string,
+): { kind: 'destination' | 'menu'; wanted: string } | null {
+  const destination = /^\s*Destination:\s*(https?:\/\/\S+)/im.exec(caseText)?.[1];
+  const text = JSON.stringify(steps).toLowerCase();
+  if (destination !== undefined) {
+    let path: string;
+    try {
+      path = new URL(destination).pathname.replace(/\/+$/, '');
+    } catch {
+      path = destination;
+    }
+    const reached = steps.some(
+      (step) =>
+        (step.action === 'goto' && (step.url.includes(path) || destination.includes(step.url))) ||
+        (step.action === 'workflow' && step.goal.toLowerCase().includes(path.toLowerCase())),
+    );
+    return reached ? null : { kind: 'destination', wanted: destination };
+  }
+  const menu = /^\s*Menu path:\s*(.+)$/im.exec(caseText)?.[1];
+  if (menu === undefined) return null;
+  const crumbs = menu
+    .split(/\s*>\s*/)
+    .map((c) => c.replace(/\s*\([^)]*\)\s*$/, '').trim().toLowerCase())
+    .filter((c) => c.length >= 2);
+  if (crumbs.length === 0) return null;
+  const named = crumbs.some((crumb) => text.includes(crumb.replace(/"/g, '\\"')));
+  if (named) return null;
+  // A flow that navigates by URL or hands the journey to the agent has a
+  // route of its own; only a flow that does neither has ignored the sheet's.
+  const travels = steps.some((step) => step.action === 'goto' || step.action === 'workflow');
+  return travels ? null : { kind: 'menu', wanted: menu.trim() };
+}
+
+/**
+ * An option set's forbidden names the flow never asserts absent (CG-14):
+ * "ไม่มี RE_REHIRE_GE1 และไม่มี RE_REHIRE_LT1" (HIR-EC-027) is a claim about
+ * two names NOT being offered, and only an `expectHidden` of each can fail
+ * when one appears. Returns the first unasserted name, or null.
+ */
+export function unassertedForbiddenOption(
+  steps: readonly FlowStep[],
+  caseText: string,
+): { field: string; name: string } | null {
+  const block = sectionOf(caseText, 'expected');
+  if (block === null) return null;
+  const hidden = steps
+    .filter((step) => step.action === 'expectHidden')
+    .map((step) => JSON.stringify(step).toLowerCase());
+  for (const set of optionSetsIn(block.replace(/\[RECORD ONLY\]\s*/g, ''))) {
+    for (const name of set.forbidden) {
+      if (hidden.some((line) => line.includes(name.toLowerCase()))) continue;
+      return { field: set.field, name };
+    }
+  }
+  return null;
 }

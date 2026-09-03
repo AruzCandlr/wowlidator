@@ -9,7 +9,7 @@
  */
 
 import type { LanguageModel } from 'ai';
-import type { Page } from 'playwright';
+import type { CDPSession, Page } from 'playwright';
 import { z } from 'zod';
 
 import { CacheManager, type HealedSelectorEntry } from '../cache/cache-manager.js';
@@ -120,6 +120,14 @@ export interface HealRequest {
    * a five-second timeout to arrive exactly where it started.
    */
   rejected?: readonly string[] | undefined;
+  /**
+   * The value the step is trying to put in, for `fill`/`type`/`selectOption`
+   * (EH-13, 2026-09-03). Without it the model proposed a static text that
+   * merely mentioned the value; with it the prompt says the replacement must
+   * be the control that TAKES the value. Absent for every other action, so
+   * prompts for those are byte-identical to what they were.
+   */
+  entry?: string | undefined;
 }
 
 /** Pluggable model backend, so tests can inject a deterministic stub. */
@@ -231,6 +239,16 @@ Returning the selector that just failed is never an answer. If nothing in the
 tree can serve the intent, say so with a low confidence rather than repeating
 it.
 
+Two idioms this application family uses, and how they appear in the tree:
+- A custom select is a \`button "<Label>" value="<chosen>"\` (it has a popup;
+  the value is what it currently shows). For an action that CHOOSES a value,
+  propose that BUTTON. Its options are not in the tree while it is closed and
+  must never be proposed; a \`role=option\` selector cannot be repaired here.
+- A read-only textbox named by its placeholder (\`textbox "Select date" readonly\`)
+  is a display shell over the real input. Propose the editable
+  \`textbox "<Field label>"\` beside it, never the shell.
+- A required field is marked \`required\` in the tree — an asterisk on the page.
+
 ${DETERMINISM_RULES}
 
 ${procedure('HOW TO CHOOSE THE REPLACEMENT', [
@@ -298,6 +316,33 @@ export class HealUnavailableError extends Error {
   }
 }
 
+/** Actions that put a value into a control — the ones `HealRequest.entry` speaks for. */
+const ENTRY_ACTIONS: ReadonlySet<string> = new Set(['fill', 'type', 'selectOption', 'fillRetry', 'paste']);
+
+/**
+ * Actions whose target need not be visible for the repair to be right: a
+ * count may include hidden items, and an absence claim is about hidden-ness
+ * itself. Every other action acts on or reads a visible element, so a heal
+ * that resolves only hidden ones (a portal option of a closed list, a control
+ * in a collapsed section) is not a repair — the runner's re-run at the
+ * healed timeout then fails and deletes the entry, 5 s verify + 10 s run
+ * wasted (EH-13, 2026-09-03).
+ */
+const HIDDEN_OK_ACTIONS: ReadonlySet<string> = new Set(['expectCount', 'saveCount', 'expectHidden', 'expectAttribute']);
+
+/**
+ * Actions that act on the element and so need Playwright's own visibility
+ * (a non-empty box, nothing hiding it). A presence or read step is held to
+ * the weaker "rendered" bar: an EMPTY container proposed for an `expectText`
+ * that is still waiting on its XHR is a legitimate repair (tests/api.test.ts
+ * "still heals normally when the failing request is an ordinary 4xx"), while
+ * a `display: none` one — a closed list's option, a collapsed section's
+ * control — is not.
+ */
+const ACTING_ACTIONS: ReadonlySet<string> = new Set([
+  'click', 'fill', 'type', 'paste', 'selectOption', 'check', 'uncheck', 'press', 'scrollTo', 'fillRetry', 'upload',
+]);
+
 /** Whether two selectors are the same repair, ignoring case-flag and spacing noise. */
 function sameSelector(a: string, b: string): boolean {
   const normal = (value: string) =>
@@ -339,6 +384,12 @@ export function buildUserPrompt(request: HealRequest, hints?: HealHints): string
         'counted — a group, not one element. The "identify one element" rule does ' +
         'not apply here. Propose the selector for the repeated items themselves ' +
         '(e.g. the buttons inside the group container the tree shows).',
+    );
+  }
+  if (request.entry !== undefined && ENTRY_ACTIONS.has(request.action)) {
+    lines.push(
+      `This step ENTERS a value (${JSON.stringify(request.entry)}): the replacement must be ` +
+        'the control that takes it — a textbox, a select button, a combobox — never a static text.',
     );
   }
   // The tree ranked against what the step was trying to do, not just capped
@@ -465,6 +516,8 @@ interface CdpAxNode {
   description?: CdpAxValue;
   value?: CdpAxValue;
   properties?: CdpAxProperty[];
+  /** The DOM node behind this AX node — what `DOM.resolveNode` takes. */
+  backendDOMNodeId?: number;
 }
 
 interface CdpAxTreeResponse {
@@ -561,6 +614,15 @@ export interface AxNode {
    */
   readonly?: boolean | undefined;
   /**
+   * The control must be filled before the form submits — CDP's `required`
+   * property (`aria-required` or the attribute). Surfaced (OA-6, 2026-09-03)
+   * because ~300 rows say "กรอกข้อมูล Mandatory อื่นให้ครบถ้วน" and delegate
+   * the required set to the tester's eyes; without it the agent could not
+   * tell an asterisked field from an optional one. Optional so hand-built
+   * nodes and older captures keep their shape.
+   */
+  required?: boolean | undefined;
+  /**
    * Where a link points, when Chrome reports one.
    *
    * Captured because it is the difference between a generated navigation
@@ -588,6 +650,7 @@ export async function captureAxNodes(
     const tree = (await session.send('Accessibility.getFullAXTree')) as unknown as CdpAxTreeResponse;
 
     const nodes: AxNode[] = [];
+    let popupReads = 0;
     for (const node of tree.nodes ?? []) {
       if (nodes.length >= maxNodes) break;
       if (node.ignored) continue;
@@ -598,14 +661,36 @@ export async function captureAxNodes(
       const name = asText(node.name);
       if (!name && !INTERACTIVE_ROLES.has(role)) continue;
 
+      let value = asText(node.value);
+      // **A popup button's visible text is its value.** A hand-rolled select
+      // (`button[aria-haspopup=listbox]` named by its label, showing the
+      // chosen option as its text) reaches the tree as `button "Gender"` and
+      // nothing more: the label is the name, and a button has no value. So
+      // the agent could not see what was selected, and the goal-evidence check
+      // refused a finish the page had earned — Gender WAS "Female" (ec10
+      // HIR-EC-002, 2026-09-02, both legs). One DOM read per such button,
+      // bounded, so the tree reads `button "Gender" value="Female"`.
+      if (
+        value === '' &&
+        role === 'button' &&
+        node.backendDOMNodeId !== undefined &&
+        popupReads < MAX_POPUP_VALUE_READS &&
+        propertyText(node, 'hasPopup') !== '' &&
+        propertyText(node, 'hasPopup') !== 'false'
+      ) {
+        popupReads += 1;
+        value = await popupButtonText(session, node.backendDOMNodeId);
+      }
+
       nodes.push({
         role,
         name,
-        value: asText(node.value),
+        value,
         description: asText(node.description),
         disabled: propertyFlag(node, 'disabled'),
         checked: propertyFlag(node, 'checked'),
         ...(propertyFlag(node, 'readonly') ? { readonly: true } : {}),
+        ...(propertyFlag(node, 'required') ? { required: true } : {}),
         url: propertyText(node, 'url'),
       });
     }
@@ -613,6 +698,33 @@ export async function captureAxNodes(
     return nodes;
   } finally {
     await session.detach().catch(() => undefined);
+  }
+}
+
+/** How many popup buttons one capture will read the DOM for — a bound on CDP round trips, not a feature. */
+const MAX_POPUP_VALUE_READS = 60;
+
+/**
+ * The visible text of the DOM node behind an AX node, trimmed of the caret
+ * glyph a select draws after its value. Empty when the read fails for any
+ * reason: a value the tree cannot show is what it showed before.
+ */
+async function popupButtonText(session: CDPSession, backendNodeId: number): Promise<string> {
+  try {
+    const { object } = (await session.send('DOM.resolveNode', { backendNodeId })) as unknown as {
+      object: { objectId?: string };
+    };
+    if (object.objectId === undefined) return '';
+    const { result } = (await session.send('Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration:
+        'function () { return String(this.innerText || this.textContent || "").replace(/[\\u25BE\\u25BC\\u2304\\u02C5]/g, " ").replace(/\\s+/g, " ").trim().slice(0, 120); }',
+      returnByValue: true,
+    })) as unknown as { result: { value?: unknown } };
+    await session.send('Runtime.releaseObject', { objectId: object.objectId }).catch(() => undefined);
+    return typeof result.value === 'string' ? result.value : '';
+  } catch {
+    return '';
   }
 }
 
@@ -631,6 +743,9 @@ export function formatAxNode(node: AxNode): string {
   // Printed so a reader of the tree — model or lint — can tell the shell from
   // the input: `textbox "Select date" readonly` beside `textbox "Hire Date"`.
   if (node.readonly) parts.push('readonly');
+  // An asterisked field, as the tree can say it — what a "fill every
+  // mandatory field" goal works down.
+  if (node.required) parts.push('required');
   return parts.join(' ');
 }
 
@@ -664,6 +779,8 @@ export interface HealInput {
   failureReason?: string | undefined;
   /** The test case the step serves, passed straight through to `HealRequest`. */
   caseContext?: string | undefined;
+  /** The value an entry step is putting in, passed straight through to `HealRequest.entry`. */
+  entry?: string | undefined;
 }
 
 export class JitHealer {
@@ -740,6 +857,7 @@ export class JitHealer {
           interactions,
           failureReason: input.failureReason,
           rejected,
+          ...(input.entry === undefined ? {} : { entry: input.entry }),
         });
       } catch (error) {
         // The model never answered — a provider fact, not a page fact. Typed
@@ -800,7 +918,12 @@ export class JitHealer {
       }
 
       try {
-        await this.#verify(input.page, candidate, input.action === 'expectCount');
+        await this.#verify(
+          input.page,
+          candidate,
+          input.action === 'expectCount',
+          HIDDEN_OK_ACTIONS.has(input.action) ? 'attached' : ACTING_ACTIONS.has(input.action) ? 'visible' : 'rendered',
+        );
         break;
       } catch (error) {
         const why = error instanceof Error ? error.message : String(error);
@@ -833,7 +956,12 @@ export class JitHealer {
    * made healing a count selector structurally impossible (PB-02-01's radio
    * count could never be repaired, whatever the model proposed).
    */
-  async #verify(page: Page, selector: string, countable: boolean): Promise<void> {
+  async #verify(
+    page: Page,
+    selector: string,
+    countable: boolean,
+    need: 'attached' | 'rendered' | 'visible' = 'visible',
+  ): Promise<void> {
     let count: number;
     try {
       await page.locator(selector).first().waitFor({
@@ -848,6 +976,31 @@ export class JitHealer {
 
     if (count > 1 && !countable) {
       throw new Error(`healed selector "${selector}" is ambiguous — matched ${count} elements`);
+    }
+    // Attached is not enough for a step that clicks, fills or reads: a
+    // hidden-only match passes here and fails the re-run at the healed
+    // timeout. Say so now, so the re-ask knows the candidate is off-screen.
+    if (need === 'attached') return;
+    let shown = 0;
+    if (need === 'visible') {
+      shown = await page.locator(selector).filter({ visible: true }).count().catch(() => 0);
+    } else {
+      // Rendered: not under `display: none` / `visibility: hidden` / `hidden`,
+      // an empty box allowed. `checkVisibility` is exactly that question.
+      const flags = await page
+        .locator(selector)
+        .evaluateAll((els) =>
+          (els as unknown as { checkVisibility?: (o: { visibilityProperty: boolean }) => boolean; getClientRects(): ArrayLike<unknown> }[]).map(
+            (el) => (typeof el.checkVisibility === 'function' ? el.checkVisibility({ visibilityProperty: true }) : el.getClientRects().length > 0),
+          ),
+        )
+        .catch(() => [] as boolean[]);
+      shown = flags.filter(Boolean).length;
+    }
+    if (shown === 0) {
+      throw new Error(
+        `healed selector "${selector}" matched ${count} element(s), none visible — a hidden control cannot serve this step`,
+      );
     }
   }
 }

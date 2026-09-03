@@ -13,17 +13,44 @@
  * interface is what lets the whole thing be tested without a network.
  */
 
+import { createHash } from 'node:crypto';
+
 import type { LanguageModel } from 'ai';
-import type { Page } from 'playwright';
+import type { Locator, Page } from 'playwright';
 import { z } from 'zod';
 
 import { lenientObject } from '../providers/model-output.js';
 
 import { SELECTOR_SYNTAX_RULES, captureAxNodes } from '../healer/jit-healer.js';
-import { CONSENT_ACCEPT_NAME, CONSENT_GATE_URL_PATTERN, acceptConsentGateAnywhere, consentGateShowing } from '../engine/sign-in.js';
+import {
+  CONSENT_ACCEPT_NAME,
+  CONSENT_GATE_URL_PATTERN,
+  acceptConsentGateAnywhere,
+  consentGateShowing,
+  performSignOut,
+} from '../engine/sign-in.js';
+import { revealHidden } from '../engine/reveal.js';
+import { selectFromListbox } from '../engine/listbox.js';
+import { isoDateOf } from '../engine/dates.js';
 import { scopeUrl, type CacheManager } from '../cache/cache-manager.js';
 import type { AxNode } from '../healer/jit-healer.js';
-import { decisionKey, focusTree, goalAlreadyShowing, renderTree, repeatedToggleClick, selectorGrounded, selectorName, unscopedDestructiveClick } from './agent-guards.js';
+import {
+  decisionKey,
+  focusTree,
+  formGaps,
+  formatFormGaps,
+  goalAlreadyShowing,
+  menuNodeScore,
+  menuPathOf,
+  multiPersonaGoal,
+  multiPersonaSummary,
+  renderTree,
+  repeatedToggleClick,
+  selectorGrounded,
+  selectorName,
+  unscopedDestructiveClick,
+  type MenuSegment,
+} from './agent-guards.js';
 import { normaliseAgentSelector } from '../engine/selector.js';
 import {
   LlmFactory,
@@ -32,13 +59,18 @@ import {
 } from '../providers/llm-factory.js';
 import type { AgentAction, AgentRecord } from '../engine/proof-bundle.js';
 import {
+  anyValueAppears,
   atGoalDestination,
+  describeOutcomes,
   destinationReached,
-  goalCitedValue,
+  foldValue,
+  goalCitedValues,
   goalDestination,
-  goalOutcome,
-  outcomeShown,
+  goalOutcomes,
+  outcomesShown,
+  urlMoveNote,
   valueAppearsAnywhere,
+  wizardStepHint,
 } from './goal-evidence.js';
 import { DETERMINISM_RULES, procedure } from '../providers/prompt-discipline.js';
 
@@ -158,7 +190,16 @@ export function agentEarlyStopDefault(env: NodeJS.ProcessEnv = process.env): boo
  * to look again, was told it already had, asked once more, and the run was
  * recorded as a harness error with the goal's control on screen.
  */
-export const IDLE_ACTIONS: ReadonlySet<string> = new Set(['wait', 'scroll', 'read']);
+export const IDLE_ACTIONS: ReadonlySet<string> = new Set(['wait', 'scroll', 'read', 'save']);
+/**
+ * How many times per leg an ok `scroll`/`wait` that CHANGED the full tree is
+ * credited as progress (OA-10, 2026-09-03). A lazily-rendered employee list
+ * (87k rows on humi, 20 more per scroll) needs more than five looks, and the
+ * prompt already tells the model "a page whose tree did not change after a
+ * scroll is finished" — the loop just never measured it. Bounded at three
+ * no-progress budgets so an infinite feed still ends the leg.
+ */
+export const AGENT_TREE_CHANGE_CREDITS = AGENT_NO_PROGRESS_TURNS * 3;
 /**
  * The actions that actually ENGAGE a control the goal is about — the thing a
  * leg is trying to reach. A leg that never lands one of these has found
@@ -178,6 +219,10 @@ export const INTERACTION_ACTIONS: ReadonlySet<string> = new Set([
   'type',
   'paste',
   'selectOption',
+  // Ending the session engages the app's own sign-out control (OA-15): it is
+  // a page-changing act, never a look, and never available to a reveal or
+  // read-only run.
+  'signOut',
 ]);
 /** Everything a `readOnly` run may do: look, look again, and answer. */
 export const READ_ONLY_ACTIONS: ReadonlySet<string> = new Set([...IDLE_ACTIONS, 'finish', 'fail']);
@@ -215,6 +260,13 @@ export const REVEAL_ACTIONS: ReadonlySet<string> = new Set([
  * otherwise be a no-op.
  */
 export const WAIT_SETTLE_MS = 750;
+/**
+ * The beat a look (scroll/wait) is given before the progress judge asks
+ * whether it rendered more (OA-10): a scroll listener fires on the NEXT
+ * frame, after `scrollBy` returned — measured ~50 ms — and an immediate
+ * capture would read the tree before the rows it triggered exist.
+ */
+export const LOOK_SETTLE_MS = 100;
 
 function envMaxSteps(): number | null {
   const raw = process.env['WOWLIDATOR_AGENT_MAX_STEPS'];
@@ -223,6 +275,18 @@ function envMaxSteps(): number | null {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 export const DEFAULT_AGENT_MAX_NODES = 60;
+/**
+ * The prompt's node budget for a FORM-shaped goal (OA-3, 2026-09-03): three
+ * or more `set X = Y` outcomes, or wording about every required/mandatory/
+ * asterisked field. A hire form's tree is well over sixty nodes, and the
+ * focused tree cut the very controls the goal named. Applies only when the
+ * instance runs on the default budget — a caller that set its own keeps it.
+ */
+export const FORM_AGENT_MAX_NODES = 120;
+/** How much of a `read`/`save` observation rides the record (OA-14; was 120 on the history line only). */
+export const READ_OBSERVATION_CHARS = 600;
+/** The DONE ledger's size cap in the prompt (OA-7). */
+export const DONE_LEDGER_CHARS = 700;
 /** Per-action timeout while the agent holds the browser. */
 export const DEFAULT_AGENT_ACTION_TIMEOUT_MS = 5_000;
 /**
@@ -288,6 +352,18 @@ export const AGENT_ACTIONS = [
   // out, and the repeat guard stalled the leg. Looking is cheaper than
   // re-acting, and an observation in the record is evidence a claim is not.
   'read',
+  // Remember a value the page shows, under a name later steps can use as
+  // `{{name}}` (OA-8, 2026-09-03). ~200 rows say "บันทึก Employee ID ที่ระบบ
+  // สร้าง" and then search by it two cases later; the generated id appears
+  // on a page no authoring-time tree ever saw, so `saveText` could not be
+  // grounded by the author — only the agent standing on that page can read
+  // it. Idle: never progress, never a stall, and allowed to a read-only run,
+  // because reading a value changes nothing.
+  'save',
+  // End the current session through the app's own sign-out control (OA-15):
+  // the only way a goal that continues as another person can proceed. An
+  // interaction, never a look; excluded from the reveal and read-only sets.
+  'signOut',
   'finish',
   'fail',
 ] as const;
@@ -309,14 +385,14 @@ const DecisionSchema = lenientObject({
   selector: z
     .string()
     .describe(
-      'Playwright selector for click/fill/type/check/uncheck/selectOption/press/hover, or the element to scroll into view. ' +
+      'Playwright selector for click/fill/type/paste/check/uncheck/selectOption/press/hover/read/save, or the element to scroll into view. ' +
         'For dbCount: the database table name (schema-qualified if shown that way). Empty otherwise.',
     ),
   value: z
     .string()
     .describe(
-      'Text for fill/type, the option\'s VISIBLE LABEL for selectOption, key name for press (Enter, Escape, Tab, ArrowDown). ' +
-        'check/uncheck take no value. ' +
+      'Text for fill/type/paste, the option\'s VISIBLE LABEL for selectOption, key name for press (Enter, Escape, Tab, ArrowDown), ' +
+        'the VARIABLE NAME for save. check/uncheck/signOut take no value. ' +
         'For dbCount: the where clause as "column=value, column2=value2" equality pairs, or empty to count the whole table. Empty otherwise.',
     ),
   url: z.string().describe('Absolute URL for goto. Empty otherwise.'),
@@ -343,6 +419,18 @@ export interface AgentObservation {
   caseContext?: string | undefined;
   /** What has been tried so far, and how it went. */
   history: string[];
+  /**
+   * `REQUIRED AND STILL EMPTY (N): …` — the required controls the full tree
+   * shows unfilled (OA-6), rendered right after the tree. A separate field,
+   * never tree text: settlement and the value-hunt judge read the tree.
+   */
+  formGaps?: string | undefined;
+  /**
+   * `DONE so far (N actions): fill Bank="Kasikorn" · …` — the ok interactions
+   * of the whole leg, one entry per control, in place of the elision line
+   * (OA-7). Built from `actions`, never from history strings.
+   */
+  ledger?: string | undefined;
   stepsRemaining: number;
   /**
    * Why the model's previous answer for THIS turn was refused, when it was —
@@ -435,6 +523,12 @@ Each turn you see the current URL, the page's accessibility tree, and what you h
 - type   — type into a field key by key, firing real keyboard events. Selector
            plus "value". Use INSTEAD of fill only for a field that reacts per
            keystroke: autocomplete, typeahead, a masked input.
+- paste  — insert the whole value at once, as a paste does. Selector plus
+           "value". The last way into a control that refuses both fill and
+           type: a date field, a masked input, a rich editor. A DATE goes in as
+           YYYY-MM-DD; a read-only date display is redirected to the real date
+           input beside it for you, so name the field by its label and paste
+           the ISO date.
 - check / uncheck — tick or untick a checkbox, radio, or ARIA toggle. Selector
            only, no value. Prefer these over click when the point is the
            resulting state — they confirm it actually changed.
@@ -460,12 +554,18 @@ Each turn you see the current URL, the page's accessibility tree, and what you h
 - goto   — navigate directly. Absolute URL in "url".
 - read   — report a control's CURRENT state (its value, whether it is checked,
            expanded, disabled) without touching it. Selector in "selector".
-A tree line ending in "readonly" is a DISPLAY, not an input: writing into it changes nothing. Its
-real input is beside it, named by the field's label (textbox "Hire Date" next to textbox "Select date"
-readonly) — fill or paste into THAT, and give a date input its value as YYYY-MM-DD.
            Use it to learn whether a choice has taken BEFORE deciding to click
            again, and before you finish: a finish is checked against what the
-           page shows, not against what you did.
+           page shows, not against what you did. When the goal says record /
+           บันทึกค่า / note what the system shows, read each named control,
+           then finish quoting the observed values — they ride into the record.
+- save   — remember a value the page shows for later steps. Selector of the
+           node showing the value; the VARIABLE NAME in "value" — the goal
+           tells you the name ("save the generated Employee ID as
+           EMPLOYEE_ID"). Later steps use it as {{EMPLOYEE_ID}}.
+- signOut — end the current session through the app's own sign-out control,
+           when the goal says to continue as another person; the sign-in
+           form then appears. No selector, no value.
 - finish — the goal is met. Explain how you know in "reasoning", quoting the
            tree line that shows the end state — never "the click succeeded".
 - fail   — the goal cannot be reached from here. Explain why.
@@ -524,7 +624,42 @@ Rules:
   is an error — and say which in "reasoning".
 - When the tree says it is TRUNCATED, absence from it is not absence from the
   page: scroll or navigate toward where the goal's control would be before
-  concluding it is missing.`;
+  concluding it is missing.
+- A dropdown the tree lists as a BUTTON with a value (button "Gender"
+  value="Select Gender") is a custom select: selectOption on
+  role=button[name="Gender" i] — never role=combobox, which is not in the
+  tree. Its value= is the CURRENT selection: when it already shows the option
+  the goal wants, that part of the goal is done — do not select it again.
+- A field the goal names that is NOT in the tree may sit inside a collapsed
+  section: the tree shows the section's header (button "Personal
+  Information*") with an "Expand" button beside it, or an "Expand all". Act on
+  the field by its label anyway (selectOption role=button[name="Gender" i]) —
+  the harness opens the section for you — or click the section's own header
+  first. Never conclude the field is missing while a section is collapsed.
+- A tree line ending in "readonly" is a DISPLAY, not an input: writing into it
+  changes nothing. Its real input is beside it, named by the field's label
+  (textbox "Hire Date" next to textbox "Select date" readonly) — fill or paste
+  into THAT, and give a date input its value as YYYY-MM-DD. A date field shown
+  as a BUTTON (button "Start Date" that opens a calendar dialog) is a picker:
+  click it, then use the dialog's month/year controls and click the day button
+  (its name is the day number); paste YYYY-MM-DD instead only if the dialog
+  offers a textbox.
+- When the goal says every required / mandatory / asterisked field (ครบ,
+  ดอกจัน): work down the REQUIRED AND STILL EMPTY list under the tree, one
+  control per turn, with a plausible value for its label (a name, a phone, a
+  13-digit ID, an amount, the first option of a dropdown). Finish when that
+  list is empty and the values the goal names are shown.
+- To find one row in a long table, use the table's search or filter textbox
+  (fill it, then wait) or the pager BEFORE scrolling. Scroll only when rows
+  render lazily and each scroll shows new rows; the history says when a look
+  rendered more.
+- On a wizard (Step N of M / ขั้นตอนที่ N จาก M), fill the CURRENT step's fields
+  the goal names, then click Next/ถัดไป; do not re-open section headers to
+  find a field that belongs to the next step. A goal that says "stay on
+  /path" is satisfied on any step of that path (?step=2 is the same page).
+- Every "set X = Y" the goal names is checked on the page when you finish: a
+  finish is refused naming the pairs the page does not show. Set each one,
+  and read a dropdown's value= before you finish.`;
 
 export function buildUserPrompt(observation: AgentObservation): string {
   // The budget is deliberately NOT shown. It is the one input that changes
@@ -550,6 +685,9 @@ export function buildUserPrompt(observation: AgentObservation): string {
     );
   }
   lines.push('', 'Accessibility tree:', observation.axTree);
+  // The form's state, summarised (OA-6): between the tree and the URL, so the
+  // stable-first ordering holds — it changes only when the page does.
+  if (observation.formGaps) lines.push(observation.formGaps);
   lines.push('', `Current URL: ${observation.url}`);
   if (observation.history.length > 0) {
     // Late turns do not need the verbatim log of every early action — the last
@@ -561,7 +699,12 @@ export function buildUserPrompt(observation: AgentObservation): string {
     const history = observation.history;
     lines.push('', 'What you have tried:');
     if (history.length > MAX_HISTORY_LINES) {
-      lines.push(`  - (${history.length - MAX_HISTORY_LINES} earlier action(s) elided)`);
+      // The elided actions used to vanish into a count, and on a 30-field
+      // form the model refilled what it could no longer see (OA-7, HIR-EC-002
+      // leg 12: 18 turns, section headers re-opened, dropdowns re-picked).
+      // The ledger names every control already done, once, in the line the
+      // count occupied.
+      lines.push(`  - ${observation.ledger ?? `(${history.length - MAX_HISTORY_LINES} earlier action(s) elided)`}`);
     }
     for (const entry of history.slice(-MAX_HISTORY_LINES)) lines.push(`  - ${entry}`);
   }
@@ -729,6 +872,13 @@ export interface RunOptions {
    * advice to verify through the page instead.
    */
   dbProbe?: AgentDbProbe | undefined;
+  /**
+   * Where a `save` action puts the value it read (OA-8): the runner wires
+   * this to its `VariableStore.set`, so later steps interpolate `{{name}}`.
+   * Absent on a run with no store — the action still records what it read
+   * (the history line and the observation), it just has nowhere to keep it.
+   */
+  saveVariable?: ((name: string, value: string) => void) | undefined;
 }
 
 /** See `RunOptions.dbProbe`. The observed count is evidence; a thrown message is the failure. */
@@ -766,7 +916,87 @@ export function scriptOf(actions: readonly AgentAction[]): PlanStep[] {
     }));
 }
 
-export interface WorkflowResult extends AgentRecord {}
+/**
+ * What a `read` or `save` saw, kept on the record (OA-14). ~250 sheet lines
+ * say "ให้รันจริงแล้วบันทึกค่าที่ระบบแสดง" — the observed value IS the
+ * deliverable, and it used to ride one history line and vanish. `text` is
+ * the control's text/value with its state facts, capped at
+ * `READ_OBSERVATION_CHARS`.
+ */
+export interface AgentObservationRecord {
+  selector: string;
+  text: string;
+  url: string;
+}
+
+/**
+ * `AgentAction` plus what a `read`/`save` observed. Structural on purpose:
+ * `AgentAction` lives in `engine/proof-bundle.ts` (the reporter's), and this
+ * compiles whether or not that interface has gained the field yet — the
+ * value is on the record either way.
+ */
+export interface ObservedAgentAction extends AgentAction {
+  observed?: string | undefined;
+}
+
+export interface WorkflowResult extends AgentRecord {
+  /** Every `read`/`save` observation of the leg, in order — see `AgentObservationRecord`. */
+  observations?: AgentObservationRecord[] | undefined;
+}
+
+/**
+ * `DONE so far (12 actions): fill Bank="Kasikorn" · selectOption
+ * Currency="THB" · check Probation Exemption · click Next(x2) …` — the ok
+ * interactions of the leg so far, one entry per control (the last value
+ * wins; repeated activations are counted), password-shaped values masked,
+ * capped at `DONE_LEDGER_CHARS`. Built from the actions, never from history
+ * strings, so it survives the history cap that made a 40-field form refill
+ * itself (OA-7). Null when nothing has been done.
+ */
+export function doneLedger(actions: readonly AgentAction[], cap = DONE_LEDGER_CHARS): string | null {
+  const done = actions.filter((a) => a.ok && INTERACTION_ACTIONS.has(a.action));
+  if (done.length === 0) return null;
+  const entries = new Map<string, { label: string; count: number }>();
+  for (const a of done) {
+    const selector = a.selector ?? '';
+    const name = selectorName(selector) ?? selector;
+    const key = `${a.action} ${selector}`;
+    const value =
+      a.value === null || a.value === ''
+        ? ''
+        : /password|passwd|pwd/i.test(selector)
+          ? `•••• (${a.value.length} chars)`
+          : JSON.stringify(a.value);
+    const label = `${a.action}${name ? ` ${name}` : ''}${value ? `=${value}` : ''}`;
+    entries.set(key, { label, count: (entries.get(key)?.count ?? 0) + 1 });
+  }
+  const parts = [...entries.values()].map((e) => (e.count > 1 ? `${e.label}(x${e.count})` : e.label));
+  const text = `DONE so far (${done.length} actions): ${parts.join(' · ')}`;
+  return text.length > cap ? `${text.slice(0, cap - 1)}…` : text;
+}
+
+/** One line of a full rendered tree, hashed — the progress judge's "did the look show more?" (OA-10). */
+function treeKeyOf(nodes: readonly AxNode[]): string {
+  return createHash('sha1').update(renderTree(nodes, nodes.length)).digest('hex');
+}
+
+/** The goals whose prompt tree earns the larger budget — see `FORM_AGENT_MAX_NODES`. */
+const FORM_GOAL = /required|mandatory|ครบ|every field|all fields|ดอกจัน/iu;
+
+/**
+ * Is the control an outcome names on this page at all — every word of it on
+ * one line of the rendered tree, the same reading `outcomeShown` makes? An
+ * outcome whose control is nowhere cannot be judged on this page; see the
+ * finish settlement in `run()`.
+ */
+function controlOnPage(control: string, tree: string): boolean {
+  const words = control.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
+  if (words.length === 0) return false;
+  return tree.split('\n').some((line) => {
+    const l = line.toLowerCase();
+    return words.every((w) => l.includes(w));
+  });
+}
 
 function originOf(url: string): string | null {
   try {
@@ -834,6 +1064,19 @@ export class WorkflowAgent {
     const allowedActions: ReadonlySet<string> | null =
       runOptions.readOnly === true ? READ_ONLY_ACTIONS : (runOptions.allowedActions ?? null);
     this.#dbProbe = runOptions.dbProbe ?? null;
+    this.#saveVariable = runOptions.saveVariable ?? null;
+    this.#goal = goal;
+    this.#lastTree = null;
+    this.#lastObserved = null;
+    this.#observations = [];
+    // The prompt's node budget for THIS goal (OA-3): a form-shaped goal gets
+    // the larger one, because the focused tree was cutting the very controls
+    // it named. The full tree is captured every turn regardless; only what
+    // the model is SHOWN is budgeted.
+    const maxNodes =
+      goalOutcomes(goal).length >= 3 || FORM_GOAL.test(goal)
+        ? Math.max(this.#maxAxNodes, FORM_AGENT_MAX_NODES)
+        : this.#maxAxNodes;
     // A per-call ceiling can only LOWER the instance's own budget, never
     // raise it — `runOptions.maxSteps` exists for a caller that knows this
     // particular leg has already spent its retry budget (a fail-fast risk
@@ -907,6 +1150,22 @@ export class WorkflowAgent {
     let intendedUrl = startUrl;
     const destination = goalDestination(goal);
 
+    // **One session cannot be two people** (OA-15). A goal that names a
+    // second persona — "submit as employee, then the manager approves"
+    // (ML_01_06, PRB manager→HRBP→HR admin, consent admin↔employee) — has
+    // one credential pair, one sign-out, and a finish rule that judges one
+    // page; the agent either stalls on the sign-in form or is refused a
+    // finish, at model turns each, to learn what the wording already said.
+    // Refused up front as a SUMMARY (never a throw — `run()` never throws)
+    // whose `multi-persona goal:` prefix is the protocol `run-cases` reads as
+    // an authoring refusal, not a failed step. A read-only look is exempt:
+    // it acts as nobody.
+    const personas = runOptions.readOnly === true ? null : multiPersonaGoal(goal);
+    if (personas !== null) {
+      history.push(`(the goal names ${personas.join(' and ')}; one session cannot be both — refused before the first turn)`);
+      return this.#result(goal, false, multiPersonaSummary(personas), actions, 0, startedMs, 0, 0, effectiveMaxSteps);
+    }
+
     // ---- Zero-call rungs, in cost order, before any model turn ----------
     //
     // Measured across 81 workflow steps: 3.8 model turns each, ~3,350 input
@@ -967,7 +1226,16 @@ export class WorkflowAgent {
       );
     }
 
-    const preflight = await this.#preflight(page, goal, startUrl, destination, allowed, actions, history);
+    const preflight = await this.#preflight(
+      page,
+      goal,
+      startUrl,
+      destination,
+      allowed,
+      actions,
+      history,
+      allowedActions === null || allowedActions.has('click'),
+    );
     if (preflight !== null) {
       this.#remember(key, memory, actions);
       return this.#result(goal, true, preflight, actions, 0, startedMs, 0, 0, effectiveMaxSteps);
@@ -985,14 +1253,19 @@ export class WorkflowAgent {
     // password fills stay refused.
     let lastTreeSeen: string | null = null;
 
-    // See `AGENT_VALUE_HUNT_TURNS`: the value a `set X to Y` goal names, and
-    // whether it has shown up in any tree this leg has looked at. `null`
-    // means either the goal names no such value (most goals) or the value
-    // has already been seen — both are "nothing to watch for" states, kept
-    // as one variable so the per-turn check below is a single comparison.
-    const huntedValue = goalCitedValue(goal);
-    let huntedValueSeenAtTurn: number | null = null;
-    let sawTruncatedTree = false;
+    // See `AGENT_VALUE_HUNT_TURNS`: EVERY value a `set X to Y` goal names
+    // (OA-4), and whether any of them has shown up in a tree this leg has
+    // looked at. A key-in leg naming five fields spends its early turns on
+    // the first two, and a judge watching one value would have ended it
+    // while it was working — so the judge fires only when NONE has appeared.
+    // Judged against the FULL tree (OA-3), which is never truncated, so the
+    // old "a cut tree withdraws the judge" clause has nothing left to guard.
+    const huntedValues = goalCitedValues(goal);
+    let huntedValueSeen = false;
+    // OA-10: the full tree's hash at the top of the turn, and how many looks
+    // have been credited as progress for changing it.
+    let treeKey: string | null = null;
+    let treeChangeCredits = 0;
 
     for (;;) {
       // A configured ceiling still holds (the capture pilot's short leash,
@@ -1027,28 +1300,38 @@ export class WorkflowAgent {
         doneHere.clear();
         lastUrlSeen = page.url();
       }
-      // Goal-focused: the nodes the goal names survive the budget cut.
+      // Goal-focused: the nodes the goal names survive the budget cut. The
+      // FULL tree is rendered too (bytes, never tokens — it is not sent to
+      // the model): the judges and the wizard hint read it (OA-3, OA-11).
       const all = await captureAxNodes(page, Number.MAX_SAFE_INTEGER);
-      const axTree = renderTree(focusTree(all, goal, this.#maxAxNodes), all.length);
+      const fullTree = renderTree(all, all.length);
+      this.#lastTree = fullTree;
+      treeKey = createHash('sha1').update(fullTree).digest('hex');
+      const axTree = renderTree(focusTree(all, goal, maxNodes), all.length);
       if (lastTreeSeen !== null && axTree !== lastTreeSeen) doneHere.clear();
       lastTreeSeen = axTree;
+      // The required controls still empty (OA-6) — a separate observation
+      // field, so settlement and the value hunt never read it as tree text.
+      const gapsLine = formatFormGaps(formGaps(all));
+      // What has been DONE across the whole leg (OA-7), for the prompt's
+      // elision slot — built from the actions, so the history cap cannot
+      // hide a filled field from the model.
+      const ledger = doneLedger(actions);
 
-      // The value-hunt guard: a goal naming a concrete value that has not
-      // shown up ANYWHERE after several turns is evidence the value is not
-      // reachable from here, however many still-successful clicks keep
+      // The value-hunt guard: a goal naming concrete values none of which
+      // has shown up ANYWHERE after several turns is evidence the values are
+      // not reachable from here, however many still-successful clicks keep
       // landing on other controls. See `AGENT_VALUE_HUNT_TURNS`.
-      if (axTree.includes('TREE TRUNCATED')) sawTruncatedTree = true;
-      if (huntedValue !== null && huntedValueSeenAtTurn === null && valueAppearsAnywhere(huntedValue, axTree)) {
-        huntedValueSeenAtTurn = turns;
+      if (huntedValues.length > 0 && !huntedValueSeen && anyValueAppears(huntedValues, fullTree)) {
+        huntedValueSeen = true;
       }
-      if (
-        huntedValue !== null &&
-        huntedValueSeenAtTurn === null &&
-        !sawTruncatedTree &&
-        turns > AGENT_VALUE_HUNT_TURNS
-      ) {
+      if (huntedValues.length > 0 && !huntedValueSeen && turns > AGENT_VALUE_HUNT_TURNS) {
+        const named =
+          huntedValues.length === 1
+            ? `value ${JSON.stringify(huntedValues[0])}`
+            : `values ${huntedValues.map((v) => JSON.stringify(v)).join(', ')}`;
         summary =
-          `agent gave up: the goal's value ${JSON.stringify(huntedValue)} never appeared on any of the ` +
+          `agent gave up: the goal's ${named} never appeared on any of the ` +
           `${turns} page state(s) this leg observed — it may not exist on this journey, rather than merely ` +
           'being hard to reach';
         break;
@@ -1070,9 +1353,11 @@ export class WorkflowAgent {
             url: page.url(),
             axTree,
             ...(runOptions.caseContext === undefined ? {} : { caseContext: runOptions.caseContext }),
+            ...(gapsLine === null ? {} : { formGaps: gapsLine }),
             // Snapshot: the agent keeps mutating `history`, and an observation
             // handed to the model must not change under it after the fact.
             history: [...history],
+            ...(ledger === null ? {} : { ledger }),
             stepsRemaining: effectiveMaxSteps - turns,
             ...(feedback === undefined ? {} : { feedback }),
           });
@@ -1154,26 +1439,48 @@ export class WorkflowAgent {
         // triage look's goal text parses as an outcome, the settlement
         // refused the verdict once, and every fail verdict cost two model
         // calls instead of one.
-        const outcome = runOptions.readOnly === true ? null : goalOutcome(goal);
-        if (outcome !== null) {
-          const liveTree = renderTree(focusTree(await captureAxNodes(page, Number.MAX_SAFE_INTEGER), goal, this.#maxAxNodes), Number.MAX_SAFE_INTEGER);
-          const shown = outcomeShown(outcome, liveTree);
-          if (shown === null) {
+        //
+        // EVERY `set X = Y` the goal names must be shown (OA-4), and it is
+        // judged against the FULL live tree (OA-3): the focused 60-node tree
+        // was always marked truncated at settlement, so on any page bigger
+        // than the budget the check declined and the finish rode the claim.
+        // The full tree costs bytes, never tokens — it is not sent anywhere.
+        //
+        // An outcome whose CONTROL is nowhere on this page — not one of its
+        // words on any line, nor its value anywhere — cannot be judged here
+        // and is left out of the settlement: a pair the parser read out of
+        // prose ("then stop:\n- If the page…" is `stop = "- If the page"` to
+        // it — the capture pilot's own goal), or a field that lives on the
+        // page a submit leads to. A control that IS on the page and shows
+        // another value stays a refusal. When nothing is judgeable the
+        // record says so and the finish rides the claim, visibly.
+        const named = runOptions.readOnly === true ? [] : goalOutcomes(goal);
+        const liveTree = named.length === 0 ? '' : await this.#fullTree(page);
+        const outcomes = named.filter((o) => controlOnPage(o.control, liveTree) || valueAppearsAnywhere(o.value, liveTree));
+        const settled = outcomes.length === 0 ? null : outcomesShown(outcomes, liveTree);
+        if (named.length > 0 && outcomes.length === 0) {
+          this.#settledBy = {
+            rule: 'agent-claim',
+            evidence: `${decision.reasoning.slice(0, 200)} (none of the goal's named controls — ${named.map((o) => o.control).join(', ')} — is on this page, so the pairs could not be judged here)`,
+          };
+        } else if (outcomes.length > 0 && settled !== null) {
+          if (settled.missing.length > 0) {
+            const missing = describeOutcomes(settled.missing);
             if (!finishRefusedForState) {
               finishRefusedForState = true;
               const reason =
-                `the goal says ${outcome.control} should show ${JSON.stringify(outcome.value)}, and no node in the ` +
-                'current tree shows that — read the control (action "read") and set it, or call fail and say what the page shows instead';
+                `the page does not show ${missing} — no node in the current tree shows ${settled.missing.length === 1 ? 'that pair' : 'those pairs'}; ` +
+                'read the control (action "read") and set it, or call fail and say what the page shows instead';
               history.push(`(refused finish: ${reason})`);
               actions.push(this.#record(actions.length, decision, page.url(), false, 0, reason));
               turnsWithoutProgress += 1;
               continue;
             }
-            summary = `agent claimed finish, but the page does not show ${outcome.control} = ${JSON.stringify(outcome.value)}`;
+            summary = `agent claimed finish, but the page does not show ${missing}`;
             actions.push(this.#record(actions.length, decision, page.url(), false, 0, summary));
             return this.#result(goal, false, summary, actions, turns, startedMs, inputTokens, outputTokens, effectiveMaxSteps);
           }
-          this.#settledBy = { rule: 'observed-state', evidence: shown };
+          this.#settledBy = { rule: 'observed-state', evidence: settled.shown.map((s) => s.line).join(' | ') };
         } else {
           this.#settledBy = { rule: 'agent-claim', evidence: decision.reasoning.slice(0, 200) };
         }
@@ -1238,6 +1545,7 @@ export class WorkflowAgent {
           ok,
           Date.now() - actionStarted,
           error,
+          this.#takeObserved(),
         );
         actions.push(record);
         // What the model needs to not repeat itself: WHICH value went into
@@ -1251,7 +1559,10 @@ export class WorkflowAgent {
           current.action === 'fill' && current.value !== ''
             ? ` = ${/password|passwd|pwd/i.test(current.selector) ? `•••• (${current.value.length} chars)` : JSON.stringify(current.value)}`
             : '';
-        const moved = page.url() === urlBefore ? `still at ${page.url()}` : `moved ${urlBefore} → ${page.url()}`;
+        // "still on the page, now at ?step=2" for a query-only change (OA-9):
+        // told "moved …/hire → …/hire?step=2" the model reasons as if it left
+        // the page and clicks back to where the field was not.
+        const moved = urlMoveNote(urlBefore, page.url());
         const note = this.#lastTargetNote === null ? '' : ` (${this.#lastTargetNote})`;
         this.#lastTargetNote = null;
         history.push(
@@ -1348,7 +1659,7 @@ export class WorkflowAgent {
       // a `goto` that reached a URL this leg had not seen. A `goto` back to a
       // page already visited is a reload — not progress — and no longer buys
       // five fresh turns (PL_07_03: the plans page reloaded turn after turn).
-      const advanced = actions.slice(turnStart).some((a) => {
+      let advanced = actions.slice(turnStart).some((a) => {
         if (!a.ok || IDLE_ACTIONS.has(a.action)) return false;
         if (a.action !== 'goto') return true;
         const url = page.url();
@@ -1356,6 +1667,32 @@ export class WorkflowAgent {
         visitedUrls.add(url);
         return true;
       });
+      // **A look that showed more is progress, a bounded number of times**
+      // (OA-10). A lazily-rendered table appends rows on every scroll, and a
+      // page still hydrating fills in after a wait: the FULL tree's hash
+      // differs from the one this turn began on. Measured against the same
+      // capture the next turn would make, one extra CDP read on idle turns
+      // only, and never past AGENT_TREE_CHANGE_CREDITS — an infinite feed
+      // still ends the leg. A look that changed nothing stays what it was:
+      // a turn that advanced nothing.
+      if (!advanced && treeKey !== null && treeChangeCredits < AGENT_TREE_CHANGE_CREDITS) {
+        const looks = actions.slice(turnStart);
+        const onlyLooked = looks.length > 0 && looks.every((a) => a.ok && (a.action === 'scroll' || a.action === 'wait'));
+        if (onlyLooked) {
+          // What a scroll renders arrives AFTER the scroll: the rows a lazy
+          // list fetches land on network idle (immediate on a quiet page),
+          // and even a purely client-side append runs on the next frame —
+          // measured, a scroll listener fired ~50 ms after `scrollBy`
+          // returned, past an immediate capture. One settle and one beat.
+          await page.waitForLoadState('networkidle', { timeout: NETWORK_SETTLE_MS }).catch(() => undefined);
+          await page.waitForTimeout(LOOK_SETTLE_MS).catch(() => undefined);
+          if (treeKeyOf(await captureAxNodes(page, Number.MAX_SAFE_INTEGER)) !== treeKey) {
+            advanced = true;
+            treeChangeCredits += 1;
+            history.push('(the page rendered more after that look — keep looking only while each look shows more)');
+          }
+        }
+      }
       if (advanced) {
         turnsWithoutProgress = 0;
       } else {
@@ -1460,7 +1797,7 @@ export class WorkflowAgent {
         actions.push(this.#record(actions.length, decision, page.url(), false, Date.now() - started, describe(error)));
         return i;
       }
-      const record = this.#record(actions.length, decision, page.url(), true, Date.now() - started);
+      const record = this.#record(actions.length, decision, page.url(), true, Date.now() - started, undefined, this.#takeObserved());
       actions.push(record);
       history.push(`${step.action} ${step.selector || step.url} — ok (replayed)`);
       if (this.#onAction) await this.#onAction(page, record);
@@ -1549,6 +1886,7 @@ export class WorkflowAgent {
     allowed: string[],
     actions: AgentAction[],
     history: string[],
+    mayClick = true,
   ): Promise<string | null> {
     // A consent gate in front of the page: accept it (the goal cannot be
     // reached through it), and come back to the page the step began on.
@@ -1565,15 +1903,17 @@ export class WorkflowAgent {
     if (gate === 'arrived') {
       return `reached ${page.url()}, the destination the goal names, after clearing a consent gate — no model turn spent`;
     }
-    if (destination === null) return null;
-    if (atGoalDestination(page.url(), destination)) return null; // nothing to do; the loop's rules decide
+    if (destination !== null && atGoalDestination(page.url(), destination)) return null; // nothing to do; the loop's rules decide
 
     // A link in the tree that points exactly where the goal ends IS the
     // route the goal describes, so it is clicked as written — the one thing
     // the tree says with no judgment involved.
-    const nodes = await captureAxNodes(page, Number.MAX_SAFE_INTEGER);
-    const link = nodes.find((n: AxNode) => n.role === 'link' && n.url !== '' && n.name !== '' && atGoalDestination(n.url, destination));
-    if (link) {
+    const nodes = destination === null ? [] : await captureAxNodes(page, Number.MAX_SAFE_INTEGER);
+    const link =
+      destination === null
+        ? undefined
+        : nodes.find((n: AxNode) => n.role === 'link' && n.url !== '' && n.name !== '' && atGoalDestination(n.url, destination));
+    if (link && mayClick) {
       const decision: AgentDecision = {
         action: 'click',
         selector: normaliseAgentSelector(`role=link[name=${JSON.stringify(link.name)}]`),
@@ -1598,6 +1938,16 @@ export class WorkflowAgent {
         return `reached ${page.url()} by the link the tree showed to it — no model turn spent`;
       }
     }
+
+    // A goal that names the menu path level by level is a literal, and a
+    // literal is a $0 rung (OA-2): walk it. The model takes over from
+    // wherever the walk stopped, with the partial path in the history.
+    const path = mayClick ? menuPathOf(goal) : null;
+    if (path !== null) {
+      const walked = await this.#walkMenuPath(page, path, allowed, actions, history, goal, startUrl);
+      if (walked !== null) return walked;
+    }
+    if (destination === null) return null;
 
     // A goal that names WHERE but not HOW may be met by going there. One that
     // names a route ("via the sidebar") is about the route, and a goto would
@@ -1665,7 +2015,99 @@ export class WorkflowAgent {
       outputTokens,
       ...(this.#lookedOnly ? { lookedOnly: true } : {}),
       ...(success && this.#settledBy !== null ? { settledBy: this.#settledBy.rule, settledEvidence: this.#settledBy.evidence } : {}),
+      ...(this.#observations.length > 0 ? { observations: [...this.#observations] } : {}),
     };
+  }
+
+  /** The whole live tree, rendered with no truncation marker — for the judges, never the model. */
+  async #fullTree(page: Page): Promise<string> {
+    const nodes = await captureAxNodes(page, Number.MAX_SAFE_INTEGER);
+    return renderTree(nodes, nodes.length);
+  }
+
+  /** The observation the last `read`/`save` left, consumed once into its record. */
+  #takeObserved(): string | undefined {
+    const observed = this.#lastObserved;
+    this.#lastObserved = null;
+    return observed ?? undefined;
+  }
+
+  /**
+   * Walk the menu path the goal names — "EC > Hire & Onboard (New Hire)",
+   * "1. HR 2. Benefits Admin 3. Benefit Plans" — by clicking the tab, button,
+   * link, menuitem or treeitem whose name answers each segment, at $0 (OA-2).
+   * Every case's first leg is this walk, and each level cost a model turn
+   * because ROUTE_WORDS keeps the goto rung off any goal that names a route.
+   * Exact names win over containing ones ("HR" over "HR Analytics"); an
+   * already-open section trigger is not clicked again (a second click folds
+   * it); the walk stops at the first segment the tree does not show and hands
+   * the model the partial path in the history. Returns the arrived summary
+   * when the last click lands on the goal's destination, else null.
+   */
+  async #walkMenuPath(
+    page: Page,
+    path: readonly MenuSegment[],
+    allowed: string[],
+    actions: AgentAction[],
+    history: string[],
+    goal: string,
+    startUrl: string,
+  ): Promise<string | null> {
+    const MENU_ROLES = new Set(['tab', 'button', 'link', 'menuitem', 'treeitem']);
+    for (let i = 0; i < path.length; i += 1) {
+      const segment = path[i]!;
+      const nodes = await captureAxNodes(page, Number.MAX_SAFE_INTEGER);
+      let best: { node: AxNode; score: 1 | 2 } | null = null;
+      for (const node of nodes) {
+        if (!MENU_ROLES.has(node.role) || node.name === '') continue;
+        const score = menuNodeScore(segment, node.name);
+        if (score === 0) continue;
+        if (best === null || score > best.score) best = { node, score };
+        if (best.score === 2) break;
+      }
+      if (best === null) {
+        history.push(`(menu path: "${segment.name}" is not in the tree after ${i} level(s); asking the model)`);
+        return null;
+      }
+      const selector = normaliseAgentSelector(`role=${best.node.role}[name=${JSON.stringify(best.node.name)}]`);
+      if (best.node.role !== 'link') {
+        const expanded = await page
+          .locator(selector)
+          .first()
+          .getAttribute('aria-expanded', { timeout: 500 })
+          .catch(() => null);
+        if (expanded === 'true') {
+          history.push(`(menu path segment ${i + 1} of ${path.length}: "${best.node.name}" is already open)`);
+          continue;
+        }
+      }
+      const decision: AgentDecision = {
+        action: 'click',
+        selector,
+        value: '',
+        url: '',
+        reasoning: `menu path segment ${i + 1} of ${path.length}: "${segment.name}"`,
+      };
+      const started = Date.now();
+      let ok = true;
+      let error: string | undefined;
+      try {
+        await this.#act(page, decision, allowed);
+      } catch (caught) {
+        ok = false;
+        error = describe(caught);
+      }
+      const record = this.#record(actions.length, decision, page.url(), ok, Date.now() - started, error);
+      actions.push(record);
+      if (this.#onAction) await this.#onAction(page, record);
+      history.push(ok ? `click ${selector} — ok (menu path)` : `click ${selector} — FAILED: ${error ?? ''}`);
+      if (!ok) return null;
+      await page.waitForLoadState('networkidle', { timeout: NETWORK_SETTLE_MS }).catch(() => undefined);
+      if (destinationReached(goal, startUrl, page.url())) {
+        return `reached ${page.url()} by walking the menu path ${path.map((s) => s.name).join(' > ')} — no model turn spent`;
+      }
+    }
+    return null;
   }
 
   /**
@@ -1712,7 +2154,14 @@ export class WorkflowAgent {
     // `scroll` is in this list (2026-08-25): scrolling to a name the tree
     // does not show waited the full action timeout, three turns running, on
     // every "bring row PL_03_… into view" leg whose row was not rendered.
-    if (decision.action === 'click' || decision.action === 'fill' || decision.action === 'hover' || decision.action === 'press' || decision.action === 'scroll') {
+    if (
+      decision.action === 'click' ||
+      decision.action === 'fill' ||
+      decision.action === 'hover' ||
+      decision.action === 'press' ||
+      decision.action === 'scroll' ||
+      decision.action === 'save'
+    ) {
       if (decision.selector !== '' && selectorGrounded(decision.selector, axTree) === false) {
         return `"${decision.selector}" names a control that is not in the accessibility tree; take the role and name verbatim from the tree`;
       }
@@ -1746,7 +2195,11 @@ export class WorkflowAgent {
       case 'fill': {
         if (!decision.selector) throw new Error('fill decision carried no selector');
         await this.#target(page, decision.selector);
-        await this.#writable(page, decision.selector);
+        const dateInput = await this.#writable(page, decision.selector);
+        if (dateInput !== null) {
+          await this.#writeDate(dateInput, decision.value);
+          break;
+        }
         const field = page.locator(decision.selector).first();
         await field.fill(decision.value, { timeout: this.#actionTimeoutMs });
         // **A fill the framework reverts is the quietest false negative in
@@ -1819,31 +2272,55 @@ export class WorkflowAgent {
         if (!decision.value) throw new Error('selectOption decision carried no option label (put it in value)');
         await this.#target(page, decision.selector);
         const control = page.locator(decision.selector).first();
-        try {
-          // Native <select> — by visible label, then by value/text as a
-          // fallback for a label that is really the option's value attribute.
-          await control.selectOption({ label: decision.value }, { timeout: this.#actionTimeoutMs });
-        } catch (nativeError) {
+        const tag = await control
+          .evaluate((el) => ((el as unknown as { tagName?: string }).tagName ?? '').toLowerCase(), undefined, { timeout: TARGET_ATTACH_MS })
+          .catch(() => '');
+        if (tag === 'select') {
           try {
-            await control.selectOption(decision.value, { timeout: 1_000 });
-          } catch {
-            // A custom listbox/combobox: open it, then click the option by
-            // its accessible name. Mirrors what the engine does for the same
-            // widget — never "fill" a dropdown, never guess its items.
-            await control.click({ timeout: this.#actionTimeoutMs });
-            const option = page
-              .getByRole('option', { name: decision.value, exact: false })
-              .first();
+            // Native <select> — by visible label, then by value/text as a
+            // fallback for a label that is really the option's value attribute.
+            await control.selectOption({ label: decision.value }, { timeout: this.#actionTimeoutMs });
+          } catch (nativeError) {
             try {
-              await option.click({ timeout: this.#actionTimeoutMs });
+              await control.selectOption(decision.value, { timeout: 1_000 });
             } catch {
               throw new Error(
-                `could not choose ${JSON.stringify(decision.value)} in ${JSON.stringify(decision.selector)} — ` +
-                  `it is not a <select> and no option with that name appeared (${describe(nativeError)})`,
+                `could not choose ${JSON.stringify(decision.value)} in the <select> ${JSON.stringify(decision.selector)} — ` +
+                  `no option with that label or value (${describe(nativeError)})`,
               );
             }
           }
+          break;
         }
+        // A custom listbox/combobox (OA-1): the engine's own procedure —
+        // open only when not already `aria-expanded` (a second click on an
+        // open trigger closes it), type the value's stable head into the
+        // popup's search box when one is offered (a Position list of 87k
+        // rows is never scanned by name), match whole name → whole word →
+        // code half → label half, never substring ("Male" is not "Female",
+        // "New Hire" is not every "Re-hire"), and on a miss close the list
+        // and name the options actually seen, so the next turn and the
+        // report know what the list offered. The read-back is recorded, not
+        // required: a trigger whose text is its label (not its value) is a
+        // shape this loop meets, and the next turn's tree shows the pick.
+        const picked = await selectFromListbox(page, control, decision.value, {
+          timeout: this.#actionTimeoutMs,
+          readBack: 'record',
+        });
+        const notes: string[] = [];
+        if (picked.typed !== undefined) notes.push(`typed ${JSON.stringify(picked.typed)} into the list search`);
+        notes.push(
+          `picked ${picked.picked.map((p) => JSON.stringify(p)).join(', ')}` +
+            (picked.matchedBy === 'whole' ? '' : ` by its ${picked.matchedBy}`),
+        );
+        if (picked.readBack !== null) {
+          notes.push(
+            picked.confirmed
+              ? `the control now shows ${JSON.stringify(picked.readBack.slice(0, 80))}`
+              : `the control shows ${JSON.stringify(picked.readBack.slice(0, 80))} — read it before relying on the pick`,
+          );
+        }
+        this.#note(notes.join('; '));
         break;
       }
 
@@ -1861,7 +2338,11 @@ export class WorkflowAgent {
         // decides whether it took.
         if (!decision.selector) throw new Error('paste decision carried no selector');
         await this.#target(page, decision.selector);
-        await this.#writable(page, decision.selector);
+        const dateInput = await this.#writable(page, decision.selector);
+        if (dateInput !== null) {
+          await this.#writeDate(dateInput, decision.value);
+          break;
+        }
         const target = page.locator(decision.selector).first();
         await target.click({ timeout: this.#actionTimeoutMs }).catch(() => undefined);
         await target.fill('', { timeout: this.#actionTimeoutMs }).catch(async () => {
@@ -1875,7 +2356,11 @@ export class WorkflowAgent {
       case 'type': {
         if (!decision.selector) throw new Error('type decision carried no selector');
         await this.#target(page, decision.selector);
-        await this.#writable(page, decision.selector);
+        const dateInput = await this.#writable(page, decision.selector);
+        if (dateInput !== null) {
+          await this.#writeDate(dateInput, decision.value);
+          break;
+        }
         const field = page.locator(decision.selector).first();
         // Focus and clear the way a user would, then type key by key so a
         // field that reacts per keystroke (autocomplete, typeahead, masked
@@ -1964,25 +2449,58 @@ export class WorkflowAgent {
         if (!decision.selector) throw new Error('read decision carried no selector');
         await this.#target(page, decision.selector);
         const loc = page.locator(decision.selector).first();
-        const [name, value, checked, expanded, disabled, readonly] = await Promise.all([
-          loc.evaluate((el) => (el as unknown as { innerText?: string }).innerText?.trim().slice(0, 120) ?? '').catch(() => ''),
-          loc.inputValue({ timeout: 500 }).catch(() => ''),
-          loc.getAttribute('aria-checked').catch(() => null),
-          loc.getAttribute('aria-expanded').catch(() => null),
-          loc.isDisabled({ timeout: 500 }).catch(() => false),
-          // A read-only field is the fact that decides whether writing here can
-          // ever work — worth one more read on the same turn.
-          loc.evaluate((el) => (el as unknown as { readOnly?: boolean }).readOnly === true).catch(() => false),
-        ]);
-        const facts = [
-          name ? `text ${JSON.stringify(name)}` : '',
-          value ? `value ${JSON.stringify(value)}` : '',
-          checked !== null ? `checked=${checked}` : '',
-          expanded !== null ? `expanded=${expanded}` : '',
-          disabled ? 'DISABLED' : '',
-          readonly ? 'READONLY — a display; the input the label points at is beside it' : '',
-        ].filter(Boolean);
-        this.#lastTargetNote = `observed ${facts.length ? facts.join(', ') : 'an element with no readable state'}`;
+        const observed = await this.#observe(loc);
+        // The observation is the deliverable of a record-what-the-system-
+        // shows leg (OA-14): it rides the history line for the model AND the
+        // action's own record for the report, at the full cap rather than
+        // the 120 characters the line alone used to carry.
+        this.#lastObserved = observed;
+        this.#observations.push({ selector: decision.selector, text: observed, url: page.url() });
+        this.#note(`observed ${observed}`);
+        break;
+      }
+
+      case 'save': {
+        // Remember a value the page shows (OA-8): the node's input value or
+        // text, a leading "<label>:" stripped when the label is the control's
+        // own name or a word of the goal ("Employee ID: 20001234" → the id),
+        // handed to the run's variable store under the name the model chose.
+        if (!decision.selector) throw new Error('save decision carried no selector');
+        const name = decision.value.trim();
+        if (name === '') throw new Error('save decision carried no variable name (put it in value)');
+        await this.#target(page, decision.selector);
+        const loc = page.locator(decision.selector).first();
+        let text = (await loc.inputValue({ timeout: 500 }).catch(() => '')).trim();
+        if (text === '') {
+          text = await loc
+            .evaluate((el) => (el as unknown as { innerText?: string; textContent?: string | null }).innerText ?? (el as unknown as { textContent?: string | null }).textContent ?? '')
+            .catch(() => '');
+        }
+        text = text.replace(/\s+/g, ' ').trim();
+        const labelled = /^([^:：]{1,60}?)\s*[:：]\s*(\S.*)$/u.exec(text);
+        if (labelled) {
+          const label = foldValue(labelled[1] as string);
+          const own = selectorName(decision.selector);
+          if ((own !== null && foldValue(own) === label) || (label !== '' && foldValue(this.#goal).includes(label))) {
+            text = (labelled[2] as string).trim();
+          }
+        }
+        if (text === '') throw new Error(`"${decision.selector}" shows no text or value to save — read the tree for the node that shows it`);
+        if (this.#saveVariable !== null) this.#saveVariable(name, text);
+        const shown = text.length > READ_OBSERVATION_CHARS ? `${text.slice(0, READ_OBSERVATION_CHARS - 1)}…` : text;
+        this.#lastObserved = `${name} = ${JSON.stringify(shown)}`;
+        this.#observations.push({ selector: decision.selector, text: this.#lastObserved, url: page.url() });
+        this.#note(`saved ${name} = ${JSON.stringify(shown.slice(0, 120))}${this.#saveVariable === null ? ' — no variable store on this run, recorded only' : ''}`);
+        break;
+      }
+
+      case 'signOut': {
+        // The app's own sign-out control, the same way the engine's signOut
+        // step does it (OA-15) — never a storage wipe, which tests nothing
+        // and leaves a cookie-backed session alive.
+        const out = await performSignOut(page);
+        if (!out.ok) throw new Error(out.reason);
+        this.#note(`signed out via ${out.via}, now at ${out.landedUrl}`);
         break;
       }
 
@@ -2025,7 +2543,27 @@ export class WorkflowAgent {
     try {
       await locator.first().waitFor({ state: 'attached', timeout: TARGET_ATTACH_MS });
     } catch {
-      throw new Error(`no element matches "${selector}" (waited ${TARGET_ATTACH_MS} ms)`);
+      // Out of the tree is not the same as off the page: a control folded
+      // inside a collapsed section matches once hidden elements are counted,
+      // and the section's disclosure is the click a person makes (ec10
+      // HIR-EC-002: Gender inside the collapsed "Personal Information" card
+      // stalled the agent for five turns). See `engine/reveal.ts`.
+      const revealed = await revealHidden(page, selector).catch(() => null);
+      if (revealed === null || !revealed.revealed) {
+        // A control on wizard step 2 is not in the DOM on step 1 at all, so
+        // the reveal cannot find it either; the tree the loop last rendered
+        // says whether this is a wizard, and the miss says so (OA-11 —
+        // HIR-EC-002 leg 12 spent 18 turns re-opening section headers
+        // before Next was tried).
+        const hint = this.#lastTree === null ? null : wizardStepHint(this.#lastTree);
+        throw new Error(
+          `no element matches "${selector}" (waited ${TARGET_ATTACH_MS} ms)` +
+            (revealed === null ? '' : ` — expanded "${revealed.disclosures.join(', ')}" and it stayed hidden`) +
+            (hint === null ? '' : ` — ${hint}`),
+        );
+      }
+      this.#lastTargetNote = `inside a collapsed section — expanded "${revealed.disclosures.join(', ')}" to reach it`;
+      return;
     }
     const count = await locator.count().catch(() => 1);
     if (count > 1) this.#lastTargetNote = `${count} matched, acted on the first`;
@@ -2044,7 +2582,7 @@ export class WorkflowAgent {
    * error, because it is the same shape every time: the input the label
    * points at sits beside the display.
    */
-  async #writable(page: Page, selector: string): Promise<void> {
+  async #writable(page: Page, selector: string): Promise<Locator | null> {
     const state = await page
       .locator(selector)
       .first()
@@ -2070,8 +2608,17 @@ export class WorkflowAgent {
         { timeout: TARGET_ATTACH_MS },
       )
       .catch(() => null);
-    if (state === null) return;
+    if (state === null) return null;
     if (state.readOnly) {
+      // The one deterministic thing (OA-5): humi's date picker is a readOnly
+      // display ("Select date") with a transparent `input[type=date]` drawn
+      // over it, in the same container. When that input is there, the write
+      // goes to it — as ISO — instead of a turn spent on advice.
+      const beside = await this.#dateInputBeside(page, selector);
+      if (beside !== null) {
+        this.#note('read-only display — wrote to the date input beside it');
+        return beside;
+      }
       throw new Error(
         `"${selector}" is a READ-ONLY field — a display, not the input; writing into it changes nothing. ` +
           `The real input is usually beside it and named by the field's LABEL: try ` +
@@ -2088,10 +2635,107 @@ export class WorkflowAgent {
           'If it is a dropdown, use selectOption; if it opens a picker, click it and act on what opens.',
       );
     }
+    return null;
   }
 
   /** Set by `#target` for the history line of the action that follows. */
   #lastTargetNote: string | null = null;
+  /** What the last `read`/`save` observed, consumed into its record by `#takeObserved`. */
+  #lastObserved: string | null = null;
+  /** Every observation of the leg, in order — see `WorkflowResult.observations`. */
+  #observations: AgentObservationRecord[] = [];
+  /** The full rendered tree the loop last showed the judges — the wizard hint reads it. */
+  #lastTree: string | null = null;
+  /** The goal of the leg in progress — `save` strips a label the goal names. */
+  #goal = '';
+  /** This run's variable sink, when the runner provided one (`RunOptions.saveVariable`). */
+  #saveVariable: ((name: string, value: string) => void) | null = null;
+
+  /** Append to the history note of the action in progress — `#target` may already have left one. */
+  #note(text: string): void {
+    this.#lastTargetNote = this.#lastTargetNote === null ? text : `${this.#lastTargetNote}; ${text}`;
+  }
+
+  /**
+   * A control's current state, in one line: its text (or value), checked /
+   * expanded / haspopup, disabled, readonly, required, and the label that
+   * names it — capped at `READ_OBSERVATION_CHARS`.
+   */
+  async #observe(loc: Locator): Promise<string> {
+    const [name, value, checked, expanded, haspopup, disabled, flags] = await Promise.all([
+      loc.evaluate((el) => (el as unknown as { innerText?: string }).innerText?.trim() ?? '').catch(() => ''),
+      loc.inputValue({ timeout: 500 }).catch(() => ''),
+      loc.getAttribute('aria-checked').catch(() => null),
+      loc.getAttribute('aria-expanded').catch(() => null),
+      loc.getAttribute('aria-haspopup').catch(() => null),
+      loc.isDisabled({ timeout: 500 }).catch(() => false),
+      // A read-only field is the fact that decides whether writing here can
+      // ever work; a required one is a fact the finish is held to.
+      loc
+        .evaluate((el) => {
+          const node = el as unknown as {
+            readOnly?: boolean;
+            required?: boolean;
+            id?: string;
+            getAttribute(n: string): string | null;
+            labels?: ArrayLike<{ textContent: string | null }>;
+          };
+          const labels = node.labels;
+          const label = labels && labels.length > 0 ? (labels[0]?.textContent ?? '').trim() : node.getAttribute('aria-label') ?? '';
+          return {
+            readonly: node.readOnly === true || node.getAttribute('aria-readonly') === 'true',
+            required: node.required === true || node.getAttribute('aria-required') === 'true',
+            label,
+          };
+        })
+        .catch(() => ({ readonly: false, required: false, label: '' })),
+    ]);
+    const cap = (s: string): string => (s.length > READ_OBSERVATION_CHARS ? `${s.slice(0, READ_OBSERVATION_CHARS - 1)}…` : s);
+    const facts = [
+      name ? `text ${JSON.stringify(cap(name.replace(/\s+/g, ' ')))}` : '',
+      value ? `value ${JSON.stringify(cap(value))}` : '',
+      flags.label && flags.label !== name ? `label ${JSON.stringify(flags.label.slice(0, 80))}` : '',
+      checked !== null ? `checked=${checked}` : '',
+      expanded !== null ? `expanded=${expanded}` : '',
+      haspopup !== null && haspopup !== 'false' ? `haspopup=${haspopup}` : '',
+      flags.required ? 'required' : '',
+      disabled ? 'DISABLED' : '',
+      flags.readonly ? 'READONLY — a display; the input the label points at is beside it' : '',
+    ].filter(Boolean);
+    return facts.length ? facts.join(', ') : 'an element with no readable state';
+  }
+
+  /**
+   * The `input[type=date]` in the read-only display's own container (one or
+   * two levels up), or null. Two levels, never further: a date input three
+   * fieldsets away belongs to another field.
+   */
+  async #dateInputBeside(page: Page, selector: string): Promise<Locator | null> {
+    const display = page.locator(selector).first();
+    for (const up of ['xpath=..', 'xpath=../..']) {
+      const input = display.locator(up).locator('input[type="date"]').first();
+      if ((await input.count().catch(() => 0)) > 0) return input;
+    }
+    return null;
+  }
+
+  /**
+   * Write a date into a `type=date` input as ISO, converting what the model
+   * gave (`15/09/2027`, `1 Sep 2027`, a Buddhist-era `2570`) through
+   * `isoDateOf`; the read-back must hold it, or the turn is told the truth.
+   */
+  async #writeDate(input: Locator, value: string): Promise<void> {
+    const iso = isoDateOf(value) ?? isoDateOf(value, 'th');
+    if (iso === null) {
+      throw new Error(`${JSON.stringify(value)} is not a date this harness can write into a date input — give it as YYYY-MM-DD`);
+    }
+    await input.fill(iso, { timeout: this.#actionTimeoutMs });
+    const held = await input.inputValue({ timeout: 1_000 }).catch(() => null);
+    if (held !== null && held !== iso) {
+      throw new Error(`the date input did not keep ${iso} (holds ${JSON.stringify(held)}) — the page may constrain the date; read the field's bounds`);
+    }
+    this.#note(`wrote ${iso}${iso === value.trim() ? '' : ` for ${JSON.stringify(value)}`}`);
+  }
   /**
    * Set when the loop ended because every action taken was a look — see the
    * no-progress judge. Reset at the top of `run()`; read into the RESULT
@@ -2116,7 +2760,8 @@ export class WorkflowAgent {
     ok: boolean,
     durationMs: number,
     error?: string,
-  ): AgentAction {
+    observed?: string,
+  ): ObservedAgentAction {
     return {
       index,
       action: decision.action,
@@ -2127,6 +2772,7 @@ export class WorkflowAgent {
       ok,
       error,
       durationMs,
+      ...(observed === undefined ? {} : { observed }),
     };
   }
 }

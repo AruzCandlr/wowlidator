@@ -337,6 +337,15 @@ const COMMON_BROWSER_FIELDS: readonly Field[] = [
     advanced: true,
   },
   {
+    name: 'browsers',
+    label: 'Chromes to run across',
+    type: 'number',
+    min: 1,
+    placeholder: '1',
+    help: 'How many browsers a parallel run spreads its cases over: the one on the CDP port plus this many minus one on the ports after it, each on its own profile, started headless. One Chrome’s main thread queues every lane’s renderer, encoder and CDP session, so a run at 8 cases waits on Chrome rather than on the application — 4 browsers is a good start. Only worth more than 1 with more than one case at a time.',
+    advanced: true,
+  },
+  {
     name: 'no-ensure-chrome',
     label: 'Do not start or repair Chrome',
     type: 'boolean',

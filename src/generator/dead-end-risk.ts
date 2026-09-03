@@ -86,8 +86,13 @@ export interface RiskRequest {
   declaredRoutes: readonly string[];
   /** Whether backend steps may run at all this pass. */
   backend: boolean;
-  /** The sheet's own recorded Actual Result, when it holds one. */
-  knownResult?: 'passed' | 'failed' | undefined;
+  /**
+   * The sheet's own recorded Actual Result, when it holds one. `blocked` is
+   * the sheet's Blocked / Pending deploy (CG-01, `sheetVerdict`): the tester
+   * could not reach the claim either, which is evidence for a dead-end, not
+   * for a fail.
+   */
+  knownResult?: 'passed' | 'failed' | 'blocked' | undefined;
 }
 
 export interface RiskAssessment {
@@ -169,8 +174,13 @@ export function riskSignals(request: RiskRequest): string[] {
     if (!request.backend && /^(request|expectStatus|expectJson|expectHeader|expectCalls|dbSnapshot|expectDb)/.test(step.action)) {
       signals.push(`${at}: ${step.action} — a backend step, and the backend is off this pass`);
     }
-    if ('selector' in step && typeof step.selector === 'string') {
-      for (const name of selectorNames(step.selector)) {
+    // The one selector, or an either/or step's several (CG-08) — each
+    // alternative names a label the page must render for that branch.
+    const selectors: string[] = [];
+    if ('selector' in step && typeof step.selector === 'string') selectors.push(step.selector);
+    if (step.action === 'expectAnyVisible') selectors.push(...step.selectors);
+    for (const selector of selectors) {
+      for (const name of selectorNames(selector)) {
         const key = fold(name);
         if (seenNames.has(key)) continue;
         seenNames.add(key);
@@ -183,6 +193,11 @@ export function riskSignals(request: RiskRequest): string[] {
   if (request.knownResult === 'failed') {
     signals.push(
       "the sheet's own Actual Result records this case as FAILED — a known defect the tester already hit; a rerun most likely fails the same way",
+    );
+  }
+  if (request.knownResult === 'blocked') {
+    signals.push(
+      "the sheet's own Actual Result records this case as BLOCKED — the tester could not reach the claim either (a missing page, a pending deploy); a run most likely dead-ends before its assertions",
     );
   }
   if (/known\s*fail|failed\s+\d{4,}/i.test(request.caseText)) {

@@ -25,9 +25,7 @@ import { join } from 'node:path';
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 import {
   SCREENSHOT_BUDGET_BYTES,
-  VIDEO_BUDGET_BYTES,
   catalogReportPath,
-  chooseEmbeddedVideos,
   renderCatalogReport,
   verdictChipOf,
   type CatalogReportCase,
@@ -206,43 +204,6 @@ const withVideo = (over: Partial<CatalogReportCase>, data: string, over2: Partia
     } as Partial<ProofBundle>),
   });
 
-describe('chooseEmbeddedVideos', () => {
-  it('serves cases that did NOT pass first — a catalog is mostly passes', () => {
-    // Two of these three fit. Document order would spend the budget on the
-    // pass and leave the failure, the case a reader actually opens, with none.
-    const keep = chooseEmbeddedVideos(
-      [
-        withVideo({ id: 'A', verdict: 'passed' }, 'x'.repeat(60)),
-        withVideo({ id: 'B', verdict: 'failed' }, 'x'.repeat(60)),
-        withVideo({ id: 'C', verdict: 'review' }, 'x'.repeat(60)),
-      ],
-      130,
-    );
-    assert.deepEqual([...keep].sort(), ['B', 'C']);
-  });
-
-  it('within a group takes the smallest first, so the budget buys the most cases', () => {
-    const keep = chooseEmbeddedVideos(
-      [
-        withVideo({ id: 'BIG', verdict: 'failed' }, 'x'.repeat(100)),
-        withVideo({ id: 'S1', verdict: 'failed' }, 'x'.repeat(40)),
-        withVideo({ id: 'S2', verdict: 'failed' }, 'x'.repeat(40)),
-      ],
-      90,
-    );
-    assert.deepEqual([...keep].sort(), ['S1', 'S2']);
-  });
-
-  it('ignores a case with no recording at all rather than counting it', () => {
-    assert.equal(chooseEmbeddedVideos([kase({ id: 'A' })]).size, 0);
-    assert.equal(chooseEmbeddedVideos([withVideo({ id: 'B' }, '')]).size, 0);
-  });
-
-  it('has a budget at all — a 75MB catalog is not a report anyone opens', () => {
-    assert.equal(VIDEO_BUDGET_BYTES, 25_000_000);
-  });
-});
-
 describe('the recording in the page', () => {
   const render = (cases: CatalogReportCase[]): string =>
     renderCatalogReport({ title: 't', runKey: null, generatedAt: null, cases });
@@ -283,15 +244,14 @@ describe('the recording in the page', () => {
     assert.match(html, /data-failure-offset="4\.50"/);
   });
 
-  it('names what it left out instead of dropping it in silence', () => {
+  it('embeds a recording whatever it weighs — there is no size cap (removed 2026-09-03)', () => {
     const html = renderCatalogReport({
       title: 't', runKey: null, generatedAt: null,
       cases: [withVideo({ id: 'A' }, 'x'.repeat(30_000_000))],
     });
-    assert.match(html, /left out to keep this file portable/);
-    assert.doesNotMatch(html, /data-webm="x/);
-    // …and gives no seek control into a film that is not there.
-    assert.doesNotMatch(html, /data-seek=/);
+    assert.match(html, /data-webm="x/);
+    assert.doesNotMatch(html, /left out to keep this file portable/);
+    assert.match(html, /data-seek=/);
   });
 
   it('says a recording FAILED differently from one that was never made', () => {

@@ -60,3 +60,36 @@ export function generateValue(kind: DataKind, attempt = 1): string {
   const base = GENERATORS[kind]();
   return attempt <= 1 ? base : withUniqueSuffix(base, kind, attempt);
 }
+
+// --- unique per run -------------------------------------------------------------
+
+/**
+ * The last six alphanumerics of a catalog run key —
+ * `be100@2026-08-31t07-20-25-957z` → `25957z`.
+ *
+ * Six because the run key's tail is its timestamp, and the tail moves on every
+ * pass; alphanumerics only because the suffix lands in a Plan ID, a rule name
+ * or a document code, and `-957z` with the key's own hyphen reads as a range
+ * where the app wants an identifier.
+ */
+export function runSuffix(runKey: string): string {
+  const compact = runKey.replace(/[^A-Za-z0-9]+/g, '');
+  return compact.slice(-6);
+}
+
+/**
+ * A key value made unique to THIS run: `PL_06_21` → `PL_06_21_25957z`.
+ *
+ * The BE sheet's create rows set the unique field to the case id itself
+ * (`Benefit Plan ID = PL_06_21`, `Benefit name = QA-Insert`, Consent `SIT_*`
+ * codes). On any rerun the app answers "Plan ID already exists" and the create
+ * case fails for a reason the case never asked about; the sheet's own testers
+ * appended `_R1`/`_R2`/`_R3` by hand (PL_06_21_R3 is in the workbook). This is
+ * that hand, deterministic: the same case in the same run always gets the same
+ * value, so an assertion that echoes the id still matches what was typed.
+ */
+export function uniquePerRun(value: string, runKey: string): string {
+  const suffix = runSuffix(runKey);
+  if (suffix === '') return value;
+  return `${value}_${suffix}`;
+}

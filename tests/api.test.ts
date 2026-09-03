@@ -1780,3 +1780,28 @@ describe('a typed credential never reaches the record', () => {
     assert.equal(looksLikeCredentialField('role=searchbox[name="Search"]'), false);
   });
 });
+
+// --- Variables: builtins and arithmetic (CG-07 / EH-03, 2026-09-03) ---------
+
+describe('variable store: {{date:…}} builtins and {{name+N}} arithmetic', () => {
+  it('computes a date token at interpolation time instead of asking the author to', () => {
+    const store = new VariableStore({ now: () => new Date(2026, 8, 3) });
+    assert.equal(store.interpolate('{{date:today}}'), '2026-09-03');
+    assert.equal(store.interpolate('{{date:today+119d}}'), '2026-12-31');
+    assert.equal(store.interpolate('{{date:monthEnd|dd/MM/yyyy}}'), '30/09/2026');
+    assert.throws(() => store.interpolate('{{date:yesterweek}}'), UnknownVariableError);
+  });
+
+  it('moves the first number in a saved value by N, keeping the rest of the text and its style', () => {
+    const store = new VariableStore();
+    store.set('before_total', '75');
+    store.set('rows-before', '1,234 rows');
+    assert.equal(store.interpolate('{{before_total+1}}'), '76');
+    assert.equal(store.interpolate('{{before_total-1}}'), '74');
+    assert.equal(store.interpolate('{{rows-before+1}}'), '1,235 rows');
+    assert.equal(store.interpolate('{{rows-before}}'), '1,234 rows', 'a hyphenated name still reads as itself');
+    store.set('label', 'Active');
+    assert.throws(() => store.interpolate('{{label+1}}'), /is not a number/);
+    assert.throws(() => store.interpolate('{{missing+1}}'), UnknownVariableError);
+  });
+});

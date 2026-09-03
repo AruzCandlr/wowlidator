@@ -305,12 +305,23 @@ const RUNG_PROSE: Record<string, string> = {
   fast: 'Tried the selector exactly as the test wrote it',
   case: 'Retried it ignoring letter-case',
   narrow: "Re-matched the author's text selector against what the page actually renders",
+  // The free rungs added on the humi benchmark (2026-09-03): a control folded
+  // inside a collapsed section, a fixed bar over the control, a claim held
+  // against the label's container, and the two stop rungs that end the
+  // ladder with a verdict instead of paying a model to disprove nothing.
+  reveal: "Opened the collapsed section holding the control and retried the author's own selector",
+  scroll: 'Scrolled the control clear of the fixed bar that was intercepting the pointer and retried',
+  kin: "Checked the claim against the control's container, where a label's value sits beside it",
+  absence: "Stopped — the text is nowhere in the page's visible text, so no repair could find it; the claim fails on the page as it stands",
+  'not-found': 'Stopped — the application had navigated to a page it does not have (a 404 rendered in place); no repair attempted',
   cache: 'Tried a selector repaired on an earlier run',
   late: 'Gave the content one longer window to render',
   backend: 'Stopped without attempting a repair — a request had already failed',
   authorization: 'Stopped without attempting a repair — the page is an authorization failure',
   known: 'Stopped — this exact selector already dead-ended on this page earlier in the run',
+  declined: 'Declined to ask the model for a repair',
   jit: 'Asked the model for a replacement selector',
+  agent: 'Let the agent drive the browser to make the control reachable, then retried',
 };
 
 /**
@@ -325,7 +336,10 @@ export function escalationTrace(error: string | undefined): TraceRung[] {
   if (!error || !error.includes('\n')) return [];
   const rungs: TraceRung[] = [];
   for (const line of error.split('\n')) {
-    const match = /^\s*-\s+([a-z]+)\b[^:]*:\s*(.*)$/i.exec(line);
+    // A rung's name may carry a hyphen (`not-found:` — the app-404 stop rung);
+    // the old `[a-z]+` read it as "not" and the account said "Tried the not
+    // step". A lone `not` never names a rung, so the widening is safe.
+    const match = /^\s*-\s+([a-z]+(?:-[a-z]+)*)\b[^:]*:\s*(.*)$/i.exec(line);
     if (!match) continue;
     const rung = (match[1] ?? '').toLowerCase();
     const detail = (match[2] ?? '').trim();

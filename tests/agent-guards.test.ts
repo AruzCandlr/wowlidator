@@ -24,6 +24,14 @@ import {
   repeatedToggleClick,
   TOGGLE_CLICK_LIMIT,
   unscopedDestructiveClick,
+  goalIdentifiers,
+  DESTRUCTIVE_NAME,
+  menuPathOf,
+  menuNodeScore,
+  multiPersonaGoal,
+  multiPersonaSummary,
+  formGaps,
+  formatFormGaps,
 } from '../src/orchestrator/agent-guards.js';
 import {
   AGENT_ACTIONS,
@@ -990,5 +998,158 @@ describe('the dbCount action (CDP)', { skip: skipBrowser }, () => {
     });
     assert.equal(result.actions[0]?.ok, false);
     assert.match(result.actions[0]?.error ?? '', /no database is configured .* verify through the page/);
+  });
+});
+
+// --- OA-12: identifiers without digits, quoted names, deactivate/terminate ----------
+
+describe('unscopedDestructiveClick — identifiers without a digit, and the sheets\' destructive verbs (OA-12)', () => {
+  const click = (selector: string) => ({ action: 'click', selector, value: '', url: '' });
+
+  it('names the row of a digit-less identifier, a quoted name and a Capitalised target', () => {
+    // EC-Consent teardown "5. คืนค่าเดิมโดยปิดใช้งานเอกสารรหัส SIT_DUP_DOC";
+    // BE "Delete plan Medical Reimbursement (ICU) (TH_MED_005)"; BE
+    // "Benefit Name = QA-Delete"; a plan named with no code at all.
+    assert.deepEqual(goalIdentifiers('ปิดใช้งานเอกสารรหัส SIT_DUP_DOC / SIT_TARGET_DOC'), ['SIT_DUP_DOC', 'SIT_TARGET_DOC']);
+    assert.deepEqual(goalIdentifiers('Delete plan Medical Reimbursement (ICU) (TH_MED_005) and confirm'), ['TH_MED_005', 'Medical Reimbursement']);
+    assert.deepEqual(goalIdentifiers('delete the Dental plan'), ['Dental']);
+    assert.deepEqual(goalIdentifiers('delete the row "QA-Delete while filter Type"'), ['QA-Delete', 'QA-Delete while filter Type']);
+    assert.deepEqual(goalIdentifiers('delete the first draft'), [], 'a goal that names no row is left to the prompt');
+    // A quoted button label, dialog title or answer is what the click lands on, never what it is scoped to.
+    assert.deepEqual(goalIdentifiers('click "Delete", then in the "Confirm delete plan" dialog answer "Yes, delete"'), []);
+  });
+
+  it('refuses the first Deactivate / พ้นสภาพ the way it refuses the first Delete', () => {
+    assert.match(DESTRUCTIVE_NAME.source, /deactivate/);
+    assert.ok(DESTRUCTIVE_NAME.test('ปิดใช้งาน') && DESTRUCTIVE_NAME.test('พ้นสภาพ') && DESTRUCTIVE_NAME.test('Terminate'));
+    assert.equal(DESTRUCTIVE_NAME.test('ยกเลิก'), false, 'Cancel is the Cancel button of every Thai dialog');
+    const why = unscopedDestructiveClick(click('role=button[name="Deactivate" i] >> nth=0'), 'ปิดใช้งานเอกสาร SIT_DUP_DOC');
+    assert.match(why ?? '', /^destructive:/);
+    assert.match(why ?? '', /SIT_DUP_DOC/);
+    assert.match(unscopedDestructiveClick(click('role=button[name="พ้นสภาพ"]'), 'พ้นสภาพพนักงาน EMP042') ?? '', /EMP042/);
+    assert.equal(unscopedDestructiveClick(click('role=row[name="SIT_DUP_DOC" i] >> role=button[name="ปิดใช้งาน"]'), 'ปิดใช้งานเอกสาร SIT_DUP_DOC'), null);
+  });
+
+  it('accepts a row scoped by part of a long name, and still refuses the bare button', () => {
+    const goal = 'Delete plan Medical Reimbursement (ICU) (TH_MED_005)';
+    assert.equal(unscopedDestructiveClick(click('role=row[name="Medical Reimbursement" i] >> role=button[name="Delete" i]'), goal), null);
+    assert.match(unscopedDestructiveClick(click('role=button[name="Delete" i] >> nth=0'), goal) ?? '', /^destructive:/);
+    assert.match(unscopedDestructiveClick(click('role=button[name="Delete" i] >> nth=0'), 'delete the Dental plan') ?? '', /about Dental/);
+    assert.equal(unscopedDestructiveClick(click('role=row[name="Dental" i] >> role=button[name="Delete" i]'), 'delete the Dental plan'), null);
+  });
+});
+
+// --- OA-13: a Thai surface name -----------------------------------------------------
+
+describe('goalSurfaceNames in Thai (OA-13)', () => {
+  const node = (role: string, name: string): AxNode => ({
+    role, name, value: '', description: '', disabled: false, checked: false, url: '',
+  });
+  it('reads a quoted name after ป็อปอัพ / หน้าต่าง, and a Latin name before เปิดขึ้น', () => {
+    assert.deepEqual(goalSurfaceNames('กดปุ่ม Delete แล้วป็อปอัพ "ยืนยันการลบ" แสดงขึ้น'), ['ยืนยันการลบ']);
+    assert.deepEqual(goalSurfaceNames('หน้าต่าง Confirm Delete เปิดขึ้น'), ['Confirm Delete']);
+    assert.equal(goalAlreadyShowing('กดปุ่ม Delete แล้วป็อปอัพ "ยืนยันการลบ" แสดงขึ้น', [node('dialog', 'ยืนยันการลบแผน')]), 'ยืนยันการลบแผน');
+  });
+});
+
+// --- OA-2: the menu path a goal names (pure half) ----------------------------------
+
+describe('menuPathOf (OA-2, pure half)', () => {
+  it('reads the arrow chain the EC, PY and consent sheets write', () => {
+    // Menu column verbatim: "EC > Hire & Onboard (New Hire)", "SPD Admin >
+    // Payroll > Run Payroll", "เปิดเมนู Setup > ระบบ > ความปลอดภัย > Consent Form".
+    assert.deepEqual(menuPathOf('open EC > Hire & Onboard (New Hire) and click Add'), [
+      { name: 'EC', alternatives: ['EC'] },
+      { name: 'Hire & Onboard', alternatives: ['Hire & Onboard', 'New Hire'] },
+    ]);
+    assert.deepEqual(menuPathOf('SPD Admin > Payroll > Run Payroll')?.map((s) => s.name), ['SPD Admin', 'Payroll', 'Run Payroll']);
+    assert.deepEqual(menuPathOf('เปิดเมนู Setup > ระบบ > ความปลอดภัย > Consent Form')?.map((s) => s.name), ['Setup', 'ระบบ', 'ความปลอดภัย', 'Consent Form']);
+    assert.deepEqual(
+      menuPathOf('Navigate via HR > Benefits Admin > Benefit Plans to the Benefit Plan Catalog page and end on /en/benefits/plans')?.map((s) => s.name),
+      ['HR', 'Benefits Admin', 'Benefit Plans'],
+      'the sentence after the path is not a segment',
+    );
+    assert.deepEqual(menuPathOf('Sign in, then open Team Management -> Probation Reviews and end on /en/workflows/probation')?.map((s) => s.name), ['Team Management', 'Probation Reviews']);
+  });
+
+  it('reads the numbered form the BE and TM sheets write, only after a menu word', () => {
+    // "Menu: 1. HR\n2. Benefits Admin\n3. Benefit Plans" (359 BE rows); "1. ME\n2. Time & Attendance\n3. Leave request" (TM).
+    assert.deepEqual(menuPathOf('menu path:\n1. ME\n2. Time & Attendance\n3. Leave request')?.map((s) => s.name), ['ME', 'Time & Attendance', 'Leave request']);
+    assert.deepEqual(menuPathOf('Follow the menu path: 1. HR 2. Benefits Admin 3. Benefit Plans and end on /en/benefits/plans')?.map((s) => s.name), ['HR', 'Benefits Admin', 'Benefit Plans']);
+    assert.equal(menuPathOf('Steps: 1. กด Menu 2. ตรวจสอบการมองเห็นเมนู HR'), null, 'numbered STEPS are not a menu path');
+  });
+
+  it('is null for a single level, so the link and goto rungs keep their goals', () => {
+    // tests/agent-economy.test.ts "leaves a goal that names a route the tree does not show to the model".
+    assert.equal(menuPathOf('Navigate via the Eligibility rules tile and end on /hub/rules'), null);
+    assert.equal(menuPathOf('Open the main navigation menu and click HR'), null);
+    assert.equal(menuPathOf('Use the menu to reach /hub/plans'), null);
+  });
+
+  it('scores a node exactly-named above one that merely contains the label, badge aside', () => {
+    const hr = { name: 'HR', alternatives: ['HR'] };
+    assert.equal(menuNodeScore(hr, 'HR'), 2);
+    assert.equal(menuNodeScore(hr, 'HR Analytics'), 1);
+    assert.equal(menuNodeScore(hr, 'Chrome'), 0);
+    assert.equal(menuNodeScore({ name: 'Probation Reviews', alternatives: ['Probation Reviews'] }, 'Probation Reviews 3'), 2, 'a live-count badge is not part of the name');
+    assert.equal(menuNodeScore({ name: 'Hire & Onboard', alternatives: ['Hire & Onboard', 'New Hire'] }, 'New Hire'), 2, 'the alias counts');
+  });
+});
+
+// --- OA-15: a goal for two people (pure half) --------------------------------------
+
+describe('multiPersonaGoal (OA-15, pure half)', () => {
+  it('names the split when a goal needs two people', () => {
+    // PRB "Data: ผู้ทดสอบ <MANAGER_ACCOUNT> ผู้ประเมิน และ <HRBP_ACCOUNT> ผู้อนุมัติ";
+    // TM ML_01_01 "1. Login web humi … 8. กดปุ่ม Submit 9. Manager กดปุ่ม approve request leave".
+    assert.deepEqual(multiPersonaGoal('ผู้ทดสอบ <MANAGER_ACCOUNT> ผู้ประเมิน และ <HRBP_ACCOUNT> ผู้อนุมัติ: submit the review then approve'), ['manager', 'hrbp']);
+    assert.deepEqual(multiPersonaGoal('Submit the leave request as the employee, then the manager approves it'), ['employee', 'manager']);
+    assert.deepEqual(multiPersonaGoal('Login web humi, submit Sick Leave, then Manager กดปุ่ม approve request leave'), ['the signed-in person', 'manager']);
+    assert.deepEqual(multiPersonaGoal('sign out and sign in again as the manager'), ['manager', 'another person']);
+    assert.match(multiPersonaSummary(['employee', 'manager']), /^multi-persona goal: .*signOut → sign-in as manager → workflow/);
+  });
+
+  it('is null for one person, however many times the goal names them', () => {
+    // "3. Login ด้วย <HR_ADMIN_ACCOUNT> (HRBP)" (PRB, 18 rows) is one account
+    // acting in a role — a human mapping, not a split.
+    assert.equal(multiPersonaGoal('Login ด้วย <HR_ADMIN_ACCOUNT> (HRBP) แล้วกด Open case รายการเดิมแล้วกด Approve'), null);
+    assert.equal(multiPersonaGoal('as HR admin, delete the plan, then as HR admin verify the row is gone'), null);
+    assert.equal(multiPersonaGoal('Login ด้วย <MANAGER_ACCOUNT> ของพนักงานที่ประเมิน แล้วกด Submit'), null, 'ของพนักงาน (of the employee) names no second actor');
+    assert.equal(multiPersonaGoal('submit the request; the approval route shows Manager'), null, 'mentioning the route is not acting as the approver');
+    assert.equal(multiPersonaGoal('Login as manager, then the manager approves the pending request'), null);
+  });
+});
+
+// --- OA-6: required and still empty (pure half) -------------------------------------
+
+describe('formGaps (OA-6, pure half)', () => {
+  it('lists the required controls still empty, by flag or by the asterisk in the label', () => {
+    // "กรอกข้อมูล Mandatory อื่นให้ครบถ้วนเพื่อให้สามารถ Submit ได้" (HIR-EC-106
+    // and 20 more); "Employee Group*" as the ec10 report renders the label.
+    const gaps = formGaps([
+      { role: 'textbox', name: 'Bank*', value: '' },
+      { role: 'button', name: 'Currency', value: '— Select —', required: true },
+      { role: 'textbox', name: 'Nickname', value: '' },
+      { role: 'button', name: 'Employee Group*', value: 'A — Permanent' },
+      { role: 'checkbox', name: 'I agree*', value: '', checked: false },
+      { role: 'button', name: 'Submit', value: '' },
+      { role: 'textbox', name: 'Hire Date', value: 'dd/mm/yyyy', required: true },
+      { role: 'button', name: 'Gender*', value: 'กรุณาเลือก' },
+      { role: 'textbox', name: 'Off*', value: '', disabled: true },
+      { role: 'heading', name: 'Personal Information*', value: '' },
+    ]);
+    assert.deepEqual(gaps.map((g) => g.line), [
+      'textbox "Bank*"',
+      'button "Currency" value="— Select —"',
+      'checkbox "I agree*"',
+      'textbox "Hire Date" value="dd/mm/yyyy"',
+      'button "Gender*" value="กรุณาเลือก"',
+    ]);
+    assert.equal(
+      formatFormGaps(gaps),
+      'REQUIRED AND STILL EMPTY (5): textbox "Bank*" · button "Currency" value="— Select —" · checkbox "I agree*" · textbox "Hire Date" value="dd/mm/yyyy" · button "Gender*" value="กรุณาเลือก"',
+    );
+    assert.equal(formatFormGaps([]), null);
+    assert.match(formatFormGaps(gaps, 2) ?? '', /^REQUIRED AND STILL EMPTY \(5\): textbox "Bank\*" · button "Currency" value="— Select —" · … and 3 more$/);
   });
 });

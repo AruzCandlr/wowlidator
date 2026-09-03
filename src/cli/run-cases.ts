@@ -4,7 +4,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import { formatCoverage, meaningfulCoverage } from '../coverage/ax-coverage.js';
 import {
@@ -19,7 +19,7 @@ import {
   type GenerationProvenance,
   type ProofBundle,
 } from '../engine/proof-bundle.js';
-import { runFlow, type Flow, type RunFlowOptions } from '../engine/runner.js';
+import { DEFAULT_CDP_URL, runFlow, type Flow, type RunFlowOptions } from '../engine/runner.js';
 import { AGENT_FAIL_FAST_MAX_STEPS } from '../orchestrator/workflow-agent.js';
 import type { DeadEndRisk } from '../engine/proof-bundle.js';
 import { describeRisk } from '../generator/dead-end-risk.js';
@@ -46,7 +46,8 @@ import {
 import { raiseSessionCapFor } from '../providers/claude-cli-session.js';
 import { describeDiagnosis, diagnoseError } from '../generator/error-diagnosis.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
-import { writeFlowFile } from './artifacts.js';
+import { laneBrowsers, writeFlowFile } from './artifacts.js';
+import { BrowserLease } from '../browser/pool.js';
 import { FlowRepairLoop } from '../repair/flow-repair-loop.js';
 import { LlmFlowRepairModel } from '../repair/flow-repair-model.js';
 import { RepairMemory } from '../repair/repair-memory.js';
@@ -104,6 +105,7 @@ import {
   PIPELINED_CONCURRENCY_AFTER_AUTHORING,
   PIPELINED_CONCURRENCY_WHILE_AUTHORING,
   caseWrites,
+  orderDependentsAfterSources,
   readersFirst,
   runQueue,
   withWorkflowScripts,
@@ -114,6 +116,7 @@ import {
   truthRows,
   truthTally,
   writeTruthTable,
+  type KnownResult,
 } from '../reporter/truth-table.js';
 import type { CliOptions } from './options.js';
 import { clearPauseFile, pauseFileFor, pauseRequested, requestPause, resetPause } from './pause.js';
@@ -129,6 +132,7 @@ import {
   emitTagged,
   lineLogger,
   planLogger,
+  runPersonas,
   stepLogger,
 } from './runtime.js';
 
@@ -174,6 +178,29 @@ export interface SuiteCase {
    * resume can decide whether to author it again. See `suite-progress.ts`.
    */
   refused?: { reason: string; attempt: number } | undefined;
+  /**
+   * Cases this one continues from (CG-12), as the ids their names start
+   * with. The lane waits for each to finish and runs only if every one
+   * passed; a source that failed, was blocked, or is not in this run blocks
+   * this case with the reason — never a run against a record the source
+   * never created.
+   */
+  dependsOn?: readonly string[] | undefined;
+  /**
+   * The sheet's own verdict for the row (CG-01), the truth table's ground
+   * truth — `blocked` included, which the provenance's typed field cannot
+   * carry. Recorded on the ledger so a resume still grades the case.
+   */
+  knownResult?: KnownResult | undefined;
+  /**
+   * Every Expected line of the row is record-only (CG-09): the flow captures
+   * and asserts nothing, on purpose. It is RUN (the vacuous gate lets it
+   * through), and a clean run ends `review` with its captures — the sheet has
+   * no oracle, so there is nothing to pass.
+   */
+  recordOnly?: boolean | undefined;
+  /** Credentials by persona label for this case's `signIn` steps (CG-05). In memory only. */
+  personas?: Readonly<Record<string, { email: string; password: string }>> | undefined;
 }
 
 /**
@@ -359,6 +386,8 @@ export async function runCases(
       vacuous?: boolean | undefined;
       proofPath?: string | undefined;
       authoringRefused?: number | undefined;
+      dependsOn?: readonly string[] | undefined;
+      knownResult?: KnownResult | undefined;
     } = {},
   ): Promise<void> => {
     if (ledger === null || where.ledger === undefined) return;
@@ -370,6 +399,11 @@ export async function runCases(
     void liveReport?.refresh();
   };
   const entries: IndexEntry[] = [];
+  /** The per-row facts every ledger record carries (CG-01 / CG-12). */
+  const caseFacts = (testCase: SuiteCase): { dependsOn?: readonly string[] | undefined; knownResult?: KnownResult | undefined } => ({
+    ...(testCase.dependsOn === undefined ? {} : { dependsOn: testCase.dependsOn }),
+    ...(testCase.knownResult === undefined ? {} : { knownResult: testCase.knownResult }),
+  });
 
   // **The list may still be growing.** A catalog pushes each case into a
   // `CaseQueue` the moment it is authored, so running starts while the model
@@ -379,9 +413,18 @@ export async function runCases(
   const streaming = cases instanceof CaseQueue;
   // Readers run before writers unless the caller pinned the list's own order.
   // A streaming suite cannot be reordered — rows run as they are authored.
+  // A dependent after its source whatever the reorder did (CG-12):
+  // `readersFirst` would put a reader that continues from a writer AHEAD of
+  // it, and the loop below only ever waits on a source queued earlier.
   const queue = streaming
     ? cases
-    : closedQueue(options.sheetOrder ? cases : readersFirst(cases));
+    : closedQueue(
+        orderDependentsAfterSources(
+          options.sheetOrder ? cases : readersFirst(cases),
+          (c) => caseIdOf(c.name),
+          (c) => c.dependsOn ?? [],
+        ),
+      );
   // The report exists before the first case has a verdict.
   if (liveReport !== null) await liveReport.refresh();
 
@@ -670,11 +713,55 @@ export async function runCases(
   const heldBlocks = (name: string): boolean =>
     [...heldCases].some((id) => name === id || name.startsWith(`${id} `) || name.startsWith(id));
 
+  /**
+   * Where a case's sources stand (CG-12). `ready` — every source passed;
+   * `wait` — a source is queued ahead of it and not finished yet (the
+   * dispatch is held; the loop re-asks as lanes finish); `blocked` — a source
+   * failed, was blocked, awaits review, is not in this run, or is queued
+   * BEHIND the dependent (which the loop's index order could never reach
+   * first — the producer and `orderDependentsAfterSources` rule it out, and
+   * this is the honest answer if one slips through rather than a deadlock).
+   * A resume reads the earlier pass's verdicts for sources it did not re-run.
+   */
+  const dependencyStatus = (
+    testCase: SuiteCase,
+    index: number,
+  ): { kind: 'ready' } | { kind: 'wait'; on: string } | { kind: 'blocked'; reason: string } => {
+    for (const id of testCase.dependsOn ?? []) {
+      if (id === caseIdOf(testCase.name)) continue;
+      const at = queue.items.findIndex((c) => caseIdOf(c.name) === id);
+      const done = at >= 0 ? collected[at] : undefined;
+      const prior = inherited?.[id];
+      const verdict = done?.verdict ?? (at === -1 ? prior?.verdict : undefined);
+      if (verdict === 'passed') continue;
+      if (verdict === undefined) {
+        if (at >= 0 && at < index) return { kind: 'wait', on: id };
+        if (at >= 0) return { kind: 'blocked', reason: `depends on ${id}, which is queued after it — order the sheet so ${id} comes first` };
+        if (!queue.closed && (where.ledger?.planned ?? []).includes(id)) return { kind: 'wait', on: id };
+        return { kind: 'blocked', reason: `depends on ${id}, which is not in this run` };
+      }
+      const why = verdict === 'review' ? 'awaits review' : verdict === 'blocked' ? 'never ran' : 'did not pass';
+      return { kind: 'blocked', reason: `depends on ${id} which ${why}${done?.reason ?? prior?.reason ? ` (${(done?.reason ?? prior?.reason ?? '').split('\n')[0]})` : ''}` };
+    }
+    return { kind: 'ready' };
+  };
+  const dependencyWaitLogged = new Set<number>();
+
   const canRunWith = (
     testCase: SuiteCase,
     index: number,
     inflight: readonly { item: SuiteCase; index: number }[],
   ): boolean => {
+    // A dependent waits for its source's verdict before anything else is
+    // asked; the source is queued ahead, so it is in flight or done.
+    const dependency = dependencyStatus(testCase, index);
+    if (dependency.kind === 'wait') {
+      if (!dependencyWaitLogged.has(index)) {
+        dependencyWaitLogged.add(index);
+        process.stdout.write(`  [c${index + 1}]      waits for ${dependency.on} — ${testCase.name} continues from it\n`);
+      }
+      return false;
+    }
     const held = heldBlocks(testCase.name);
     // Under data locks the only thing that can refuse a dispatch is an
     // explicit hold: two cases that touch the same section are no longer kept
@@ -837,6 +924,13 @@ export async function runCases(
   // The warm claude pool must fit the lanes, or the (concurrency+1)th ask
   // falls to a cold one-shot — the exact bill parallelism exists to avoid.
   if (parallel) raiseSessionCapFor(concurrencyOf());
+  // The browsers the lanes spread over (`--browsers`): each case leases the
+  // least-loaded one for its length. One browser — the CDP port — unless
+  // `prepare` was asked for a pool, so a single-browser run is unchanged.
+  const browsers = new BrowserLease(laneBrowsers().length > 0 ? laneBrowsers() : [options.cdp ?? DEFAULT_CDP_URL]);
+  if (parallel && browsers.size > 1) {
+    process.stdout.write(`  browsers   ${browsers.size}, each case on the least-busy one\n`);
+  }
   if (governor !== null && !streaming && queue.length > 1) void governor.onEvent(observe('suite-start'));
   await runQueue(
     queue,
@@ -860,7 +954,21 @@ export async function runCases(
       emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
       if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
       collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
-      await noteOutcome(collected[index]!, { authoringRefused: testCase.refused.attempt });
+      await noteOutcome(collected[index]!, { authoringRefused: testCase.refused.attempt, ...caseFacts(testCase) });
+      where.onCaseDone?.(testCase, collected[index]!);
+      return;
+    }
+    // **A case whose source did not pass is not run** (CG-12): the record it
+    // continues from was never created, and a failure against a missing
+    // record would file the source's defect twice. Blocked with the reason,
+    // and `--resume` re-runs it once the source passes.
+    const dependency = dependencyStatus(testCase, index);
+    if (dependency.kind !== 'ready') {
+      const reason = dependency.kind === 'blocked' ? dependency.reason : `depends on ${dependency.on}, which had not finished`;
+      emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
+      if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
+      collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
+      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, ...caseFacts(testCase) });
       where.onCaseDone?.(testCase, collected[index]!);
       return;
     }
@@ -868,13 +976,15 @@ export async function runCases(
     // assertions are the sign-in proof and a URL, so the browser would spend
     // a minute producing a green that says nothing; it is recorded as
     // blocked — with the reason — and the next `--resume` re-authors it.
-    const vacuous = vacuousFlow(testCase.flow);
+    // The one exception is a record-only case (CG-09): asserting nothing IS
+    // its shape — it runs to capture, and ends for review below.
+    const vacuous = testCase.recordOnly === true ? null : vacuousFlow(testCase.flow);
     if (vacuous !== null) {
       const reason = `vacuous flow — ${vacuous}; re-authored on --resume`;
       emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
       if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
       collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
-      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, vacuous: true });
+      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, vacuous: true, ...caseFacts(testCase) });
       where.onCaseDone?.(testCase, collected[index]!);
       return;
     }
@@ -889,7 +999,7 @@ export async function runCases(
       emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
       if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
       collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
-      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, vacuous: true });
+      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, vacuous: true, ...caseFacts(testCase) });
       where.onCaseDone?.(testCase, collected[index]!);
       return;
     }
@@ -916,9 +1026,10 @@ export async function runCases(
         ? (flow: Flow): ReturnType<typeof dataGateFor> =>
             dataGateFor(flow, locks, { fkPairs, onLog: (line) => emitTagged(tag, `  ${line}\n`) })
         : null;
+    const laneCdp = browsers.acquire();
     try {
       const ordinaryRunOptions: RunFlowOptions = {
-        cdpUrl: options.cdp,
+        cdpUrl: laneCdp,
         // Concurrent cases must not share a browser context, whatever the
         // video mode says — see `SmartRunnerOptions.isolate`.
         isolate: parallel,
@@ -950,6 +1061,12 @@ export async function runCases(
         // Carried for masking only: a password the person supplied must not
         // reach the proof bundle or the emailable report in cleartext.
         credentials: options.credentials,
+        // Every persona the run may sign in as (CG-05): the flags, the `--as`
+        // default, and the labels this row resolved — in memory only.
+        personas: runPersonas(options, testCase.personas),
+        // Where an `upload` step's fixture path is resolved from: the flow's
+        // own folder, the same rule `run` uses for a hand-written flow.
+        ...(testCase.flowPath === undefined ? {} : { flowDir: dirname(resolve(testCase.flowPath)) }),
         historyPath: options.history ? options.historyPath : null,
         onStep: stepLogger(options, tag),
         onPlan: planLogger(options, tag),
@@ -1039,22 +1156,35 @@ export async function runCases(
           emitTagged(tag, `  ! no verdict: ${blocked}\n`, 'err');
         }
         if (reportPath !== null && blocked === null) indexed[index] = { bundle, reportPath };
+        const verdict: CaseOutcome['verdict'] =
+          blocked !== null
+            ? 'blocked'
+            // The status a consumer acts on: an auto-review ruling (the
+            // judge at 70%+) or a human ruling outranks the machine's
+            // deferral, so a ruled run scores passed/failed, not 'review'.
+            : effectiveStatus(bundle) === 'needs-review'
+              ? 'review'
+              : isPassing(effectiveStatus(bundle))
+                ? 'passed'
+                : 'failed';
+        // **A record-only case that ran clean is not a pass** (CG-09): its
+        // Expected lines say "record what the system shows" — the sheet has
+        // no oracle, so there is nothing the run could have proved. It ends
+        // `review` with its captures named, for a person to read.
+        const observed =
+          testCase.recordOnly === true && verdict === 'passed'
+            ? `observed only — the sheet has no oracle; captured: ${
+                bundle.variables && Object.keys(bundle.variables).length > 0
+                  ? Object.entries(bundle.variables).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(', ')
+                  : 'see the screenshots'
+              }`
+            : null;
         collected[index] = {
           name: testCase.name,
-          verdict:
-            blocked !== null
-              ? 'blocked'
-              // The status a consumer acts on: an auto-review ruling (the
-              // judge at 70%+) or a human ruling outranks the machine's
-              // deferral, so a ruled run scores passed/failed, not 'review'.
-              : effectiveStatus(bundle) === 'needs-review'
-                ? 'review'
-                : isPassing(effectiveStatus(bundle))
-                  ? 'passed'
-                  : 'failed',
+          verdict: observed === null ? verdict : 'review',
           bundle,
           reportPath: reportPath ?? undefined,
-          reason: blocked ?? failureOf(bundle),
+          reason: observed ?? blocked ?? failureOf(bundle),
         };
         if (parallel) {
           emitTagged(tag, `case "${testCase.name}" ${blocked !== null ? 'blocked' : familyLabel(bundle.status)}\n`);
@@ -1075,7 +1205,7 @@ export async function runCases(
               .catch(() => undefined);
           }
         }
-        await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, proofPath });
+        await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, proofPath, ...caseFacts(testCase) });
         // The scenario gate counts each case once; a solo re-run replaces a
         // verdict it has already counted.
         if (notify) where.onCaseDone?.(testCase, collected[index]!);
@@ -1168,9 +1298,10 @@ export async function runCases(
       const reason = error instanceof Error ? error.message.split('\n')[0] ?? '' : String(error);
       emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
       collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
-      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath });
+      await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, ...caseFacts(testCase) });
       where.onCaseDone?.(testCase, collected[index]!);
     } finally {
+      browsers.release(laneCdp);
       // The case's window joins the registry either way — the interference
       // detector needs finished writers, and a lane must never stay
       // "in flight" after a throw.
@@ -1329,14 +1460,18 @@ export async function runCases(
   if (outcomes.length > 1) {
     const blocked = outcomes.filter((o) => o.verdict === 'blocked');
     const failed = outcomes.filter((o) => o.verdict === 'failed');
-    const review = outcomes.filter((o) => o.verdict === 'review');
-    const passed = outcomes.length - blocked.length - failed.length - review.length;
+    // A record-only case that ran clean (CG-09) is counted apart from the
+    // wording near-misses: both await a person, for different reasons.
+    const observed = outcomes.filter((o) => o.verdict === 'review' && isObservedOnly(o));
+    const review = outcomes.filter((o) => o.verdict === 'review' && !isObservedOnly(o));
+    const passed = outcomes.length - blocked.length - failed.length - review.length - observed.length;
 
     // One line per listed case, always all of them. The roll-up is the only
     // place the reader can see that the count adds up.
     process.stdout.write(
       `\n${outcomes.length} case(s) — ${passed} passed, ${failed.length} failed` +
         (review.length > 0 ? `, ${review.length} proved-? awaiting human review` : '') +
+        (observed.length > 0 ? `, ${observed.length} observed only (no oracle in the sheet; captures for review)` : '') +
         (blocked.length > 0 ? `, ${blocked.length} never ran` : '') +
         '\n',
     );
@@ -1392,7 +1527,9 @@ export async function runCases(
             ? ` — pass** (** ${issues[0] ?? 'a step that only acted broke'}${issues.length > 1 ? `; +${issues.length - 1} more` : ''})`
             : '') +
           (outcome.verdict === 'review'
-            ? ' — proved-? (a wording near-miss; confirm proved or failed in the panel)'
+            ? isObservedOnly(outcome)
+              ? ' — observed only (the sheet has no oracle; read the captures in the report)'
+              : ' — proved-? (a wording near-miss; confirm proved or failed in the panel)'
             : '') +
           (outcome.verdict === 'blocked' ? ' — never ran' : '') +
           (outcome.reason === undefined || withIssues ? '' : `: ${outcome.reason}`) +
@@ -1427,10 +1564,18 @@ export async function runCases(
     // already earned: zero model tokens. Written whatever --report says,
     // because it is the suite-level result, not a per-case artifact.
     {
-      const knownByName = new Map<string, 'passed' | 'failed'>();
+      // The suite case's own record first (it carries the sheet's `blocked`,
+      // CG-01), the provenance stamp second, and for a carried case the
+      // ledger the earlier pass wrote.
+      const knownByName = new Map<string, KnownResult>();
       for (const testCase of queue.items) {
-        const known = testCase.flow.authoredBy?.knownResult;
+        const known = testCase.knownResult ?? testCase.flow.authoredBy?.knownResult;
         if (known !== undefined) knownByName.set(testCase.name, known);
+      }
+      for (const outcome of outcomes) {
+        if (knownByName.has(outcome.name)) continue;
+        const known = inherited?.[caseIdOf(outcome.name)]?.knownResult;
+        if (known !== undefined) knownByName.set(outcome.name, known);
       }
       const rows = truthRows(outcomes, knownByName);
       if (hasGroundTruth(rows)) {
@@ -1495,6 +1640,11 @@ export async function runCases(
     }
   }
   return outcomes;
+}
+
+/** A `review` outcome that is a record-only case's clean run (CG-09), not a wording near-miss. */
+function isObservedOnly(outcome: CaseOutcome): boolean {
+  return outcome.reason !== undefined && outcome.reason.startsWith('observed only');
 }
 
 /** `95s` under two minutes, `4m12s` above — a duration a reader scans, not parses. */

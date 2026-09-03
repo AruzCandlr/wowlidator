@@ -33,6 +33,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
 import { isPassing, BACKEND_TIER_ACTIONS, type ProofBundle, type ProofStep } from '../engine/proof-bundle.js';
+import { observedEvidence, stepKindFacts, stepTarget } from './step-facts.js';
 import { buildVerdict } from './verdict.js';
 
 /** Escape for XML text and attribute values. */
@@ -56,7 +57,10 @@ function seconds(ms: number): string {
 
 /** What a reader should see as the case name. */
 function caseName(step: ProofStep): string {
-  return step.intent ?? `${step.action} ${step.selector ?? ''}`.trim();
+  // `stepTarget`, not `selector`: an `expectAnyVisible` has a LIST of
+  // selectors and a `signIn` a persona, and a testcase named bare
+  // "expectAnyVisible" is the empty row wearing a CI badge.
+  return step.intent ?? `${step.action} ${stepTarget(step) ?? ''}`.trim();
 }
 
 function classOf(bundle: ProofBundle, step: ProofStep): string {
@@ -180,12 +184,19 @@ export function renderCtrf(bundles: readonly ProofBundle[], version = '0.2.0'): 
         extra: {
           action: step.action,
           selector: step.selector ?? null,
+          // What the step was aimed at when `selector` is null by construction
+          // (the alternatives of an either/or, an upload's file names, a
+          // persona LABEL — never an address), plus the kind's own facts.
+          target: stepTarget(step),
+          facts: Object.fromEntries(stepKindFacts(step).map((f) => [f.label, f.value])),
           resolution: step.resolution,
           url: step.url ?? null,
           hasScreenshot: step.screenshot !== undefined,
           // Where in the run's recording this step is, for a CI viewer that
           // has the video alongside the report.
           videoOffsetMs: step.videoOffsetMs ?? null,
+          // What the agent read off the page on an observe-and-record leg.
+          observed: observedEvidence(step),
         },
       };
       if (step.error) {

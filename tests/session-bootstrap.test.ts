@@ -245,3 +245,145 @@ describe('the session bootstrap (CDP)', { skip: skipBrowser }, () => {
     assert.match(String(signOut?.detail?.['urlAfter'] ?? ''), /\/login/);
   });
 });
+
+// --- The persona `signIn` step (EH-10, 2026-09-03) -------------------------
+
+describe('the signIn step: personas, sign-out first, the vault keyed by account (CDP)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+
+  before(async () => {
+    server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://x');
+      const cookie = req.headers.cookie ?? '';
+      const who = /(?:^|;\s*)session=([^;]+)/.exec(cookie)?.[1] ?? null;
+
+      if (url.pathname === '/login') {
+        if (req.method === 'POST') {
+          let raw = '';
+          req.on('data', (chunk) => (raw += chunk));
+          req.on('end', () => {
+            const params = new URLSearchParams(raw);
+            const email = params.get('email') ?? '';
+            if (params.get('password') === 'pw2026' && email !== '') {
+              res.writeHead(302, { 'set-cookie': `session=${encodeURIComponent(email)}; Path=/`, location: '/app' });
+            } else {
+              res.writeHead(302, { location: '/login' });
+            }
+            res.end();
+          });
+          return;
+        }
+        if (url.searchParams.get('step') === '2') {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end(
+            PAGE(
+              '<form method="post" action="/login">' +
+                `<input type="hidden" name="email" value="${url.searchParams.get('email') ?? ''}">` +
+                '<input type="password" name="password">' +
+                '<button type="submit">Sign in</button></form>',
+            ),
+          );
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(
+          PAGE(
+            '<form method="get" action="/login"><input type="hidden" name="step" value="2">' +
+              '<input type="email" name="email">' +
+              '<button type="submit">Next</button></form>',
+          ),
+        );
+        return;
+      }
+
+      if (url.pathname === '/app') {
+        if (who === null) {
+          res.writeHead(302, { location: '/login' });
+          res.end();
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(
+          PAGE(
+            `<h1>Benefit Plans</h1><p id="who">Signed in as ${decodeURIComponent(who)}</p>` +
+              '<button aria-haspopup="menu" aria-expanded="false" ' +
+              'onclick="document.getElementById(\'m\').style.display=\'block\'">Account</button>' +
+              '<div id="m" role="menu" style="display:none">' +
+              '<a role="menuitem" href="/logout">Sign out</a></div>',
+          ),
+        );
+        return;
+      }
+
+      if (url.pathname === '/logout') {
+        res.writeHead(302, { 'set-cookie': 'session=; Path=/; Max-Age=0', location: '/login' });
+        res.end();
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+
+  const personas = {
+    HR_ADMIN_ACCOUNT: { email: 'admin@b.test', password: 'pw2026' },
+    MANAGER_ACCOUNT: { email: 'manager@b.test', password: 'pw2026' },
+  };
+
+  it('signs in as one persona, hands off to another through the app\'s own sign-out, and banks the account it ended as', async () => {
+    const { SessionVault } = await import('../src/engine/session-vault.js');
+    const vault = new SessionVault();
+    const flow: Flow = {
+      name: 'employee submits, manager approves',
+      steps: [
+        { action: 'signIn', as: '<HR_ADMIN_ACCOUNT>', url: `${origin}/login` },
+        { action: 'goto', url: `${origin}/app` },
+        { action: 'expectText', selector: '#who', value: 'Signed in as admin@b.test' },
+        { action: 'signIn', as: 'manager', intent: 'the manager approves the request' },
+        { action: 'expectText', selector: '#who', value: 'Signed in as manager@b.test' },
+      ],
+    };
+    const bundle = await runFlow(flow, {
+      cdpUrl: CDP_URL,
+      video: 'off',
+      isolate: true,
+      screenshots: 'off',
+      healer: null,
+      personas,
+      sessionVault: vault,
+    });
+
+    assert.equal(bundle.status, 'passed', bundle.error ?? '');
+    const [first, , , second] = bundle.steps;
+    assert.equal(first?.detail?.['signedInAs'], 'admin@b.test');
+    assert.equal(first?.detail?.['persona'], 'HR_ADMIN_ACCOUNT');
+    assert.equal(second?.detail?.['signedInAs'], 'manager@b.test');
+    assert.match(String(second?.detail?.['signedOutVia'] ?? ''), /menuitem "Sign out" behind/, 'the live session ended through the app');
+    assert.match(String(second?.detail?.['signInUrl'] ?? ''), /\/login/, 'the sign-in page the flow named is reused');
+    assert.ok(!JSON.stringify(bundle).includes('pw2026'), 'no persona password reaches the record');
+    // The vault holds the account the run ENDED as, and only that one.
+    assert.ok(vault.get(origin, 'manager@b.test'), 'banked under the manager');
+    assert.equal(vault.get(origin, 'admin@b.test'), null, 'the admin session was signed out of, never banked');
+  });
+
+  it('an unknown persona is a harness error naming the labels available', async () => {
+    const bundle = await runFlow(
+      { name: 'unknown persona', steps: [{ action: 'signIn', as: 'HRBP_ACCOUNT', url: `${origin}/login` }] },
+      { cdpUrl: CDP_URL, video: 'off', isolate: true, screenshots: 'off', healer: null, personas },
+    );
+    assert.equal(bundle.status, 'error');
+    assert.match(bundle.steps[0]?.error ?? '', /no persona by that label/);
+    assert.match(bundle.steps[0]?.error ?? '', /"HR_ADMIN_ACCOUNT", "MANAGER_ACCOUNT"/);
+  });
+});

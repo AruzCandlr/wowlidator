@@ -27,8 +27,8 @@ Two planes, and the boundary between them is the whole design:
 ## Commands
 
 ```bash
-npm run ui            # the control panel: every command below, in a browser, with a manual
-npm run ui -- --wow   # wowUI: the same server at /wow — runs, verdicts and the proof behind them
+npm run ui            # the panel at /: runs, verdicts and the proof behind them, every command as a form, and the manual
+npm run ui -- --wow   # the older wowUI layout at /wow, kept for side-by-side comparison
 npm run cli -- go <flow.json | url | "what to test">   # one command, start to report
 npm run cli -- catalog cases.xlsx --claims-only        # what does this document claim? no browser
 npm run cli -- catalog cases.xlsx --claims c.json --url <page> --run   # prove the approved ones
@@ -137,5 +137,5 @@ same authority as this file, just paid for only when relevant:
 - `src/providers/CLAUDE.md` — Structured output on free tiers; Prompt discipline
 - `src/repair/CLAUDE.md` — Runtime script evolution
 - `src/reporter/CLAUDE.md` — Reading the report; Proof bundles and the report
-- `src/ui/CLAUDE.md` — The control panel; wowUI
+- `src/ui/CLAUDE.md` — The panel server; wowUI; the Ledger home page
 - `src/visual/CLAUDE.md` — Visual regression

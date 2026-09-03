@@ -138,6 +138,19 @@ export function diagnosisSignals(request: DiagnosisRequest): string[] {
   if (bundle.error && /provider|refused|quota|rate limit|breaker|usage cap/i.test(bundle.error)) {
     signals.push('the run error mentions the model provider — points at environment');
   }
+  // A persona the run was not given (CG-05: `signIn` by label resolves
+  // against `RunFlowOptions.personas`), or a fixture the harness could not
+  // write (CG-19), is the RUN's configuration, never the case or the flow —
+  // the fix is `--persona LABEL=email:password` or the fixture root, not a
+  // re-author.
+  for (const step of erroredSteps(bundle)) {
+    if (/persona .* has no credentials|no credentials for persona|FixtureMissingError|fixture .* could not be written/i.test(step.error ?? '')) {
+      signals.push(
+        `step ${step.index} ${step.action}: ${(step.error ?? '').split('\n')[0]} — a persona or fixture the run was not configured with; points at environment (pass --persona LABEL=email:password / check the fixture root), not at the case`,
+      );
+      break;
+    }
+  }
 
   const stalls = erroredSteps(bundle).filter((s) => s.action === 'workflow' && /stalled|nothing advanced|no progress/i.test(s.error ?? ''));
   const missingTargets = new Set<string>();

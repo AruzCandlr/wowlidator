@@ -11,6 +11,8 @@ import { describe, it } from 'node:test';
 import {
   DEFAULT_GOVERNOR_TURNS,
   RuleGovernorModel,
+  fixtureTokens,
+  governorHoldsConsumed,
   governorMode,
   LlmGovernorModel,
   QueueGovernor,
@@ -220,5 +222,96 @@ describe('the rules governor — deterministic, $0', () => {
     assert.deepEqual({ kind: third.kind, size: (third as { size?: number }).size }, { kind: 'pool', size: 4 });
     // a non-timeout failure never counts
     t = 4000; assert.equal((await gov.decide(ended('expected text to contain "x"'), null)).kind, 'idle');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fixture holds (OA-16, 2026-09-03): a consumable a case's Test data names —
+// a Position a hire takes, a plan a delete removes — is held by one case at
+// a time. The data locks serialise by TABLE; two hires on one Position have
+// different sections and dispatched together. Pure rules over facts.
+// ---------------------------------------------------------------------------
+
+describe('the rules governor holds a shared fixture', () => {
+  it('fixtureTokens reads Position codes, plan/document codes, persona tokens and TD sets, once each', () => {
+    const text =
+      'HIR-EC-072 Login ด้วย <HR_ADMIN_ACCOUNT> (HRBP). Test data: ชุดข้อมูล TD-01 Position = 40106337 ' +
+      'Department = 30000123 Benefit Plan ID = TH_MED_005 เอกสาร SIT_DUP_DOC; Position = 40106337 again; ' +
+      'amount 1,234.56 ref 12345678.9';
+    assert.deepEqual(fixtureTokens(text), [
+      '<HR_ADMIN_ACCOUNT>',
+      '40106337',
+      '30000123',
+      'HIR-EC-072',
+      'TD-01',
+      'TH_MED_005',
+      'SIT_DUP_DOC',
+    ]);
+    assert.deepEqual(fixtureTokens('no fixtures here, just prose'), []);
+  });
+
+  it('holds a pending case that names a fixture an in-flight WRITER names, and releases it when the writer ends', async () => {
+    const gov = new RuleGovernorModel();
+    const writer = { name: 'HIR-EC-072', writes: true, sections: ['table:employee'], fixtures: ['40106337', 'TD-01'] };
+    const obs: GovernorObservation = {
+      ...observation(),
+      event: 'suite-start',
+      flyingFacts: [writer],
+      pendingFacts: [
+        { name: 'PL_03_01', writes: true, sections: ['table:plan'], fixtures: ['TH_MED_005'] },
+        { name: 'HIR-EC-073', writes: true, sections: ['table:employee_2'], fixtures: ['40106337'] },
+      ],
+    };
+    const first = await gov.decide(obs, null);
+    assert.deepEqual(first, { kind: 'hold', caseId: 'HIR-EC-073', reason: 'shares fixture 40106337 with HIR-EC-072 in flight' });
+    // The same picture again: the case is already held, nothing else to do.
+    assert.equal((await gov.decide(obs, null)).kind, 'idle');
+    // The writer is gone from the lanes: the hold is lifted, on any event.
+    const after = await gov.decide({ ...obs, event: 'queue-blocked', flyingFacts: [] }, null);
+    assert.equal(after.kind, 'release');
+    assert.equal((after as { caseId?: string }).caseId, 'HIR-EC-073');
+    assert.match(after.reason, /fixture 40106337 is free/);
+  });
+
+  it('a reader in flight holds nobody, and a case without fixtures is never held', async () => {
+    const gov = new RuleGovernorModel();
+    const action = await gov.decide(
+      {
+        ...observation(),
+        event: 'suite-start',
+        flyingFacts: [{ name: 'HIR-EC-001', writes: false, sections: ['route:hire'], fixtures: ['40106337'] }],
+        pendingFacts: [
+          { name: 'HIR-EC-073', writes: true, sections: ['table:employee'], fixtures: ['40106337'] },
+          { name: 'PL_01_01', writes: true, sections: ['table:plan'] },
+        ],
+      },
+      null,
+    );
+    assert.equal(action.kind, 'idle');
+  });
+
+  it('a case that ended without passing warns the cases naming its fixture — once — and holds only when asked to', async () => {
+    const ended = { name: 'HIR-EC-072', writes: true, sections: ['table:employee'], fixtures: ['40106337'], detail: 'expectText "Hired" timed out' };
+    const obs: GovernorObservation = {
+      ...observation(),
+      event: 'case-ended',
+      endedFact: ended,
+      flyingFacts: [],
+      pendingFacts: [{ name: 'HIR-EC-073', writes: true, sections: ['table:employee'], fixtures: ['40106337'] }],
+    };
+    const noting = new RuleGovernorModel({ holdConsumed: false });
+    const note = await noting.decide(obs, null);
+    assert.equal(note.kind, 'note');
+    assert.match(note.reason, /"HIR-EC-073" likely blocked: fixture 40106337 consumed\/poisoned by HIR-EC-072 \(expectText "Hired" timed out\)/);
+    assert.equal((await noting.decide(obs, null)).kind, 'idle', 'said once');
+    // A pass consumes nothing worth a warning.
+    assert.equal((await new RuleGovernorModel().decide({ ...obs, endedFact: { ...ended, detail: '' } }, null)).kind, 'idle');
+
+    const holding = new RuleGovernorModel({ holdConsumed: true });
+    const hold = await holding.decide(obs, null);
+    assert.equal(hold.kind, 'hold');
+    assert.equal((hold as { caseId?: string }).caseId, 'HIR-EC-073');
+    assert.equal(governorHoldsConsumed({}), false);
+    assert.equal(governorHoldsConsumed({ WOWLIDATOR_GOVERNOR_HOLD_CONSUMED: '1' }), true);
   });
 });

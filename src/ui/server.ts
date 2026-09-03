@@ -76,7 +76,7 @@ import { listCatalogRuns } from './catalog-runs.js';
 import { ledgerPathFor } from '../cli/suite-progress.js';
 import { CATALOG_REPORT_DIR } from '../reporter/catalog-report.js';
 import { buildVerdict } from '../reporter/verdict.js';
-import { renderApp } from './app-html.js';
+import { renderLedger } from './ledger-html.js';
 import { renderWowUi } from './wow-ui-html.js';
 
 export const DEFAULT_UI_PORT = 4600;
@@ -322,19 +322,20 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   const path = url.pathname;
 
   // ---- the pages ----------------------------------------------------------
+  // The home page: wowUI's nouns on the Ledger layout, plus every command as
+  // a form and the manual (src/ui/ledger-html.ts). The command-first panel
+  // that used to live here was retired on 2026-09-03.
   if (path === '/' && req.method === 'GET') {
-    text(res, renderApp(), 200, 'text/html; charset=utf-8');
+    text(res, renderLedger(), 200, 'text/html; charset=utf-8');
     return;
   }
 
-  // wowUI: the same server, the same commands, GRIM's evidence-first layout.
+  // wowUI: the same server, the same commands, the older evidence-first
+  // layout — kept for side-by-side comparison until it is retired.
   if ((path === '/wow' || path === '/wow/') && req.method === 'GET') {
     text(res, renderWowUi(), 200, 'text/html; charset=utf-8');
     return;
   }
-
-  // newUI: both surfaces as one page — docs/one-page-ui-spec.md. Same
-  // server, same whitelist, same API; only the document differs.
 
 
   // ---- what this install can do ------------------------------------------
@@ -1434,8 +1435,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 2;
   }
 
-  // One server, three surfaces. `--wow` only decides which one the
-  // browser is pointed at; all are served either way.
+  // One server, two surfaces. `--wow` only decides which one the browser is
+  // pointed at; both are served either way.
   const openPath = argv.includes('--wow') ? 'wow' : '';
 
   try {
@@ -1446,9 +1447,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     });
     process.stdout.write(
       `\n  wowlidator control panel\n\n` +
-        `    ${url}                every command, with a manual on the last tab\n` +
-        `    ${url}wow             wowUI — runs, verdicts and the evidence behind them\n` +
-        `    ${url}new             newUI — everything above, on one page\n\n` +
+        `    ${url}                runs, verdicts and the evidence behind them — every command, and the manual\n` +
+        `    ${url}wow             the older wowUI layout, for comparison\n\n` +
         `  Ctrl-C to stop.\n\n`,
     );
     // Hold the process open; the server is the point of it.

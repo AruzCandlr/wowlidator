@@ -244,7 +244,26 @@ export function auditGrounding(
         }
         return;
       }
-      if (!treeUsable || !hasSelector(step)) return;
+      if (!treeUsable) return;
+      // An either/or step (CG-08) carries several selectors; each alternative
+      // is audited on its own, and one finding names every ungrounded one so
+      // the reviewer repoints the list as a whole.
+      if (step.action === 'expectAnyVisible') {
+        const ungrounded = step.selectors.filter((one) => selectorGrounded(one, tree) === false);
+        if (ungrounded.length > 0) {
+          findings.push({
+            section,
+            index,
+            step,
+            afterWorkflow,
+            reason:
+              `the accessible name in ${ungrounded.join(' ; ')} appears in no captured tree` +
+              (afterWorkflow ? ' (the step follows a workflow leg, so its page was never captured)' : ''),
+          });
+        }
+        return;
+      }
+      if (!hasSelector(step)) return;
       const grounded = selectorGrounded(step.selector, tree);
       if (grounded === false) {
         findings.push({
@@ -561,6 +580,28 @@ export function applyReview(
         record.notes.push(`${label}: "${before}" → "${url}" (${firstLine(d.reasoning)})`);
         if (step.action === 'goto') step.url = url;
         else step.value = url;
+        record.replaced += 1;
+        continue;
+      }
+      // An either/or step is repointed as a whole list — `;`-separated, the
+      // author's own convention — and every alternative must be backed, or a
+      // branch that can never show would still be handed over as a claim.
+      if (step.action === 'expectAnyVisible') {
+        const list = d.selector
+          .split(/[;\n]/)
+          .map((one) => canonical(one))
+          .filter((one) => one !== '' && !one.startsWith('/*'));
+        if (list.length < 2) {
+          reject('an expectAnyVisible needs two or more ";"-separated selectors');
+          continue;
+        }
+        const unbacked = list.find((one) => !selectorBacked(one, request.evidence));
+        if (unbacked !== undefined) {
+          reject(`"${unbacked}" names nothing in any tree, the source index or the documents`);
+          continue;
+        }
+        record.notes.push(`${label}: selectors ${step.selectors.join(' ; ')} → ${list.join(' ; ')} (${firstLine(d.reasoning)})`);
+        step.selectors = list;
         record.replaced += 1;
         continue;
       }

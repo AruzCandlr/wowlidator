@@ -18,7 +18,7 @@ import {
   type ClaimsFile,
 } from '../../catalog/catalog.js';
 import { LlmDraftModel, draftCatalog } from '../../catalog/draft.js';
-import { extractDocumentFile } from '../../catalog/extract.js';
+import { extractDocumentFile, extractWorkbookSheets } from '../../catalog/extract.js';
 import { CONTEXT_DOC_MAX_CHARS, referencedSources, selectRelevantContext } from '../../catalog/retrieve.js';
 import { assessDeadEndRisk, describeRisk, riskEnabled, type DeadEndRisk, type RiskModel } from '../../generator/dead-end-risk.js';
 import { fkPairsFromGraph } from '../sections.js';
@@ -34,13 +34,26 @@ import {
   type SequenceDoc,
 } from '../../catalog/sequence.js';
 import {
+  dbTablesNamed,
   describeCase,
+  destinationOf,
+  menuPathOf,
+  observeOnlyCase,
   parseTestCaseTable,
-  recordedResult,
+  parseWorkbookCases,
   renderTestCaseTable,
+  roundsOf,
+  sheetGateReason,
+  sheetVerdict,
+  splitPairs,
   tableToClaims,
+  testDataPairs,
+  uniqueKeys,
+  type CaseDestination,
+  type SheetVerdict,
   type TestCaseRow,
 } from '../../catalog/test-case-table.js';
+import { runSuffix, uniquePerRun } from '../../data/mock-data.js';
 import {
   LlmDiagramTranscriber,
   isDiagramImage,
@@ -119,9 +132,9 @@ import {
   writeLedger,
 } from '../suite-progress.js';
 import { substantiveAssertions, vacuousFlow } from '../../generator/vacuous.js';
-import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, mapPool, orderScenariosFastestFirst } from '../case-plan.js';
+import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, mapPool, orderDependentsAfterSources, orderScenariosFastestFirst } from '../case-plan.js';
 import { healHintsFrom } from '../../context/heal-hints.js';
-import type { CliOptions } from '../options.js';
+import { lookupPersona, personaEmails, personaLabelOf, type CliOptions } from '../options.js';
 import { pauseRequested } from '../pause.js';
 import {
   assertRolesResolvable,
@@ -523,8 +536,26 @@ interface TableCase {
   caseTitle: string;
   /** The pre-run dead-end risk, judged right after authoring — see `dead-end-risk.ts`. */
   risk?: DeadEndRisk | undefined;
-  /** The sheet's recorded Actual Result, normalised — accuracy's ground truth. */
-  knownResult?: 'passed' | 'failed' | undefined;
+  /**
+   * The sheet's recorded result (Actual Result / Test Status), normalised —
+   * accuracy's ground truth. `blocked` is the sheet saying its testers could
+   * not run the row (CG-01); it reaches the truth table as its own class and
+   * never the provenance's passed/failed field.
+   */
+  knownResult?: SheetVerdict | undefined;
+  /**
+   * Every Expected line of the row is record-only (CG-09: `= ? OQ-…`,
+   * `ยังไม่มีคำตอบ ให้บันทึกค่าที่ระบบแสดงจริง`): the case captures and never
+   * asserts, and a clean run ends `review` with its captures, not `passed`.
+   */
+  recordOnly?: boolean | undefined;
+  /** Cases this one continues from (CG-12), as their qualified ids. */
+  dependsOn?: readonly string[] | undefined;
+  /**
+   * The credentials the row's persona labels resolved to (CG-05), for the
+   * run's `signIn` steps. In memory only — never written with the flow.
+   */
+  personas?: Readonly<Record<string, { email: string; password: string }>> | undefined;
 }
 
 
@@ -545,26 +576,301 @@ interface TableCase {
  * feature exists, its wording is unsettled) but the author is told, see
  * `caseCard`.
  */
-export function sheetGate(row: TestCaseRow): string | null {
-  const actual = row.actual.trim().toLowerCase();
-  const note = row.note.trim();
-  if (/^cancel+ed$|^ยกเลิก/.test(actual)) return 'the sheet records this case as Cancelled — the requirement dropped it';
-  if (/\b(cancel+ed|dropped|removed from (?:the )?req|out of scope)\b/i.test(note) && !/re-?test/i.test(actual)) {
-    return `the sheet's Note says the case was cancelled: "${note.slice(0, 80)}"`;
+export function sheetGate(
+  row: TestCaseRow,
+  options: {
+    /** `--include-blocked`: author Blocked / Pending rows on purpose (CG-01). */
+    includeBlocked?: boolean | undefined;
+    /**
+     * Texts that may stand in for the cases a row cites but this catalog lacks
+     * (CG-12: `ต่อจากเคส E2E-118`, `Employee ID : EMXXXX (จาก E2E-118)`) — the
+     * context documents. A reference one of them names is a record the run
+     * can look up; one none of them names is a record the run cannot have.
+     */
+    registry?: readonly string[] | undefined;
+  } = {},
+): string | null {
+  // The pure gate lives with the parser (`sheetGateReason`): Cancelled, a Note
+  // that says cancelled or cannot-run-yet, and — since CG-01 — a Test Status
+  // of Blocked / Pending deploy / Pending confirm with its bug ticket.
+  const reason = sheetGateReason(row, { includeBlocked: options.includeBlocked });
+  if (reason !== null) return reason;
+  // A row that NEEDS a case this catalog does not hold — its employee, its
+  // plan — cannot be authored standalone: measured, the probation rows cite
+  // E2E-118's hire and the harness would create nothing and fail on a record
+  // that does not exist. Refused here, $0, unless a supplied document names
+  // the case (a registry of what the earlier cycle created).
+  const external = (row.externalRefs ?? []).filter(
+    (id) => !(options.registry ?? []).some((text) => text.includes(id)),
+  );
+  if (external.length > 0) {
+    return `depends on ${external.join(', ')}, which is not in this catalog — pass a --context-doc that records what it created, or run that case first`;
   }
-  // The sheet's own verdict that the case CANNOT BE RUN YET — the screen it
-  // needs is not delivered, the tester is told to record "not yet testable".
-  // CNS-EC-028 (2026-09-02) carried exactly that in its Note; authored anyway,
-  // the model narrowed all five steps to three "the page exists" assertions
-  // and the case went green about a feature the sheet says is absent. A row
-  // that says so is recorded blocked with its own words, and costs no model.
-  const notYet =
-    /ยังรันไม่ได้|ยังทดสอบไม่ได้|ยังไม่สามารถทดสอบ|บันทึกผลเป็นยังทดสอบไม่ได้|cannot (?:be )?(?:run|tested) yet|not (?:yet )?testable|blocked until (?:dev|the team|delivery)/i.exec(
-      note,
-    );
-  if (notYet !== null) {
-    const line = note.split('\n').find((l) => l.includes(notYet[0])) ?? notYet[0];
-    return `the sheet's Note says the case cannot be run yet: "${line.trim().slice(0, 140)}"`;
+  return null;
+}
+
+/**
+ * The persona labels a row names, in order of first appearance (CG-05): the
+ * workbook's `<HR_ADMIN_ACCOUNT>` tokens (424 mentions), and the role words
+ * the PY and TM sheets use instead of a token — `Login ด้วย SPD Admin` (every
+ * PY row), `หัวหน้าอนุมัติ` / `Manager approve` (the hand-off rows), `HRBP`,
+ * `Login web humi` / `พนักงานเข้าสู่ระบบ` (an employee's own session). A bare
+ * "Manager" is NOT a persona — `Approval route = Manager` is a field value —
+ * so the role word must be doing something (approving, signing in).
+ */
+export function personasOf(row: TestCaseRow): string[] {
+  const text = [row.persona, row.preconditions, row.testData, row.steps, row.testCase].join('\n');
+  const found: { label: string; at: number }[] = [];
+  for (const match of text.matchAll(/<([A-Z][A-Z0-9_]*_ACCOUNT)>/g)) {
+    found.push({ label: match[1]!, at: match.index ?? 0 });
+  }
+  const ROLE_WORDS: readonly [RegExp, string][] = [
+    [/SPD\s*Admin/iu, 'SPD_ADMIN'],
+    [/\bHR\s*Admin\b/iu, 'HR_ADMIN_ACCOUNT'],
+    [/\bHRBP\b/u, 'HRBP_ACCOUNT'],
+    [/\b(?:line\s+)?manager\b[^\n.]{0,24}?(?:approv|reject|log ?in|sign ?in|อนุมัติ|ปฏิเสธ|เข้าสู่ระบบ)|หัวหน้า(?:งาน)?\s*(?:อนุมัติ|ปฏิเสธ|เข้าสู่ระบบ|กด|login)/iu, 'MANAGER_ACCOUNT'],
+    [/login\s+web\s+humi|พนักงานเข้าสู่ระบบ|\bemployee\b[^\n.]{0,16}?(?:log ?in|sign ?in|เข้าสู่ระบบ)/iu, 'EMPLOYEE_ACCOUNT'],
+  ];
+  for (const [re, label] of ROLE_WORDS) {
+    const match = re.exec(text);
+    if (match !== null) found.push({ label, at: match.index });
+  }
+  found.sort((a, b) => a.at - b.at);
+  const out: string[] = [];
+  for (const { label } of found) if (!out.includes(label)) out.push(label);
+  return out;
+}
+
+/**
+ * The row's labels resolved through the persona map (CG-05). A single
+ * persona, or the FIRST of several, may fall back to the unlabelled `--as`
+ * account — that is what every run before this passed, and `<HR_ADMIN_ACCOUNT>`
+ * with `WOWLIDATOR_AS=admin@…` is the ec10 benchmark's own shape. A SECOND
+ * persona has no such fallback: one session cannot be both people, and an
+ * unmapped second label is exactly the guessed password this exists to end.
+ * `missing` names the labels the row cannot be authored without.
+ */
+export function resolveRowPersonas(
+  labels: readonly string[],
+  options: Pick<CliOptions, 'personas' | 'credentials'>,
+): {
+  personas: Record<string, { email: string; password: string }>;
+  missing: string[];
+  first: { email: string; password: string } | undefined;
+  fellBack: string | null;
+} {
+  const personas: Record<string, { email: string; password: string }> = {};
+  const missing: string[] = [];
+  let fellBack: string | null = null;
+  labels.forEach((label, index) => {
+    const key = personaLabelOf(label);
+    let creds = lookupPersona(options.personas, key);
+    if (creds === undefined && index === 0 && options.credentials !== undefined) {
+      creds = options.credentials;
+      fellBack = key;
+    }
+    if (creds === undefined) missing.push(key);
+    else personas[key] = creds;
+  });
+  const firstLabel = labels[0] === undefined ? undefined : personaLabelOf(labels[0]);
+  const first = firstLabel === undefined ? options.credentials : (personas[firstLabel] ?? options.credentials);
+  return { personas, missing, first, fellBack };
+}
+
+/**
+ * The described case with each `<LABEL>` token the map resolves spelled as
+ * `email (<LABEL>)` — so the sheet's own `Login ด้วย <HR_ADMIN_ACCOUNT>` tells the
+ * author which account, by email, and keeps the label a `signIn` step names.
+ * Never the password.
+ */
+export function describeWithPersonas(
+  described: string,
+  personas: Readonly<Record<string, { email: string; password: string }>>,
+): string {
+  return described.replace(/<([A-Z][A-Z0-9_]*_ACCOUNT)>/g, (token, label: string) => {
+    const creds = lookupPersona(personas, label);
+    return creds === undefined ? token : `${creds.email} (${token})`;
+  });
+}
+
+/**
+ * The sheet's key values made unique to this run, in every column at once
+ * (CG-13). The sheet says `Benefit Plan ID = PL_06_21`; the application
+ * answered "already exists" on every rerun after the first, and the testers
+ * appended `_R1`, `_R2` by hand. The resolver rewrites the TYPED value
+ * (`fromUniquePerRun`); the assertions quote Expected, so the same literal
+ * must change in Test data, Steps and Expected together or the case types
+ * one thing and looks for another. One suffix, `runSuffix(runKey)`, and a
+ * value already carrying it is left alone — the substitution is idempotent,
+ * so the resolver seeing the rewritten text cannot add a second tail.
+ */
+export function substituteUniqueKeys(
+  row: TestCaseRow,
+  runKey: string | undefined,
+): { row: TestCaseRow; substitutions: { key: string; from: string; to: string }[] } {
+  if (runKey === undefined || runSuffix(runKey) === '') return { row, substitutions: [] };
+  const suffix = runSuffix(runKey);
+  const substitutions: { key: string; from: string; to: string }[] = [];
+  const seen = new Set<string>();
+  // Longest first, so `PL_06_21_R3` is rewritten before `PL_06_21` could eat its head.
+  const keys = [...uniqueKeys(row)]
+    .map((k) => ({ ...k, value: k.value.replace(/^["“]|["”]$/g, '').trim() }))
+    .filter((k) => k.value !== '' && !k.value.endsWith(`_${suffix}`))
+    .sort((a, b) => b.value.length - a.value.length);
+  let { testData, steps, expected } = row;
+  for (const key of keys) {
+    if (seen.has(key.value)) continue;
+    seen.add(key.value);
+    const to = uniquePerRun(key.value, runKey);
+    const escaped = key.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'gu');
+    testData = testData.replace(re, to);
+    steps = steps.replace(re, to);
+    expected = expected.replace(re, to);
+    substitutions.push({ key: key.key, from: key.value, to });
+  }
+  if (substitutions.length === 0) return { row, substitutions };
+  return { row: { ...row, testData, steps, expected }, substitutions };
+}
+
+/**
+ * A multi-round row as one labelled case per round (CG-10): `รอบที่ 2 …`
+ * legs of a hire, `Case 2:` sub-runs of a payroll period, `--Insert R2--`
+ * phases, a `ว่างทีละช่อง` loop over fields. Each round is its own case —
+ * `PL_08_19#r2` — with the round's data written over the base Test data (a
+ * key the round overrides takes the round's value; a new key is appended),
+ * the round named in its Preconditions so the author performs the full
+ * script ONCE for it, and an edge to the round before it (an `Insert R2`
+ * inserts after R1's row exists). A row citing the expanded case now cites
+ * its last round. A single-round row is returned as it was.
+ */
+export function expandRounds(rows: readonly TestCaseRow[]): TestCaseRow[] {
+  const lastRound = new Map<string, string>();
+  const out: TestCaseRow[] = [];
+  for (const row of rows) {
+    const rounds = roundsOf(row).map((round) => ({
+      ...round,
+      // The EC sheet writes a round's data INTO its header line — `3. รอบที่ 2
+      // หน่วยธุรกิจ CU ค่าที่ต่างจากรอบอื่นในรอบนี้ Company = C013` — where the
+      // parser keeps it as the label. The pairs are read off the label then.
+      dataOverrides:
+        round.dataOverrides !== '' || !/\s=\s/.test(round.label)
+          ? round.dataOverrides
+          : splitPairs(round.label.slice(round.label.search(/[A-Z][A-Za-z0-9 /()'-]{0,40}\s=\s/)))
+              .filter((pair) => pair.key.split(/\s+/).length <= 5)
+              .map((pair) => `${pair.key} = ${pair.value}`)
+              .join('; '),
+    }));
+    if (rounds.length < 2) {
+      out.push(row);
+      continue;
+    }
+    // A sheet that numbers its later rounds from 2 leaves round 1 implicit —
+    // the base Test data as written. It is a case too.
+    if (rounds[0]!.n > 1) rounds.unshift({ label: 'รอบที่ 1 (ชุดข้อมูลหลัก)', n: 1, dataOverrides: '' });
+    const total = rounds.length;
+    rounds.forEach((round, index) => {
+      const id = `${row.caseId}#r${round.n}`;
+      const previous = index === 0 ? null : `${row.caseId}#r${rounds[index - 1]!.n}`;
+      const ref = round.stepsRef === undefined ? '' : ` (repeat steps ${round.stepsRef})`;
+      const banner =
+        `Round ${round.n} of ${total} — ${round.label}${ref}: this case performs the full script ONCE ` +
+        `with this round's data below; the other rounds are separate cases.`;
+      out.push({
+        ...row,
+        caseId: id,
+        sheetCaseId: row.sheetCaseId ?? row.caseId,
+        testCase: `${row.testCase} — round ${round.n}/${total}: ${round.label}`,
+        preconditions: row.preconditions === '' ? banner : `${banner}\n${row.preconditions}`,
+        testData: applyRoundOverrides(row.testData, round.dataOverrides),
+        dependsOn: [...(row.dependsOn ?? []), ...(previous === null ? [] : [previous])],
+      });
+      lastRound.set(row.caseId, id);
+    });
+  }
+  if (lastRound.size === 0) return out;
+  return out.map((row) =>
+    row.dependsOn === undefined
+      ? row
+      : { ...row, dependsOn: [...new Set(row.dependsOn.map((id) => (id === row.caseId ? id : (lastRound.get(id) ?? id))))] },
+  );
+}
+
+/** `Key = value; Key2 = value2` written over the Test data block, one pair per line. */
+function applyRoundOverrides(testData: string, overrides: string): string {
+  const pairs = overrides
+    .split('; ')
+    .map((pair) => pair.trim())
+    .filter((pair) => pair.includes(' = '))
+    .map((pair) => {
+      const at = pair.indexOf(' = ');
+      return { key: pair.slice(0, at).trim(), value: pair.slice(at + 3).trim() };
+    });
+  if (pairs.length === 0) return testData;
+  const lines = testData.split('\n');
+  const appended: string[] = [];
+  for (const pair of pairs) {
+    const re = new RegExp(`^(\\s*[-•*]?\\s*)${pair.key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=\\s*.*$`, 'iu');
+    let hit = false;
+    for (let i = 0; i < lines.length; i += 1) {
+      const m = re.exec(lines[i]!);
+      if (m === null) continue;
+      lines[i] = `${m[1] ?? ''}${pair.key} = ${pair.value}`;
+      hit = true;
+    }
+    if (!hit) appended.push(`${pair.key} = ${pair.value}`);
+  }
+  return [...lines, ...appended].filter((line, i, all) => !(line.trim() === '' && i === all.length - 1)).join('\n');
+}
+
+/**
+ * The workbook sliced to the worksheets and Categories asked for (CG-11),
+ * case-insensitively; a Category may be spelled `SHEET/Category`. Empty
+ * filters keep everything.
+ */
+export function sliceRows(
+  rows: readonly TestCaseRow[],
+  sheets: readonly string[],
+  categories: readonly string[],
+): TestCaseRow[] {
+  const fold = (value: string | undefined): string => (value ?? '').trim().toLowerCase();
+  const wantSheets = sheets.map(fold).filter((s) => s !== '');
+  const wantCategories = categories.map(fold).filter((c) => c !== '');
+  return rows.filter((row) => {
+    if (wantSheets.length > 0 && !wantSheets.includes(fold(row.sheet))) return false;
+    if (wantCategories.length > 0) {
+      const own = fold(row.category);
+      const qualified = `${fold(row.sheet)}/${own}`;
+      if (!wantCategories.includes(own) && !wantCategories.includes(qualified)) return false;
+    }
+    return true;
+  });
+}
+
+/** Names that OPEN something — a dialog, a form, the wizard's next step. Never a save, a submit, a delete. */
+const OPENING_NAME = /^(?:create|add|new|next|continue|insert|open|edit|make correction|\+|สร้าง|เพิ่ม|ถัดไป|เปิด|แก้ไข|ทำรายการ)/iu;
+const NOT_AN_OPENING = /delete|remove|ลบ|save|submit|บันทึก|confirm|ยืนยัน|approve|อนุมัติ|reject|ปฏิเสธ|sign|log ?out|ออกจากระบบ/iu;
+
+/**
+ * The first control a row's Steps click to reach its fields (CG-18, the
+ * reduced form): `กดปุ่ม "Create Plan"`, `Click Add`, `กด ถัดไป`, `+`. Only
+ * an OPENING name qualifies — the capture may open a dialog or a wizard step
+ * on its own tab, never save, submit or delete anything — and only from the
+ * first three steps: a control clicked later is past fields the author has
+ * to fill first. Null when the row names none.
+ */
+export function openingControlOf(steps: string): string | null {
+  const lines = steps
+    .split('\n')
+    .map((line) => line.replace(/^\s*\d{1,2}[.)]\s*/, '').trim())
+    .filter((line) => line !== '')
+    .slice(0, 3);
+  for (const line of lines) {
+    const quoted = /(?:กด(?:ปุ่ม)?|click|press|เลือก|select)\s*(?:the\s+)?(?:button\s+)?["“]([^"”\n]{1,40})["”]/iu.exec(line);
+    const bare = /(?:กด(?:ปุ่ม)?|click|press)\s+(?:the\s+)?(?:button\s+)?(\+|[A-Z][A-Za-z0-9&/-]*(?:\s+[A-Z][A-Za-z0-9&/-]*){0,3}|ถัดไป|สร้าง[\p{L}\p{M}]*|เพิ่ม[\p{L}\p{M}]*)/iu.exec(line);
+    const name = (quoted?.[1] ?? bare?.[1] ?? '').trim();
+    if (name === '') continue;
+    if (OPENING_NAME.test(name) && !NOT_AN_OPENING.test(name)) return name;
   }
   return null;
 }
@@ -576,7 +882,10 @@ export function caseCard(row: TestCaseRow): string | undefined {
     return `${label}: ${folded.length > max ? `${folded.slice(0, max)}…` : folded}`;
   };
   const lines = [
-    cut('Case', `${row.caseId} ${row.testCase}`, 160),
+    // The qualified id is the case's identity (CG-04: `TM:PL_03_01`); the
+    // sheet's own spelling rides beside it, since that is the id a tester
+    // will look for in the workbook.
+    cut('Case', `${row.caseId}${row.sheetCaseId === undefined ? '' : ` (sheet id ${row.sheetCaseId})`} ${row.testCase}`, 160),
     cut('Expected', row.expected, 420),
     // 420, not 120 (2026-08-28): the old cut ended PL_03_07's card mid-value
     // ("Benefit name = QA-Create Plan Benefit Type Reimbu…"), so every
@@ -664,6 +973,15 @@ async function authorEachRow(
      * not resolve; every case then runs the ordinary way.
      */
     risk?: RiskModel | null | undefined;
+    /** The catalog run's key — its last six alphanumerics make a sheet's key values unique to this run (CG-13). */
+    runKey?: string | undefined;
+    /**
+     * What "today" is for the relative dates a sheet writes (`Hire Date =
+     * Today`, `+119 Day`) — decided once per invocation, `WOWLIDATOR_NOW`
+     * overriding the clock, so every row of a pass resolves against the same
+     * day and a test can pin it.
+     */
+    now?: Date | undefined;
   },
 ): Promise<{ first: AuthoredFlow; cases: TableCase[] }> {
   // Kept by sheet position, compacted at the end: rows authored side by side
@@ -691,22 +1009,63 @@ async function authorEachRow(
   const rowLog = (row: TestCaseRow): ((line: string) => void) | undefined =>
     workers > 1 && context.log ? (line) => context.log?.(`[${row.caseId}] ${line}`) : context.log;
 
-  const authorRow = async (row: TestCaseRow, index: number, page?: Page): Promise<void> => {
-    const log = rowLog(row);
-    const scenarioKey = row.scenarioId || 'ungrouped';
+  const authorRow = async (sheetRow: TestCaseRow, index: number, page?: Page): Promise<void> => {
+    const log = rowLog(sheetRow);
+    const scenarioKey = sheetRow.scenarioId || 'ungrouped';
     // **The Note and Actual columns are a gate, not a footnote** (S7 of the
     // 2026-08-28 audit). A row the sheet records as Cancelled is a feature
     // the requirement dropped — four be100 rows were authored, run, and
     // failed against filters removed on 6 Jul. It never reaches a model.
-    const gate = sheetGate(row);
+    // Since CG-01 the same gate holds Blocked / Pending rows (with their bug
+    // ticket) unless --include-blocked, and since CG-12 a row that needs a
+    // case this catalog does not hold.
+    const gate = sheetGate(sheetRow, {
+      includeBlocked: options.includeBlocked,
+      registry: context.context.map((doc) => doc.text),
+    });
     if (gate !== null) {
       context.gate?.authored(scenarioKey);
-      refused.push(`${row.caseId}: ${gate}`);
-      log?.(`  ${row.caseId}: skipped — ${gate}`);
+      refused.push(`${sheetRow.caseId}: ${gate}`);
+      log?.(`  ${sheetRow.caseId}: skipped — ${gate}`);
       // A gated row is final: recorded at the cap so a resume does not keep
       // listing it among the cases "left".
-      await context.onRefused?.(row, gate, AUTHORING_REFUSAL_CAP);
+      await context.onRefused?.(sheetRow, gate, AUTHORING_REFUSAL_CAP);
       return;
+    }
+    // **Every persona the row names must have credentials** (CG-05). One
+    // persona, or the first of several, may be the `--as` account; a second
+    // one may not — one session cannot be two people, and a label nobody
+    // supplied is exactly the guessed password this ends. Refused before a
+    // model is spent, with the flag that fixes it.
+    const personaLabels = personasOf(sheetRow);
+    const resolved = resolveRowPersonas(personaLabels, options);
+    if (resolved.missing.length > 0) {
+      const reason = `persona ${resolved.missing.join(', ')} has no credentials (pass --persona ${resolved.missing[0]}=email:password, or WOWLIDATOR_PERSONAS)`;
+      context.gate?.authored(scenarioKey);
+      refused.push(`${sheetRow.caseId}: ${reason}`);
+      log?.(`  ${sheetRow.caseId}: skipped — ${reason}`);
+      await context.onRefused?.(sheetRow, reason, AUTHORING_REFUSAL_CAP);
+      return;
+    }
+    if (personaLabels.length > 0) {
+      log?.(
+        `  ${sheetRow.caseId}: persona${personaLabels.length > 1 ? 's' : ''} ` +
+          personaLabels.map((label) => `${personaLabelOf(label)} → ${resolved.personas[personaLabelOf(label)]?.email ?? '?'}`).join(', ') +
+          (resolved.fellBack === null ? '' : ` (${resolved.fellBack} is the --as account; pass --persona ${resolved.fellBack}=… to name it)`),
+      );
+    }
+    // **The sheet's key values are made unique to this run before anything
+    // reads the row** (CG-13): `Benefit Plan ID = PL_06_21` becomes
+    // `PL_06_21_<run suffix>` in Test data, Steps and Expected at once, so the
+    // typed value and the asserted value are the same literal, and a rerun
+    // never meets "already exists" about its own earlier run.
+    const keyed = substituteUniqueKeys(sheetRow, context.runKey);
+    const row = keyed.row;
+    if (keyed.substitutions.length > 0) {
+      log?.(
+        `  ${row.caseId}: unique per run — ` +
+          keyed.substitutions.map((sub) => `${sub.key}: ${sub.from} → ${sub.to}`).join(', '),
+      );
     }
     const refusedBefore = context.refusedBefore?.get(row.caseId) ?? 0;
     const lenientGrounding = refusedBefore > 0;
@@ -727,7 +1086,10 @@ async function authorEachRow(
     // spent roughly 360k input tokens on background, eleven-twelfths of it
     // about rows this call is not writing. The row's own steps and
     // expectations are the strongest query available anywhere in the system.
-    const described = describeCase(row);
+    // The row's own words, with each persona token spelled as the account it
+    // resolved to (email only) — the author reads which person, the flow
+    // keeps the label for its signIn step.
+    const described = describeWithPersonas(describeCase(row), resolved.personas);
     // A row that CITES another source for its expected value ("as per the
     // Master Benefit List", "ตามเอกสาร Requirement") is the row whose own
     // words are the weakest query for that value — the value lives in the
@@ -794,8 +1156,21 @@ async function authorEachRow(
         ? undefined
         : await captureJourneyTree(page, options, context.graph ?? null, described, log, {
             // The Menu column is the sheet saying where the row goes, in the
-            // application's own labels; the title and steps second.
-            where: [row.menu, row.testCase, row.steps].filter((t) => t !== '').join('\n'),
+            // application's own labels — as breadcrumbs first (CG-11), then
+            // the cell, the title and the steps.
+            where: [menuPathOf(row).join(' > '), row.menu, row.testCase, row.steps].filter((t) => t !== '').join('\n'),
+            // A literal destination the row states outranks every ranking:
+            // the PY rows put their URL in Steps, not in Menu, and 233 rows
+            // pick a tab on arrival.
+            destination: destinationOf(row),
+            // The capture signs in as the row's own first persona (CG-05):
+            // an HRBP row read through the admin's session sees the admin's
+            // page, and the author grounds every selector in the wrong one.
+            credentials: resolved.first,
+            // The row's first opening click (CG-18, reduced): the fields of
+            // ~400 rows live behind "Create Plan" / "Add" / "ถัดไป", and a
+            // tree read before that click shows none of them.
+            opening: openingControlOf(row.steps),
             // **Not behind a flag on this path.** A sheet row names a
             // destination that is almost never the start url, and authoring it
             // from the sign-in tree alone is the failure this capture exists
@@ -818,6 +1193,19 @@ async function authorEachRow(
       cited.length === 0 ? described : `${described}\n${cited.join('\n')}`,
     );
     try {
+      // What the value resolver reads beside the case text (CG-02 / CG-05 /
+      // CG-06): the Test data already split one pair per line by the parser,
+      // the row's id, the pass's "today", and the persona map. NOT the run
+      // key: the sheet's key values were already made unique above, in every
+      // column at once, and the resolver's own `fromUniquePerRun` would put a
+      // second tail on a `QA-…` name it cannot tell from a fresh one — one
+      // source of the suffix, so the typed value and the assertion agree.
+      const rowFacts = {
+        testDataPairs: testDataPairs(row.testData),
+        caseId: row.caseId,
+        ...(context.now === undefined ? {} : { now: context.now }),
+        ...(Object.keys(resolved.personas).length === 0 ? {} : { personas: resolved.personas }),
+      };
       const one = await author.author(prompt, page, {
         journeyTree,
         lenientGrounding,
@@ -827,6 +1215,7 @@ async function authorEachRow(
         // its assertions (ec10, 2026-09-02).
         caseText: described,
         ...(rowProjectContext === '' ? {} : { projectContext: rowProjectContext }),
+        ...rowFacts,
       });
       first ??= one;
       // The sheet's own Positive/Negative column is the author's word on what
@@ -843,7 +1232,15 @@ async function authorEachRow(
       // truth accuracy compares this case's verdict against. Travels on the
       // provenance stamp, like scenario and caseTitle — a fact about the
       // sheet row, not about any one run.
-      const knownResult = recordedResult(row.actual);
+      // `sheetVerdict`, not `recordedResult` (CG-01): a Test Status of
+      // Blocked reaches the truth table as its own class. Only passed/failed
+      // are a ground truth the risk judge and the provenance may read.
+      const knownResult = sheetVerdict(row.actual);
+      const humanVerdict = knownResult === 'passed' || knownResult === 'failed' ? knownResult : undefined;
+      // A row whose every Expected line is record-only (CG-09) captures and
+      // never asserts; the run ends it `review` with the captures rather
+      // than scoring a flow that could not fail.
+      const recordOnly = observeOnlyCase(row);
       const testCase: TableCase = {
         name: `${row.caseId} ${row.testCase}`,
         flow: {
@@ -856,7 +1253,11 @@ async function authorEachRow(
         scenario: `${row.scenarioId} ${row.scenario}`.trim() || 'ungrouped',
         caseTitle: row.testCase,
         ...(knownResult === undefined ? {} : { knownResult }),
+        ...(recordOnly ? { recordOnly: true } : {}),
+        ...(row.dependsOn === undefined || row.dependsOn.length === 0 ? {} : { dependsOn: [...row.dependsOn] }),
+        ...(Object.keys(resolved.personas).length === 0 ? {} : { personas: resolved.personas }),
       };
+      if (recordOnly) log?.(`  ${row.caseId}: every Expected line is record-only — the run will capture and end for review, never pass`);
       // Judged on the evidence the author just read — the ranked documents,
       // the repository slice, the declared routes — before a browser is spent.
       // A case above the threshold runs once with every retry path off.
@@ -872,7 +1273,7 @@ async function authorEachRow(
             backend: options.backend,
             // The sheet's own Actual Result: a row the tester already saw
             // fail is the strongest expected-fail evidence there is.
-            ...(knownResult === undefined ? {} : { knownResult }),
+            ...(humanVerdict === undefined ? {} : { knownResult: humanVerdict }),
           },
           { model: context.risk, log: (line) => process.stderr.write(`${line}\n`) },
         );
@@ -893,13 +1294,14 @@ async function authorEachRow(
                 lenientGrounding,
                 caseText: described,
                 ...(rowProjectContext === '' ? {} : { projectContext: rowProjectContext }),
+                ...rowFacts,
                 priorFeedback: risk.reasons.map((r) => `the pre-run risk judge found: ${r}`),
               });
               const riskAgain = await assessDeadEndRisk(
                 { caseName: testCase.name, caseText: `${row.testCase}\n${described}`, flow: again.flow,
                   documents: selected.documents.map((d) => ({ name: d.name, text: d.text })), repository: rowProjectContext,
                   declaredRoutes: declaredPageRoutes(context.graph ?? null), backend: options.backend,
-                  ...(knownResult === undefined ? {} : { knownResult }) },
+                  ...(humanVerdict === undefined ? {} : { knownResult: humanVerdict }) },
                 { model: context.risk, log: (line) => process.stderr.write(`${line}\n`) },
               );
               // Only a genuinely better flow replaces the first — feedback must never make the
@@ -1017,6 +1419,16 @@ async function tableInventory(
   graph?: ProjectGraph | null,
   description?: string | undefined,
   log?: ((line: string) => void) | undefined,
+  /**
+   * Tables the sheet's Expected column names as its oracle (CG-17:
+   * `DB : time_management.leave_requests`, `table employee_center.
+   * probation_transactions column …`) — 29 rows. Checked against the
+   * introspected inventory and, when declared, listed AHEAD of the relevance
+   * picks and exempt from the API-route gate: a row that names the table is
+   * evidence the feature reaches it, whatever the routes say. An unknown name
+   * is logged, never invented into the inventory.
+   */
+  named: readonly string[] = [],
 ): Promise<{ name: string; summary: string }[]> {
   try {
     // A selected repo's graph outranks the default cache: its tables are the
@@ -1026,6 +1438,25 @@ async function tableInventory(
     const all = source.nodes
       .filter((node) => node.kind === 'table')
       .map((node) => ({ name: node.name, summary: node.meta?.['columns'] ?? '' }));
+    const declared = new Map(all.map((table) => [table.name.toLowerCase(), table]));
+    const namedKnown: { name: string; summary: string }[] = [];
+    const namedUnknown: string[] = [];
+    for (const name of new Set(named.map((n) => n.toLowerCase()))) {
+      // `schema.table` as declared, else the bare table name under any schema.
+      const hit = declared.get(name) ?? all.find((table) => table.name.toLowerCase().endsWith(`.${name}`) || table.name.toLowerCase() === name.split('.').pop());
+      if (hit === undefined) namedUnknown.push(name);
+      else if (!namedKnown.includes(hit)) namedKnown.push(hit);
+    }
+    if (namedUnknown.length > 0) {
+      log?.(`schema: the sheet names ${namedUnknown.join(', ')} but the indexed schema declares no such table — not offered`);
+    }
+    if (namedKnown.length > 0) {
+      log?.(`schema: ${namedKnown.length} table(s) the sheet names as its oracle are offered first: ${namedKnown.map((t) => t.name).join(', ')}`);
+    }
+    const withNamed = (picked: { name: string; summary: string }[]): { name: string; summary: string }[] => [
+      ...namedKnown,
+      ...picked.filter((table) => !namedKnown.includes(table)),
+    ];
 
     // THE PERMISSION TO CLAIM THE DATABASE IS EVIDENCE THAT THE FEATURE HAS AN
     // API. A schema indexed from a .sql file says the tables exist; it says
@@ -1056,11 +1487,12 @@ async function tableInventory(
       if (Math.max(0, ...apiScores) <= 0) {
         log?.(
           `schema: ${all.length} table(s) indexed, but none of the ${apiRoutes.length} API route(s) ` +
-            'this repository declares matches what is being tested — DB checks are not offered. ' +
+            'this repository declares matches what is being tested — DB checks are not offered' +
+            (namedKnown.length > 0 ? ' beyond the tables the sheet itself names. ' : '. ') +
             'A database claim needs evidence the feature reaches a backend; a screen that keeps ' +
             'its state in the browser would fail one on every run.',
         );
-        return [];
+        return namedKnown;
       }
     }
 
@@ -1073,7 +1505,7 @@ async function tableInventory(
     // ot_request_attachment) for one journey, and which one comes back is
     // exactly the kind of coin-flip that makes two runs of one prompt disagree.
     if (description === undefined || description.trim() === '' || all.length <= TABLE_INVENTORY_MAX) {
-      return all;
+      return withNamed(all);
     }
     const scores = bm25(all.map((table) => `${table.name} ${table.summary}`), description);
     const best = Math.max(0, ...scores);
@@ -1081,7 +1513,7 @@ async function tableInventory(
     // the whole inventory is the honest answer — narrowing to an arbitrary
     // forty would silently remove the ability to author a DB check at all,
     // and presence of the inventory IS the permission.
-    if (best <= 0) return all;
+    if (best <= 0) return withNamed(all);
     const kept = all
       .map((table, i) => ({ table, score: scores[i] ?? 0 }))
       .filter((entry) => entry.score >= best * TABLE_SCORE_FLOOR)
@@ -1092,7 +1524,7 @@ async function tableInventory(
       `schema: ${kept.length} of ${all.length} table(s) match this test — the rest are not ` +
         'offered, so a DB check can only be written against these',
     );
-    return kept;
+    return withNamed(kept);
   } catch {
     return [];
   }
@@ -1552,7 +1984,25 @@ async function captureJourneyTree(
    * and title — when the caller has it apart from the rest. Matched against
    * the application's own menu labels; the whole description is the fallback.
    */
-  hints: { where?: string | undefined; force?: boolean | undefined } = {},
+  hints: {
+    where?: string | undefined;
+    force?: boolean | undefined;
+    /**
+     * The row's own stated destination (CG-11, `destinationOf`): a literal
+     * URL on this origin outranks every ranking below; a tab is named in
+     * the section so the author clicks it before reading.
+     */
+    destination?: CaseDestination | null | undefined;
+    /** The account the capture signs in as — the row's first persona (CG-05); `--as` otherwise. */
+    credentials?: { email: string; password: string } | undefined;
+    /**
+     * The row's first opening control (CG-18, reduced): clicked ONCE on the
+     * capture tab after the landing tree is read, and the page after it
+     * captured as a second, labelled tree. Only a name `openingControlOf`
+     * passed — never a save, submit or delete.
+     */
+    opening?: string | null | undefined;
+  } = {},
 ): Promise<string | undefined> {
   // `--scope e2e` turns this on by itself. An end-to-end test whose
   // destination page was never read cannot be grounded in it: measured, 9 of 9
@@ -1584,12 +2034,23 @@ async function captureJourneyTree(
   // named its page in step 2 and the ranker chose `…/:id/change-type` from
   // the same words, which needed an id and was skipped.
   const startRoute = findRouteForUrl(graph, options.url);
-  const literal = literalDestinations(description, options.url);
+  const stated = hints.destination?.url ?? null;
+  const literal = [
+    ...(stated === null ? [] : literalDestinations(stated, options.url)),
+    ...literalDestinations(description, options.url),
+  ];
   let resolved: { ok: true; url: string } | undefined;
   if (literal.length > 0) {
     resolved = { ok: true, url: literal[0] as string };
     log?.(`journey capture: the request names ${resolved.url} — reading it`);
+  } else if (stated !== null) {
+    // A URL on ANOTHER host is not a page this run can reach — the 234 PY rows
+    // naming payroll-cnext-dev — and `tableToClaims` has already refused the
+    // row when it was passed the start url; here it only means "not here".
+    log?.(`journey capture: the row names ${stated}, which is not on ${options.url} — ignored`);
   }
+  // The capture's own account: the row's first persona, else the run's `--as`.
+  const credentials = hints.credentials ?? options.credentials;
   // **The application's own menu, before any ranking over the code.** A
   // sheet says "Team → Probation Reviews"; the code says
   // `/:locale/workflows/probation`; only the deployed sidebar knows they are
@@ -1661,14 +2122,14 @@ async function captureJourneyTree(
     // stops the author guessing a landing path, which four cases in one run
     // did, identically, and failed on for 10 seconds each.
     if (
-      options.credentials &&
-      shouldSignInForCapture({ landedUrl: options.url, credentials: options.credentials, alreadyTried: false })
+      credentials &&
+      shouldSignInForCapture({ landedUrl: options.url, credentials, alreadyTried: false })
     ) {
       await extra.goto(options.url, { waitUntil: 'domcontentloaded' });
       await extra.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
       if (LOGIN_URL_PATTERN.test(extra.url())) {
-        log?.(`journey capture: signing in as ${options.credentials.email} first…`);
-        const outcome = await signInOnCaptureTab(extra, options.credentials);
+        log?.(`journey capture: signing in as ${credentials.email} first…`);
+        const outcome = await signInOnCaptureTab(extra, credentials);
         if (outcome.ok && !LOGIN_URL_PATTERN.test(extra.url())) landingAfterSignIn = extra.url();
       }
     }
@@ -1686,7 +2147,7 @@ async function captureJourneyTree(
       if (
         !shouldSignInForCapture({
           landedUrl: landed,
-          credentials: options.credentials,
+          credentials,
           alreadyTried: false,
         })
       ) {
@@ -1698,9 +2159,8 @@ async function captureJourneyTree(
 
       // Announced, because it is an action taken on someone's application.
       // A sign-in this performed and did not mention would be indefensible.
-      const credentials = options.credentials as { email: string; password: string };
-      log?.(`journey capture: signing in as ${credentials.email} to reach ${resolved.url}…`);
-      const outcome = await signInOnCaptureTab(extra, credentials);
+      log?.(`journey capture: signing in as ${(credentials as { email: string }).email} to reach ${resolved.url}…`);
+      const outcome = await signInOnCaptureTab(extra, credentials as { email: string; password: string });
       if (!outcome.ok) {
         log?.(`journey capture: ${journeyCaptureNote(outcome.reason)}`);
         return undefined;
@@ -1717,7 +2177,7 @@ async function captureJourneyTree(
       landed = extra.url();
       if (LOGIN_URL_PATTERN.test(landed)) {
         log?.(
-          `journey capture: ${journeyCaptureNote({ kind: 'sign-in-refused', email: credentials.email, landed })}`,
+          `journey capture: ${journeyCaptureNote({ kind: 'sign-in-refused', email: (credentials as { email: string }).email, landed })}`,
         );
         return undefined;
       }
@@ -1729,12 +2189,22 @@ async function captureJourneyTree(
       return undefined;
     }
     log?.(`journey capture: read ${landed}`);
+    // **The row's first opening click, once, on the capture tab** (CG-18,
+    // reduced). ~400 rows' fields live behind "Create Plan" / "Add" / "ถัดไป",
+    // and a tree read before that click shows none of them — every grounding
+    // lint then declines the fields the row is about. The control must be in
+    // the landed tree by name and must be an OPENING name (`openingControlOf`
+    // has already refused saves, submits and deletes); the tab is a context of
+    // its own, so what opens here reaches no run. Never fatal: a click that
+    // does not land leaves the capture as it was.
+    const opened = await captureAfterOpening(extra, hints.opening ?? null, log);
+    const tab = hints.destination?.tab ?? null;
     const landing =
       landingAfterSignIn === undefined ||
       LOGIN_URL_PATTERN.test(landingAfterSignIn) ||
       CONSENT_URL_PATTERN.test(landingAfterSignIn)
         ? ''
-        : `SIGN-IN LANDING (observed): after signing in as ${(options.credentials as { email: string }).email}` +
+        : `SIGN-IN LANDING (observed): after signing in as ${(credentials as { email: string }).email}` +
           ` — and passing the consent gate, when one appeared — the application landed on ${landingAfterSignIn}. ` +
           'This is the ONLY landing path you may expectUrl, and only for that same account; any ' +
           'other persona\'s landing is unknown, so its proof of sign-in is expectHidden of the ' +
@@ -1744,7 +2214,13 @@ async function captureJourneyTree(
       `ANOTHER PAGE IN THIS JOURNEY — the accessibility tree of ${landed}, which the request ` +
       'describes. It is NOT the page this run starts on: a selector taken from here resolves ' +
       'only after the flow has navigated to that page, so write the goto or the click that ' +
-      `reaches it first.\n\n${tree}`
+      `reaches it first.${tab === null ? '' : ` The row selects the tab "${tab}" on arrival — click it before reading.`}\n\n${tree}` +
+      (opened === null
+        ? ''
+        : `\n\nAFTER CLICKING "${opened.name}" ON ${landed} — the accessibility tree once that control ` +
+          `(${opened.selector}) was clicked, now at ${opened.url}: the dialog, form or wizard step the row's ` +
+          'fields live in. Write that click FIRST; every selector below resolves only after it, and none of ' +
+          `them is on the page above.\n\n${opened.tree}`)
     );
   } catch (error) {
     // Diagnostic, and swallowed: authoring without this section is exactly
@@ -1758,6 +2234,52 @@ async function captureJourneyTree(
     // The capture ran in a context of its own (`openCaptureTab`); closing it
     // is the whole cleanup, and nothing it did can reach the runs that follow.
     await closeExtra?.();
+  }
+}
+
+/**
+ * Click the named opening control on the capture tab and read the page after
+ * it. Deterministic and $0: the control is matched by accessible name in the
+ * tree already captured (whole name, whitespace-folded, case-insensitive;
+ * else the first whose name starts with it), roles button / link / menuitem /
+ * tab only. Null — with the reason logged — when nothing matches or the click
+ * does not land; the capture then stands as it was.
+ */
+async function captureAfterOpening(
+  tab: Page,
+  opening: string | null,
+  log?: ((line: string) => void) | undefined,
+): Promise<{ name: string; selector: string; url: string; tree: string } | null> {
+  if (opening === null) return null;
+  const fold = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
+  const wanted = fold(opening);
+  try {
+    const nodes = (await captureAxNodes(tab, 600)).filter(
+      (node) => ['button', 'link', 'menuitem', 'tab'].includes(node.role) && node.name.trim() !== '',
+    );
+    const hit =
+      nodes.find((node) => fold(node.name) === wanted) ??
+      nodes.find((node) => fold(node.name).startsWith(wanted)) ??
+      nodes.find((node) => wanted.length >= 3 && fold(node.name).includes(wanted));
+    if (hit === undefined) {
+      log?.(`journey capture: the row's first click "${opening}" names no button or link on this page — the fields behind it are not captured`);
+      return null;
+    }
+    const selector = `role=${hit.role}[name="${hit.name.replace(/\s+/g, ' ').trim().replace(/"/g, '\\"')}" i]`;
+    const before = tab.url();
+    await tab.locator(selector).first().click({ timeout: 3_000 });
+    await tab.waitForTimeout(800);
+    await tab.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
+    const tree = await captureAxTree(tab, DEFAULT_AUTHOR_MAX_NODES);
+    if (tree.trim() === '') {
+      log?.(`journey capture: after clicking "${hit.name}" the tree was empty — not captured`);
+      return null;
+    }
+    log?.(`journey capture: clicked "${hit.name}" (${selector}) and read the page after it${tab.url() === before ? '' : ` — now at ${tab.url()}`}`);
+    return { name: hit.name, selector, url: tab.url(), tree };
+  } catch (error) {
+    log?.(`journey capture: clicking "${opening}" did not land (${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}) — the landing tree stands`);
+    return null;
   }
 }
 
@@ -1914,9 +2436,44 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     } catch {
       table = null;
     }
+  } else if (document.format === 'xlsx') {
+    // A workbook is read as a grid, sheet by sheet — never as its text form
+    // re-parsed as a delimited file, which loses cell line breaks and sparse
+    // rows and, on a real tracker, invented cases out of bug-ticket cells.
+    try {
+      table = parseWorkbookCases(extractWorkbookSheets(await readFile(resolve(file))));
+    } catch {
+      table = null;
+    }
   }
   if (table !== null) {
-    log?.(`${document.name} is a test-case table — ${table.length} case(s), read from its columns`);
+    const sheets = [...new Set(table.map((row) => row.sheet).filter((s): s is string => s !== undefined))];
+    log?.(
+      `${document.name} is a test-case table — ${table.length} case(s), read from its columns` +
+        (sheets.length > 0 ? ` across ${sheets.length} sheet(s): ${sheets.join(', ')}` : ''),
+    );
+    // **A workbook is sliced before it becomes claims** (CG-11): `--sheet EC
+    // --category Hiring` makes the claims file, the ledger and the report
+    // that slice's, rather than a 1,286-row plan someone strikes 1,136 rows
+    // out of by hand. An empty slice is a usage error naming what exists.
+    if (options.sheets.length > 0 || options.categories.length > 0) {
+      const sliced = sliceRows(table, options.sheets, options.categories);
+      if (sliced.length === 0) {
+        const categories = [...new Set(table.map((row) => `${row.sheet ?? '-'}/${row.category ?? '-'}`))];
+        process.stderr.write(
+          `wowlidator catalog: --sheet ${options.sheets.join(', ') || '(any)'} --category ${options.categories.join(', ') || '(any)'} selects no row. ` +
+            `Sheets: ${sheets.join(', ') || '(none)'}. Categories: ${categories.slice(0, 20).join(', ')}${categories.length > 20 ? ', …' : ''}\n`,
+        );
+        return 2;
+      }
+      log?.(
+        `slice: ${sliced.length} of ${table.length} row(s) — sheet ${options.sheets.join('/') || 'any'}, category ${options.categories.join('/') || 'any'}`,
+      );
+      table = sliced;
+    }
+  } else if (options.sheets.length > 0 || options.categories.length > 0) {
+    process.stderr.write('wowlidator catalog: --sheet / --category slice a test-case table or workbook, and this document is not one\n');
+    return 2;
   }
 
   // A sequence diagram is structured the way a table is: read, not
@@ -1969,7 +2526,9 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       document.name,
       {
         summary: `${table.length} test case(s) across ${new Set(table.map((row) => row.scenarioId)).size} scenario(s)`,
-        claims: tableToClaims(table),
+        // The start url lets the parser refuse rows that navigate elsewhere
+        // (CG-03: 234 PY rows name another host) at the gate, $0.
+        claims: tableToClaims(table, options.url),
         model: 'read from the sheet (no model call)',
         latencyMs: 0,
         documentNote: document.note,
@@ -2107,11 +2666,21 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // are the question, never the corpus the answer is retrieved from).
   setClaudeRetrievalCorpus({ docs: contextDocs, graph: repoContextGraph });
   // The claims are what this catalog is about, so they decide which tables are
-  // worth offering — same narrowing as the describe path, same reason.
+  // worth offering — same narrowing as the describe path, same reason. The
+  // tables the sheet's Expected names outright (CG-17) are offered first.
+  const approvedSources = new Set(approved.map((claim) => claim.source));
+  const namedTables = [
+    ...new Set(
+      (table ?? [])
+        .filter((row) => approvedSources.has(row.caseId))
+        .flatMap((row) => dbTablesNamed(row).map((t) => t.table)),
+    ),
+  ];
   const tables = await tableInventory(
     repoContextGraph,
     approved.map((claim) => claim.claim).join('\n'),
     log ?? undefined,
+    namedTables,
   );
   if (tables.length > 0) {
     log?.(`schema indexed — ${tables.length} table(s) available for DB checks`);
@@ -2183,7 +2752,17 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // the general path distils it into, so when the rows are there the author gets
   // them — the difference between a model inventing a journey and being told it.
   const approvedIds = new Set(approvedClaims(claimsFile).map((claim) => claim.source));
-  const allRows = table === null ? [] : table.filter((row) => approvedIds.has(row.caseId));
+  // **A row with rounds is one case per round** (CG-10): `รอบที่ 2`, `Case 2:`,
+  // `--Insert R2--`, a per-field `ว่างทีละช่อง` loop each become their own
+  // labelled case with that round's data, so the plan, the ledger and the
+  // report count what the sheet actually asks for. After the gate, not
+  // before it: the claims a person reviews are the sheet's rows, one each,
+  // and the split is mechanical — a round case is approved by the row's id.
+  const approvedRows = table === null ? [] : table.filter((row) => approvedIds.has(row.caseId));
+  const allRows = expandRounds(approvedRows);
+  if (allRows.length !== approvedRows.length) {
+    log?.(`rounds: ${approvedRows.length} approved row(s) become ${allRows.length} case(s) — a row listing rounds is one case per round`);
+  }
   // `--resume`: the progress ledger beside the claims file says which cases
   // already have a verdict; only the ones that never ran, or were never
   // reached, are authored and run again. Stated out loud, with the counts,
@@ -2227,6 +2806,11 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
             agent: options.agent,
             // The email only — see `SuiteLedger.launch.persona`.
             ...(options.credentials === undefined ? {} : { persona: options.credentials.email }),
+            // Labels → emails, never a password (CG-05); the slice (CG-11).
+            ...(Object.keys(options.personas).length === 0 ? {} : { personas: personaEmails(options.personas) }),
+            ...(options.sheets.length === 0 ? {} : { sheets: [...options.sheets] }),
+            ...(options.categories.length === 0 ? {} : { categories: [...options.categories] }),
+            ...(options.includeBlocked ? { includeBlocked: true } : {}),
           },
         };
   let rows = allRows;
@@ -2388,6 +2972,12 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     );
   }
 
+  // **A dependent authors and runs after its source** (CG-12), whatever the
+  // sheet's or the speed ordering's opinion: the source must exist before the
+  // row that continues from it is written against the page, and the run loop
+  // only ever waits on a source queued AHEAD of the dependent.
+  rows = orderDependentsAfterSources(rows, (row) => row.caseId, (row) => row.dependsOn ?? []);
+
   // Announced once, at initialisation: this is the name under which the run —
   // and any later resume of it — appears in the record's run list.
   if (ledgerSpec !== undefined) {
@@ -2496,17 +3086,61 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       // left"). Buffered until the runner exists; flushed into its queue
       // then, or written straight to the ledger if nothing at all authored.
       const pendingRefused: SuiteCase[] = [];
-      const refusedCaseOf = (row: TestCaseRow, reason: string, attempt: number): SuiteCase => ({
-        name: row.caseId,
-        flow: { name: row.caseId, steps: [] },
-        kind: 'catalog',
-        ...(row.scenarioId ? { scenarioId: row.scenarioId } : {}),
-        refused: { reason, attempt },
-      });
+      const refusedCaseOf = (row: TestCaseRow, reason: string, attempt: number): SuiteCase => {
+        const known = sheetVerdict(row.actual);
+        return {
+          name: row.caseId,
+          flow: { name: row.caseId, steps: [] },
+          kind: 'catalog',
+          ...(row.scenarioId ? { scenarioId: row.scenarioId } : {}),
+          ...(row.dependsOn === undefined || row.dependsOn.length === 0 ? {} : { dependsOn: [...row.dependsOn] }),
+          ...(known === undefined ? {} : { knownResult: known }),
+          refused: { reason, attempt },
+        };
+      };
+      // **A dependent is never pushed ahead of its source** (CG-12). Rows are
+      // authored in a pool and `onCase` fires in COMPLETION order, so the
+      // dependent's flow can be ready before the source's. The queue indexes
+      // by arrival and the run loop dispatches in index order, so a source
+      // behind its dependent would never be dispatched while the dependent
+      // waits for it. Held here until every planned source has been pushed
+      // (or refused — a refusal is pushed too, and blocks the dependent with
+      // its reason downstream); flushed at close so no case is abandoned.
+      const plannedIds = new Set(rows.map((row) => row.caseId));
+      const pushedIds = new Set<string>();
+      const heldBySource = new Map<string, (() => Promise<void>)[]>();
+      const releaseDependents = async (sourceId: string): Promise<void> => {
+        pushedIds.add(sourceId);
+        const released = heldBySource.get(sourceId) ?? [];
+        heldBySource.delete(sourceId);
+        for (const push of released) await push();
+      };
+      const offer = async (caseId: string, dependsOn: readonly string[] | undefined, push: () => Promise<void>): Promise<void> => {
+        const missing = (dependsOn ?? []).find((id) => id !== caseId && plannedIds.has(id) && !pushedIds.has(id));
+        if (missing === undefined) {
+          await push();
+          await releaseDependents(caseId);
+          return;
+        }
+        log?.(`  ${caseId}: held until ${missing} is queued — it continues from that case`);
+        const list = heldBySource.get(missing) ?? [];
+        list.push(async () => offer(caseId, dependsOn, push));
+        heldBySource.set(missing, list);
+      };
+      const flushHeld = async (): Promise<void> => {
+        const pending = [...heldBySource.values()].flat();
+        heldBySource.clear();
+        for (const push of pending) {
+          // Its source never arrived: pushed anyway, so the run records it
+          // blocked with the reason rather than losing it.
+          await push();
+        }
+      };
       const enqueueRefused = (refusedCase: SuiteCase): void => {
         if (queue === null) return;
         if (refusedCase.scenarioId !== undefined) gate?.queued(refusedCase.scenarioId);
         queue.push(refusedCase);
+        void releaseDependents(refusedCase.name);
       };
       try {
         const authoredRows = await authorEachRow(rows, author, options, {
@@ -2517,6 +3151,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           gate,
           risk: riskModel,
           refusedBefore,
+          runKey: runKeyOf(),
+          now: authoringNow(),
           onRefused: async (row, reason, attempt) => {
             const refusedCase = refusedCaseOf(row, reason, attempt);
             if (queue !== null && drain.value !== null) enqueueRefused(refusedCase);
@@ -2553,12 +3189,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
                   for (const refusedCase of pendingRefused.splice(0)) enqueueRefused(refusedCase);
                   // Same stamp and same file the non-pipelined path writes
                   // below — built here because the run needs both now.
-                  testCase.flow.authoredBy = {
-                    ...provenanceOf(first),
-                    scenario: testCase.scenario,
-                    caseTitle: testCase.caseTitle,
-                    ...(testCase.knownResult === undefined ? {} : { knownResult: testCase.knownResult }),
-                  };
+                  testCase.flow.authoredBy = stampProvenance(provenanceOf(first), testCase);
                   const flowPath = await writeFlowFile(
                     catalogFlowPath(options, {
                       dir: join(dir, slugify(testCase.scenarioId)),
@@ -2569,18 +3200,22 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
                     testCase.flow,
                   );
                   queuedPaths.push(flowPath);
-                  log?.(`  queued ${testCase.name} → ${flowPath}`);
-                  queue.push({
-                    name: testCase.name,
-                    flow: testCase.flow,
-                    flowPath,
-                    kind: 'catalog',
-                    scenarioId: testCase.scenarioId,
-                    ...(group === undefined ? {} : { group: `${group}/${slugify(testCase.scenarioId)}` }),
-                    generatedBy: testCase.flow.authoredBy,
-                    ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
+                  const caseId = caseIdOfName(testCase.name);
+                  await offer(caseId, testCase.dependsOn, async () => {
+                    log?.(`  queued ${testCase.name} → ${flowPath}`);
+                    queue.push({
+                      name: testCase.name,
+                      flow: testCase.flow,
+                      flowPath,
+                      kind: 'catalog',
+                      scenarioId: testCase.scenarioId,
+                      ...(group === undefined ? {} : { group: `${group}/${slugify(testCase.scenarioId)}` }),
+                      generatedBy: testCase.flow.authoredBy,
+                      ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
+                      ...suiteFactsOf(testCase),
+                    });
+                    gate?.queued(testCase.scenarioId);
                   });
-                  gate?.queued(testCase.scenarioId);
                 },
         });
         authored = authoredRows.first;
@@ -2589,6 +3224,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         // Authoring broke; the cases already queued are still running and
         // still owed their reports. Let them finish before the error lands,
         // or they are abandoned mid-run with their proofs half-written.
+        await flushHeld().catch(() => undefined);
         queue?.close();
         if (drain.value !== null) await drain.value.catch(() => undefined);
         // Nothing ran, so no runner wrote the ledger: the refusals go there
@@ -2597,6 +3233,9 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         if (pendingRefused.length > 0 && ledgerSpec !== undefined) await persistRefusals(ledgerSpec.path, pendingRefused);
         throw error;
       } finally {
+        // A dependent whose source never arrived is pushed now — recorded
+        // blocked with the reason, never abandoned — before the queue closes.
+        await flushHeld().catch(() => undefined);
         queue?.close();
       }
       if (drain.value !== null && placed.value !== null) {
@@ -2665,12 +3304,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // scenario and test-case title — so the run list can group by the former
   // and print the latter without re-reading the sheet.
   for (const testCase of cases) {
-    testCase.flow.authoredBy = {
-      ...catalogProvenance,
-      ...(testCase.scenario === undefined ? {} : { scenario: testCase.scenario }),
-      ...(testCase.caseTitle === undefined ? {} : { caseTitle: testCase.caseTitle }),
-      ...(testCase.knownResult === undefined ? {} : { knownResult: testCase.knownResult }),
-    };
+    testCase.flow.authoredBy = stampProvenance(catalogProvenance, testCase);
   }
   for (const [index, testCase] of cases.entries()) {
     // A sheet groups its rows by scenario; the folder does the same, so twelve
@@ -2711,6 +3345,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       // and case title the run list groups and labels by.
       generatedBy: testCase.flow.authoredBy ?? catalogProvenance,
       ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
+      ...suiteFactsOf(testCase),
     })), ...refusedForSerialRun],
     options,
     {
@@ -2926,6 +3561,61 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
   await openReport(reportPath, options);
   await cleanupChrome(options);
   return quarantine.quarantined ? EXIT.ok : exitCodeFor(bundle);
+}
+
+/**
+ * "Today" for the sheet's relative dates: `WOWLIDATOR_NOW` (an ISO date or
+ * date-time) when set — what makes a run reproducible and a test pinnable —
+ * else the wall clock, read once per invocation so every row agrees. A
+ * resume takes ITS day, not the original pass's: the tester's calendar is
+ * what the application compares against.
+ */
+function authoringNow(): Date {
+  const raw = (process.env['WOWLIDATOR_NOW'] ?? '').trim();
+  if (raw !== '') {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+    process.stderr.write(`  ! WOWLIDATOR_NOW="${raw}" is not a date — using the clock\n`);
+  }
+  return new Date();
+}
+
+/** The case id a suite case name starts with — the same rule the ledger keys on. */
+function caseIdOfName(name: string): string {
+  return name.split(/\s+/, 1)[0] ?? name;
+}
+
+/**
+ * The provenance stamp for one authored case: the pass-wide record plus the
+ * sheet's per-row facts. The truth table's ground truth is the typed
+ * passed/failed only — `blocked` (CG-01) travels on the suite case and the
+ * ledger, never as a human verdict a judge may not overrule. `recordOnly`
+ * (CG-09) is written into the file so a re-run of it still ends for review;
+ * it rides a spread because `GenerationProvenance` does not declare it yet
+ * (proof-bundle.ts is another implementer's file).
+ */
+function stampProvenance(
+  base: GenerationProvenance,
+  testCase: Partial<TableCase>,
+): GenerationProvenance {
+  const human = testCase.knownResult === 'passed' || testCase.knownResult === 'failed' ? testCase.knownResult : undefined;
+  return {
+    ...base,
+    ...(testCase.scenario === undefined ? {} : { scenario: testCase.scenario }),
+    ...(testCase.caseTitle === undefined ? {} : { caseTitle: testCase.caseTitle }),
+    ...(human === undefined ? {} : { knownResult: human }),
+    ...(testCase.recordOnly === true ? { recordOnly: true } : {}),
+  };
+}
+
+/** The per-row facts a `SuiteCase` carries beside its flow (CG-01/05/09/12). */
+function suiteFactsOf(testCase: Partial<TableCase>): Pick<SuiteCase, 'dependsOn' | 'knownResult' | 'recordOnly' | 'personas'> {
+  return {
+    ...(testCase.dependsOn === undefined || testCase.dependsOn.length === 0 ? {} : { dependsOn: [...testCase.dependsOn] }),
+    ...(testCase.knownResult === undefined ? {} : { knownResult: testCase.knownResult }),
+    ...(testCase.recordOnly === true ? { recordOnly: true } : {}),
+    ...(testCase.personas === undefined ? {} : { personas: testCase.personas }),
+  };
 }
 
 /**

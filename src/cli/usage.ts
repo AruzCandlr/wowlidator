@@ -218,7 +218,18 @@ catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mm
   --rerun-errors       Re-run every recorded case the harness ended in error; implies --resume
   --rerun-failed       Re-run every failed / dead-end case with autoheal; implies --resume --repair
   --rerun-case <id>    Re-author the named case from its sheet row and re-run it, whatever its
-                       verdict; repeatable; implies --resume
+                       verdict; repeatable; implies --resume. A case id the workbook
+                       repeats is qualified (TM:PL_03_01, TSH_01_01#2) — use that spelling.
+  --sheet <name>       (workbook) Only this worksheet — EC, BE, TM, PY; repeatable,
+                       case-insensitive. The claims file, the ledger and the report
+                       are then this slice's.
+  --category <name>    (workbook) Only rows of this Category column (Hiring, Benefit
+                       Plan …); repeatable, case-insensitive; combines with --sheet.
+  --include-blocked    Author and run rows the sheet records as Blocked / Pending
+                       deploy / Pending confirm. Off by default: the sheet's own
+                       testers could not run them, and each names a bug ticket the
+                       run would only file again. Their sheet status still reaches
+                       the truth table as "sheet: blocked", outside the accuracy.
   --claims-out <path>  Where --claims-only writes
                        (default: <report-dir>/catalogs/<name>.claims.json)
   --context-doc <path> A supporting document — background for the model, never
@@ -268,6 +279,14 @@ Browser lifecycle (wowlidator starts and checks Chrome itself — no wrapper scr
                        is restarted without its window. Never touches a Chrome
                        on another profile.
   --no-headless        Give the window back.
+  --browsers <n>       Spread a parallel run over n Chromes (env WOWLIDATOR_BROWSERS):
+                       the one on the CDP port plus n-1 on the ports after it,
+                       each on its own profile (<profile>-2, -3, …), started
+                       headless unless --no-headless. Each case leases the
+                       least-busy one. One browser's main thread queues every
+                       lane's renderer, encoder and CDP session, so with
+                       --concurrency above 3 or so this is where the time goes.
+                       --stop-chrome stops every one this run started.
   --stop-chrome        Quit the browser afterwards, but only if this run started it.
   --wait-for <url>     Wait until this responds before starting — for a dev
                        server that is still booting.
@@ -353,7 +372,18 @@ Browser lifecycle (wowlidator starts and checks Chrome itself — no wrapper scr
                        ungrounded; see the saved ones: wowlidator context list
   --as <email>:<pass>  The account an authored flow signs in as. Without it the
                        model invents a password and the flow cannot sign in;
-                       also settable as WOWLIDATOR_AS.
+                       also settable as WOWLIDATOR_AS. The unlabelled default a
+                       single-persona row falls back to.
+  --persona <LABEL>=<email>:<pass>
+                       Credentials for a named persona — the sheet's
+                       <HR_ADMIN_ACCOUNT>, <MANAGER_ACCOUNT>, <HRBP_ACCOUNT>,
+                       <EMPLOYEE_ACCOUNT> tokens, or SPD_ADMIN for "Login ด้วย SPD
+                       Admin". Repeatable; also WOWLIDATOR_PERSONAS as JSON
+                       ({"MANAGER_ACCOUNT":{"email":"…","password":"…"}}). A row
+                       that hands off between two personas needs both, or it is
+                       recorded blocked with the missing label named — never a
+                       guessed password. Labels travel in flow files and in the
+                       ledger (emails only); passwords stay in env and argv.
   --api                Generate API tests from the indexed OpenAPI spec instead
                        of reading a page. Needs "wowlidator context build --openapi
                        <spec>" first: with no spec there is no endpoint

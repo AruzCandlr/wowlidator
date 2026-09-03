@@ -22,6 +22,7 @@
  */
 
 import { REDACTED } from './redact.js';
+import { dateBuiltin } from '../engine/dates.js';
 
 /**
  * Matches `{{name}}`, allowing surrounding whitespace inside the braces.
@@ -37,7 +38,53 @@ import { REDACTED } from './redact.js';
  * and three rows died renaming the placeholder because nothing said that was
  * the problem.
  */
-const PLACEHOLDER = /\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}/g;
+const PLACEHOLDER = /\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?:([+-])\s*(\d+)\s*)?\}\}/g;
+
+/**
+ * A builtin: `{{date:today+30d}}`, `{{date:monthEnd|dd/MM/yyyy}}`. The name
+ * before the colon picks the resolver, everything after it is the resolver's
+ * to read. Substituted BEFORE saved variables, so a builtin can never be
+ * shadowed by a saved name and a saved name can never contain a colon.
+ *
+ * Why a builtin at all (CG-07/EH-03, 2026-09-03): ~330 sheet rows write a
+ * date relative to the day the case runs — "Hire Date = Today",
+ * "Effective Start = Next day+1", "+119 Day" — and an author that had to
+ * compute those wrote them as literals that were stale by the next run. One
+ * token, resolved at step time, is the same fact every day.
+ */
+const BUILTIN = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^{}]*?)\s*\}\}/g;
+
+/** A resolver for a builtin's argument; `null` means the argument was not understood. */
+export type BuiltinResolver = (argument: string, context: { now: Date }) => string | null;
+
+/** The builtins every store knows. `date` is the only one so far. */
+export const DEFAULT_BUILTINS: Readonly<Record<string, BuiltinResolver>> = {
+  date: (argument, { now }) => dateBuiltin(argument, now),
+};
+
+/**
+ * The first integer in a saved value — "1,234 rows" → 1234, "Pending 1D" →
+ * 1, "-3" → -3 — with where it sits and whether it used thousands separators,
+ * so `{{name+1}}` can put the new number back in the same place, in the same
+ * style. `null` when the value holds no integer.
+ */
+export function firstInteger(value: string): { start: number; end: number; n: number; grouped: boolean } | null {
+  const m = /-?\d[\d,]*/.exec(value);
+  if (m === null) return null;
+  const raw = m[0].replace(/,+$/, '');
+  return {
+    start: m.index,
+    end: m.index + raw.length,
+    n: Number(raw.replace(/,/g, '')),
+    grouped: raw.includes(','),
+  };
+}
+
+function groupThousands(n: number): string {
+  const sign = n < 0 ? '-' : '';
+  const digits = String(Math.abs(n));
+  return sign + digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
 
 /**
  * Any `{{…}}` at all — what `interpolate` scans for AFTER substituting, so a
@@ -60,19 +107,42 @@ export class UnknownVariableError extends Error {
   override readonly name = 'UnknownVariableError';
   readonly variable: string;
 
-  constructor(variable: string, known: readonly string[]) {
+  /**
+   * `reason`, when given, replaces the "nothing has saved it yet" wording —
+   * for a variable that IS saved but cannot serve the token as written
+   * (`{{count+1}}` on a value with no number in it, `{{date:yesterweek}}`).
+   * Same class on purpose: it is the same harness-class fault, an author's
+   * token the run cannot honour, and `classifyStepFailure` knows the name.
+   */
+  constructor(variable: string, known: readonly string[], reason?: string) {
     super(
-      `unknown variable {{${variable}}} — nothing has saved it yet. ` +
-        (known.length > 0
-          ? `Available: ${known.map((entry) => `{{${entry}}}`).join(', ')}.`
-          : 'No variables have been saved in this run.'),
+      reason !== undefined
+        ? `variable {{${variable}}} ${reason}`
+        : `unknown variable {{${variable}}} — nothing has saved it yet. ` +
+            (known.length > 0
+              ? `Available: ${known.map((entry) => `{{${entry}}}`).join(', ')}.`
+              : 'No variables have been saved in this run.'),
     );
     this.variable = variable;
   }
 }
 
+export interface VariableStoreOptions {
+  /** Extra or replacement builtins, laid over `DEFAULT_BUILTINS`. */
+  builtins?: Record<string, BuiltinResolver> | undefined;
+  /** The clock `{{date:today}}` reads — injectable so a test can pin the day. */
+  now?: (() => Date) | undefined;
+}
+
 export class VariableStore {
   readonly #values = new Map<string, string>();
+  readonly #builtins: Record<string, BuiltinResolver>;
+  readonly #now: () => Date;
+
+  constructor(options: VariableStoreOptions = {}) {
+    this.#builtins = { ...DEFAULT_BUILTINS, ...(options.builtins ?? {}) };
+    this.#now = options.now ?? (() => new Date());
+  }
 
   set(name: string, value: string): void {
     this.#values.set(name, value);
@@ -96,10 +166,43 @@ export class VariableStore {
    * wearing a different hat and used to pass through as literal text.
    */
   interpolate(text: string): string {
-    const out = text.replace(PLACEHOLDER, (_match, name: string) => {
-      const value = this.#values.get(name);
-      if (value === undefined) throw new UnknownVariableError(name, this.names());
+    const withBuiltins = text.replace(BUILTIN, (match, name: string, argument: string) => {
+      const resolver = this.#builtins[name];
+      if (resolver === undefined) return match; // left for the stray check below
+      const value = resolver(argument, { now: this.#now() });
+      if (value === null) {
+        throw new UnknownVariableError(`${name}:${argument}`, this.names(), `is not a ${name} this harness can compute`);
+      }
       return value;
+    });
+    const out = withBuiltins.replace(PLACEHOLDER, (_match, name: string, op?: string, digits?: string) => {
+      let value = this.#values.get(name);
+      let operator = op;
+      let amount = digits;
+      // `{{rows-before-1}}`: hyphens belong to names, so the greedy name ate
+      // the `-1`. When THAT name is unknown but the part before the trailing
+      // `-N` is saved, the author meant arithmetic.
+      if (value === undefined && operator === undefined) {
+        const split = /^(.*[^-])-(\d+)$/.exec(name);
+        if (split !== null && this.#values.has(split[1]!)) {
+          value = this.#values.get(split[1]!);
+          operator = '-';
+          amount = split[2]!;
+        }
+      }
+      if (value === undefined) throw new UnknownVariableError(name, this.names());
+      if (operator === undefined || amount === undefined) return value;
+      // `{{before_total+1}}` — a claim of "+1 / -1 / ไม่เปลี่ยนแปลง" against a
+      // number the case observed first (CG-07: BE summary boxes, TM quota
+      // lines, probation queue counts — 65 rows). The first integer in the
+      // saved text moves; everything around it stays, in the same style.
+      const found = firstInteger(value);
+      if (found === null) {
+        throw new UnknownVariableError(name, this.names(), `is not a number (it holds ${JSON.stringify(value)}), so {{${name}${operator}${amount}}} cannot be computed`);
+      }
+      const next = found.n + (operator === '-' ? -1 : 1) * Number(amount);
+      const rendered = found.grouped ? groupThousands(next) : String(next);
+      return value.slice(0, found.start) + rendered + value.slice(found.end);
     });
     const stray = ANY_PLACEHOLDER.exec(out);
     if (stray !== null) {

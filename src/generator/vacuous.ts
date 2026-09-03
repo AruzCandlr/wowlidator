@@ -34,12 +34,17 @@ const ASSERTIONS = new Set([
   'expectEnabled',
   'expectDisabled',
   'expectCount',
+  // Either/or (CG-08) and the field-scoped error (EH-12) are claims like any
+  // other expect*: a flow whose only proof is one of them is not vacuous.
+  'expectAnyVisible',
+  'expectFieldError',
   'expectUrl',
   'expectValue',
   'expectAttribute',
   'expectFocused',
   'expectTabOrder',
   'expectScrollable',
+  'expectNotScrollable',
   'expectModal',
   'expectDbRow',
   'expectDbDelta',
@@ -147,4 +152,26 @@ export function vacuousClaim(steps: readonly FlowStep[]): string | null {
 /** Setup + steps, the way a run sees a flow. */
 export function vacuousFlow(flow: { setup?: readonly FlowStep[] | undefined; steps: readonly FlowStep[] }): string | null {
   return vacuousClaim([...(flow.setup ?? []), ...flow.steps]);
+}
+
+/**
+ * The steps that RECORD without claiming — `saveText`, `saveCount`,
+ * `snapshot`. A record-only case (CG-09: every Expected line says "บันทึก
+ * ค่าที่ระบบแสดง", "= ? OQ-…") is authored as the script plus these and
+ * nothing else; it is vacuous by this module's definition and RIGHT to be.
+ * `runCases` maps a vacuous flow whose provenance says `recordOnly` to the
+ * verdict `review` with these steps' captures, never to `blocked`. One
+ * predicate for the author, the runner and the report, the `vacuousClaim`
+ * rule again.
+ */
+export function observationSteps(steps: readonly FlowStep[]): FlowStep[] {
+  const out: FlowStep[] = [];
+  for (const step of steps) {
+    if (step.action === 'when') {
+      out.push(...observationSteps(step.then), ...observationSteps(step.else ?? []));
+      continue;
+    }
+    if (step.action === 'saveText' || step.action === 'saveCount' || step.action === 'snapshot') out.push(step);
+  }
+  return out;
 }

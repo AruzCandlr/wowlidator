@@ -1,12 +1,13 @@
 /**
- * newUI — the one-page surface at `/new` (docs/one-page-ui-spec.md).
+ * Ledger — the home page at `/` (src/ui/ledger-html.ts).
  *
  * Page-string assertions, the same way `wow-ui.test.ts` pins wowUI: the page
  * is one self-contained document built through `el()`, it composes wowUI's
- * script rather than forking it, and every feature the spec's retention
- * ledger names has a hook in the source. Plus the manual parser, which is the
- * one piece of new server-side logic: it turns our own static HTML into data
- * so the page needs no `innerHTML` at all.
+ * script rather than forking it, the two things only the retired command
+ * panel offered (every command as a form, the manual) are here, and nothing
+ * on the page reaches for `window.prompt` or `window.confirm`. Plus the manual
+ * parser, the one piece of server-side logic: it turns our own static HTML
+ * into data so the page needs no `innerHTML` at all.
  */
 
 import assert from 'node:assert/strict';
@@ -14,15 +15,14 @@ import { describe, it } from 'node:test';
 
 import { COMMANDS } from '../src/ui/commands.js';
 import { MANUAL } from '../src/ui/manual.js';
-import { parseManualHtml, renderNewUi } from '../src/ui/new-ui-html.js';
+import { parseManualHtml, renderLedger } from '../src/ui/ledger-html.js';
 
-describe('the newUI page', () => {
-  const html = renderNewUi();
+describe('the Ledger page', () => {
+  const html = renderLedger();
+  const ledgerPart = html.slice(html.indexOf('ledger =='));
 
   it('cannot phone home — it is one self-contained document', () => {
     assert.doesNotMatch(html, /<script src=|rel="stylesheet"|fonts\.googleapis|@import/);
-    // The manual's own prose carries a literal `http://…` placeholder; nothing else may.
-    assert.doesNotMatch(html, /https?:\/\/(?!localhost|www\.w3\.org|…)/);
   });
 
   it('renders whole and parses — a stray backtick truncates the page', () => {
@@ -40,41 +40,38 @@ describe('the newUI page', () => {
     assert.match(html, /function manualNode\(/);
   });
 
-  it('composes wowUI rather than forking it: the base functions are renamed, the rest replaced', () => {
-    for (const name of ['wowOpenLauncher', 'wowLauncherBox', 'wowPost', 'wowDataSignature']) {
+  it('composes wowUI rather than forking it: two base functions renamed, the layout ones replaced', () => {
+    for (const name of ['wowPost', 'wowDataSignature']) {
       assert.equal((html.match(new RegExp(`function ${name}\\(`, 'g')) ?? []).length, 1, name);
     }
-    // wowUI's evidence machinery ships unchanged: the checks table, the drawer, the launcher gate.
-    for (const name of ['checksTable', 'evidencePanel', 'claimsGate', 'recomputeLanes', 'agentActionLog', 'streamJob', 'outputSection', 'jobForRun', 'progressBar', 'tqdmReadout']) {
+    // The evidence machinery ships unchanged: the checks table, the drawer, the launcher gate, the live console.
+    for (const name of ['checksTable', 'evidencePanel', 'claimsGate', 'recomputeLanes', 'agentActionLog', 'streamJob', 'outputSection', 'jobForRun', 'progressBar', 'tqdmReadout', 'renderGroup', 'taskRow', 'renderKeys', 'renderRepos', 'renderHistory', 'renderHealed', 'renderReports', 'workQueueBox', 'confirmDeleteGroup']) {
       assert.match(html, new RegExp(`function ${name}\\(`), name);
     }
+    // And the layout is declared again, later, so the base calls land here.
+    for (const name of ['render', 'show', 'renderSidebar', 'pageHead', 'renderRuns', 'statsStrip', 'attentionItems', 'renderAttention', 'boot']) {
+      assert.equal((ledgerPart.match(new RegExp(`\\nfunction ${name}\\(`, 'g')) ?? []).length, 1, `${name} is redeclared once`);
+    }
   });
 
-  it('is one page: six anchored sections, no router, old addresses mapped', () => {
-    for (const id of ['now', 'start', 'runs', 'library', 'machinery', 'help']) {
-      assert.match(html, new RegExp(`id="sec-${id}"`), id);
+  it('is six tabs on a top bar, and every address the older surfaces wrote still lands', () => {
+    assert.match(html, /<nav class="tabs" id="tabs"/);
+    assert.match(html, /<div class="topstatus" id="status"/);
+    for (const id of ['runs', 'history', 'learned', 'machinery', 'commands', 'help']) {
+      assert.match(html, new RegExp(`\\{ id: '${id}', label: '`), id);
     }
     assert.match(html, /var LEGACY_HASH = \{/);
-    for (const old of ['history', 'healed', 'attention', 'reports', 'keys', 'repos', 'flows', 'cache', 'manual']) {
-      assert.match(html, new RegExp(`\\b${old}: '`), `old hash #${old} lands somewhere`);
+    for (const old of ['healed', 'attention', 'reports', 'cache', 'keys', 'repos', 'manual', 'panel', 'flows']) {
+      assert.match(html, new RegExp(`\\b${old}: \\['`), `old hash #${old} lands somewhere`);
     }
-    assert.doesNotMatch(html, /location\.href = '\/'/, 'no link out to another surface');
+    assert.match(html, /if \(S\.meta && commandById\(view\)\) \{ sub = view; view = 'commands'; \}/, 'a command id opens its form');
+    assert.match(html, /if \(S\.view === 'keys'\) S\.view = 'machinery';/, 'the base usage-cap dialog still finds Models and keys');
+    assert.doesNotMatch(ledgerPart, /location\.href = '\/'/, 'no link out to another surface');
   });
 
-  it('keeps the launcher inline, with a fourth segment that offers every other command', () => {
-    assert.match(html, /id: 'launcher'/);
-    assert.match(html, /'More commands'/);
-    assert.match(html, /var MORE_EXCLUDED = \['go', 'catalog-claims', 'catalog-run', 'run'\]/);
-    assert.match(html, /S\.meta\.commands/);
-    assert.doesNotMatch(html, /openStartModal/);
-    // The rule survives: nobody is asked to type a flow. Running one is an action on its row.
-    assert.doesNotMatch(html, /The flow to run|Start from a flow on disk|Paste a flow/);
-    assert.doesNotMatch(html, /commandId: 'run'/);
-    assert.match(html, /function openRunForm\(flowPaths\)/);
-    assert.match(html, /\{ flow: true \}/, 'the flow field is locked when opened from a row');
-  });
-
-  it('renders the command form from the spec, the right way round', () => {
+  it('absorbs the command panel: every other command as a form rendered from the spec, the right way round', () => {
+    assert.match(html, /function renderCommands\(/);
+    assert.match(html, /var COMMANDS_EXCLUDED = \['go', 'catalog-claims', 'catalog-run', 'run'\]/);
     assert.match(html, /'secret' \? 'password'/);
     for (const flag of ['no-heal', 'no-agent', 'no-network', 'no-history', 'no-report', 'no-reconstruct', 'no-agent-early-stop', 'no-ensure-chrome']) {
       assert.match(html, new RegExp(`'${flag}': '`), `${flag} has a positive label`);
@@ -85,33 +82,29 @@ describe('the newUI page', () => {
     assert.match(html, /function chipsInput\(/, 'repeatable fields are a chip list');
     assert.match(html, /if \(list\.length\) values\[field\.name\] = list\.slice\(\);/, 'and submit as an array');
     assert.match(html, /turn on “/, 'a gated field is visible and says what gates it');
+    assert.match(html, /function commandLineFor\(/, 'the command line it builds is shown');
+    assert.match(html, /carried as env, never argv/);
     for (const group of ['Recording', 'Behaviour', 'Chrome', 'Output']) assert.match(html, new RegExp(`\\['${group}', \\[`));
     // Every advanced browser flag is placed in a group, so none lands in "Other options" by accident.
     const grouped = new Set([...html.matchAll(/\['(?:Recording|Behaviour|Chrome|Output)', \[([^\]]*)\]/g)].flatMap((m) => m[1]!.match(/'[^']+'/g)!.map((s) => s.slice(1, -1))));
-    const browserFlags = COMMANDS.find((c) => c.id === 'crawl')!.fields.filter((f) => f.advanced).map((f) => f.name);
-    for (const name of browserFlags) assert.ok(grouped.has(name), `${name} is grouped`);
+    const advanced = new Set(COMMANDS.flatMap((c) => c.fields.filter((f) => f.advanced).map((f) => f.name)));
+    for (const name of advanced) assert.ok(grouped.has(name), `${name} is grouped`);
+    // The rule survives: nobody is asked to pick a flow. Running one is an action on its row.
+    assert.doesNotMatch(ledgerPart, /The flow to run|Start from a flow on disk|Paste a flow|editorBox|openEditor/);
   });
 
-  it('says what the words mean, and what every number is a number of', () => {
-    assert.match(html, /var VOCAB = \[/);
-    for (const term of ['pass\\*\\*', 'proved-\\?', 'dead-end', 'quarantined', 'rung', 'ledger', 'bundle', 'vacuous', 'polarity']) {
-      assert.match(html, new RegExp(`term: '${term}'`), term);
-    }
-    assert.match(html, /'of the last ' \+ recent\.length/, 'the proved tile carries its denominator');
-    assert.match(html, /more stopped catalog run\(s\) — show all/, 'no silent cap on the banners');
-    assert.match(html, /S\.proofs\.forEach\(function \(card\) \{\n    if \(card\.status === 'needs-review'/, 'attention scans every proof');
-    assert.match(html, /function legendModal\(/);
-  });
-
-  it('uses one destructive idiom, and never window.prompt', () => {
+  it('uses one dialog idiom and never the browser\'s own prompt or confirm', () => {
     assert.match(html, /var DESTRUCTIVE = \{/);
     assert.match(html, /'cache-forget': function/);
-    assert.match(html, /'history-clear': function/);
     assert.match(html, /function confirmModal\(/);
     assert.match(html, /function promptModal\(/);
     assert.match(html, /function trapFocus\(/);
-    const newPart = html.slice(html.indexOf('newUI =='));
-    assert.doesNotMatch(newPart, /window\.prompt/);
+    assert.doesNotMatch(ledgerPart, /window\.prompt|window\.confirm/);
+    // The three prompts wowUI still makes with window.prompt are redeclared here on the modal.
+    for (const name of ['renameTask', 'renameGroup', 'resumeCatalog', 'reauthorCase', 'queueAdd', 'queueRemove', 'queueRun']) {
+      assert.match(ledgerPart, new RegExp(`\\nfunction ${name}\\(`), name);
+    }
+    assert.match(ledgerPart, /type: 'password', button: 'Resume with it'/, 'the resume password is asked in a password box');
   });
 
   it('shows the header status on every poll and never a key', () => {
@@ -121,17 +114,26 @@ describe('the newUI page', () => {
     assert.doesNotMatch(html, /apiKey|api_key|process\.env/);
   });
 
-  it('folds History into Runs and keeps Failed runs distinct', () => {
-    assert.match(html, /\['flow', 'By flow'\], \['every', 'Every run'\]/);
-    assert.match(html, /\['latest', 'Latest'\], \['name', 'Name'\]/);
-    assert.match(html, /localeCompare\(b\.name, undefined, \{ numeric: true \}\)/);
-    assert.match(html, /Failed runs — no proof was produced/);
-    assert.match(html, /\/api\/failed-runs/);
+  it('says what every number is a number of, and looks at every proof for what needs a human', () => {
+    assert.match(ledgerPart, /passed \+ ' of the last ' \+ recent\.length \+ ' runs'/, 'the proved figure carries its denominator');
+    assert.match(ledgerPart, /more stopped or finished catalog run\(s\) — show all/, 'no silent cap on the banners');
+    assert.match(ledgerPart, /S\.proofs\.forEach\(function \(card\) \{\n    if \(card\.status === 'needs-review'/, 'attention scans every proof');
+    assert.match(html, /var VOCAB = \[/);
+    for (const term of ['pass\\*\\*', 'proved-\\?', 'dead-end', 'quarantined', 'spec\\?', 'rung', 'ledger', 'bundle', 'vacuous', 'polarity']) {
+      assert.match(html, new RegExp(`term: '${term}'`), term);
+    }
   });
 
   it('carries the whole manual as data, every section by title', () => {
     for (const section of MANUAL) assert.ok(html.includes(JSON.stringify(section.title).slice(1, -1)), section.title);
     assert.match(html, /"id":"start","title":"Start here"/);
+  });
+
+  it('keeps the page from scrolling sideways on a phone and honours reduced motion', () => {
+    assert.match(html, /@media \(max-width: 720px\)/);
+    assert.match(html, /\.tbl \{ display: block; overflow-x: auto; \}/);
+    assert.match(html, /\.drawer \{ width: 100vw; \}/);
+    assert.match(html, /prefers-reduced-motion: reduce/);
   });
 });
 

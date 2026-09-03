@@ -241,6 +241,28 @@ export function buildValueResolution(
   return { model, db, ...(documents === undefined ? {} : { documents }) };
 }
 
+/**
+ * The persona map a RUN signs in from (`RunFlowOptions.personas`, CG-05): every
+ * `--persona` / `WOWLIDATOR_PERSONAS` entry, plus the unlabelled `--as` account
+ * under `DEFAULT`, plus whatever labels the catalog resolved for THIS case
+ * (`extra` — a row whose single `<HR_ADMIN_ACCOUNT>` fell back to `--as` still
+ * needs `signIn as: HR_ADMIN_ACCOUNT` to find it at run time). In memory only:
+ * a flow file carries labels, the ledger carries emails, and this record is
+ * never written anywhere. Undefined when there is nothing to sign in as, so a
+ * run without credentials is byte-for-byte what it was.
+ */
+export function runPersonas(
+  options: CliOptions,
+  extra?: Readonly<Record<string, { email: string; password: string }>> | undefined,
+): Record<string, { email: string; password: string }> | undefined {
+  const map: Record<string, { email: string; password: string }> = {
+    ...options.personas,
+    ...(options.credentials === undefined ? {} : { DEFAULT: options.credentials }),
+    ...(extra ?? {}),
+  };
+  return Object.keys(map).length === 0 ? undefined : map;
+}
+
 export function buildDataModel(options: CliOptions): LlmDataModel {
   return new LlmDataModel({ factory: options.factory });
 }

@@ -31,6 +31,7 @@ import { join, resolve } from 'node:path';
 
 import type { ProofBundle, RunStatus, TierSummary } from '../engine/proof-bundle.js';
 import { effectiveStatus, isPassing } from '../engine/proof-bundle.js';
+import { provenanceExtras } from '../reporter/step-facts.js';
 
 /** Bundles read for one listing. Beyond this, the oldest are not shown. */
 const DEFAULT_LIMIT = 150;
@@ -108,12 +109,23 @@ export interface ProofCard {
     kind: string;
     generatedAt: string;
     /** The sheet's recorded Actual Result for this case — accuracy's ground
-     *  truth. Null when the sheet recorded no verdict for the row. */
-    knownResult: 'passed' | 'failed' | null;
+     *  truth: `passed` / `failed`, or `blocked` (the sheet's Blocked / Pending
+     *  deploy, CG-01 — disclosed, never scored). Null when the sheet recorded
+     *  no verdict for the row. */
+    knownResult: string | null;
     source: string | null;
     /** A sheet's scenario and the row's test-case title, when authored from one. */
     scenario: string | null;
     caseTitle: string | null;
+    /** The sheet's own spelling of the case id when the run qualified it
+     *  (`BE:PL_03_01` → `PL_03_01`, CG-04); the sheet and category the row
+     *  came from; whether every Expected line was record-only (CG-09). Read
+     *  structurally from the stamp — null / false until the catalog plane
+     *  writes them. */
+    sheetCaseId: string | null;
+    sheet: string | null;
+    category: string | null;
+    recordOnly: boolean;
     /** The catalog run's unique key (`<catalog>@<stamp>`) — shown on the
      *  group so a reader can match the run list to a ledger, and shared by
      *  every resume of the same run. Null for pre-key bundles. */
@@ -209,6 +221,10 @@ export function toCard(bundle: ProofBundle, path: string, reportPath: string | n
             scenario: bundle.generatedBy.scenario ?? null,
             caseTitle: bundle.generatedBy.caseTitle ?? null,
             runKey: bundle.generatedBy.runKey ?? null,
+            sheetCaseId: provenanceExtras(bundle).sheetCaseId,
+            sheet: provenanceExtras(bundle).sheet,
+            category: provenanceExtras(bundle).category,
+            recordOnly: provenanceExtras(bundle).recordOnly,
           },
     // A filmed run has evidence for every step even when only its failures
     // carry a still, so asking about screenshots alone would report the
@@ -480,7 +496,18 @@ export interface RunGroup {
   runs: ProofCard[];
   total: number;
   passed: number;
+  /**
+   * Runs the SUBJECT failed (`testFailed` in `verdictKind`). Counted apart
+   * from `review` (proved-? or recorded only, awaiting a person) and
+   * `noVerdict` (the harness alone broke): the first cut lumped every
+   * non-pass here, and a catalog whose harness fell over on twenty rows read
+   * as twenty product defects.
+   */
   failed: number;
+  review: number;
+  noVerdict: number;
+  /** Cases the sheet itself recorded as Blocked / Pending — disclosed on the group, never scored. */
+  sheetBlocked: number;
   defects: number;
   /** Wall-clock and runtime model tokens summed over EVERY run in the group —
    *  the pass's real cost, retries included, not just its latest verdicts. */
@@ -597,7 +624,11 @@ export function groupAccuracy(cards: readonly ProofCard[]): AccuracyScore {
   let unscored = 0;
   for (const card of latest.values()) {
     const known = card.generatedBy?.knownResult ?? null;
-    if (known === null) {
+    // Only a recorded pass or fail is ground truth. `blocked` (the sheet's
+    // Blocked / Pending deploy, CG-01) is a row the sheet could not score
+    // either — disclosed as unscored here, counted on the group as
+    // `sheetBlocked`, never invented into agreement or disagreement.
+    if (known !== 'passed' && known !== 'failed') {
       unscored += 1;
       continue;
     }
@@ -705,6 +736,9 @@ export function groupRuns(cards: readonly ProofCard[]): RunGroup[] {
         total: 0,
         passed: 0,
         failed: 0,
+        review: 0,
+        noVerdict: 0,
+        sheetBlocked: 0,
         defects: 0,
         durationMs: 0,
         inputTokens: 0,
@@ -723,10 +757,14 @@ export function groupRuns(cards: readonly ProofCard[]): RunGroup[] {
     group.total += 1;
     // A quarantined run is reported in full and counted as neither: the flag
     // exists so a known-flaky result cannot be read as a verdict either way.
-    if (card.quarantined) {
-      // counted in `total` only.
-    } else if (isPassing(card.status)) group.passed += 1;
-    else group.failed += 1;
+    // The other four buckets follow `verdictKind` — the acted-on status, so a
+    // ruled proved-? counts where the ruling put it.
+    const kind = verdictKind(card);
+    if (kind === 'passed') group.passed += 1;
+    else if (kind === 'testFailed') group.failed += 1;
+    else if (kind === 'needsReview') group.review += 1;
+    else if (kind === 'systemError') group.noVerdict += 1;
+    if (card.generatedBy?.knownResult === 'blocked') group.sheetBlocked += 1;
     group.defects += card.defects;
     group.durationMs += card.durationMs;
     group.inputTokens += card.inputTokens;

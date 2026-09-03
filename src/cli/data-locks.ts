@@ -46,17 +46,26 @@ export function dataLocksEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
 }
 
 /** Actions that put a value into the page — where a data change begins. */
-const INPUT_ACTIONS = new Set(['fill', 'type', 'selectOption', 'check', 'uncheck', 'fillEach', 'fillRetry']);
+// `upload` is an input: a bulk-import CSV changes the table under test just
+// as a keyed field does (BE PL_10_*, RU_09_* — 44 import cases).
+const INPUT_ACTIONS = new Set(['fill', 'type', 'selectOption', 'check', 'uncheck', 'fillEach', 'fillRetry', 'upload']);
 
 /** Actions that assert something, and therefore still NEED a change to hold. */
 const ASSERTION_PREFIX = /^(expect|snapshot$)/;
 
 const READ_ONLY_VERBS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-/** Word-bounded change talk in a workflow goal — the only prose read here. */
+/**
+ * Change talk in a workflow goal — the only prose read here. The English
+ * half is word-bounded; the Thai half (CG-16) is a bare alternation, since
+ * `\b` never matches around Thai and a goal like "สร้าง Plan แล้วบันทึก"
+ * opened no window at all — the case ran unlocked beside the reader counting
+ * the same table. `บันทึกค่า`/`บันทึกว่า` (record the value shown) and
+ * `เพิ่มเติม` (additional) are excluded, the same two OA-13 excludes.
+ */
 const WRITE_VERB =
-  /\b(creat(e|es|ing)|add(s|ing)?|edit(s|ing)?|updat(e|es|ing)|chang(e|es|ing)|sav(e|es|ing)|submit(s|ting)?|insert(s|ing)?|delet(e|es|ing)|remov(e|es|ing)|cancel(s|ling|ing)?)\b/i;
-const DELETE_VERB = /\b(delet(e|es|ing)|remov(e|es|ing)|purg(e|es|ing)|drop(s|ping)?)\b/i;
+  /\b(creat(e|es|ing)|add(s|ing)?|edit(s|ing)?|updat(e|es|ing)|chang(e|es|ing)|sav(e|es|ing)|submit(s|ting)?|insert(s|ing)?|delet(e|es|ing)|remov(e|es|ing)|cancel(s|ling|ing)?)\b|สร้าง|เพิ่ม(?!เติม)|บันทึก(?!ค่า|ว่า)|อนุมัติ|ปฏิเสธ|ยื่น|ส่ง(?:คำขอ|อนุมัติ)?|ลบ|แก้ไข|นำเข้า|นำออก|ยกเลิก/iu;
+const DELETE_VERB = /\b(delet(e|es|ing)|remov(e|es|ing)|purg(e|es|ing)|drop(s|ping)?)\b|ลบ|นำออก/iu;
 
 /** Sentinel for "the page we are on is a sign-in screen", which owns no data. */
 const LOGIN = Symbol('login');

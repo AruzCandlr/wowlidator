@@ -1,11 +1,11 @@
-# CLAUDE.md — the control panel and wowUI
+# CLAUDE.md — the panel server, wowUI, and the Ledger home page
 
 Split out of the root CLAUDE.md (2026-08-24) so this loads only when working under
 `src/ui/`. Same authority as the root file; the root keeps the map of the whole system.
 
 ## The control panel (`src/ui/`)
 
-`wowlidator ui` (or `npm run ui`) serves a local page that puts every command, every option, the artefacts on disk and a manual in one place. Zero new dependencies: `node:http`, a command whitelist, and a page rendered from a TypeScript module.
+`wowlidator ui` (or `npm run ui`) serves a local page that puts every run, every command, every option, the artefacts on disk and a manual in one place. Zero new dependencies: `node:http`, a command whitelist, and a page rendered from a TypeScript module. Since 2026-09-03 the page at `/` is **Ledger** (`ledger-html.ts`, see the section at the end); the command-first panel that used to live there (`app-html.ts`) is gone, and `/wow` still serves wowUI unchanged until it is retired.
 
 **It runs the CLI; it does not reimplement it.** `JobRunner` spawns the same `wowlidator <command>` a person would type and forwards stdout/stderr line by line. A second execution path would be a second thing to keep correct, and the first symptom of it drifting would be a panel reporting a pass the command line calls a failure. Every run displays its own command line for the same reason: what you learn in the panel has to transfer to a script.
 
@@ -21,13 +21,13 @@ Three constraints on the server that are load-bearing rather than tidy:
 
 **Output is buffered, not only streamed.** A page reloaded mid-run rejoins from the buffer (the SSE stream opens with a `replay` event) instead of watching an empty pane. Artefact links are *parsed out of the output* (`  report     /path…`) rather than re-derived, so a new artifact kind announced by a command shows up in the panel without `jobs.ts` knowing it exists.
 
-**The page is one document, same as the HTML report and for a related reason.** `renderApp()` returns markup, CSS and script together, so there are no asset paths to resolve and it behaves identically under `tsx src/` and after `tsc` has emitted `dist/` — which copies no non-TypeScript files.
+**The page is one document, same as the HTML report and for a related reason.** `renderLedger()` (and `renderWowUi()`) returns markup, CSS and script together, so there are no asset paths to resolve and it behaves identically under `tsx src/` and after `tsc` has emitted `dist/` — which copies no non-TypeScript files.
 
-`ui` is dispatched in `src/cli.ts` **before** `parseArgs`, because the panel has its own flags (`--port`, `--no-open`, `--wow`) and putting them in the shared option table would make them appear valid on every other command, where they mean nothing.
+`ui` is dispatched in `src/cli.ts` **before** `parseArgs`, because the panel has its own flags (`--port`, `--no-open`, `--wow` — which only decides which of the two pages the browser opens on) and putting them in the shared option table would make them appear valid on every other command, where they mean nothing.
 
 ## wowUI (`src/ui/wow-ui-html.ts`, `src/ui/proofs.ts`)
 
-The second surface on the same server, at `/wow` (`wowlidator ui --wow` opens it directly). `app-html.ts` is organised around **commands** — pick one, fill the form, watch it run — which is right for driving a CLI and wrong for the question asked afterwards: *this flow has run eleven times, which run broke it, and what is the proof?* wowUI is GRIM's QA Command Center layout answering that, with wowlidator's nouns in it:
+The older layout, at `/wow` (`wowlidator ui --wow` opens it directly), and the script library the Ledger page composes. The retired `app-html.ts` was organised around **commands** — pick one, fill the form, watch it run — which is right for driving a CLI and wrong for the question asked afterwards: *this flow has run eleven times, which run broke it, and what is the proof?* wowUI is GRIM's QA Command Center layout answering that, with wowlidator's nouns in it:
 
 | GRIM | wowUI |
 |---|---|
@@ -44,7 +44,7 @@ The second surface on the same server, at `/wow` (`wowlidator ui --wow` opens it
 
 **The stylesheet is GRIM's, ported onto the tokens in `reporter/theme.ts`** — `--teal` becomes `--accent`, `--paper` becomes `--bg` — so wowUI follows the same light/dark system as the report and the panel rather than being a third dialect. Class names are kept verbatim (`.side`, `.row`, `.rail`, `.chip`, `.tbl`, `.drawer`) so the two can be diffed by anyone who knows either. The `url(data:image/svg+xml…)` marks for the loop rail and verdict dots stay in this file: `theme.ts` has a test asserting it contains no `url(` at all.
 
-**There is no `trustedHtml` here at all.** `app-html.ts` has exactly one `innerHTML`, for the manual it ships. wowUI has no static content to inject and displays nothing but data — selectors, model reasoning, application text quoted back by a failing step — so the escape hatch is simply absent, and there's a test asserting it stays absent.
+**There is no `trustedHtml` here at all.** The retired `app-html.ts` had exactly one `innerHTML`, for the manual; Ledger renders the manual as data instead, so no page on this server has one now. wowUI has no static content to inject and displays nothing but data — selectors, model reasoning, application text quoted back by a failing step — so the escape hatch is simply absent, and there's a test asserting it stays absent.
 
 Two things in `proofs.ts` exist because a bundle is big:
 
@@ -117,7 +117,9 @@ The fourth sibling of `keys.ts`/`models.ts`/`checks.ts`, asking about the backen
 **A workflow step expands in place.** It is the one step whose work is invisible from its row — the agent took the browser for N turns and the row can only say "workflow" — so the step list carries a `▸ N agent actions` button that unfolds the goal, what the agent reported, its cost, the `settledBy` evidence when a rule settled the step, and the turn-by-turn log, without leaving for the drawer. `agentActionLog` is shared with the drawer's Trace tab so the two cannot drift, and a password-shaped fill shows its length and never its characters. The emailable report folds the same trace into a `<details>`, open by default when the goal was not reached — the case a reader came for.
 
 
-## newUI (`src/ui/new-ui-html.ts`, `/new`, `wowlidator ui --new`) — 2026-08-27
+## newUI (`src/ui/new-ui-html.ts`, `/new`) — 2026-08-27, deleted 2026-09-03
+
+Superseded by Ledger below, which keeps its composition mechanism (`baseScript()`'s exact-match renames), its spec-rendered command form and its manual parser. The rest of this section is history.
 
 The two surfaces as **one page**, built to `docs/one-page-ui-spec.md`. Six anchored sections — Now, Start, Runs and proof, Library, Machinery, Help — a sticky header with the status a person checks before pressing Start (connection, browser free/in use, CDP, roles keyed, the usage-cap gauge; repainted every poll), a search box that filters everything on the page, and no router: `location.hash` is an anchor, and every hash the older surfaces ever wrote still lands (`#history` → Runs in the every-run density, `#keys` → Machinery, `#doctor` → that command's form).
 
@@ -176,9 +178,8 @@ a triage marker for the BA, never a verdict — the run stays needs-review.
 
 ## newUI unwired; /wow is the responsive surface (2026-08-31)
 
-The `/new` route and `ui --new` flag were removed at the user's request —
-`new-ui-html.ts` and its tests remain (they render the module directly), but
-no server route serves it; `/wow` is the surface to improve. wowUI's ≤900px
+The `/new` route and `ui --new` flag were removed at the user's request; the
+module and its test were deleted on 2026-09-03 once Ledger took `/`. wowUI's ≤900px
 media query now keeps navigation: the sidebar becomes a sticky, horizontally
 scrolling top bar (labels/footer hidden) instead of `display: none`, tables
 get `display: block; overflow-x: auto` so the page never scrolls sideways,
@@ -215,3 +216,72 @@ re-posts with `as: "<persona>:<password>"`, which becomes the job's secret env.
 The resumable-run banner says which account the run signs in as. Test:
 `tests/resume-credentials.test.ts` (real server, temp cwd, the 409 path only —
 the 201 path spawns a real run).
+
+## Ledger — the home page at `/` (`src/ui/ledger-html.ts`, 2026-09-03)
+
+The redesign chosen from three prototyped directions ("Ledger", "Bench",
+"Board"): keep the GRIM tokens and IBM Plex Sans Thai, remove chrome, not
+features. A top bar with six tabs — Runs · History · Learned · Machinery ·
+Commands · Help — the status a person checks before pressing Start (connected,
+browser free / in use, CDP, roles keyed, the usage cap) repainted on every poll,
+one 1120px column, and the evidence drawer as a 520px side sheet (full width on a
+phone, where the tabs become a scrolling row under the brand and Start).
+
+**It composes wowUI, it does not fork it.** `WOW_SCRIPT` ships verbatim as a
+library; the functions that decide *where things go* (`render`, `show`,
+`renderSidebar` — now the top bar — `pageHead`, `renderRuns`, `statsStrip`,
+`attentionItems`, `renderAttention`, `boot`) are declared again after it, and two
+base functions are wrapped (`post`, `dataSignature`) through `baseScript()`'s
+exact-match renames, which throw on the first `GET /` if an anchor moved.
+Anything wowUI fixes in a task row, the checks table, the drawer, the launcher or
+Models & keys is therefore fixed on both pages at once. `tests/ledger-ui.test.ts`
+pins the page the way `wow-ui.test.ts` pins wowUI.
+
+What Ledger adds over `/wow`, and where it lives:
+
+- **Commands** — every `CommandSpec` except `go`, `catalog-*` and `run` (the
+  launcher and the row buttons own those), as a form rendered from the spec:
+  a `no-*` boolean is a positively worded switch ON by default (`POSITIVE`), the
+  advanced browser flags sit in four named drawers (`ADV_GROUPS`, with a test
+  that every advanced flag across every command is placed), a `requiredWhen`
+  field is visible and disabled with its gate named, a repeatable field is a
+  chip list submitted as an array, a secret is a password box, and the command
+  line the form would run is shown under it (`commandLineFor`, a preview — the
+  server still builds the real argv from the same spec, and secrets are named
+  as env, never shown). A 400 naming a field in quotes lands on that field.
+  `#doctor` and every other command id still open that command.
+- **Help** — the manual as data (`parseManualHtml` on the server, `manualNode`
+  on the client), a glossary of the verdict words (`VOCAB`: the chip's plain
+  word beside the exact term the proof file carries), and the paths on this
+  machine. The last `innerHTML` on the server went with `app-html.ts`.
+- **Learned** — Needs a human, Healed selectors and Reports as three sub-tabs
+  (`S.learnedTab`, remembered per browser). Needs a human scans every proof,
+  not the first twelve, and lists runs waiting for a ruling.
+- **One dialog idiom.** `confirmModal` / `promptModal` replace every
+  `window.prompt` and `window.confirm` wowUI still makes (rename flow, rename
+  group, resume from case, re-author, the three queue confirms, and the resume
+  password — asked in a password box). `cache-forget` is gated in `post()`
+  through `DESTRUCTIVE`; Clear history keeps its two-click arming button.
+- **Old addresses land** (`LEGACY_HASH`): `#healed` `#attention` `#reports`
+  `#cache` → Learned, `#keys` `#repos` → Machinery, `#manual` → Help, `#panel`
+  `#flows` → Commands. The base usage-cap dialog's `S.view = 'keys'` is mapped
+  in `render()`.
+
+- **Machinery in two columns** (`layoutKeys`, 2026-09-03): `renderKeys` still draws
+  the role table, the provider sections, the Claude session and the Database
+  top to bottom; Ledger re-parents that DOM — roles and the provider keys on
+  the left, the Claude session on the right — and folds each provider's keys
+  under its head (`S.keysOpen`, remembered per browser). One column under
+  1040px.
+- **The claims gate is searchable and stays put** (`claimsGate` redeclared):
+  a search box, one pill per scenario (`claimScenario`, the sheet's own
+  numbering — PL_02_03 → PL_02), Select shown / Clear shown acting on the
+  filtered rows only, and Expand to lift the 320px cap. Ticking a claim
+  updates that row, the count line and the submit button through
+  `syncSubmit()` — never `renderLauncher()` — so the list keeps its scroll
+  position and the search box its focus.
+
+Deliberately absent: the old panel's flow editor (a textarea over
+`/api/file`). wowUI's rule stands — nobody picks or edits a flow file by hand;
+Run again, Repair and Re-author on the row are the actions. No endpoint was
+added or changed for any of this.

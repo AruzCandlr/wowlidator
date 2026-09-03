@@ -25,8 +25,19 @@ import {
   looksLikeSignIn,
   verificationOnlyGoal,
   goalOutcome,
-  outcomeShown,
-} from '../src/orchestrator/goal-evidence.js';
+  goalOutcomes,
+  outcomesShown,
+  describeOutcomes,
+  goalCitedValue,
+  goalCitedValues,
+  anyValueAppears,
+  valueShownIn,
+  valueSpellings,
+  differentPage,
+  queryAndHash,
+  urlMoveNote,
+  wizardStepHint,
+  outcomeShown, foldValue, valueAppearsAnywhere } from '../src/orchestrator/goal-evidence.js';
 import { WorkflowAgent, type AgentDecision } from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
 
@@ -322,5 +333,202 @@ describe('goalOutcome / outcomeShown (S1 — a finish is checked against the pag
     assert.match(outcomeShown({ control: 'Status', value: 'Inactive' }, tree) ?? '', /Status: Inactive/);
     assert.equal(outcomeShown({ control: 'Rows per page', value: '100' }, tree), null, 'the page shows 25, not 100 — the finish must be refused');
     assert.equal(outcomeShown({ control: 'Rows per page', value: '25' }, `${tree}\n[TREE TRUNCATED: 4 of 90]`), null);
+  });
+});
+
+describe('goal outcome: multi-word values and dash spellings (HIR-EC-002 leg 12)', () => {
+  it('reads a bare value to the end of its clause, not to the first space', () => {
+    assert.deepEqual(
+      goalOutcome('On /en/admin/hire, set Employee Group = A - Permanent on the New Hire form and stay on /en/admin/hire'),
+      { control: 'Employee Group', value: 'A - Permanent' },
+    );
+    assert.deepEqual(goalOutcome('set Gender = Female and Nationality = Thai'), { control: 'Gender', value: 'Female' });
+    assert.deepEqual(goalOutcome('choose the "Rows per page" control to 25.'), { control: 'Rows per page', value: '25' });
+  });
+
+  it('folds dashes and spacing so the goal\'s hyphen matches the page\'s em dash', () => {
+    assert.equal(foldValue('A - Permanent'), foldValue('A — Permanent'));
+    assert.equal(foldValue('A-Permanent'), 'a - permanent');
+    const tree = 'button "Employee Group" value="A — Permanent"\nbutton "Gender" value="Female"';
+    assert.ok(outcomeShown({ control: 'Employee Group', value: 'A - Permanent' }, tree));
+    assert.ok(outcomeShown({ control: 'Gender', value: 'Female' }, tree));
+    assert.equal(outcomeShown({ control: 'Gender', value: 'Male' }, tree), null, 'Male is not inside Female');
+    assert.ok(valueAppearsAnywhere('A - Permanent', tree));
+    assert.equal(valueAppearsAnywhere('Male', tree), false);
+    assert.ok(valueAppearsAnywhere('ลาป่วย', 'cell "วันลาป่วย 3 วัน"'), 'Thai has no word boundary — containment stays');
+  });
+});
+
+// --- OA-13: the sheets' own language --------------------------------------------
+
+describe('goal classifiers in the sheets\' own words (OA-13, 2026-09-03)', () => {
+  it('reads a Thai `set X = Y` into an outcome — verb, control and value', () => {
+    // Verbatim from EC-Probation-1 ("2. เลือก probation result = Pass
+    // probation"), PY-Config ("เลือก Country=TH แล้วกด Save"), EC-Hiring-1
+    // ("กำหนด Probation Exemption = Yes") and EC-Hiring-4 ("ตั้ง Disability
+    // Status = Yes"). Every one of these parsed to NO control before, so a
+    // Thai leg was never settled on the page and always rode the claim.
+    assert.deepEqual(goalOutcome('เลือก probation result = Pass probation'), { control: 'probation result', value: 'Pass probation' });
+    assert.deepEqual(goalOutcome('เลือก Country=TH แล้วกด Save'), { control: 'Country', value: 'TH' }, 'the Thai continuation ends the value');
+    assert.deepEqual(goalOutcome('กำหนด Probation Exemption = Yes'), { control: 'Probation Exemption', value: 'Yes' });
+    assert.deepEqual(
+      goalOutcome('เพิ่มขั้นตอนย่อยที่การ์ด ข้อมูลทั่วไป ตั้ง Disability Status = Yes'),
+      { control: 'Disability Status', value: 'Yes' },
+      'the sentence before the verb is not the control',
+    );
+  });
+
+  it('reads a Thai-named control, and the glued `เป็น` separator', () => {
+    assert.deepEqual(goalOutcome('ผลการประเมิน = Pass probation'), { control: 'ผลการประเมิน', value: 'Pass probation' });
+    assert.deepEqual(goalOutcome('เลือกประเภทการลาเป็นลาป่วย แล้วกด Submit'), { control: 'ประเภทการลา', value: 'ลาป่วย' });
+  });
+
+  it('classes a Thai step as work, and a Thai look as a look', () => {
+    // ML_01_01 "กดปุ่ม Submit"; EC-Probation "เลือก … แล้วกดปุ่ม Submit";
+    // EC-Hiring "ตรวจสอบ Employee Status, Hire Date และ Pay Group ที่ระบบบันทึก"
+    // — the last one says ตรวจสอบ and also บันทึก (save) as a noun phrase,
+    // and stays a real leg because the sheet's wording has an action in it.
+    assert.equal(verificationOnlyGoal('กดปุ่ม Submit'), false);
+    assert.equal(verificationOnlyGoal('เลือก probation result = Pass probation แล้วกดปุ่ม Submit'), false);
+    assert.equal(verificationOnlyGoal('อ่านจำนวนแผนที่แสดง'), true, 'อ่าน (read) is a look');
+    assert.equal(verificationOnlyGoal('บันทึกค่า Total leave ที่แสดง'), true, 'บันทึกค่า (note the value) is a look; bare บันทึก is Save');
+    assert.equal(verificationOnlyGoal('ตรวจสอบข้อมูลเพิ่มเติม'), true, 'เพิ่มเติม (additional) is not เพิ่ม (add)');
+    assert.equal(verificationOnlyGoal('read the numbers and note the total'), true);
+    assert.equal(goalMentionsSignIn('เข้าสู่ระบบด้วย <EMPLOYEE_ACCOUNT> ระบบพาไปหน้าหนังสือให้ความยินยอม'), true);
+  });
+});
+
+// --- OA-4: every `set X = Y`, and the values as the page spells them -----------
+
+describe('goalOutcomes — every pair a goal names (OA-4)', () => {
+  it('reads every `X = Y` pair, in order, one per control', () => {
+    // The EC key-in shape (HIR-EC-037..150): several fields on one leg.
+    assert.deepEqual(goalOutcomes('set Gender = Female and Nationality = Thai'), [
+      { control: 'Gender', value: 'Female' },
+      { control: 'Nationality', value: 'Thai' },
+    ]);
+    assert.deepEqual(
+      goalOutcomes('set Gender = Female, Nationality = Thai and Employee Group = A - Permanent on the New Hire form and stay on /en/admin/hire'),
+      [{ control: 'Gender', value: 'Female' }, { control: 'Nationality', value: 'Thai' }, { control: 'Employee Group', value: 'A - Permanent' }],
+    );
+    assert.equal(goalOutcome('set Gender = Female and Nationality = Thai')?.control, 'Gender', 'goalOutcome is still the first');
+    assert.deepEqual(goalCitedValues('set Gender = Female and Nationality = Thai'), ['Female', 'Thai']);
+    assert.equal(goalCitedValue('set Gender = Female and Nationality = Thai'), 'Female');
+  });
+
+  it('reads a sheet data line, where the next `Key =` ends the value', () => {
+    // "- คีย์ Employee Group = A - Permanent Employee Sub Group = 10 ตามชุดข้อมูล" (EC-Hiring-1, 28 rows).
+    assert.deepEqual(goalOutcomes('คีย์ Employee Group = A - Permanent Employee Sub Group = 10 ตามชุดข้อมูล'), [
+      { control: 'Employee Group', value: 'A - Permanent' },
+      { control: 'Employee Sub Group', value: '10' },
+    ]);
+    assert.deepEqual(goalOutcomes('Personnel Grade (PG) = 10 Employee Group = A - Permanent Employee Sub Group = 10').map((o) => o.control), [
+      'Personnel Grade (PG)', 'Employee Group', 'Employee Sub Group',
+    ]);
+  });
+
+  it('keeps a parenthetical inside a value, and the sentence outside the control', () => {
+    // "ระบบสร้างพนักงานสำเร็จ และ Employee Status = A (Active)" — the Expected
+    // line of 13 EC rows; "Country = Thailand (TH)" on every PY-Config row.
+    assert.deepEqual(goalOutcomes('ระบบสร้างพนักงานสำเร็จ และ Employee Status = A (Active)'), [{ control: 'Employee Status', value: 'A (Active)' }]);
+    assert.deepEqual(goalOutcomes('Business Unit = CPN (10000009) Policy Profile = CPN'), [
+      { control: 'Business Unit', value: 'CPN' },
+      { control: 'Policy Profile', value: 'CPN' },
+    ]);
+  });
+
+  it('never reads a URL, a clock time, a step reference or a sheet header as a pair', () => {
+    assert.deepEqual(goalOutcomes('Enter password hrbp2026, click Sign in, and navigate to http://localhost:3000/en/workflows/probation'), []);
+    assert.deepEqual(goalOutcomes('Reach the Benefit Plan Catalog page (test step 1: เข้าสู่เมนูที่กำหนด)'), []);
+    assert.deepEqual(
+      goalOutcomes('Menu: EC > Hire & Onboard (New Hire). Data: Country = Thailand (TH). at 10:30 open Status: Awaiting manager'),
+      [{ control: 'Country', value: 'Thailand (TH)' }],
+    );
+    assert.deepEqual(goalOutcomes('explore the Employee Group section'), []);
+  });
+
+  it('settles a finish on ALL of them, naming the ones the page does not show', () => {
+    const outcomes = goalOutcomes('set Gender = Female and Nationality = Thai and Employee Group = A - Permanent');
+    const tree = 'button "Gender" value="Female"\nbutton "Nationality" value="Thai"\nbutton "Employee Group" value="— Select —"';
+    const result = outcomesShown(outcomes, tree);
+    assert.equal(result?.shown.length, 2);
+    assert.deepEqual(result?.missing, [{ control: 'Employee Group', value: 'A - Permanent' }]);
+    assert.equal(describeOutcomes(result?.missing ?? []), 'Employee Group = "A - Permanent"');
+    assert.equal(outcomesShown(outcomes, `${tree}\n[TREE TRUNCATED: 3 of 90]`), null, 'a cut tree refuses nothing');
+    const full = outcomesShown(outcomes, tree.replace('— Select —', 'A — Permanent'));
+    assert.deepEqual(full?.missing, []);
+    assert.ok(anyValueAppears(['Male', 'Thai'], tree), 'the value-hunt judge waits while ANY cited value has shown');
+    assert.equal(anyValueAppears(['Male', 'Chinese'], tree), false);
+  });
+});
+
+describe('valueShownIn — code prefixes and aliases (OA-4)', () => {
+  it('shows a status by either half of "A (Active)", and a country by either half of "Thailand (TH)"', () => {
+    // The sheet writes "Employee Status = Active" (7 rows) and "= A (Active)"
+    // (13 rows) for the same badge; "Country = TH" against "Thailand (TH)".
+    assert.ok(valueShownIn('button "Employee Status" value="A (Active)"', 'Active'));
+    assert.ok(valueShownIn('button "Employee Status" value="Active"', 'A (Active)'));
+    assert.ok(valueShownIn('button "Employee Status" value="A"', 'A (Active)'), 'the one-letter half counts as a whole quoted token');
+    assert.equal(valueShownIn('StaticText "Select a status"', 'A (Active)'), false, 'never as a letter in a sentence');
+    assert.equal(valueShownIn('button "Employee Status" value="I (Inactive)"', 'Active'), false, 'Active is not inside Inactive');
+    assert.ok(valueShownIn('button "Country" value="Thailand (TH)"', 'TH'));
+    assert.ok(valueShownIn('StaticText "TH"', 'Thailand (TH)'));
+    assert.ok(outcomeShown({ control: 'Employee Status', value: 'Active' }, 'StaticText "Employee Status"\nStaticText "A (Active)"'));
+  });
+
+  it('shows a coded option by its label or its code — unless the page pairs the label with ANOTHER code', () => {
+    // humi renders "H_NEWHIRE — New Hire"; the sheet writes "Event Reason = New Hire" (15 rows).
+    assert.ok(valueShownIn('option "H_NEWHIRE — New Hire"', 'New Hire'));
+    assert.ok(valueShownIn('option "New Hire"', 'H_NEWHIRE - New Hire'));
+    assert.ok(valueShownIn('option "H_NEWHIRE"', 'H_NEWHIRE - New Hire'));
+    assert.equal(valueShownIn('option "H_REHIRE — New Hire"', 'H_NEWHIRE - New Hire'), false, 'same label, different code');
+    assert.equal(valueShownIn('button "Employee Group" value="B — Permanent"', 'A - Permanent'), false, 'B — Permanent is not A - Permanent');
+    assert.ok(valueShownIn('button "Employee Group" value="Permanent"', 'A - Permanent'));
+    assert.deepEqual(valueSpellings('H_NEWHIRE — New Hire'), ['h_newhire - new hire', 'new hire', 'h_newhire']);
+  });
+
+  it('shows a business unit by its code inside a longer row name', () => {
+    // "Business Unit = CPN (10000009)" against the row "CPN Hotel (10000055)".
+    assert.ok(valueShownIn('cell "CPN Hotel (10000055)"', 'CPN'));
+    assert.ok(valueShownIn('cell "CPN Hotel (10000055)"', 'CPN (10000055)'));
+    assert.equal(valueShownIn('button "Gender" value="Female"', 'Male'), false, 'the whole-word rule stands');
+    assert.ok(valueShownIn('cell "วันลาป่วย 3 วัน"', 'ลาป่วย'), 'Thai stays containment');
+  });
+});
+
+// --- OA-9: the page, not the URL --------------------------------------------------
+
+describe('differentPage / urlMoveNote — ?step=2 is the same page (OA-9)', () => {
+  it('tells a wizard step from a navigation', () => {
+    // ec10-3x HIR-EC-002 leg 12: /en/admin/hire → /en/admin/hire?step=2 was
+    // reported as "the agent ended on … not the page this step began on".
+    assert.equal(differentPage('http://localhost:3005/en/admin/hire', 'http://localhost:3005/en/admin/hire?step=2'), false);
+    assert.equal(differentPage('http://localhost:3005/en/admin/hire', 'http://localhost:3005/en/admin/employees'), true);
+    assert.equal(differentPage('http://a.test/x', 'http://b.test/x'), true, 'another origin is another page');
+    assert.equal(differentPage('not a url', 'http://b.test/x'), false, 'unparsable is never called displacement');
+    assert.equal(queryAndHash('http://localhost:3005/en/admin/hire?step=2#top'), '?step=2#top');
+  });
+
+  it('words the history line so the model does not think it navigated away', () => {
+    assert.equal(urlMoveNote('http://x.test/en/admin/hire', 'http://x.test/en/admin/hire?step=2'), 'still on the page, now at ?step=2');
+    assert.equal(urlMoveNote('http://x.test/a', 'http://x.test/a'), 'still at http://x.test/a');
+    assert.equal(urlMoveNote('http://x.test/a', 'http://x.test/b'), 'moved http://x.test/a → http://x.test/b');
+  });
+});
+
+// --- OA-11: a missing field on step 1 of 2 --------------------------------------
+
+describe('wizardStepHint — the field is on the next step (OA-11)', () => {
+  it('reads "Step 1 of 2" and "ขั้นตอนที่ N จาก M" from the tree', () => {
+    // EC-Hiring-4: "กดปุ่มเพิ่มพนักงานใหม่ ระบบเปิดฟอร์ม New Hire ที่ Step 1 of 2",
+    // "6. กดปุ่มไปหน้าถัดไป ระบบเปิด Step 2 of 2".
+    assert.match(wizardStepHint('heading "New Hire"\nStaticText "Step 1 of 2"\nbutton "Next"') ?? '', /step 1 of 2 of a wizard.*later step.*Next\/ถัดไป/);
+    assert.match(wizardStepHint('StaticText "ขั้นตอนที่ 2 จาก 2"\nbutton "ย้อนกลับ"') ?? '', /last step \(2 of 2\).*earlier step/);
+  });
+
+  it('reads a lone Next/ถัดไป button as a probable wizard, never a table pager, never ?step= in a url', () => {
+    assert.match(wizardStepHint('button "ถัดไป"') ?? '', /Next\/ถัดไป button/);
+    assert.equal(wizardStepHint('button "Previous"\nbutton "Next"'), null, 'a pager has a Previous beside its Next');
+    assert.equal(wizardStepHint('link "Hire" url="http://x/en/admin/hire?step=2"\nbutton "Save"'), null);
   });
 });

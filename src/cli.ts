@@ -34,7 +34,9 @@ import {
   parseContextBudget,
   parseScope,
   parseCredentials,
+  parsePersonas,
   parseScreenshotMode,
+  resolveBrowsers,
   resolveHeadless,
   type CliOptions,
 } from './cli/options.js';
@@ -129,6 +131,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       // `parseArgs` has no --no-x negation, same as --no-heal and --no-agent.
       'no-headless': { type: 'boolean', default: false },
       'stop-chrome': { type: 'boolean', default: false },
+      browsers: { type: 'string' },
       'wait-for': { type: 'string' },
       open: { type: 'boolean', default: false },
       timeout: { type: 'string' },
@@ -171,6 +174,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       root: { type: 'string' },
       repo: { type: 'string' },
       as: { type: 'string' },
+      // Credentials by persona label, repeatable; the password never reaches a
+      // flow file — the label does. Also WOWLIDATOR_PERSONAS. See `parsePersonas`.
+      persona: { type: 'string', multiple: true },
+      // A workbook catalog sliced to a worksheet / a Category (CG-11), both
+      // repeatable and case-insensitive.
+      sheet: { type: 'string', multiple: true },
+      category: { type: 'string', multiple: true },
+      // Author the rows the sheet records as Blocked / Pending on purpose
+      // (CG-01). Declared literally: parseArgs has no --no-x negation and the
+      // default is the gate.
+      'include-blocked': { type: 'boolean', default: false },
       'context-out': { type: 'string' },
       force: { type: 'boolean', default: false },
       'sheet-order': { type: 'boolean', default: false },
@@ -261,6 +275,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'wowlidator: --as must be <email>:<password> — both halves are required ' +
         '(the password may contain colons; the first colon separates them)\n',
     );
+    return 2;
+  }
+
+  const personas = parsePersonas(values.persona);
+  if (!personas.ok) {
+    process.stderr.write(`wowlidator: ${personas.error}\n`);
     return 2;
   }
 
@@ -395,6 +415,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     chromeProfile: values['chrome-profile'] ?? DEFAULT_CHROME_PROFILE,
     headless: resolveHeadless(values.headless === true, values['no-headless'] === true),
     stopChrome: values['stop-chrome'] === true,
+    browsers: resolveBrowsers(values.browsers),
     waitFor: values['wait-for'],
     open: values.open === true,
     timeoutMs: values.timeout === undefined ? undefined : Number(values.timeout) * 1000,
@@ -407,6 +428,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     root: values.root,
     repo: values.repo,
     credentials,
+    personas: personas.personas,
+    includeBlocked: values['include-blocked'] === true,
+    sheets: values.sheet ?? [],
+    categories: values.category ?? [],
     contextOut: values['context-out'],
     force: values.force,
     // Either refinement implies the loop itself — asking for an investigated

@@ -59,6 +59,82 @@ export function relaxRoleName(selector: string): string | null {
 }
 
 /**
+ * The same selector with its exact accessible name loosened to a WHOLE-WORD
+ * match inside a longer name — `role=option[name="New Hire" i]` →
+ * `role=option[name=/(^|[^\p{L}\p{N}])New Hire([^\p{L}\p{N}]|$)/iu]`.
+ *
+ * The role-selector mirror of `relaxTextSelector`: a quoted name demands the
+ * WHOLE accessible name, and an app that renders an option as "H_NEWHIRE —
+ * New Hire" (code and label) fails it at every timeout while the option is
+ * on screen. Unicode boundaries, not `\b`: "Male" must not be found inside
+ * "Female", and Thai has no ASCII word characters to bound on. Null when the
+ * selector is not a role selector, carries no quoted name, or already uses a
+ * regex.
+ */
+export function containsRoleName(selector: string): string | null {
+  if (!isRoleSelector(selector)) return null;
+  const match = ROLE_NAME_ATTR.exec(selector);
+  if (!match) return null;
+  const quoted = match[1]!;
+  const inner = quoted.slice(1, -1).replace(/\\(.)/g, '$1').trim();
+  if (inner === '' || inner.includes('/')) return null;
+  const escaped = inner.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  return selector.replace(
+    ROLE_NAME_ATTR,
+    () => `[name=/(^|[^\\p{L}\\p{N}])${escaped}([^\\p{L}\\p{N}]|$)/iu]`,
+  );
+}
+
+/**
+ * How an option's visible label is matched against the accessible names of an
+ * open list: the whole name (case-insensitive), then the label as a whole word
+ * inside a longer name — unicode boundaries, so "Male" is not inside "Female"
+ * and a Thai label bounds on punctuation and space. Any dash the page might
+ * draw ("A - Permanent" in the sheet is "A — Permanent" on humi's form) and
+ * any spacing around it are folded.
+ *
+ * Lives here (2026-09-03) beside the other name rewrites so `listbox.ts` and
+ * the runner share one rule; `runner.ts` keeps its own copy until it
+ * re-exports this one.
+ */
+export function optionNamePatterns(label: string): [RegExp, RegExp] {
+  const escaped = label
+    .trim()
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\s*[-\u2010-\u2015\u2212]\s*/g, '\\s*[-\\u2010-\\u2015\\u2212]\\s*')
+    .replace(/\s+/g, '\\s+');
+  return [
+    new RegExp(`^\\s*${escaped}\\s*$`, 'iu'),
+    // \p{M} beside \p{L}: a Thai vowel or tone mark belongs to its word, so a
+    // prefix of a Thai label is not a whole word (บางร is not บางรัก).
+    new RegExp(`(^|[^\\p{L}\\p{M}\\p{N}])${escaped}([^\\p{L}\\p{M}\\p{N}]|$)`, 'iu'),
+  ];
+}
+
+/** The role a selector's HEAD names (`role=option[name="X"] >> nth=0` → `option`), or null. */
+export function headRoleOf(selector: string): string | null {
+  const match = /^\s*role=([a-z]+)/i.exec(selector);
+  return match === null ? null : match[1]!.toLowerCase();
+}
+
+/**
+ * Roles that only exist inside an OPEN popup — an option in a listbox, an
+ * item in a menu, a node in a tree. The healer reads a tree captured with
+ * the list closed, so a selector headed by one of these cannot be repaired
+ * by it: the model can only echo the selector or propose the trigger (EH-13,
+ * HIR-EC-029 measured 70 s per such miss before the state-verdict rung).
+ */
+export const POPUP_ONLY_ROLES: ReadonlySet<string> = new Set([
+  'option', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'treeitem',
+]);
+
+/** True when the selector's head role lives inside a popup the healer cannot open. */
+export function targetsPopupContent(selector: string): boolean {
+  const role = headRoleOf(selector);
+  return role !== null && POPUP_ONLY_ROLES.has(role);
+}
+
+/**
  * `relaxRoleName` applied where a selector is being *written* — returns the
  * input untouched when there is nothing to relax, so call sites stay flat.
  */

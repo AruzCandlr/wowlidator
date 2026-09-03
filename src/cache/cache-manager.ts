@@ -23,7 +23,7 @@ export interface HealedSelectorEntry {
   healed: string;
   /** Which locator family the healer chose (role, text, css, …). */
   strategy: string;
-  /** Page URL, normalised to `origin + pathname`. */
+  /** Page URL, normalised by `scopeUrl` (origin + pathname + page-naming params). */
   url: string;
   /** Healer self-reported confidence, clamped to 0–1. */
   confidence: number;
@@ -50,12 +50,34 @@ export interface CacheManagerOptions {
   warn?: boolean;
 }
 
-/** Reduce a URL to `origin + pathname` so query strings don't fragment the cache. */
-export function scopeUrl(url: string): string {
+/**
+ * Query parameters that name a different PAGE, not a different view of the
+ * same one. humi's hire wizard keys its two forms as `?step=1` / `?step=2`
+ * on one route (ec10 HIR-EC-002, 2026-09-03): a repair or a dead-end memo
+ * recorded for `role=textbox[name="Select date"] >> nth=0` on step 1 was
+ * served on step 2 — a stale cached heal cost the healed timeout and a
+ * delete, and the step-1 memo made the same selector on step 2 fail after
+ * one fast attempt although step 2 is a different form. The BE import wizard
+ * and any tab strip keyed by query have the same shape.
+ */
+export const SCOPE_PARAMS: readonly string[] = ['step', 'tab', 'page', 'view', 'section'];
+
+/**
+ * Reduce a URL to `origin + pathname` (+ the page-naming query params, sorted)
+ * so tracking and navigation noise (`?next=/home`, `?utm_source=…`) does not
+ * fragment the cache while `?step=2` still keys its own page. Same function
+ * behind the healed-selector cache key, the runner's dead-end memo and the
+ * agent's replay key, so all three agree on what "this page" means.
+ */
+export function scopeUrl(url: string, keep: readonly string[] = SCOPE_PARAMS): string {
   try {
     const parsed = new URL(url);
     const path = parsed.pathname.length > 1 ? parsed.pathname.replace(/\/+$/, '') : parsed.pathname;
-    return `${parsed.origin}${path}`;
+    const kept = [...parsed.searchParams.entries()]
+      .filter(([name]) => keep.includes(name))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([name, value]) => `${name}=${encodeURIComponent(value)}`);
+    return `${parsed.origin}${path}${kept.length > 0 ? `?${kept.join('&')}` : ''}`;
   } catch {
     return url;
   }

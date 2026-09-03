@@ -57,6 +57,24 @@ const WRITE_VERB =
   /\b(creat(e|es|ing)|add(s|ing)?|edit(s|ing)?|updat(e|es|ing)|sav(e|es|ing)|submit(s|ted|ting)?|approv(e|es|ing)|reject(s|ing)?|delet(e|es|ing)|remov(e|es|ing)|extend(s|ing)?|decid(e|es|ing)|set(s|ting)? (the )?(status|value|amount|date)|chang(e|es|ing)|fill(s|ing)? (in|out)?|enter(s|ing)? (a|the|an) |typ(e|es|ing) (in|into)|select(s|ing)? (the )?(option|outcome|card)|upload(s|ing)?|send(s|ing)?|assign(s|ing)?|escalat(e|es|ing)|cancel(s|ling|ing)?|confirm(s|ing)?|mark(s|ing)? (as|it)|resolv(e|es|ing)|withdraw(s|ing)?|revok(e|es|ing)|grant(s|ing)?|pass(es|ing)? (the )?probation|fail(s|ing)? (the )?probation)\b/i;
 
 /**
+ * The same business writes in Thai (CG-16). No `\b` — Thai has no ASCII word
+ * boundaries, so `\b(สร้าง)\b` never matches and the ~600 Thai-worded rows of
+ * the HR workbook read as readers, sharing the pool with a writer on the
+ * same table (BE Plan/Rule, TM Leave: ML_01_06 "ยื่นใบลา … หัวหน้าอนุมัติ",
+ * PL_08_19 "สร้าง Plan … บันทึก"). Two exclusions, both from OA-13's
+ * classifier: `บันทึกค่า|บันทึกว่า` is "record the value shown" — a read —
+ * and `เพิ่มเติม` is "additional", not "add". `ยกเลิก` (cancel a request) is a
+ * write; the sheet-status Cancelled never reaches a goal.
+ */
+export const WRITE_VERB_TH =
+  /สร้าง|เพิ่ม(?!เติม)|บันทึก(?!ค่า|ว่า)|อนุมัติ|ปฏิเสธ|ยื่น|ส่ง(?:คำขอ|อนุมัติ)?|ลบ|แก้ไข|นำเข้า|นำออก|ยกเลิก|ขอ(?:ลา|OT|โอที|เวลา)|กด(?:ปุ่ม)?\s*(?:Submit|Save|Approve|Reject|Create|Delete|Import|Confirm)/iu;
+
+/** Does a workflow goal name a business write, in either language? */
+export function goalWrites(goal: string): boolean {
+  return WRITE_VERB.test(goal) || WRITE_VERB_TH.test(goal);
+}
+
+/**
  * Does this fill belong to signing in rather than to the case's own subject?
  *
  * Decided by **where the page is**, never by what the field is called. The
@@ -130,8 +148,8 @@ export function caseWrites(flow: Flow): boolean {
     // has been asked to change nothing.
     if (action === 'workflow') {
       const goal = (step as { goal: string }).goal;
-      if (goalMentionsSignIn(goal) && !WRITE_VERB.test(goal)) continue;
-      if (WRITE_VERB.test(goal)) return true;
+      if (goalMentionsSignIn(goal) && !goalWrites(goal)) continue;
+      if (goalWrites(goal)) return true;
       continue;
     }
 
@@ -237,6 +255,17 @@ export interface SpeedOrderRow {
   testCase?: string;
   steps?: string;
   expected?: string;
+  /**
+   * Cases this row needs finished first (CG-12: `PL_03_08` continues from
+   * `PL_03_07`; `RU_07_xx` uses the plan `PL_08_xx` created). An edge the
+   * ordering must keep: a scenario holding a dependent is never queued
+   * before the scenario holding its source, however cheap it is — the
+   * ScenarioGate would hold the source's authoring until the dependent's
+   * scenario finished RUNNING, while the dependent waits in the run loop for
+   * the source. That is a deadlock by construction, and the order is where
+   * it is prevented.
+   */
+  dependsOn?: readonly string[] | undefined;
 }
 
 /** A static unit ≈ one browser step. Only relative cost matters. */
@@ -277,17 +306,98 @@ export function orderScenariosFastestFirst<T extends SpeedOrderRow>(
       (sum, row) => sum + (priorMs.get(row.caseId) ?? SPEED_UNIT_MS * estimateRowUnits(row)),
       0,
     );
-  const order = sheetOrder
-    .map((scenario, at) => ({ scenario, at, estimateMs: Math.round(costOf(blocks.get(scenario)!)) }))
-    .sort((a, b) => a.estimateMs - b.estimateMs || a.at - b.at);
+  const priced = sheetOrder.map((scenario, at) => ({
+    scenario,
+    at,
+    estimateMs: Math.round(costOf(blocks.get(scenario)!)),
+  }));
+  // Scenario-level dependency edges: scenario B needs scenario A when any row
+  // of B depends on a row of A. Cheapest-first is then a topological pick —
+  // Kahn's algorithm choosing, among the scenarios whose sources are all
+  // placed, the cheapest (sheet order breaks ties). A cycle (two scenarios
+  // citing each other) cannot be honoured; the rest are appended cheapest
+  // first and the run loop's own dependency check says which side waited.
+  const scenarioOf = new Map<string, string>();
+  for (const [scenario, block] of blocks) for (const row of block) scenarioOf.set(row.caseId, scenario);
+  const needs = new Map<string, Set<string>>();
+  for (const [scenario, block] of blocks) {
+    const set = new Set<string>();
+    for (const row of block) {
+      for (const id of row.dependsOn ?? []) {
+        const source = scenarioOf.get(id);
+        if (source !== undefined && source !== scenario) set.add(source);
+      }
+    }
+    needs.set(scenario, set);
+  }
+  const placed = new Set<string>();
+  const order: typeof priced = [];
+  let pending = [...priced];
+  while (pending.length > 0) {
+    const ready = pending
+      .filter((entry) => [...(needs.get(entry.scenario) ?? [])].every((source) => placed.has(source)))
+      .sort((a, b) => a.estimateMs - b.estimateMs || a.at - b.at);
+    const next = ready[0] ?? [...pending].sort((a, b) => a.estimateMs - b.estimateMs || a.at - b.at)[0]!;
+    order.push(next);
+    placed.add(next.scenario);
+    pending = pending.filter((entry) => entry !== next);
+  }
   return {
-    rows: order.flatMap((entry) => blocks.get(entry.scenario)!),
+    rows: order.flatMap((entry) => orderDependentsAfterSources(blocks.get(entry.scenario)!, (row) => row.caseId, (row) => row.dependsOn ?? [])),
     order: order.map(({ scenario, estimateMs }) => ({
       scenario,
       estimateMs,
       rows: blocks.get(scenario)!.length,
     })),
   };
+}
+
+/**
+ * A dependent placed after every source it names, everything else in its
+ * given order (CG-12). Pure and total: every item survives, and an item
+ * whose sources are not in the list (or are already ahead of it) does not
+ * move. Used on the sheet's rows before authoring (so the source authors
+ * first), on a closed case list after `readersFirst` (which would otherwise
+ * put a reader dependent in front of the writer it continues from), and
+ * inside the fastest-first scenario blocks. The run loop then only ever
+ * waits on a source whose index is LOWER than the dependent's — a source
+ * queued behind its dependent is the one shape that could deadlock a loop
+ * that dispatches in index order, and this is where it is ruled out.
+ */
+export function orderDependentsAfterSources<T>(
+  items: readonly T[],
+  idOf: (item: T) => string,
+  depsOf: (item: T) => readonly string[],
+): T[] {
+  const out: T[] = [];
+  const placed = new Set<string>();
+  const ids = new Set(items.map(idOf));
+  // Deferred dependents, keyed by the source each still waits for.
+  const waiting = new Map<string, T[]>();
+  const place = (item: T): void => {
+    out.push(item);
+    const id = idOf(item);
+    placed.add(id);
+    const released = waiting.get(id);
+    if (released === undefined) return;
+    waiting.delete(id);
+    for (const dependent of released) consider(dependent);
+  };
+  const consider = (item: T): void => {
+    const missing = depsOf(item).find((dep) => dep !== idOf(item) && ids.has(dep) && !placed.has(dep));
+    if (missing === undefined) {
+      place(item);
+      return;
+    }
+    const list = waiting.get(missing) ?? [];
+    list.push(item);
+    waiting.set(missing, list);
+  };
+  for (const item of items) consider(item);
+  // A cycle (A needs B, B needs A) leaves both waiting; they keep their given
+  // order at the end rather than vanishing — every item survives.
+  for (const item of items) if (!out.includes(item)) out.push(item);
+  return out;
 }
 
 /**

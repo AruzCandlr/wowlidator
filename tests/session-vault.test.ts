@@ -130,3 +130,31 @@ describe('session carried across isolated case contexts (CDP)', { skip: skipBrow
     );
   });
 });
+
+// --- Per-account keying (EH-10, 2026-09-03) --------------------------------
+
+describe('SessionVault keyed per account', () => {
+  const state = (name: string) => ({
+    cookies: [{ name, value: 'v', domain: 'a.test', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' as const }],
+    origins: [],
+  });
+
+  it('hands a case the account it asked for, never whichever account the previous case ended as', () => {
+    // ML_01_06's shape: the employee submits, the manager approves, the next
+    // employee case must start as the employee again.
+    const vault = new SessionVault();
+    vault.put('http://a.test', state('employee'), 'employee@a.test');
+    vault.put('http://a.test', state('manager'), 'manager@a.test');
+    assert.equal(vault.get('http://a.test', 'employee@a.test')?.cookies[0]?.name, 'employee');
+    assert.equal(vault.get('http://a.test', 'manager@a.test')?.cookies[0]?.name, 'manager');
+    assert.equal(vault.get('http://a.test', 'hrbp@a.test'), null);
+  });
+
+  it('keeps the single-slot answer for a caller that names no account — the latest banked', () => {
+    const vault = new SessionVault();
+    vault.put('http://a.test', state('first'));
+    vault.put('http://a.test', state('second'), 'x@a.test');
+    assert.equal(vault.get('http://a.test')?.cookies[0]?.name, 'second');
+    assert.equal(vault.get('http://b.test'), null, 'still origin-scoped');
+  });
+});

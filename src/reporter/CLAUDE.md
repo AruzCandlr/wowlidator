@@ -92,7 +92,7 @@ The overlay is injected into the application under test, so three rules keep it 
 
 **One recording per run, addressed per step.** `ProofStep.videoOffsetMs` is stamped in `ProofBundleBuilder.addStep` — one derivation rather than eighteen call sites — and the report turns it into a "play from here" on every step. That is what makes a single clip per-step evidence instead of something a reader has to scrub. An HTTP step gets no offset for the same reason it gets no screenshot: nothing about a `request` happened on screen.
 
-Frames are capped at 960 on the long edge and the whole recording at 24MB; over that the report says the recording was made and not embedded, because "it did not fit" and "nothing was recorded" are different facts. Sealing happens **between closing the context and closing the browser**, in that order — Playwright finalises a video when its context closes, so asking earlier reads a truncated file no player will open.
+Frames are capped at 960 on the long edge; the recording itself has no size cap (the 24MB ceiling was removed 2026-09-03 — see the catalog report notes below). `video.omitted` remains for an embedder that made a recording it cannot carry, because "it did not fit" and "nothing was recorded" are different facts. Sealing happens **between closing the context and closing the browser**, in that order — Playwright finalises a video when its context closes, so asking earlier reads a truncated file no player will open.
 
 **The cut happens in the container, with no encoder** (`src/engine/webm.ts`). Playwright can only stop recording by closing the context, which is the end of the run, so the trim is done afterwards on the finished file — and dropping the *tail* of a WebM needs no re-encoding, because frames are stored in order and nothing kept still refers to what was removed. (Cutting the *head* would be a different problem: every frame after a keyframe depends on it. The segment always starts at zero, so that never arises.) Playwright writes one cluster per ~5 seconds, which is far too coarse to end at a step, so the cut is made **block by block inside the last kept cluster**; `Cues` and `SeekHead` are dropped rather than rewritten, since their byte offsets do not survive it. The output is then **re-parsed and verified before it is returned** — same rule as `catalog/extract.ts`: never hand back something we could not check. Anything unexpected returns `null`, and `null` means no video at all. A subtly malformed recording is worse than none, because it plays for three seconds and quietly misrepresents when the run ended.
 
@@ -153,12 +153,13 @@ be100-rip's 32 bundles, that is exactly what they hold — all 13 non-passing
 cases carry stills, 18 of 19 passing ones carry none — so a report that
 dropped the recording left a reader with **no evidence at all for every case
 that worked**. Each case now carries its own `<video>`, on the same rules as
-the stills: `VIDEO_BUDGET_BYTES` (25MB — median recording 55KB, tail 6MB, a
-whole catalog ~75MB embedded whole), and `chooseEmbeddedVideos` spends it in a
-pass of its own BEFORE rendering, non-passing cases first and smallest first
-within each group — document order would buy twenty passes and leave the
-failures, the cases a reader opens, with nothing. What does not fit is named,
-not dropped silently. Three mechanics are load-bearing: **the base64 rides on
+the stills — except that **recordings have no size cap** (2026-09-03; there
+was a 25MB per-report budget spent non-passing-first, and a 24MB per-recording
+ceiling in `engine/video.ts` that left `video.omitted` in the bundle — both
+removed after a long run's film was dropped as "too large", which is worse
+than a large report). Every recording is embedded whatever it weighs; what
+bounds the file now is the run, not the reporter. Three mechanics are
+load-bearing: **the base64 rides on
 `data-webm` and becomes a Blob URL in the page** (Chrome will not load a
 `data:` video — `readyState 0` forever, no error, reads exactly like a corrupt
 file); **it is decoded when the case is opened, not at load** (dozens of

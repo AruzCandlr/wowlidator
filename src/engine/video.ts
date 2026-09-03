@@ -64,9 +64,11 @@ export interface VideoRecording {
   /** Bytes on disk before base64 — what the recording actually weighs. */
   bytes: number;
   /**
-   * Set instead of `data` when the recording was too large to embed. The
-   * report says so rather than silently showing no video: "we recorded it and
-   * it is over there" and "there is no recording" are different facts.
+   * Set instead of `data` when a recording was made but could not be carried
+   * into the bundle. The report says so rather than silently showing no
+   * video: "we recorded it and it is over there" and "there is no recording"
+   * are different facts. Size is no longer a reason (the cap was removed
+   * 2026-09-03); the field stays for embedders that supply their own bundles.
    */
   omitted?: string | undefined;
   /** Index of the step the recording was cut at — the one that failed. */
@@ -97,16 +99,6 @@ const FAILURE_TAIL_MS = 750;
  */
 const MAX_VIDEO_EDGE = 960;
 
-/**
- * Ceiling on an embedded recording.
- *
- * The report is one file that has to open off a USB stick, and base64 inflates
- * by a third on top of this. A long run against a busy page can exceed it, and
- * the honest response is to keep the run's verdict and say the video was too
- * large — never to fail the run, and never to quietly produce a report with a
- * video element that plays nothing.
- */
-const MAX_EMBED_BYTES = 24 * 1024 * 1024;
 
 /**
  * Frame size for a given viewport.
@@ -372,13 +364,12 @@ export async function sealVideo(
       endsAtStep,
       durationMs,
     };
-    if (buffer.byteLength > MAX_EMBED_BYTES) {
-      recording.omitted =
-        `recording was ${Math.round(buffer.byteLength / 1024 / 1024)}MB, over the ` +
-        `${Math.round(MAX_EMBED_BYTES / 1024 / 1024)}MB limit for embedding in a self-contained report`;
-    } else {
-      recording.data = buffer.toString('base64');
-    }
+    // No size ceiling (removed 2026-09-03): a long run against a busy page
+    // produced a recording the report then said was "too large", and a report
+    // with no film is worth less than a large one. The bytes always ride
+    // along; the readers stream them from a Blob, so size costs load time,
+    // never playback.
+    recording.data = buffer.toString('base64');
     return recording;
   } catch {
     return undefined;

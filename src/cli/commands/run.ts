@@ -58,6 +58,7 @@ import {
   buildInvestigationAgent,
   lineLogger,
   planLogger,
+  runPersonas,
   stepLogger,
 } from '../runtime.js';
 
@@ -118,6 +119,7 @@ export async function cmdRun(flowPaths: readonly string[], options: CliOptions):
     // Carried for masking only: a password the person supplied must not
     // reach the proof bundle or the emailable report in cleartext.
     credentials: options.credentials,
+    personas: runPersonas(options),
     historyPath: options.history ? options.historyPath : null,
     onStep: stepLogger(options),
     onPlan: planLogger(options),
@@ -306,6 +308,7 @@ async function cmdRunWithRepair(flowPath: string, flow: Flow, options: CliOption
       // Carried for masking only: a password the person supplied must not
       // reach the proof bundle or the emailable report in cleartext.
       credentials: options.credentials,
+      personas: runPersonas(options),
       historyPath: options.history ? options.historyPath : null,
       onStep: stepLogger(options),
       onPlan: planLogger(options),
@@ -549,6 +552,7 @@ export async function cmdWatch(flowPath: string | undefined, options: CliOptions
       // Carried for masking only: a password the person supplied must not
       // reach the proof bundle or the emailable report in cleartext.
       credentials: options.credentials,
+      personas: runPersonas(options),
       historyPath: options.history ? options.historyPath : null,
     });
 

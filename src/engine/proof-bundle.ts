@@ -8,6 +8,12 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import {
+  describeAgentAction,
+  observedEvidence,
+  stepKindFacts,
+  stepTarget,
+} from '../reporter/step-facts.js';
 import type { PolaritySource, TestPolarity } from './polarity.js';
 
 import type { RequestRecord } from '../api/api-client.js';
@@ -263,6 +269,18 @@ export type ResolutionSource =
   | 'case'
   | 'narrow'
   /**
+   * The author's selector matched a control folded inside a collapsed
+   * section; the section's disclosure was clicked and the same selector
+   * resolved. Free and deterministic; see `engine/reveal.ts`.
+   */
+  | 'reveal'
+  /**
+   * The author's selector resolved but a fixed or sticky bar intercepted the
+   * pointer; the target was scrolled to the middle of the viewport and the
+   * same selector acted. Free and deterministic.
+   */
+  | 'scroll'
+  /**
    * The author's selector resolved and only its TEXT missed, and the claim
    * held against its container instead — a label whose value sits beside it.
    * Free and deterministic; see `ancestorSelectors` in `engine/runner.ts`.
@@ -354,6 +372,13 @@ export interface AgentAction {
   ok: boolean;
   error?: string | undefined;
   durationMs: number;
+  /**
+   * What a `read` (or a `save`) actually read off the page — the agent's
+   * evidence, not its claim. 179 rows of the QA workbook ask for a value to
+   * be RECORDED rather than asserted ("ยังไม่มีคำตอบ ให้บันทึกค่าที่ระบบแสดงจริง"),
+   * and without this the observation existed only inside the turn that made it.
+   */
+  observed?: string | undefined;
 }
 
 /**
@@ -397,6 +422,12 @@ export interface AgentRecord {
   success: boolean;
   summary: string;
   actions: AgentAction[];
+  /**
+   * Every value the agent read, gathered for the step's evidence — see
+   * `AgentAction.observed`. The runner copies these onto `detail.observed`
+   * so the report and the Excel export can show them as observations.
+   */
+  observations?: { selector: string; text: string; url: string }[] | undefined;
   /** Model turns consumed out of the step budget. */
   turns: number;
   /** The configured turn ceiling, or null when the run was unbounded and the
@@ -892,7 +923,22 @@ export interface GenerationProvenance {
    * the application actually behaved. Absent when the sheet recorded nothing
    * (blank, Cancelled, Pending) or the source was not a test-case table.
    */
-  knownResult?: 'passed' | 'failed' | undefined;
+  knownResult?: 'passed' | 'failed' | 'blocked' | undefined;
+  /**
+   * The sheet's own id for this case when the catalog had to qualify it
+   * (`BE:PL_03_01` for a `PL_03_01` that two sheets share; `TSH_01_01#6` for
+   * a repeat) — what the report and wowUI show as the case's chip. Absent
+   * when `caseId` is the sheet's spelling already (CG-04, 2026-09-03).
+   */
+  sheetCaseId?: string | undefined;
+  /** The workbook sheet and category the row came from (CG-11). */
+  sheet?: string | undefined;
+  category?: string | undefined;
+  /**
+   * The row's Expected column is wholly record-only ("= ? OQ-HIR-nn … ให้รัน
+   * จริงแล้วบันทึกค่าที่ระบบแสดง") — the run captures, a person judges (CG-09).
+   */
+  recordOnly?: boolean | undefined;
   /**
    * The document this was authored from — a catalog's file name.
    *
@@ -1699,8 +1745,12 @@ export class ProofBundleBuilder {
     // from the link's own href — "expected /orders, got /login" is a routing
     // fact, and inviting a judge to bless a wrong route is exactly the
     // softening the numeric guard refuses for numbers.
+    // A step the runner stamped `verdict: 'not-found'` (EH-09, 2026-09-03)
+    // failed because the application showed its own missing-page surface —
+    // the heading is the evidence and there is no wording to rule on.
     const nearEligible = (s: ProofStep): boolean =>
       s.action !== 'expectUrl' &&
+      s.detail?.['verdict'] !== 'not-found' &&
       (s.status === 'failed' ||
         (s.status === 'dead-end' && s.detail?.['foundInPageText'] === true));
     if (
@@ -1811,7 +1861,11 @@ export async function writeProofBundle(bundle: ProofBundle, dir: string): Promis
  */
 export function formatStepLine(step: ProofStep): string {
   const mark = step.status === 'passed' ? '✓' : '✗';
-  const target = step.resolvedSelector ?? step.selector;
+  // Not `resolvedSelector ?? selector`: four wave-2 step kinds carry no
+  // selector at all (`expectAnyVisible` has a list, `signIn` a persona label,
+  // `upload` its files), and a bare `✗ [9] expectAnyVisible` names nothing a
+  // reader can act on. `stepTarget` is the one reading every renderer shares.
+  const target = stepTarget(step);
   const tag = step.resolution && step.resolution !== 'fast' ? `${step.resolution}, ` : '';
   const kind = step.status === 'error' ? ' ERROR' : step.status === 'dead-end' ? ' DEAD END' : '';
   const lines = [
@@ -1820,8 +1874,14 @@ export function formatStepLine(step: ProofStep): string {
   if (step.intent) lines.push(`      ${step.intent}`);
   const comparison = expectedActual(step);
   if (comparison) lines.push(`      ${comparison}`);
+  for (const fact of stepKindFacts(step)) {
+    lines.push(`      ${fact.label}: ${fact.value.split('\n').join('\n        ')}`);
+  }
   const described = describeTarget(step.target);
   if (described !== null) lines.push(`      target: ${described}`);
+  for (const seen of observedEvidence(step)) {
+    lines.push(`      observed ${seen.selector === null ? '' : seen.selector + ': '}${JSON.stringify(seen.text)}`);
+  }
   const valueFrom = describeValueSource(step);
   if (valueFrom !== null) lines.push(`      value ${valueFrom}`);
   for (const change of describeDbChanges(step.dbChanges)) lines.push(`      ${change}`);
@@ -1848,10 +1908,14 @@ export function expectedActual(step: ProofStep): string | null {
 /** One line per completed agent turn, for live progress during a `workflow` step. */
 export function formatAgentAction(action: AgentAction): string {
   const mark = action.ok ? '✓' : '✗';
-  const target = action.selector ?? action.url ?? action.value ?? '';
+  // `save` and `signOut` (wave 2) have no selector worth printing and a
+  // meaning the raw fields do not carry; `describeAgentAction` is the same
+  // reading the report uses, so the terminal and the report agree.
+  const { target, note } = describeAgentAction(action);
   const lines = [
-    `  ${mark} agent: ${action.action}${target ? ` ${target}` : ''} (${action.durationMs}ms)`,
+    `  ${mark} agent: ${action.action}${target && target !== '—' ? ` ${target}` : ''} (${action.durationMs}ms)`,
   ];
+  if (note) lines.push(`        ${note}`);
   if (action.reasoning) lines.push(`        ${action.reasoning}`);
   return lines.join('\n');
 }

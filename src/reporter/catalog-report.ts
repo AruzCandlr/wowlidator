@@ -17,8 +17,10 @@
  *   rest. Measured on be100-rip, that is exactly what the bundles hold — all
  *   13 non-passing cases carry stills and 18 of 19 passing ones carry none —
  *   so a report that dropped the recording left a reader with no evidence at
- *   all for every case that worked. Same budget rule as the stills, same
- *   priority: a case that did not pass keeps its recording first.
+ *   all for every case that worked. Every recording is embedded, whatever it
+ *   weighs (the 25MB budget was removed 2026-09-03: a report with no film is
+ *   worth less than a large one). It is decoded only when its case is opened,
+ *   so a heavy catalog costs load time, not the reader's patience.
  * - **A case opens into a two-pane view**: LEFT the steps, each expandable
  *   into its full detail (intent, selector, resolution, error, heal, agent
  *   turns, screenshot) plus an explanation drawn from the run history (trend,
@@ -51,21 +53,24 @@ import type { ProofBundle, ProofStep } from '../engine/proof-bundle.js';
 import { describeDbChanges, describeTarget, describeValueSource, verdictFamily } from '../engine/proof-bundle.js';
 import { grimTheme } from './theme.js';
 import { slugify } from './html-reporter.js';
+import {
+  countVerdicts,
+  describeAgentAction,
+  describeResolution,
+  describeVerdictCounts,
+  displayCaseId,
+  observedEvidence,
+  provenanceExtras,
+  recordOnlyCase,
+  recordedCaptures,
+  sheetLabel,
+  stepKindFacts,
+  stepTarget,
+} from './step-facts.js';
 
 export const CATALOG_REPORT_DIR = 'reports';
 /** Routine screenshots are embedded until this many bytes of base64 are spent. */
 export const SCREENSHOT_BUDGET_BYTES = 15_000_000;
-/**
- * Recordings are embedded until this many bytes of base64 are spent.
- *
- * Measured on be100-rip's 32 bundles: median recording 55 KB of base64, but the
- * tail reaches 6 MB and the set totals 22 MB. A whole 108-row catalog would
- * therefore be somewhere near 75 MB embedded whole, which is past the point a
- * browser opens it pleasantly. 25 MB fits every recording of a normal run and
- * still bounds the pathological one; what does not fit is named, not dropped
- * in silence.
- */
-export const VIDEO_BUDGET_BYTES = 25_000_000;
 /** A step at or over the fast-path budget is worth a reader's eye. */
 const SLOW_STEP_MS = 2_000;
 
@@ -87,6 +92,23 @@ export interface CatalogReportCase {
    * ("broken for the last 5 runs"), prior failure shapes, heal pressure.
    */
   history: readonly string[];
+  /**
+   * The sheet's own spelling of the id when `id` was qualified (CG-04:
+   * `BE:PL_03_01` runs as one case, the sheet still says `PL_03_01`), and the
+   * workbook sheet / category the row came from. Optional — a ledger written
+   * before the parser recorded them carries none, and the bundle's own
+   * provenance stamp is read as the fallback (`provenanceExtras`).
+   */
+  sheetCaseId?: string | undefined;
+  sheet?: string | undefined;
+  category?: string | undefined;
+}
+
+/** The sheet-side identity of a case: the row's own fields first, the bundle's stamp second. */
+function sheetIdentity(c: CatalogReportCase): { sheetCaseId: string | null; label: string | null } {
+  const stamped = provenanceExtras(c.bundle);
+  const label = sheetLabel({ sheet: c.sheet ?? stamped.sheet, category: c.category ?? stamped.category });
+  return { sheetCaseId: c.sheetCaseId ?? stamped.sheetCaseId, label };
 }
 
 export interface CatalogReportInput {
@@ -120,7 +142,11 @@ function fmtMs(ms: number): string {
 export function verdictChipOf(c: CatalogReportCase): { cls: string; label: string } {
   if (c.verdict === 'never-ran') return { cls: 'never', label: 'never ran' };
   if (c.verdict === 'blocked') return { cls: 'never', label: 'blocked' };
-  if (c.verdict === 'review') return { cls: 'review', label: 'needs review' };
+  // Two reasons a case ends in review, two colours: a wording near-miss a
+  // human must rule on (proved-?), and a case the sheet gave no oracle for —
+  // wholly record-only, judged by its captures (CG-09). The second is not a
+  // "needs review" of anything the machine claimed; it claimed nothing.
+  if (c.verdict === 'review') return recordOnlyCase(c) ? { cls: 'record', label: 'recorded only' } : { cls: 'review', label: 'needs review' };
   if (c.verdict === 'passed') return { cls: 'pass', label: c.status === 'passed-with-issues' ? 'pass**' : 'passed' };
   const family = c.status === null ? 'test-failed' : verdictFamily(c.status);
   return family === 'system-error'
@@ -142,9 +168,16 @@ function stepDetail(step: ProofStep, budget: ShotBudget): string {
     rows.push(`<div class="kv"><span>${esc(label)}</span><${mono ? 'code' : 'span'}>${esc(value)}</${mono ? 'code' : 'span'}></div>`);
   };
   row('intent', step.intent, false);
-  row('selector', step.selector);
+  row('selector', step.selector ?? stepTarget(step));
+  // The kind's own facts: an either/or's alternatives, an upload's file
+  // names, a sign-in's persona label, the author's timeout. Rendered as rows
+  // so a step with no `selector` is still a step a reader can read.
+  for (const fact of stepKindFacts(step)) row(fact.label, fact.value);
   if (step.resolvedSelector && step.resolvedSelector !== step.selector) row('resolved as', step.resolvedSelector);
-  row('resolution', step.resolution ?? undefined);
+  // The rung by name, then what it did — `reveal` and `scroll` are one-line
+  // explanations here, not words a reader has to look up.
+  const how = describeResolution(step.resolution);
+  if (how !== null) row('resolution', `${step.resolution} — ${how.label}: ${how.explanation}`, false);
   // What the selector WAS: role, name, where it sat — and the red rectangle
   // in the still below is drawn around exactly this box.
   row('target', describeTarget(step.target), false);
@@ -163,13 +196,30 @@ function stepDetail(step: ProofStep, budget: ShotBudget): string {
   }
   if (step.agent) {
     const a = step.agent;
+    // Each turn by what it was aimed at — `save` names the variable it filled,
+    // `signOut` has no selector, `read` quotes what it saw (`describeAgentAction`).
     const turns = (a.actions ?? [])
-      .map((t) => `<li class="${t.ok ? 'ok' : 'no'}">${esc(t.action)}${t.selector ? ` <code>${esc(t.selector)}</code>` : ''}${t.error ? ` — ${esc(t.error)}` : ''}</li>`)
+      .map((t) => {
+        const { target, note } = describeAgentAction(t);
+        return `<li class="${t.ok ? 'ok' : 'no'}">${esc(t.action)} <code>${esc(target)}</code>${note ? ` <em>${esc(note)}</em>` : ''}${t.error ? ` — ${esc(t.error)}` : ''}</li>`;
+      })
       .join('');
     rows.push(
       `<div class="agent"><div class="kv"><span>agent</span><span>${esc(a.summary ?? '')} (${a.turns} turn(s))</span></div>` +
         (turns === '' ? '' : `<ol class="turns">${turns}</ol>`) +
         '</div>',
+    );
+  }
+  // What the agent READ off the page on an observe-and-record leg — the
+  // evidence such a leg has (OA-14), quoted verbatim with where it was read.
+  const observed = observedEvidence(step);
+  if (observed.length > 0) {
+    rows.push(
+      `<div class="observed"><div class="kv"><span>observed</span><span>${observed.length} value(s) read off the page</span></div><ul class="turns">` +
+        observed
+          .map((o) => `<li><code>${esc(o.text)}</code>${o.selector ? ` <em>from ${esc(o.selector)}</em>` : ''}${o.url ? ` <em>at ${esc(o.url)}</em>` : ''}</li>`)
+          .join('') +
+        '</ul></div>',
     );
   }
   if (step.screenshot) {
@@ -189,37 +239,6 @@ function stepDetail(step: ProofStep, budget: ShotBudget): string {
 }
 
 /**
- * Which recordings this file will carry.
- *
- * Decided in a pass of its own, BEFORE any case renders, because the priority
- * is not document order: a catalog is mostly passes, and spending the budget
- * on the first twenty of them would leave the failures — the cases a reader
- * actually opens — with nothing. Non-passing cases are served first, and
- * within each group the smallest recordings first, so the budget buys the most
- * cases rather than the longest ones.
- *
- * Returns the set of case ids whose recording is embedded; everything else
- * gets the honest note instead.
- */
-export function chooseEmbeddedVideos(
-  cases: readonly CatalogReportCase[],
-  budgetBytes: number = VIDEO_BUDGET_BYTES,
-): Set<string> {
-  const withVideo = cases
-    .filter((c) => typeof c.bundle?.video?.data === 'string' && c.bundle.video.data !== '')
-    .map((c) => ({ id: c.id, passed: c.verdict === 'passed', size: (c.bundle!.video!.data as string).length }))
-    .sort((a, b) => Number(a.passed) - Number(b.passed) || a.size - b.size);
-  const keep = new Set<string>();
-  let left = budgetBytes;
-  for (const entry of withVideo) {
-    if (entry.size > left) continue;
-    left -= entry.size;
-    keep.add(entry.id);
-  }
-  return keep;
-}
-
-/**
  * The run on film, inside the case that produced it.
  *
  * **The base64 rides on an attribute and becomes a Blob URL in the page**, as
@@ -233,20 +252,13 @@ export function chooseEmbeddedVideos(
  * for seconds to build players nobody opened. The case's own `toggle` is the
  * signal, so a reader still does nothing but click the case.
  */
-function videoBlock(c: CatalogReportCase, embedded: boolean): string {
+function videoBlock(c: CatalogReportCase): string {
   const video = c.bundle?.video;
   if (!video) return '';
   if (!video.data) {
     return `<figure class="rec"><figcaption>Recording</figcaption><div class="muted">${esc(
       video.omitted ?? 'the recording could not be embedded',
     )}</div></figure>`;
-  }
-  if (!embedded) {
-    return `<figure class="rec"><figcaption>Recording</figcaption><div class="muted">${(
-      video.data.length / 1_000_000
-    ).toFixed(1)} MB — left out to keep this file portable; it stays in the proof bundle${
-      c.bundle?.runId ? ` (run ${esc(c.bundle.runId)})` : ''
-    }.</div></figure>`;
   }
   const steps = c.bundle?.steps ?? [];
   const failing = steps.find((s) => s.status !== 'passed' && !s.superseded && s.videoOffsetMs !== undefined);
@@ -335,15 +347,15 @@ function exportControl(c: CatalogReportCase, input: CatalogReportInput): string 
   );
 }
 
-function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: ShotBudget, embeddedVideo: boolean): string {
+function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: ShotBudget): string {
   const chip = verdictChipOf(c);
   const anchor = `case-${slugify(c.id)}`;
   const bundle = c.bundle;
   const steps = bundle?.steps ?? [];
-  const film = videoBlock(c, embeddedVideo);
-  // Seek buttons only where there is something to seek IN: an unembedded
-  // recording would give a reader a control that silently does nothing.
-  const hasVideo = embeddedVideo && typeof bundle?.video?.data === 'string' && bundle.video.data !== '';
+  const film = videoBlock(c);
+  // Seek buttons only where there is something to seek IN: a recording that
+  // was never made would give a reader a control that silently does nothing.
+  const hasVideo = typeof bundle?.video?.data === 'string' && bundle.video.data !== '';
   const left =
     steps.length === 0
       ? `<div class="muted">No steps were recorded${c.reason ? ` — ${esc(c.reason)}` : ''}.</div>`
@@ -354,7 +366,7 @@ function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: Sh
             return (
               `<details class="step ${ok ? 'ok' : 'no'}"><summary><b class="dot"></b>` +
               `<span class="sname">${s.index} ${esc(s.action)}</span>` +
-              `<span class="ssub">${esc(s.intent ?? s.selector ?? '')}</span>` +
+              `<span class="ssub">${esc(s.intent ?? stepTarget(s) ?? '')}</span>` +
               `<span class="sms">${esc(fmtMs(s.durationMs))}</span>` +
               seekControl(s, hasVideo) +
               '</summary>' +
@@ -363,14 +375,35 @@ function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: Sh
           })
           .join('');
   const notes = (bundle?.notes ?? []).map((n) => `<div class="hline">${esc(n)}</div>`).join('');
+  // The sheet's own id when the run qualified it (`BE:PL_03_01` on the row,
+  // `PL_03_01` in the sheet), and the sheet/category the row came from — so
+  // a reader holding the workbook finds the row, and a `--rerun-case` still
+  // has the qualified id in front of them.
+  const identity = sheetIdentity(c);
+  const shownId = displayCaseId(c.id, identity.sheetCaseId);
+  const sheetChip = shownId.qualified
+    ? `<span class="sid" title="the sheet's own spelling of this case id — the run qualified it to ${esc(shownId.qualified)} because the id repeats across or within sheets">sheet id ${esc(shownId.shown)}</span>`
+    : '';
+  const sheetTag = identity.label ? `<span class="ctag" title="the workbook sheet and category this case came from">${esc(identity.label)}</span>` : '';
+  // A record-only case (CG-09) is judged by what it captured: the values are
+  // listed FIRST in the case, before the steps, since they are its whole
+  // deliverable and the reason it wears the `recorded only` colour.
+  const captures = recordOnlyCase(c) ? recordedCaptures(bundle) : [];
+  const capturesBlock = !recordOnlyCase(c)
+    ? ''
+    : `<div class="captures"><div class="cap">Recorded only — the sheet has no oracle; ${captures.length} value(s) captured for review</div>` +
+      (captures.length === 0
+        ? '<div class="hline muted">No values were captured — nothing to hand a reviewer.</div>'
+        : captures.map((k) => `<div class="kv"><span>${esc(k.name)}</span><code>${esc(k.value)}</code></div>`).join('')) +
+      '</div>';
   return (
     `<details class="case" id="${anchor}" data-name="${esc(c.name)}">` +
     `<summary><span class="chip ${chip.cls}">${esc(chip.label)}</span>` +
-    `<span class="cname">${esc(c.name)}</span>` +
+    `<span class="cname">${esc(c.name)}${sheetChip}${sheetTag}</span>` +
     (bundle ? `<span class="cms">${esc(fmtMs(bundle.caseDurationMs ?? bundle.durationMs))}</span>` : '') +
     exportControl(c, input) +
     '</summary>' +
-    `<div class="split"><div class="steps-pane">${film}${historyBlock(c.history)}${left}` +
+    `<div class="split"><div class="steps-pane">${film}${capturesBlock}${historyBlock(c.history)}${left}` +
     (notes === '' ? '' : `<div class="history"><div class="cap">Run notes</div>${notes}</div>`) +
     `</div><div class="time-pane">${steps.length === 0 ? '<div class="muted">no timing — the case never ran</div>' : timePane(steps)}</div></div>` +
     '</details>'
@@ -471,7 +504,15 @@ h1 { font-size: 20px; margin: 0 0 4px; }
 .chip.fail { background: color-mix(in srgb, #c0392b 14%, transparent); color: #c0392b; }
 .chip.error { background: color-mix(in srgb, #b8860b 16%, transparent); color: #b8860b; }
 .chip.review { background: color-mix(in srgb, #6a5acd 14%, transparent); color: #6a5acd; }
+/* Recorded only: its own colour — not the violet of a wording near-miss, and
+   never green. The case claimed nothing; a person reads its captures. */
+.chip.record { background: color-mix(in srgb, #1f7a8c 14%, transparent); color: #1f7a8c; border: 1px dashed #1f7a8c; }
 .chip.never { background: color-mix(in srgb, var(--muted) 18%, transparent); color: var(--muted); }
+.sid { font-size: 11px; color: var(--muted); margin-left: 8px; font-family: ui-monospace, monospace; }
+.ctag { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; margin-left: 8px; }
+.captures { background: color-mix(in srgb, #1f7a8c 8%, transparent); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+.captures .kv code { color: #1f7a8c; }
+.observed em, .turns em { color: var(--muted); font-style: normal; font-size: 11px; }
 details.case { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; background: var(--panel, transparent); }
 details.case > summary { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; list-style: none; }
 details.case > summary .cname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -525,8 +566,6 @@ body.single .split { grid-template-columns: minmax(0, 1fr) 340px; }
 
 export function renderCatalogReport(input: CatalogReportInput): string {
   const budget: ShotBudget = { left: SCREENSHOT_BUDGET_BYTES, omitted: 0 };
-  // Decided up front, across the whole catalog — see `chooseEmbeddedVideos`.
-  const embeddedVideos = chooseEmbeddedVideos(input.cases);
   const byScenario = new Map<string, CatalogReportCase[]>();
   for (const c of input.cases) {
     const key = c.scenario || 'ungrouped';
@@ -540,25 +579,24 @@ export function renderCatalogReport(input: CatalogReportInput): string {
   }
   const sections = [...byScenario.entries()]
     .map(([scenario, cases]) => {
-      const passed = cases.filter((c) => c.verdict === 'passed').length;
+      // Passed of N first, then the rest APART — failed, awaiting review /
+      // recorded only, no verdict, never ran — so a scenario whose harness
+      // fell over on three rows does not read as three product defects.
+      const counts = describeVerdictCounts(countVerdicts(cases), {
+        review: cases.filter((c) => c.verdict === 'review').every((c) => recordOnlyCase(c)) ? 'recorded only' : 'awaiting review',
+      });
       return (
         `<section class="scenario"><div class="shead">${esc(scenario)}` +
-        `<span class="scount">${passed} of ${cases.length} passed</span></div>` +
-        cases.map((c) => caseSection(c, input, budget, embeddedVideos.has(c.id))).join('') +
+        `<span class="scount">${esc(counts)}</span></div>` +
+        cases.map((c) => caseSection(c, input, budget)).join('') +
         '</section>'
       );
     })
     .join('');
-  const withVideo = input.cases.filter((c) => c.bundle?.video?.data).length;
-  const omittedVideos = withVideo - embeddedVideos.size;
   const omittedNote =
     budget.omitted === 0
       ? ''
       : `<div class="meta">${budget.omitted} routine screenshot(s) omitted to keep this file portable — every one stays in its proof bundle.</div>`;
-  const videoNote =
-    omittedVideos <= 0
-      ? ''
-      : `<div class="meta">${omittedVideos} recording(s) left out to keep this file portable — cases that did not pass keep theirs first; every one stays in its proof bundle.</div>`;
   const finished = input.cases.filter((c) => c.verdict !== 'never-ran').length;
   // A live report reloads itself: its rows are still being filled in, and a
   // reader who opened it from the panel mid-run should not have to know that.
@@ -583,7 +621,6 @@ export function renderCatalogReport(input: CatalogReportInput): string {
     liveNote +
     `<div class="tally">${[...tally.entries()].map(([label, n]) => `<span>${esc(label)}: <b>${n}</b></span>`).join('')}</div>` +
     omittedNote +
-    videoNote +
     sections +
     // The player source is also a VALUE in the page so a copy of it can carry
     // the player into another document — see `PLAYER_SCRIPT`.

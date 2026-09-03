@@ -61,6 +61,20 @@ export interface LedgerOutcome {
    * with the same two "left").
    */
   authoringRefused?: number | undefined;
+  /**
+   * The cases this one needed finished first (CG-12), as their qualified
+   * ids — recorded so a resume honours the edge: a dependent whose source
+   * failed or never ran in the earlier pass is blocked again with the reason,
+   * not re-run against a record the source never created.
+   */
+  dependsOn?: string[] | undefined;
+  /**
+   * The sheet's own verdict for this row (`Test Status`, normalised — CG-01):
+   * `passed` / `failed`, or `blocked` when the sheet's testers could not run
+   * it. Kept here so a resume's roll-up can still grade a carried case
+   * against the sheet without re-reading it.
+   */
+  knownResult?: 'passed' | 'failed' | 'blocked' | undefined;
   at: string;
 }
 
@@ -118,6 +132,17 @@ export interface SuiteLedger {
          * as login-only flows, and the four that ran fail at "Sign in".
          */
         persona?: string | undefined;
+        /**
+         * The persona labels the run had credentials for, as label → EMAIL
+         * (CG-05) — never a password. A resume rebuilt from this record
+         * knows which `--persona` entries to ask for again.
+         */
+        personas?: Record<string, string> | undefined;
+        /** The workbook slice this run was (`--sheet` / `--category`, CG-11). */
+        sheets?: string[] | undefined;
+        categories?: string[] | undefined;
+        /** Whether Blocked / Pending rows were authored on purpose (`--include-blocked`). */
+        includeBlocked?: boolean | undefined;
       }
     | undefined;
   /**
@@ -204,10 +229,14 @@ export function recordOutcome(
     vacuous?: boolean | undefined;
     proofPath?: string | undefined;
     authoringRefused?: number | undefined;
+    dependsOn?: readonly string[] | undefined;
+    knownResult?: 'passed' | 'failed' | 'blocked' | undefined;
   } = {},
 ): void {
   ledger.outcomes[caseIdOf(outcome.name)] = {
     ...(extra.authoringRefused === undefined ? {} : { authoringRefused: extra.authoringRefused }),
+    ...(extra.dependsOn === undefined || extra.dependsOn.length === 0 ? {} : { dependsOn: [...extra.dependsOn] }),
+    ...(extra.knownResult === undefined ? {} : { knownResult: extra.knownResult }),
     verdict: outcome.verdict,
     status: outcome.bundle?.status ?? null,
     reason: outcome.reason ?? null,

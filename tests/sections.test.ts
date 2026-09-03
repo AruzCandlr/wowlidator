@@ -154,3 +154,11 @@ describe('route↔table aliasing — one case carrying both keys proves they are
     assert.deepEqual(aliases.canon(['route:orders/pending']), ['route:orders/pending']);
   });
 });
+
+describe('Thai delete talk (CG-16)', () => {
+  it('ลบ / นำออก in a workflow goal mark the case as deleting, outside any ASCII word boundary', () => {
+    assert.equal(caseScheduleMeta(flow([{ action: 'workflow', goal: 'ลบ Plan PL_06_21 แล้วตรวจสอบว่าหายไป' }])).deletes, true);
+    assert.equal(caseScheduleMeta(flow([{ action: 'workflow', goal: 'นำออกจากรายการ' }])).deletes, true);
+    assert.equal(caseScheduleMeta(flow([{ action: 'workflow', goal: 'เปิดหน้า Benefit Plans แล้วอ่านค่า' }])).deletes, false);
+  });
+});

@@ -39,14 +39,25 @@ export interface TruthOutcome {
   reason?: string | undefined;
 }
 
-export type TruthClass = 'TP' | 'TN' | 'FP' | 'FN' | 'no-verdict' | 'review' | 'unscored';
+/**
+ * The sheet's own verdict for a row (CG-01): `passed` / `failed` from an
+ * Actual Result or Test Status column, or `blocked` when the sheet's testers
+ * recorded that they could not run it (Blocked, Pending deploy — 114 rows of
+ * the HR workbook, most with a bug ticket). Blocked is a class of its own on
+ * the page, never a blank: a suite verdict about such a row agrees with
+ * nothing and is graded against nothing, but the reader must see that the
+ * sheet said so rather than wonder why the row is unscored.
+ */
+export type KnownResult = 'passed' | 'failed' | 'blocked';
+
+export type TruthClass = 'TP' | 'TN' | 'FP' | 'FN' | 'no-verdict' | 'review' | 'sheet-blocked' | 'unscored';
 
 export interface TruthRow {
   name: string;
   scenario: string | null;
   polarity: string | null;
   /** The sheet's recorded result — the ground truth. Null = the sheet never scored the row. */
-  known: 'passed' | 'failed' | null;
+  known: KnownResult | null;
   verdict: TruthOutcome['verdict'];
   /** The bundle's raw status, so a dead-end graded as failed stays visible. */
   status: string | null;
@@ -57,9 +68,12 @@ export interface TruthRow {
 
 export function classifyTruth(
   verdict: TruthOutcome['verdict'],
-  known: 'passed' | 'failed' | null,
+  known: KnownResult | null,
 ): TruthClass {
   if (known === null) return 'unscored';
+  // The sheet could not run it: nothing to agree or disagree with, whatever
+  // this run found — excluded from accuracy like an unscored row, shown apart.
+  if (known === 'blocked') return 'sheet-blocked';
   if (verdict === 'blocked') return 'no-verdict';
   if (verdict === 'review') return 'review';
   if (verdict === 'failed') return known === 'failed' ? 'TP' : 'FP';
@@ -74,11 +88,11 @@ export function classifyTruth(
  */
 export function truthRows(
   outcomes: readonly TruthOutcome[],
-  knownByName?: ReadonlyMap<string, 'passed' | 'failed'>,
+  knownByName?: ReadonlyMap<string, KnownResult>,
 ): TruthRow[] {
   return outcomes.map((outcome) => {
     const generated = outcome.bundle?.generatedBy;
-    const known = generated?.knownResult ?? knownByName?.get(outcome.name) ?? null;
+    const known: KnownResult | null = generated?.knownResult ?? knownByName?.get(outcome.name) ?? null;
     return {
       name: outcome.name,
       scenario: generated?.scenario ?? null,
@@ -100,6 +114,8 @@ export interface TruthTally {
   fn: number;
   noVerdict: number;
   review: number;
+  /** Rows the sheet itself recorded as Blocked / Pending — graded against nothing. */
+  sheetBlocked: number;
   unscored: number;
   /** Of the cases that delivered a verdict against a scored row: (TP+TN)/(TP+TN+FP+FN). Null when none did. */
   accuracy: number | null;
@@ -121,6 +137,7 @@ export function truthTally(rows: readonly TruthRow[]): TruthTally {
     fn,
     noVerdict: of('no-verdict'),
     review: of('review'),
+    sheetBlocked: of('sheet-blocked'),
     unscored: of('unscored'),
     accuracy: scored === 0 ? null : (tp + tn) / scored,
     precision: tp + fp === 0 ? null : tp / (tp + fp),
@@ -149,6 +166,7 @@ const CLASS_LABEL: Record<TruthClass, string> = {
   FN: 'FN',
   'no-verdict': 'no verdict',
   review: 'review',
+  'sheet-blocked': 'sheet: blocked',
   unscored: 'unscored',
 };
 
@@ -164,7 +182,7 @@ export function renderTruthTable(meta: TruthTableMeta, rows: readonly TruthRow[]
   const t = truthTally(rows);
   const tr = rows
     .map(
-      (r) => `<tr class="${r.cls === 'unscored' ? 'dim' : ''}">
+      (r) => `<tr class="${r.cls === 'unscored' || r.cls === 'sheet-blocked' ? 'dim' : ''}">
 <td class="nm">${esc(r.name)}</td>
 <td>${esc(r.polarity ?? '—')}</td>
 <td>${r.known === null ? '<span class="mut">—</span>' : esc(r.known)}</td>
@@ -215,7 +233,7 @@ tr.dim td { color:var(--muted) }
 .c-tp,.c-tn { background:var(--good-bg); color:var(--good) }
 .c-fp { background:var(--warn-bg); color:var(--warn) }
 .c-fn { background:var(--bad-bg); color:var(--bad) }
-.c-no-verdict,.c-review { background:var(--nv-bg); color:var(--muted) }
+.c-no-verdict,.c-review,.c-sheet-blocked { background:var(--nv-bg); color:var(--muted) }
 .c-unscored { color:var(--muted); border:1px dashed var(--line); background:transparent }
 .note { color:var(--muted); font-size:.8rem; max-width:72ch }
 </style>
@@ -232,11 +250,13 @@ positive = wowlidator flagged a defect · finished ${esc(meta.ranAt)}</p>
 <div class="cell bad"><b>${t.fn}</b><span>FN · bug missed</span></div>
 <div class="cell nv"><b>${t.noVerdict}</b><span>no verdict</span></div>
 ${t.review > 0 ? `<div class="cell nv"><b>${t.review}</b><span>awaiting review</span></div>` : ''}
+${t.sheetBlocked > 0 ? `<div class="cell nv"><b>${t.sheetBlocked}</b><span>sheet: blocked</span></div>` : ''}
 <div class="cell"><b>${t.unscored}</b><span>unscored</span></div>
 </div>
 <p class="stats">accuracy <b>${pct(t.accuracy)}</b> · precision <b>${pct(t.precision)}</b> ·
 recall <b>${pct(t.recall)}</b> — over verdict-delivering cases only; a no-verdict case is the
-harness's gap, counted against neither side.</p>
+harness's gap, counted against neither side, and a row the sheet itself recorded as blocked is
+graded against nothing.</p>
 <div class="wrap">
 <table>
 <thead><tr><th>case</th><th>pos/neg</th><th>sheet</th><th>wowlidator</th><th>class</th><th>detail</th></tr></thead>

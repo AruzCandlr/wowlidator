@@ -848,7 +848,10 @@ describe('ladder guards: dead ends, denial, timing (CDP)', { skip: skipBrowser }
         baseUrl: origin,
         steps: [
           { action: 'goto', url: '/' },
-          { action: 'expectVisible', selector: 'role=button[name="Nowhere at all" i]' },
+          // A NEAR MISS, deliberately: "Sign in" IS on the page (as a
+          // button), so the absence stop rung lets this through to the agent —
+          // what this test is about is the triage economy, not absence.
+          { action: 'expectVisible', selector: 'role=link[name="Sign in" i]' },
         ],
       },
       {
@@ -889,7 +892,8 @@ describe('ladder guards: dead ends, denial, timing (CDP)', { skip: skipBrowser }
         baseUrl: origin,
         steps: [
           { action: 'goto', url: '/' },
-          { action: 'expectVisible', selector: 'role=button[name="Still nowhere" i]' },
+          // A near miss for the same reason as the test above.
+          { action: 'expectVisible', selector: 'role=link[name="Sign in" i]' },
         ],
       },
       {
@@ -929,7 +933,8 @@ describe('ladder guards: dead ends, denial, timing (CDP)', { skip: skipBrowser }
         baseUrl: origin,
         steps: [
           { action: 'goto', url: '/' },
-          { action: 'expectVisible', selector: 'role=button[name="Not here either" i]' },
+          // A near miss for the same reason as the two tests above.
+          { action: 'expectVisible', selector: 'role=link[name="Sign in" i]' },
         ],
       },
       {
@@ -1855,5 +1860,23 @@ describe('passed-with-issues: the claims held, the path did not', () => {
     b.addStep(step('click', 'passed'));
     b.addStep(step('expectVisible', 'passed'));
     assert.equal(b.finish().status, 'passed');
+  });
+});
+
+// --- Wave 2 (2026-09-03): the verdict stops --------------------------------
+
+describe('a StepResolutionError carrying a verdict classifies as content-only', () => {
+  it('an absence or a not-found stop is a failed verdict, never a dead end, and keeps its attempts', () => {
+    const attempts = [
+      'fast "text=Employee Profile": locator.waitFor: Timeout 400ms exceeded.',
+      'not-found: the page is showing "404 — ไม่พบหน้าที่ค้นหา" at http://x/missing — the application navigated to a page it does not have; no repair attempted',
+    ];
+    const error = new StepResolutionError('text=Employee Profile', attempts, { verdict: "the page is the application's not-found page" });
+    assert.equal(error.contentOnly, true);
+    assert.deepEqual(error.attempts, attempts);
+    assert.match(error.message, /not-found: the page is showing/);
+    // Without the option the same lines are a dead end — the ladder's own
+    // classification is untouched.
+    assert.equal(new StepResolutionError('text=Employee Profile', attempts).contentOnly, false);
   });
 });

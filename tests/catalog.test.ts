@@ -562,3 +562,178 @@ describe('the test-case table, read whole', () => {
     assert.match(described, /Note \(from the sheet\):\n {2}the union is the sync contract/);
   });
 });
+
+// --- A workbook read as a grid (2026-09-03) ---------------------------------
+//
+// Built here with the reporter's own ZIP writer: the ZIP/XML reading is
+// already proved against an openpyxl-written fixture (`catalog.xlsx`), and
+// what this pins is the SHAPE — cell line breaks kept, sparse rows kept in
+// their columns, several sheets, non-case sheets skipped.
+import { buildZip } from '../src/reporter/excel-export.js';
+import { extractDocument as extractDocumentText, extractWorkbookSheets } from '../src/catalog/extract.js';
+import { parseTestCaseTable as parseTestCaseTableText, parseWorkbookCases, recordedResult as recorded } from '../src/catalog/test-case-table.js';
+
+function cell(ref: string, text: string): string {
+  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '&#10;');
+  return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escaped}</t></is></c>`;
+}
+function sheetXml(rows: Record<string, string>[]): Buffer {
+  const body = rows
+    .map((cells, i) => `<row r="${i + 1}">${Object.entries(cells).map(([col, text]) => cell(`${col}${i + 1}`, text)).join('')}</row>`)
+    .join('');
+  return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${body}</sheetData></worksheet>`);
+}
+function trackerWorkbook(): Buffer {
+  const workbook = Buffer.from(
+    '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets>' +
+      '<sheet name="Dashboard" sheetId="1" r:id="rId1" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>' +
+      '<sheet name="EC" sheetId="2" r:id="rId2" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>' +
+      '<sheet name="TM" sheetId="3" r:id="rId3" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>' +
+      '</sheets></workbook>',
+  );
+  const dashboard = sheetXml([{ A: 'Module', B: 'Passed' }, { A: 'EC', B: '8' }]);
+  const ec = sheetXml([
+    { A: 'No', B: 'Category', C: 'Scenario ID', D: 'Test Scenario', E: 'Test Case ID', F: 'Positive/Negative', G: 'Priority', H: 'Test Case', I: 'Test Data', J: 'Menu', K: 'Test Script / Steps', L: 'Expected Output', M: 'Test Status', N: 'Bug ticket' },
+    { A: '1', B: 'Hiring', C: 'E2E-29', D: 'Hiring | Keyin', E: 'HIR-EC-029', F: 'Negative', G: 'High', H: 'Event Reason shows 3 values', I: '- Login = <HR_ADMIN_ACCOUNT>', J: 'EC > Hire & Onboard (New Hire)', K: '1. Login\n2. Open Event Reason', L: 'dropdown แสดง 3 ค่า\n- ไม่แสดง H_CORENTRY', M: 'Failed', N: 'BUG 71875' },
+    // A remark row: the "id" column holds a paragraph, not a case.
+    { E: 'ดูรายละเอียดเพิ่มเติมที่ชีท Hiring Test Data ก่อนคีย์ทุกครั้ง และแจ้งผู้ดูแลระบบให้ยกเลิกพนักงานหลังทดสอบ', H: 'note' },
+    { A: '2', C: '', E: 'HIR-EC-030', F: 'Positive', G: 'Medium', H: 'Second case, scenario carried down', K: '1. x', L: 'y', M: 'Re-Test Passed' },
+  ]);
+  // A sheet whose header sits on a SPARSE row (extra columns further right)
+  // and whose data rows leave columns empty — the shape that made the text
+  // form's header unrecognisable.
+  const tm = sheetXml([
+    { A: 'No', B: 'Category', C: 'Scenario ID', D: 'Test Scenario', E: 'Test Case ID', F: 'Positive/Negative', G: 'Priority', H: 'Test Case', I: 'Test Data', J: 'Menu', K: 'Test Script / Steps', L: 'Expected Output', M: 'Test Status', Q: 'Blocker group', T: '4161', V: 'Tue' },
+    { A: '163', B: 'Timesheet', C: 'TSH_02', D: 'ตรวจสอบ Work Schedule\n- เมนูย่อย Schedule', E: 'TSH_02_01', F: 'Positive', G: 'High', H: 'ตรวจสอบกรณี schedule_template_code = D05H0400_01', J: '1. ME\n2. Time & Attendance\n3. My Timesheet', K: '1. กด Menu\n2. กดเมนู ME', L: 'แสดงปฏิทินการทำงาน', M: 'Passed', Q: 'Test data' },
+  ]);
+  return buildZip([
+    { name: 'xl/workbook.xml', data: workbook },
+    { name: 'xl/worksheets/sheet1.xml', data: dashboard },
+    { name: 'xl/worksheets/sheet2.xml', data: ec },
+    { name: 'xl/worksheets/sheet3.xml', data: tm },
+  ]);
+}
+
+describe('a tracking workbook is read as a grid, sheet by sheet', () => {
+  it('keeps cell line breaks and sparse columns, and names each sheet', () => {
+    const sheets = extractWorkbookSheets(trackerWorkbook());
+    assert.deepEqual(sheets.map((s) => s.name), ['Dashboard', 'EC', 'TM']);
+    const ec = sheets[1]!;
+    assert.equal(ec.rows[1]![10], '1. Login\n2. Open Event Reason', 'the Steps cell is a multi-line cell, kept whole');
+    const tm = sheets[2]!;
+    assert.equal(tm.rows[0]![16], 'Blocker group', 'a sparse header keeps its column (Q = 16)');
+    assert.equal(tm.rows[1]![8], '', 'an empty Test Data cell is an empty string in its column');
+    assert.equal(tm.rows[1]![9], '1. ME\n2. Time & Attendance\n3. My Timesheet');
+  });
+
+  it('parses only the case sheets, tags rows with their sheet, and reads the tracker\'s columns', () => {
+    const rows = parseWorkbookCases(extractWorkbookSheets(trackerWorkbook()));
+    assert.ok(rows);
+    assert.deepEqual(rows.map((r) => `${r.sheet}:${r.caseId}`), ['EC:HIR-EC-029', 'EC:HIR-EC-030', 'TM:TSH_02_01'], 'the dashboard is not a case sheet; a remark row is not a case');
+    const first = rows[0]!;
+    assert.equal(first.category, 'Hiring');
+    assert.equal(first.menu, 'EC > Hire & Onboard (New Hire)');
+    assert.equal(first.steps, '1. Login\n2. Open Event Reason');
+    assert.equal(first.expected, 'dropdown แสดง 3 ค่า\n- ไม่แสดง H_CORENTRY');
+    assert.equal(first.bugTicket, 'BUG 71875');
+    assert.equal(recorded(first.actual), 'failed', 'Test Status is the sheet\'s recorded verdict');
+    const second = rows[1]!;
+    assert.equal(second.scenarioId, 'E2E-29', 'scenario carries down');
+    assert.equal(second.category, 'Hiring', 'so does the category');
+    assert.equal(recorded(second.actual), 'passed');
+    const tm = rows[2]!;
+    assert.equal(tm.sheet, 'TM');
+    assert.equal(tm.testCase, 'ตรวจสอบกรณี schedule_template_code = D05H0400_01');
+    assert.equal(tm.menu, '1. ME\n2. Time & Attendance\n3. My Timesheet');
+    assert.equal(tm.testData, '');
+  });
+
+  it('is what the text form of the same workbook cannot give', () => {
+    // The text path is for a model to read; re-parsing it as a delimited
+    // table loses the multi-line cell and the sparse header. Pinned so the
+    // catalog command is never quietly pointed back at it.
+    const text = extractDocumentText('tracker.xlsx', trackerWorkbook(), Number.MAX_SAFE_INTEGER).text;
+    const viaText = parseTestCaseTableText(text)?.find((r) => r.caseId === 'HIR-EC-029');
+    const viaGrid = parseWorkbookCases(extractWorkbookSheets(trackerWorkbook()))?.find((r) => r.caseId === 'HIR-EC-029');
+    assert.equal(viaGrid?.steps, '1. Login\n2. Open Event Reason');
+    assert.notEqual(viaText?.steps, viaGrid?.steps, 'the text form has flattened the Steps cell');
+  });
+});
+
+// --- The sheet grammar reaches the author (2026-09-03) ----------------------
+//
+// `tests/sheet-grammar.test.ts` pins each reader on the workbook's own lines;
+// this pins what the catalog path does with them: the prompt's new sections
+// sit between Test data and Steps so the older blocks keep their shape, the
+// workbook's duplicate ids come out unique, and the claims gate can refuse a
+// row that navigates off the run's origin.
+import { describeCase as describeCaseRow, parseWorkbookCases as parseCases, sheetGateReason, tableToClaims as claimsOf } from '../src/catalog/test-case-table.js';
+
+function collidingWorkbook(): Buffer {
+  const workbook = Buffer.from(
+    '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets>' +
+      '<sheet name="BE" sheetId="1" r:id="rId1" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>' +
+      '<sheet name="TM" sheetId="2" r:id="rId2" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>' +
+      '</sheets></workbook>',
+  );
+  const header = { A: 'No', B: 'Category', C: 'Scenario ID', D: 'Test Scenario', E: 'Test Case ID', F: 'Positive/Negative', G: 'Priority', H: 'Test Case', I: 'Test Data', J: 'Menu', K: 'Test Script / Steps', L: 'Expected Output', M: 'Test Status', N: 'Bug ticket', O: 'Note' };
+  const be = sheetXml([
+    header,
+    { A: '1', B: 'Benefit Plan', C: 'PL_03', D: 'Create', E: 'PL_03_07', F: 'Positive', G: 'High', H: 'สร้าง Plan', I: 'Benefit Plan ID = PL_03_07\nBenefit name = QA-Create Plan\nCompany = C056 + C057', J: '1. HR\n2. Benefits Admin\n3. Benefit Plans', K: '1. เข้าสู่เมนูที่กำหนด\n2. กด Create', L: '6.1 จำนวนใน Total Plans +1\n6.2 จำนวนใน Reimbursement +1', M: 'Passed' },
+    { A: '2', E: 'PL_03_08', F: 'Positive', G: 'High', H: 'Make Correction ไม่เปลี่ยนจำนวน', I: 'Benefit Plan ID = PL_03_07', J: '', K: '1. เข้าสู่เมนูที่กำหนด\n2. กด Make Correction', L: '4.1 จำนวนใน Total Plans ไม่เปลี่ยนแปลง', M: 'Blocked', N: '#71906' },
+  ]);
+  const tm = sheetXml([
+    header,
+    { A: '1', B: 'Leave Request', C: 'PL_03', D: 'ลา', E: 'PL_03_07', F: 'Positive', G: 'High', H: 'ลาป่วย', I: '', J: '1. ME\n2. Time & Attendance\n3. Leave request', K: '1. Login web humi\n2. กดเมนู ME', L: '- DB : time_management.leave_requests', M: 'Passed' },
+    { A: '2', E: 'TSH_01_01', F: 'Positive', G: 'High', H: 'Timesheet A', K: '1. Navigate ไปที่ https://payroll-cnext-dev.central.co.th/admin/config/sso -> เลือกแท็บ "SSO Base Amount"', L: 'y', M: 'Not Start' },
+    { A: '3', E: 'TSH_01_01', F: 'Positive', G: 'High', H: 'Timesheet B', K: '1. x', L: 'y', M: 'Not Start' },
+  ]);
+  return buildZip([
+    { name: 'xl/workbook.xml', data: workbook },
+    { name: 'xl/worksheets/sheet1.xml', data: be },
+    { name: 'xl/worksheets/sheet2.xml', data: tm },
+  ]);
+}
+
+describe('the sheet grammar reaches the author', () => {
+  const rows = parseCases(extractWorkbookSheets(collidingWorkbook()))!;
+
+  it('qualifies the workbook\'s colliding ids and keeps the sheet\'s spelling for the prompt', () => {
+    assert.deepEqual(rows.map((r) => r.caseId), ['BE:PL_03_07', 'PL_03_08', 'TM:PL_03_07', 'TSH_01_01', 'TSH_01_01#2'], 'only the ids that collide are qualified');
+    assert.equal(rows[0]!.sheetCaseId, 'PL_03_07');
+    assert.equal(rows[3]!.sheetCaseId, undefined);
+    assert.equal(rows[4]!.sheetCaseId, 'TSH_01_01');
+    assert.deepEqual(rows[1]!.dependsOn, ['BE:PL_03_07'], 'a reference resolves to the same sheet\'s row, by its qualified id');
+    assert.equal(rows[1]!.menu, rows[0]!.menu, 'a blank Menu inherits within the scenario');
+  });
+
+  it('describeCase adds its sections between Test data and Steps, and leaves the older blocks as they were', () => {
+    const described = describeCaseRow(rows[0]!);
+    const headings = described.split('\n').filter((line) => !/^ {2}/.test(line));
+    assert.deepEqual(headings, [
+      'PL_03_07: สร้าง Plan',
+      'Scenario: Create',
+      'Type: Positive',
+      'Menu path: HR > Benefits Admin > Benefit Plans',
+      'Test data:',
+      'Steps:',
+      'Expected output:',
+    ]);
+    assert.match(described, /\nTest data:\n {2}Benefit Plan ID = PL_03_07\n {2}Benefit name = QA-Create Plan\n {2}Company = C056 \+ C057\nSteps:\n/);
+    assert.match(described, /\nExpected output:\n {2}6\.1 จำนวนใน Total Plans \+1\n {2}6\.2 จำนวนใน Reimbursement \+1$/);
+    const tm = describeCaseRow(rows[2]!);
+    assert.match(tm, /\nMenu path: ME > Time & Attendance > Leave request\nDatabase tables named: time_management\.leave_requests\nSteps:\n/);
+    const py = describeCaseRow(rows[3]!);
+    assert.match(py, /\nDestination: https:\/\/payroll-cnext-dev\.central\.co\.th\/admin\/config\/sso \(tab "SSO Base Amount"\)\nSteps:\n/);
+  });
+
+  it('the claims gate refuses a row that leaves the run\'s origin, and the sheet gate a Blocked one with its ticket', () => {
+    const claims = claimsOf(rows, 'http://localhost:3005/humi/en/login');
+    assert.equal(claims[3]!.testable, false);
+    assert.match(claims[3]!.source, /^TSH_01_01 \(navigates to payroll-cnext-dev\.central\.co\.th/);
+    assert.equal(claims[0]!.testable, true);
+    assert.equal(claimsOf(rows)[3]!.testable, true, 'without a start URL the host is not judged');
+    assert.equal(sheetGateReason(rows[1]!), 'the sheet records this case as Blocked — bug ticket #71906');
+    assert.equal(sheetGateReason(rows[0]!), null);
+  });
+});

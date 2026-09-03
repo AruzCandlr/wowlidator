@@ -20,7 +20,8 @@ import {
   // one a navigation returns is Playwright's.
   type Response as PlaywrightResponse,
 } from 'playwright';
-import { rm } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { ApiActions, type FlowRequestSpec } from '../api/api-actions.js';
 import { BrowserTransport, FetchTransport, type ApiTransport } from '../api/api-client.js';
@@ -101,23 +102,44 @@ import {
 } from './review-judge.js';
 import {
   agentModelUnavailable,
+  differentPage,
   goalEvidence,
   looksLikeSignIn,
+  queryAndHash,
   verificationOnlyGoal,
 } from '../orchestrator/goal-evidence.js';
 import { performSignIn, performSignOut, acceptConsentGate, acceptConsentGateAnywhere, CONSENT_GATE_URL_PATTERN } from './sign-in.js';
 import { generateValue, type DataKind } from '../data/mock-data.js';
 import type { DataModel } from '../data/data-model.js';
-import { describeDialog, findDismissButton, openDialogNow, waitForDialog } from './modal.js';
+import {
+  describeDialog,
+  dialogIsIntendedContext,
+  dialogMentions,
+  findDismissButton,
+  openDialogNow,
+  selectorInsideDialog,
+  waitForDialog,
+} from './modal.js';
 import {
   exactTextSelector,
+  headRoleOf,
   isTextSelector,
+  optionNamePatterns,
   qualifyBareRole,
   relaxRoleName,
+  targetsPopupContent,
   withoutGreeting,
   relaxTextSelector,
-  sanitizeSelector,
-} from './selector.js';
+  sanitizeSelector, containsRoleName } from './selector.js';
+// The wave-1 helpers (2026-09-03): each is deterministic and $0, and each is
+// the engine half of a shape the HR workbook meets on nearly every case.
+import { selectFromListbox } from './listbox.js';
+import { pickDateInDialog } from './calendar.js';
+import { readFieldError } from './field-error.js';
+import { attachFiles, captureDownload } from './upload.js';
+import { notFoundSurface } from './not-found.js';
+import { codeAndLabelOf, foldValue, foldedIncludes, foldedMatch } from './normalise.js';
+import { isoDateOf as isoDateOfText, type DateLocale } from './dates.js';
 import { expandFlow, hasIncludes } from './compose.js';
 import {
   API_STEP_ACTIONS,
@@ -142,6 +164,7 @@ import {
   nearMiss,
 } from './proof-bundle.js';
 import { captureTarget, TARGET_READ_BUDGET_MS } from './target.js';
+import { revealHidden } from './reveal.js';
 import { inferPolarity, type TestPolarity } from './polarity.js';
 import type { DataGate } from '../cli/data-locks.js';
 
@@ -158,6 +181,22 @@ export const DEFAULT_FAST_TIMEOUT_MS = 2_000;
 const ATTRIBUTE_READ_TIMEOUT_MS = 250;
 /** Timeout for a cached or freshly healed selector, which we expect to work. */
 export const DEFAULT_HEALED_TIMEOUT_MS = 10_000;
+
+/**
+ * The ceiling on a step's own `timeoutMs` (EH-07, 2026-09-03). A payroll run
+ * or a bulk import can take minutes, and the sheets' "สถานะเปลี่ยนเป็น
+ * Complete" (TC_PY_REC_001..095, TC_PY_SSO_001..062) and "Import Job Monitor
+ * → Completed" (PL_10_24/26/57, RU_09_24/26) claims are about exactly that
+ * wait. The author declares the patience per step; this caps it so a typo
+ * cannot park a lane for an hour. Ten minutes.
+ */
+export const MAX_STEP_TIMEOUT_MS = 600_000;
+
+/** A declared per-step patience, clamped to the ceiling; `undefined` when none was declared. */
+export function stepPatience(timeoutMs: number | undefined): number | undefined {
+  if (timeoutMs === undefined || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return undefined;
+  return Math.min(Math.floor(timeoutMs), MAX_STEP_TIMEOUT_MS);
+}
 
 // Re-exported for callers that configure a run through the runner's surface
 // (`src/config.ts`); the rules themselves live in `evidence.ts`/`video.ts`.
@@ -227,6 +266,34 @@ export interface SmartRunnerOptions {
    * outranks the attached browser's state when present.
    */
   sessionState?: StoredSession | undefined;
+
+  /**
+   * Credentials by persona label — `HR_ADMIN_ACCOUNT`, `MANAGER_ACCOUNT`,
+   * `SPD_ADMIN` — for `signIn` steps and for `<X_ACCOUNT>` tokens the catalog
+   * resolves. Never written into a flow file; the label is.
+   */
+  personas?: Record<string, { email: string; password: string }> | undefined;
+
+  /**
+   * How the sheets write dates — `th` reads `dd/mm/yyyy` day-first and a
+   * Buddhist year (`2569`) as one to convert; `en-US` month-first; absent
+   * leaves `01/09/2027` unconverted (January or September is never guessed).
+   * Threaded from `Flow.locale`. See `engine/dates.ts` (EH-03).
+   */
+  locale?: DateLocale | undefined;
+
+  /**
+   * The directory an `upload` step's relative fixture paths resolve against
+   * — the flow's own directory, the same one `use` fragments resolve from.
+   */
+  flowDir?: string | undefined;
+
+  /**
+   * Where a `download` step saves what it captured. Defaults to
+   * `.wowlidator/downloads/<flow>`; the CLI points it at the run's media
+   * folder so the report can link the file.
+   */
+  downloadDir?: string | undefined;
 
   /**
    * Stills.
@@ -408,7 +475,12 @@ function sleep(ms: number): Promise<void> {
  * is the one a reader must know about: a stand-in the author invented.
  */
 export interface StepValueSource {
-  kind: 'test-data' | 'repo' | 'db' | 'generated';
+  /**
+   * `relative-date` and `unique-per-run` (2026-09-03) are the resolver's two
+   * deterministic rewrites — "Hire Date = Today" computed at authoring, a
+   * key value suffixed so an import never collides with an earlier run.
+   */
+  kind: 'test-data' | 'repo' | 'db' | 'generated' | 'relative-date' | 'unique-per-run';
   detail: string;
 }
 
@@ -432,6 +504,13 @@ interface ResolveResult<T> {
   agent?: AgentRecord | undefined;
   /** What the agent judged and chose, when it was asked to decide for itself. */
   decision?: StepDecision | undefined;
+  /**
+   * Facts a rung learned on the way to resolving — what a calendar rung
+   * entered as, which option a listbox rung picked. Merged into the step's
+   * `detail` at the recording boundary, since the ladder has no other way to
+   * put a reading on the record.
+   */
+  note?: Record<string, unknown> | undefined;
 }
 
 /**
@@ -556,23 +635,44 @@ export class StepResolutionError extends Error {
    */
   decision?: StepDecision | undefined;
 
-  constructor(selector: string, attempts: string[]) {
+  constructor(
+    selector: string,
+    attempts: string[],
+    /**
+     * `verdict`: the ladder stopped on a reading that IS the answer — text
+     * nowhere on the page (the absence rung), a page the app does not have
+     * (the not-found rung), a declared wait that ran out — and the step must
+     * classify `failed`, never `dead-end`, whatever the attempt lines say.
+     */
+    options: { verdict?: string | undefined } = {},
+  ) {
     // "Could not resolve" must not headline a failure where every rung DID
     // resolve the selector and the content behind it was wrong — that header
     // reads as "the control is missing" and files the wrong defect. Seen
     // live: `expectText role=main` resolved instantly on every rung, failed
     // on text, and the report said the control was never found.
-    const contentOnly =
+    const textOnly =
       attempts.length > 0 &&
       attempts.some((line) => /expected text to contain/i.test(line)) &&
       attempts.every(
         (line) =>
           /expected text to contain/i.test(line) || line.startsWith('known content mismatch:'),
       );
+    // A state contradiction (count, enabled/disabled, focus) is a verdict the
+    // moment a rung reads it, whatever the rungs before it said — a fast
+    // timeout followed by "found 51" means the list took a moment to open and
+    // then held 51, not that the control was missing.
+    const stateContradicted = endedInStateContradiction(attempts);
+    const verdict = options.verdict !== undefined;
+    const contentOnly = textOnly || stateContradicted || verdict;
     super(
-      contentOnly
-        ? `"${selector}" resolved, but its content did not hold after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`
-        : `could not resolve "${selector}" after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`,
+      verdict
+        ? `"${selector}" — ${options.verdict} after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`
+        : stateContradicted
+          ? `"${selector}" resolved, but the claim did not hold after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`
+          : contentOnly
+            ? `"${selector}" resolved, but its content did not hold after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`
+            : `could not resolve "${selector}" after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`,
     );
     this.name = 'StepResolutionError';
     this.selector = selector;
@@ -615,6 +715,53 @@ export class RouteNotFoundError extends Error {
 }
 
 /**
+ * Errors a step's own callback may raise that describe the HARNESS, not the
+ * page — the ladder lets them through untouched (see the fast rung).
+ */
+const HARNESS_STEP_ERRORS: ReadonlySet<string> = new Set(['FixtureMissingError', 'PersonaUnknownError', 'UnknownVariableError']);
+
+/**
+ * A `signIn` step named a persona the run was not given (EH-10). Harness-
+ * class like `RouteNotFoundError`: the flow asked for an account that does
+ * not exist in this run's map, which says nothing about the application —
+ * `error`, the case blocked, and the message names the labels that do exist.
+ */
+export class PersonaUnknownError extends Error {
+  override readonly name = 'PersonaUnknownError';
+}
+
+/**
+ * The persona `as` names, from the run's map — or null.
+ *
+ * Labels match loosely on purpose, because the sheets write them four ways:
+ * `<HR_ADMIN_ACCOUNT>`, `HR_ADMIN_ACCOUNT`, `HR admin`, `hr-admin`; angle
+ * brackets, an `_ACCOUNT`/`ACCOUNT` tail, case and separators are all
+ * folded before comparing. A literal email that equals a persona's email
+ * matches too, so a flow may say who by address.
+ */
+export function resolvePersona(
+  as: string,
+  personas: Readonly<Record<string, { email: string; password: string }>>,
+): { label: string; email: string; password: string } | null {
+  const fold = (text: string): string =>
+    text
+      .trim()
+      .replace(/^[<{[]+|[>}\]]+$/g, '')
+      .replace(/[\s_\-.]+/g, '')
+      .replace(/account$/i, '')
+      .toLowerCase();
+  const wanted = fold(as);
+  if (wanted === '') return null;
+  const asEmail = as.trim().toLowerCase();
+  for (const [label, creds] of Object.entries(personas)) {
+    if (label === as || fold(label) === wanted || creds.email.toLowerCase() === asEmail) {
+      return { label, email: creds.email, password: creds.password };
+    }
+  }
+  return null;
+}
+
+/**
  * The backend steps a flow carries, by index — empty when it carries none.
  *
  * Used by the two enforcement layers below the author: `runFlow` refuses a
@@ -645,6 +792,82 @@ export function backendStepsIn(
 /** Did this attempt resolve the element and miss only on its text? */
 export function isContentMiss(line: string): boolean {
   return /expected text to contain/i.test(line);
+}
+
+/**
+ * A rung that RESOLVED the element(s) and found the claim about their STATE
+ * contradicted: the wrong count (of a non-empty match — zero is absence, and
+ * absence may still be selector drift), the wrong enabled/disabled state, or
+ * focus elsewhere. Unlike a text miss, no other rung can change this answer:
+ * the healer proposes a different string for a control the page already
+ * showed, and the agent's one look cannot make 51 options into 3. Live
+ * (ec10 HIR-EC-029, 2026-09-02): `expectCount role=option = 3` found 51 at the
+ * patience rung — the exact defect the sheet recorded as Failed — and the
+ * ladder went on to spend 70 s on a healer and an agent, then classified the
+ * step as a dead end that "could not resolve" the control, and every later
+ * step inherited the page the agent had wandered onto.
+ */
+export function isStateContradiction(line: string): boolean {
+  return (
+    /expected \d+ matches, found [1-9]\d*/.test(line) ||
+    /expected element to be (?:enabled|disabled), but it is/.test(line) ||
+    /expected element to have focus/.test(line) ||
+    // The list opened and was read, and the option is not in it (EH-01,
+    // 2026-09-03): the healer cannot open a list and the agent's one look
+    // cannot put an option into one. The read IS the verdict — "the option
+    // set is wrong" is what HIR-EC-027/029's Failed rows mean.
+    /no option named .* appeared/.test(line) ||
+    // A click on a disabled control (EH-14): Playwright waits for "enabled"
+    // until the timeout and names the state in its call log. The sheets'
+    // "ทดลองกด … ไม่มีการเปลี่ยนแปลง" (MC_02_02, ML_01_05/06, PL_06_05, RU_07_02)
+    // clicks a gated button on purpose; walking four rungs to say so is the
+    // 60 s per case this line saves.
+    // (`not editable` is deliberately NOT here: a read-only field is the
+    // shell rung's case, one rung below, and has a real input beside it.)
+    /element is not enabled/.test(line) ||
+    /element is disabled/.test(line) ||
+    // The calendar has the day and refuses it (EH-11): the picker's own
+    // rule about the date, never the selector's.
+    /is outside the picker's allowed range/.test(line) ||
+    // The field resolved and was read for its message, and it shows none
+    // (EH-12): a reading, not a resolution problem.
+    /no validation message is shown for this field|validation message under the field, but none is shown/.test(line)
+  );
+}
+
+/**
+ * An attempt line's reason: the error's first line, plus the state
+ * Playwright names further down its call log when there is one.
+ *
+ * `describe()` keeps the first line only — right for prose, and blind to
+ * "element is not enabled", which Playwright prints as a call-log bullet
+ * under "locator.click: Timeout 2000ms exceeded." A disabled control then
+ * read exactly like a missing one and the ladder walked every rung (EH-14).
+ * The state is appended so `isStateContradiction` can read it off the line.
+ */
+export function describeAttempt(error: unknown): string {
+  const first = describe(error);
+  if (!(error instanceof Error)) return first;
+  const state = /element is not enabled|element is disabled/.exec(error.message);
+  if (state === null || first.includes(state[0])) return first;
+  return `${first} (${state[0]})`;
+}
+
+/**
+ * `true` when the ladder's last real reading contradicted the claim — a state
+ * contradiction followed by nothing but the dead-end memo. The memo line is
+ * evidence the element was read on an earlier step, not a rung of its own.
+ */
+export function endedInStateContradiction(attempts: readonly string[]): boolean {
+  let last = -1;
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    if (isStateContradiction(attempts[i] ?? '')) {
+      last = i;
+      break;
+    }
+  }
+  if (last === -1) return false;
+  return attempts.slice(last + 1).every((line) => line.startsWith('known content mismatch:'));
 }
 
 /**
@@ -820,7 +1043,7 @@ function describe(error: unknown): string {
  * something (click, fill) is excluded on purpose — acting on an arbitrary
  * match changes what the test exercises.
  */
-const PRESENCE_ACTIONS: ReadonlySet<string> = new Set(['expectText', 'expectVisible']);
+const PRESENCE_ACTIONS: ReadonlySet<string> = new Set(['expectText', 'expectVisible', 'expectAnyVisible']);
 
 /**
  * How long an ordinary click waits for a popup it did not declare.
@@ -961,10 +1184,22 @@ function excerptAround(actual: string, matched: string): string {
  * claim that genuinely rides on capitalisation is not provable through
  * `innerText` in the first place and belongs in a visual check.
  */
-export type TextMatchRelaxation = 'case' | 'template' | 'template-case';
+export type TextMatchRelaxation = 'case' | 'template' | 'template-case' | 'normalised';
 
 /** `{Plan name}`, `{{plan}}`, `<name>` — a sheet author's stand-in for a value. */
 const EXPECTED_PLACEHOLDER = /\{\{?[^{}]*\}?\}|<[^<>]+>/g;
+
+/** Intents that say a step is OPENING something — the only clicks whose trigger state is pre-read. */
+const OPEN_INTENT = /\bopen|\bexpand|\bunfold|\bdrop-?down|\blistbox|เปิด|กาง/i;
+
+/**
+ * How an option's visible label is matched against the accessible names of an
+ * open list — the rule now lives in `selector.ts` beside the other name
+ * rewrites so `listbox.ts` and this file share it (EH-01, 2026-09-03);
+ * re-exported here so `tests/form-actions.test.ts` and `tests/reveal.test.ts`
+ * keep their imports.
+ */
+export { optionNamePatterns };
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1024,7 +1259,35 @@ export function relaxedTextMatch(
   const looseHit = looseTemplate?.exec(actual);
   if (looseHit?.[0]) return { found: looseHit[0], relaxation: 'template-case' };
 
+  // The LAST look (EH-05, 2026-09-03): the value as the sheet reads it —
+  // dashes, currency marks, thousands separators, quotes, and the code or
+  // label half of a "CODE - Label" value — never script, never plain
+  // substring. "A - Permanent" against "A — Permanent" (HIR-EC-037..150),
+  // "Active" against "A (Active)", "30,000.00" against "฿30,000.00" were each
+  // scored as defects by a comparator that folded case and nothing else.
+  const normalised = normalisedTextMatch(needle, actual);
+  if (normalised !== null) return { found: normalised, relaxation: 'normalised' };
+
   return null;
+}
+
+/**
+ * `foldedMatch` as a text assertion may use it: the whole value, then the
+ * label half, and the code half only when it is a real code (two or more
+ * characters) — a one-letter code such as the `A` of "A - Permanent" folds
+ * to the English article and would be found as a whole word in any sentence.
+ * Returns the folded spelling that matched, or null.
+ */
+export function normalisedTextMatch(expected: string, actual: string): string | null {
+  const kind = foldedMatch(expected, actual);
+  if (kind === null) return null;
+  const halves = codeAndLabelOf(expected);
+  if (kind === 'exact' || kind === 'contains') return foldValue(expected);
+  if (halves === null) return null;
+  if (kind === 'label') return foldValue(halves.label);
+  // `code`
+  if (foldValue(halves.code).length >= 2) return foldValue(halves.code);
+  return foldedIncludes(actual, halves.label) ? foldValue(halves.label) : null;
 }
 
 export function scriptMismatchNote(expected: string, actual: string): string {
@@ -1095,6 +1358,19 @@ export function fieldNamesIn(intent: string | undefined): string[] {
   if (intent === undefined || intent.trim() === '') return [];
   const found = new Set<string>();
   for (const m of intent.matchAll(/["“']([^"”']{2,60})["”']/g)) found.add(m[1]!.trim());
+  // The Thai phrase after a data-entry verb — "กรอกวันเกิด", "ระบุวันที่มีผล
+  // = 15 ก.ย. 2569", "เลือก Event Reason เป็น New Hire" — up to the value
+  // separator (` = `, `เป็น`, `ตาม`, `ด้วย`, `:`) or the end (EH-03 (3),
+  // 2026-09-03). A Thai intent yielded nothing before, so the shell rung
+  // skipped its label-first branch on every Thai sheet. Vowel signs and tone
+  // marks are `\p{M}`, not `\p{L}` — a class without it stops mid-word.
+  for (const m of intent.matchAll(
+    /(?:กรอก|เลือก|ระบุ|ตั้งค่า|ใส่|คีย์|กำหนด|พิมพ์)\s*(?:ช่อง|ฟิลด์|field)?\s*([\p{L}\p{M}\p{N} /&]{2,60}?)\s*(?:=|:|เป็น|ตาม|ด้วย|ให้|แล้ว|,|$)/gmu,
+  )) {
+    const phrase = m[1]!.trim().replace(/\s+(?:ว่า|คือ)$/u, '');
+    if (phrase.length < 2 || /^\d+$/.test(phrase)) continue;
+    found.add(phrase);
+  }
   for (const m of intent.matchAll(/\b([A-Z][A-Za-z]+(?:(?:\s+(?:of|the|and|&|\/)\s*|\s+)[A-Z][A-Za-z]*)*)\b/g)) {
     // Strip the verb a step intent opens with ("Enter the National ID / Tax
     // ID" → "National ID / Tax ID"), then drop what is left of the openers,
@@ -1111,23 +1387,15 @@ export function fieldNamesIn(intent: string | undefined): string[] {
   return [...found].sort((a, b) => b.length - a.length).slice(0, 3);
 }
 
-export function isoDateOf(text: string): string | null {
-  const t = text.trim();
-  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
-  if (iso) return t;
-  const MONTHS: Record<string, string> = {
-    jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
-    jul: '07', aug: '08', sep: '09', sept: '09', oct: '10', nov: '11', dec: '12',
-  };
-  const dmy = /^(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/.exec(t);
-  const mdy = /^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$/.exec(t);
-  const [d, mon, y] = dmy ? [dmy[1]!, dmy[2]!, dmy[3]!] : mdy ? [mdy[2]!, mdy[1]!, mdy[3]!] : [null, null, null];
-  if (d === null || mon === null || y === null) return null;
-  const mm = MONTHS[mon.slice(0, 4).toLowerCase()] ?? MONTHS[mon.slice(0, 3).toLowerCase()];
-  if (mm === undefined) return null;
-  const dd = d.padStart(2, '0');
-  if (Number(dd) < 1 || Number(dd) > 31) return null;
-  return `${y}-${mm}-${dd}`;
+/**
+ * Since 2026-09-03 (EH-03) the conversion lives in `engine/dates.ts` — a
+ * superset of what this file did (Thai months, a Buddhist year beside one,
+ * `dd/mm/yyyy` under a locale, `31/12/9999` anywhere) with the same refusals
+ * (`01/09/2027` with no locale stays null). Re-exported so callers and
+ * `tests/form-actions.test.ts` keep their import.
+ */
+export function isoDateOf(text: string, locale?: DateLocale | undefined): string | null {
+  return isoDateOfText(text, locale);
 }
 
 export function valueMatches(asked: string, held: string): boolean {
@@ -1135,7 +1403,12 @@ export function valueMatches(asked: string, held: string): boolean {
   const a = fold(asked);
   const h = fold(held);
   if (a === '') return h === '';
-  return h.includes(a);
+  if (h.includes(a)) return true;
+  // The sheet's spelling against the control's rendering (EH-05): "A -
+  // Permanent" held as "A — Permanent", "CDS (C001)" held as "C001". Whole
+  // words, never substring, so this widens only past the dash and code
+  // conventions the page and the sheet disagree on.
+  return foldedMatch(asked, held) !== null;
 }
 
 const NAVIGATING_ACTIONS: ReadonlySet<string> = new Set([
@@ -1146,18 +1419,14 @@ const NAVIGATING_ACTIONS: ReadonlySet<string> = new Set([
   'forward',
   'workflow',
   'closeModal',
+  // A persona switch signs out, travels to the sign-in page and lands on
+  // the account's home — three navigations the flow asked for (EH-10).
+  'signIn',
 ]);
 
-/** Whether two recorded URLs are different pages, ignoring the query and hash. */
-function differentPage(before: string, after: string): boolean {
-  try {
-    const a = new URL(before);
-    const b = new URL(after);
-    return a.origin !== b.origin || a.pathname !== b.pathname;
-  } catch {
-    return false;
-  }
-}
+// `differentPage` (origin or pathname differ) is imported from
+// `orchestrator/goal-evidence.ts` since 2026-09-03 (OA-9) so the runner's
+// displacement note and the agent's own history line share one predicate.
 
 /**
  * Whether this URL can hold web storage at all.
@@ -1286,6 +1555,23 @@ export class SmartRunner {
   #sessionBootstrapTried = false;
   /** Only a context this runner created may be closed by it — see `close()`. */
   #ownsContext = false;
+  /** Credentials by persona label, for `signIn` steps — see `SmartRunnerOptions.personas`. */
+  readonly #personas: Record<string, { email: string; password: string }>;
+  /** How the sheets write dates — see `SmartRunnerOptions.locale`. */
+  readonly #locale: DateLocale | undefined;
+  /** What `upload` fixture paths resolve against. */
+  readonly #flowDir: string | undefined;
+  /** Where `download` saves. */
+  readonly #downloadDir: string;
+  /**
+   * The sign-in page this flow's own gotos named, learned from the first goto
+   * that asked for one — where a `signIn` step goes when it names no `url`.
+   */
+  #signInUrl: string | null = null;
+  /** The account the last `signIn` step established, for the suite's vault. */
+  #lastSignedInAs: string | null = null;
+  /** URLs the not-found rung already filed a defect for — one per page, never per step. */
+  readonly #notFoundReported = new Set<string>();
 
   private constructor(
     browser: Browser,
@@ -1324,11 +1610,21 @@ export class SmartRunner {
     this.#networkEnabled = options.network ?? true;
     this.#networkRedaction = options.networkRedaction ?? {};
     // Only the password. The email is not a secret and is the evidence that
-    // says which persona signed in.
+    // says which persona signed in. Every persona's password joins the set
+    // (EH-10): a `signIn` step never writes one into a flow file, but the
+    // sign-in it performs must not leak one into a record either.
+    this.#personas = options.personas ?? {};
     this.#secretValues = new Set(
-      options.credentials?.password ? [options.credentials.password] : [],
+      [
+        ...(options.credentials?.password ? [options.credentials.password] : []),
+        ...Object.values(this.#personas).map((p) => p.password),
+      ].filter((p) => p !== ''),
     );
     this.#credentials = options.credentials;
+    this.#locale = options.locale;
+    this.#flowDir = options.flowDir;
+    this.#downloadDir =
+      options.downloadDir ?? join('.wowlidator', 'downloads', options.bundle.name.replace(/[^\p{L}\p{N}._-]+/gu, '_').slice(0, 80) || 'run');
     this.#flowSignsInItself = options.flowSignsInItself ?? false;
     this.#networkMaxCalls = options.networkMaxCalls;
     this.#sequenceMark = Date.now();
@@ -1549,6 +1845,9 @@ export class SmartRunner {
       // dead-ending against login furniture as "frontend" defects. Only the
       // most recent goto says what the flow means to be looking at now.
       this.#lastGotoAskedSignIn = looksLikeSignIn(asked.href);
+      // The flow's own sign-in page, remembered for a `signIn` step that
+      // names none — the same place `groundCredentialFills` learns it from.
+      if (this.#lastGotoAskedSignIn && this.#signInUrl === null) this.#signInUrl = asked.href;
     } catch {
       this.#lastGotoPath = null;
       this.#lastGotoAskedSignIn = false;
@@ -1656,6 +1955,25 @@ export class SmartRunner {
         // grace window is consulted. No attribute pre-read: that would spend
         // a second rung-timeout before the click got its first, silently
         // doubling the fast path for every click on the page.
+        // A listbox trigger TOGGLES. A flow that opens a dropdown, counts its
+        // options, then "opens" it again before the next check closes it,
+        // and every check after that fails on a list that is not there (ec10
+        // HIR-EC-029, 2026-09-02). Only when the step's own intent says it is
+        // opening something is the one-attribute read paid, and only an
+        // already-expanded popup trigger is left alone.
+        if (intent !== undefined && OPEN_INTENT.test(intent)) {
+          const state = await locator
+            .first()
+            .evaluate((el) => [el.getAttribute('aria-haspopup'), el.getAttribute('aria-expanded')], undefined, {
+              timeout: ATTRIBUTE_READ_TIMEOUT_MS,
+            })
+            .catch(() => null);
+          if (state !== null && state[0] !== null && state[0] !== 'false' && state[1] === 'true') {
+            detail['skipped'] = 'already open';
+            this.bundle.note(`${selector}: already open (aria-expanded=true) — not clicked again; a second click would close it`);
+            return;
+          }
+        }
         const popupPromise = this.page
           .waitForEvent('popup', { timeout: POPUP_GRACE_MS })
           .catch(() => null);
@@ -1672,9 +1990,33 @@ export class SmartRunner {
           await this.#adoptPage(popup);
           detail['openedNewTab'] = this.page.url();
         }
+        await this.#noteNotFoundLanding(detail);
       },
       detail,
     );
+  }
+
+  /**
+   * Did the action just land the run on the application's own not-found
+   * page? The click itself did what it said — it is recorded on the PASSED
+   * step as `landedOnNotFound`, and the verdict lands on the first assertion
+   * after it (the not-found stop rung, EH-09). One bounded read, after the
+   * navigation the click started has had a moment to commit; a navigation
+   * still in flight is caught by the next step's rung instead.
+   */
+  async #noteNotFoundLanding(detail: Record<string, unknown>): Promise<void> {
+    try {
+      await this.page.waitForLoadState('domcontentloaded', { timeout: 500 }).catch(() => undefined);
+      const surface = await notFoundSurface(this.page, 500);
+      if (surface === null) return;
+      detail['landedOnNotFound'] = surface.heading;
+      this.bundle.note(
+        `the page now shows "${surface.heading}" at ${surface.url} — the action led to a page the application does not have; ` +
+          'the next assertion carries the verdict',
+      );
+    } catch {
+      // Evidence only — a read that fails changes nothing about the step.
+    }
   }
 
   /**
@@ -1739,7 +2081,7 @@ export class SmartRunner {
         const tag = await locator.first().evaluate((el) => el.tagName, undefined, { timeout });
         detail['via'] = tag === 'SELECT' ? 'native' : 'custom';
         if (tag === 'SELECT') await this.#selectNative(locator, value, timeout);
-        else await this.#selectCustom(locator, selector, value, timeout);
+        else await this.#selectCustom(locator, selector, value, timeout, detail);
       },
       detail,
     );
@@ -1756,34 +2098,44 @@ export class SmartRunner {
   }
 
   /**
-   * Custom dropdown: click to open, then click the option the way a user
-   * would. The option is searched page-wide because custom dropdowns render
-   * their options in a portal at the end of the document, not inside the
-   * control.
+   * Custom dropdown: click to open, then pick the option the way a user
+   * would — `selectFromListbox` (`engine/listbox.ts`, EH-01 2026-09-03). The
+   * driver waits for a dependent list to fill (District after Province,
+   * HIR-EC-001), types the CODE half into the search box humi's searchable
+   * selects offer, matches the whole name before a whole word and never a
+   * substring, ticks each row of a multi-value ("CDS (C001), B2S (C006)",
+   * PL_06_07), and reads the trigger back so a click that landed on a
+   * disabled option is a failure with evidence rather than a green step.
+   * The option is searched page-wide because custom dropdowns portal their
+   * options to the end of the document, not inside the control.
+   *
+   * The list is given the HEALED budget, not the rung's: resolving the
+   * trigger is the race the ladder times; a fetch that fills the list is
+   * the application's own pace, the same argument `type` makes for typing.
    */
   async #selectCustom(
     locator: Locator,
     selector: string,
     value: string,
     timeout: number,
+    detail: Record<string, unknown>,
   ): Promise<void> {
-    await locator.click({ timeout });
-    const option = this.page
-      .getByRole('option', { name: value })
-      .or(this.page.getByRole('menuitem', { name: value }))
-      .or(this.page.getByRole('menuitemradio', { name: value }))
-      .first();
-    try {
-      await option.click({ timeout });
-    } catch (error) {
-      // Close the dropdown so a ladder retry starts from a closed state and
-      // later steps are not covered by an abandoned open list.
-      await this.page.keyboard.press('Escape').catch(() => undefined);
-      throw new Error(
-        `opened ${JSON.stringify(selector)} but no option named ${JSON.stringify(value)} ` +
-          `appeared (looked for role=option, menuitem, menuitemradio): ${describe(error)}`,
-      );
-    }
+    void selector;
+    // `record`, not `require`: a trigger whose text is its LABEL ("City")
+    // never shows the pick, and demanding it failed a listbox that had
+    // worked (tests/form-actions.test.ts). The read-back is on the record;
+    // a click that landed on a disabled option is already its own error.
+    const result = await selectFromListbox(this.page, locator, value, {
+      timeout: Math.max(timeout, this.#healedTimeoutMs),
+      readBack: 'record',
+    });
+    detail['selected'] = result.picked;
+    detail['matchedBy'] = result.matchedBy;
+    detail['readBack'] = result.readBack;
+    detail['readBackConfirmed'] = result.confirmed;
+    detail['waitedMs'] = result.waitedMs;
+    if (result.typed !== undefined) detail['typed'] = result.typed;
+    if (result.via === 'checkbox') detail['via'] = 'multi-select';
   }
 
   /** Tick a checkbox, radio, or ARIA toggle — see `#setChecked`. */
@@ -1878,9 +2230,14 @@ export class SmartRunner {
     );
   }
 
-  async waitFor(selector: string, intent?: string): Promise<void> {
-    await this.#step('waitFor', selector, intent, (locator, timeout) =>
-      locator.waitFor({ state: 'visible', timeout }),
+  async waitFor(selector: string, intent?: string, timeoutMs?: number): Promise<void> {
+    await this.#step(
+      'waitFor',
+      selector,
+      intent,
+      (locator, timeout) => locator.waitFor({ state: 'visible', timeout }),
+      undefined,
+      stepPatience(timeoutMs),
     );
   }
 
@@ -2612,24 +2969,34 @@ export class SmartRunner {
    * catch. Like other presence/absence checks, this does not go through the
    * escalation ladder: there's no selector here to heal.
    */
-  async expectModal(name?: string, intent?: string): Promise<void> {
+  async expectModal(name?: string, intent?: string, timeoutMs?: number): Promise<void> {
     const detail: Record<string, unknown> = {
       name,
       intent,
       ...(name === undefined ? {} : { expected: name }),
     };
+    const patience = stepPatience(timeoutMs);
+    if (patience !== undefined) detail['timeoutMs'] = patience;
     await this.#bareStep('expectModal', detail, async () => {
-      const dialog = await waitForDialog(this.page, this.#healedTimeoutMs);
+      const started = Date.now();
+      const dialog = await waitForDialog(this.page, patience ?? this.#healedTimeoutMs);
+      if (patience !== undefined) detail['waitedMs'] = Date.now() - started;
       if (!dialog) {
         if (name !== undefined) detail['actual'] = '(no dialog or modal visible)';
         throw new Error('no dialog or modal is currently visible');
       }
       if (name) {
+        // Label, heading, or anywhere in the text (EH-02): humi's Create
+        // Plan modal opens with an eyebrow, so the first 80 characters named
+        // the wrong thing and "Confirm delete plan" could not match a dialog
+        // whose title was the second line.
+        const mention = await dialogMentions(dialog, name);
         const label = await describeDialog(dialog);
-        detail['actual'] = label;
-        if (!label.toLowerCase().includes(name.toLowerCase())) {
+        detail['actual'] = mention === null ? label : mention.text;
+        if (mention === null) {
           throw new Error(`open dialog ("${label}") does not mention "${name}"`);
         }
+        detail['mentionedVia'] = mention.via;
       }
     });
   }
@@ -2686,13 +3053,16 @@ export class SmartRunner {
     expected: string,
     intent?: string,
     anyOf?: readonly string[],
+    timeoutMs?: number,
   ): Promise<void> {
     const accepted = [expected, ...(anyOf ?? [])];
+    const patience = stepPatience(timeoutMs);
     // Mutated by the callback below, read when the step is recorded — this is
     // how "which rendering satisfied the claim" reaches the bundle.
     const detail: Record<string, unknown> = {
       expected,
       ...(anyOf?.length ? { anyOf: [...anyOf] } : {}),
+      ...(patience === undefined ? {} : { timeoutMs: patience }),
     };
     await this.#step(
       'expectText',
@@ -2766,11 +3136,16 @@ export class SmartRunner {
         );
       },
       detail,
+      patience,
     );
   }
 
-  async expectVisible(selector: string, intent?: string): Promise<void> {
-    const detail: Record<string, unknown> = { expected: 'visible' };
+  async expectVisible(selector: string, intent?: string, timeoutMs?: number): Promise<void> {
+    const patience = stepPatience(timeoutMs);
+    const detail: Record<string, unknown> = {
+      expected: 'visible',
+      ...(patience === undefined ? {} : { timeoutMs: patience }),
+    };
     await this.#step(
       'expectVisible',
       selector,
@@ -2815,6 +3190,7 @@ export class SmartRunner {
         }
       },
       detail,
+      patience,
     );
   }
 
@@ -2824,18 +3200,31 @@ export class SmartRunner {
    * Runs *outside* the escalation ladder. Healing a selector whose whole point
    * is that it should not resolve would let the healer "repair" it onto some
    * unrelated element and turn a correct pass into a meaningless one.
+   *
+   * `timeoutMs` (EH-07) is the one dial: a toast that auto-dismisses after
+   * five seconds (humi `toast.tsx`, RU_05_02 "Warning หายไปอัตโนมัติ 5-6
+   * วินาที") fails the fast window while being exactly what the sheet said.
    */
-  async expectHidden(selector: string, intent?: string): Promise<void> {
-    const detail: Record<string, unknown> = { selector, intent, expected: 'hidden or absent' };
+  async expectHidden(selector: string, intent?: string, timeoutMs?: number): Promise<void> {
+    const patience = stepPatience(timeoutMs);
+    const detail: Record<string, unknown> = {
+      selector,
+      intent,
+      expected: 'hidden or absent',
+      ...(patience === undefined ? {} : { timeoutMs: patience }),
+    };
     await this.#bareStep('expectHidden', detail, async () => {
+      const started = Date.now();
       try {
         await this.page
           .locator(selector)
           .first()
-          .waitFor({ state: 'hidden', timeout: this.#fastTimeoutMs });
+          .waitFor({ state: 'hidden', timeout: patience ?? this.#fastTimeoutMs });
         detail['actual'] = 'hidden or absent';
+        if (patience !== undefined) detail['waitedMs'] = Date.now() - started;
       } catch (error) {
         detail['actual'] = 'still visible';
+        if (patience !== undefined) detail['waitedMs'] = Date.now() - started;
         throw error;
       }
     });
@@ -2877,13 +3266,278 @@ export class SmartRunner {
     );
   }
 
+  // --- enhancedX wave-2 steps (2026-09-03) ---------------------------------
+
+  /**
+   * Either/or (CG-08): pass when ANY of `selectors` is visible, fail naming
+   * every one that was not. The sheets offer alternatives on ~95 rows —
+   * "ระบบประมวลผลสำเร็จหรือแสดง error ตามเงื่อนไข ไม่ crash" (PY negatives),
+   * "กรณีสร้างสำเร็จ / กรณีปฏิเสธ" — and an author forced to pick one branch
+   * failed a correct application on the other.
+   *
+   * Through the ladder on the FIRST selector — so its free rewrites (case,
+   * bare role, reveal, dialog, patience) apply — while every alternative is
+   * polled as written in the same window: the ladder's rungs never rewrite
+   * the alternatives, and a heal of the first is one heal, not N.
+   */
+  async expectAnyVisible(selectors: string[], intent?: string, timeoutMs?: number): Promise<void> {
+    const list = selectors.map((s) => s.trim()).filter((s) => s !== '');
+    if (list.length === 0) throw new Error('expectAnyVisible needs at least one selector');
+    const patience = stepPatience(timeoutMs);
+    const detail: Record<string, unknown> = {
+      expected: 'any visible',
+      selectors: [...list],
+      ...(patience === undefined ? {} : { timeoutMs: patience }),
+    };
+    const others = list.slice(1);
+    await this.#step(
+      'expectAnyVisible',
+      list[0]!,
+      intent,
+      async (locator, timeout) => {
+        const deadline = Date.now() + timeout;
+        const candidates: { label: string; locator: Locator }[] = [
+          { label: list[0]!, locator: locator.first() },
+          ...others.map((s) => ({ label: s, locator: this.page.locator(s).first() })),
+        ];
+        for (;;) {
+          for (const candidate of candidates) {
+            if (await candidate.locator.isVisible().catch(() => false)) {
+              detail['actual'] = `visible: ${candidate.label}`;
+              detail['matched'] = candidate.label;
+              return;
+            }
+          }
+          if (Date.now() >= deadline) break;
+          await this.page.waitForTimeout(Math.min(150, Math.max(1, deadline - Date.now())));
+        }
+        detail['actual'] = 'none visible';
+        throw new Error(
+          `none of ${list.length} visible: ${list.map((s) => JSON.stringify(s)).join(', ')} — ` +
+            'the request accepts either outcome, and the page shows neither',
+        );
+      },
+      detail,
+      patience,
+    );
+  }
+
+  /**
+   * The validation message shown FOR a named field (EH-12): the control's
+   * `aria-errormessage` / `aria-describedby`, else its FormField container
+   * (`engine/field-error.ts`). A message under the WRONG field passes an
+   * unscoped `expectText body`; the sheets say "ระบบแสดง Error message '…'
+   * ด้านล่าง Field X" on ~110 rows (PL_06_05/10/15, TC_SSO_009/011,
+   * HIR-EC-049/055/059…) and mean exactly the field. With `value` the
+   * wording is compared like `expectText` (verbatim, then case, then the
+   * sheet's own normalisation); without it any non-empty message passes.
+   */
+  async expectFieldError(selector: string, value?: string, intent?: string): Promise<void> {
+    const detail: Record<string, unknown> = {
+      ...(value === undefined ? { expected: 'a validation message under the field' } : { expected: value }),
+    };
+    await this.#step(
+      'expectFieldError',
+      selector,
+      intent,
+      async (locator, timeout) => {
+        await locator.first().waitFor({ state: 'attached', timeout });
+        // Poll through the window: validation renders after the submit that
+        // triggered it, and one read at resolve time is a race.
+        const deadline = Date.now() + timeout;
+        let read = await readFieldError(this.page, locator, { timeout });
+        while (read === null && Date.now() < deadline) {
+          await this.page.waitForTimeout(Math.min(150, Math.max(1, deadline - Date.now())));
+          read = await readFieldError(this.page, locator, { timeout });
+        }
+        if (read === null) {
+          detail['actual'] = '(no validation message under this field)';
+          throw new Error(
+            value === undefined
+              ? 'expected a validation message under the field, but none is shown'
+              : `no validation message is shown for this field (expected ${JSON.stringify(value)})`,
+          );
+        }
+        detail['actual'] = read.text;
+        detail['via'] = read.via;
+        detail['invalid'] = read.invalid;
+        if (value === undefined) return;
+        if (read.text.includes(value)) return;
+        const relaxed = relaxedTextMatch(value, read.text);
+        if (relaxed !== null) {
+          detail['relaxation'] = relaxed.relaxation;
+          detail['matchedText'] = relaxed.found;
+          this.bundle.note(
+            `expectFieldError ${selector}: the field says ${JSON.stringify(read.text)} where the claim says ` +
+              `${JSON.stringify(value)} — accepted as a ${relaxed.relaxation} difference; confirm the wording if the claim rides on it`,
+          );
+          return;
+        }
+        detail['foundInPageText'] = true;
+        throw new Error(`expected text to contain ${JSON.stringify(value)}, got ${JSON.stringify(read.text)}`);
+      },
+      detail,
+    );
+  }
+
+  /**
+   * Attach `files` through the control `selector` names (EH-08): the
+   * `input[type=file]` itself, a dropzone hiding one, a `<label for>` or
+   * `aria-controls` pointing at one, or a button that opens the native
+   * chooser — `engine/upload.ts`. Paths resolve against the flow's own
+   * directory; a fixture that is not on disk is a harness fault
+   * (`FixtureMissingError` → `error`, never a defect against the app).
+   * Bulk Import CSV (PL_10_07..57, RU_09_07..57), consent PDFs (CNS-EC-003…),
+   * medical certificates (ML_01_05/06) — ~110 rows had no step for this.
+   */
+  async upload(selector: string, files: string[], intent?: string): Promise<void> {
+    const detail: Record<string, unknown> = { files: [...files] };
+    await this.#step(
+      'upload',
+      selector,
+      intent,
+      async (locator, timeout) => {
+        const result = await attachFiles(this.page, locator, files, {
+          timeout,
+          ...(this.#flowDir === undefined ? {} : { baseDir: this.#flowDir }),
+        });
+        detail['via'] = result.via;
+        detail['attached'] = result.files.map((f) => ({ name: f.name, bytes: f.bytes }));
+      },
+      detail,
+    );
+  }
+
+  /**
+   * Click `selector` and capture the download it starts (EH-08), saving it
+   * under the run's download directory and putting the saved path into the
+   * variable store as `{{as}}` so a later step can name it. Playwright never
+   * saves a download unless the event is armed first, so an unarmed click
+   * simply loses the file — "Download Sample CSV" (PL_10_06/23, RU_09_06/23,
+   * PL_11_01..12) was unprovable. Capture only; what the file holds is the
+   * data plane's to check.
+   */
+  async download(selector: string, as: string, intent?: string): Promise<void> {
+    const detail: Record<string, unknown> = { as };
+    await this.#step(
+      'download',
+      selector,
+      intent,
+      async (locator, timeout) => {
+        await mkdir(this.#downloadDir, { recursive: true });
+        const captured = await captureDownload(this.page, () => locator.first().click({ timeout }), {
+          dir: this.#downloadDir,
+          timeout: this.#healedTimeoutMs,
+        });
+        detail['download'] = { filename: captured.filename, bytes: captured.bytes, path: captured.path, url: captured.url };
+        this.variables.set(as, captured.path);
+      },
+      detail,
+    );
+  }
+
+  /**
+   * Sign in as the persona `as` names (EH-10): a label from
+   * `SmartRunnerOptions.personas` (`HR_ADMIN_ACCOUNT`, `<MANAGER_ACCOUNT>`,
+   * `manager`…) or a literal email that matches one. When a session is live
+   * the application's own sign-out path is travelled first (`performSignOut`,
+   * the same control a user clicks); then the sign-in page — `url`, else the
+   * one this flow's own gotos named, else `/login` on the current origin —
+   * and the deterministic two-step sign-in every other caller uses. A
+   * `#bareStep`: nothing here is a selector to heal. The password is masked
+   * like every `--as` value; the email is the evidence of who signed in.
+   *
+   * ~125 rows hand off between people mid-case (PRB-EC-001..088
+   * manager→HRBP→HR admin, ML_01_* employee→manager, consent admin/employee)
+   * and used to author the second login by hand — the shape PB-02-01 got
+   * wrong three times in one flow.
+   */
+  async signIn(as: string, url?: string, intent?: string): Promise<void> {
+    const detail: Record<string, unknown> = { as, intent, urlBefore: this.page.url() };
+    await this.#bareStep('signIn', detail, async () => {
+      const persona = resolvePersona(as, this.#personas);
+      if (persona === null) {
+        throw new PersonaUnknownError(
+          `signIn as ${JSON.stringify(as)}: no persona by that label — ` +
+            (Object.keys(this.#personas).length === 0
+              ? 'no personas were supplied to this run (WOWLIDATOR_PERSONAS / RunFlowOptions.personas)'
+              : `the labels available are ${Object.keys(this.#personas).map((k) => JSON.stringify(k)).join(', ')}`),
+        );
+      }
+      detail['persona'] = persona.label;
+      detail['signedInAs'] = persona.email;
+
+      // End the live session the way a user does. A sign-in form is hidden
+      // from a signed-in user, so this is not optional; the fallback wipe is
+      // disclosed, exactly as the `signOut` step discloses it.
+      if (!looksLikeSignIn(this.page.url()) && hasStorableOrigin(this.page.url())) {
+        const out = await performSignOut(this.page);
+        if (out.ok) {
+          detail['signedOutVia'] = out.via;
+        } else {
+          await this.page.context().clearCookies();
+          await this.page
+            .evaluate(() => {
+              const g = globalThis as unknown as BrowserGlobals;
+              g.localStorage.clear();
+              g.sessionStorage.clear();
+            })
+            .catch(() => undefined);
+          detail['signedOutVia'] =
+            `fallback — ${out.reason}; cleared cookies and storage instead, so the application's own sign-out path was NOT exercised`;
+        }
+      }
+
+      const target = url ?? this.#signInUrl ?? new URL('/login', this.page.url()).toString();
+      detail['signInUrl'] = target;
+      if (!looksLikeSignIn(this.page.url()) || url !== undefined) {
+        await this.page.goto(target, { waitUntil: 'domcontentloaded' });
+      }
+      this.#lastGotoAskedSignIn = true;
+      const outcome = await performSignIn(this.page, { email: persona.email, password: persona.password });
+      if (!outcome.ok) {
+        detail['urlAfter'] = this.page.url();
+        throw new Error(`signIn as ${persona.label} (${persona.email}) did not take — ${outcome.reason}`);
+      }
+      // The run now means to be where the sign-in landed it: the session
+      // guard reads the last goto, and this step was that navigation.
+      try {
+        this.#lastGotoPath = new URL(this.page.url()).pathname;
+      } catch {
+        this.#lastGotoPath = null;
+      }
+      this.#lastGotoAskedSignIn = false;
+      this.#lastSignedInAs = persona.email;
+      detail['urlAfter'] = this.page.url();
+    });
+  }
+
+  /** The account the last `signIn` step established, for the suite's vault; null when none ran. */
+  get lastSignedInAs(): string | null {
+    return this.#lastSignedInAs;
+  }
+
   /** Assert how many elements the selector matches. Zero bypasses the ladder. */
-  async expectCount(selector: string, expected: number, intent?: string): Promise<void> {
+  async expectCount(selector: string, expected: number, intent?: string, timeoutMs?: number): Promise<void> {
+    const patience = stepPatience(timeoutMs);
     if (expected === 0) {
-      // Same reasoning as expectHidden: absence must not be "repaired".
-      const zeroDetail: Record<string, unknown> = { selector, expected, intent };
+      // Same reasoning as expectHidden: absence must not be "repaired". A
+      // declared patience is the window the count may take to reach zero
+      // (a list emptying after a delete) — polled, since a single read at
+      // t=0 answers a question nobody asked.
+      const zeroDetail: Record<string, unknown> = {
+        selector,
+        expected,
+        intent,
+        ...(patience === undefined ? {} : { timeoutMs: patience }),
+      };
       await this.#bareStep('expectCount', zeroDetail, async () => {
-        const actual = await this.page.locator(selector).count();
+        const deadline = Date.now() + (patience ?? 0);
+        let actual = await this.page.locator(selector).count();
+        while (actual !== 0 && Date.now() < deadline) {
+          await this.page.waitForTimeout(Math.min(150, Math.max(1, deadline - Date.now())));
+          actual = await this.page.locator(selector).count();
+        }
         zeroDetail['actual'] = actual;
         if (actual !== 0) {
           throw new Error(`expected 0 matches, found ${actual}`);
@@ -2892,7 +3546,10 @@ export class SmartRunner {
       return;
     }
 
-    const detail: Record<string, unknown> = { expected };
+    const detail: Record<string, unknown> = {
+      expected,
+      ...(patience === undefined ? {} : { timeoutMs: patience }),
+    };
     await this.#step(
       'expectCount',
       selector,
@@ -2906,6 +3563,7 @@ export class SmartRunner {
         }
       },
       detail,
+      patience,
     );
   }
 
@@ -3062,13 +3720,38 @@ export class SmartRunner {
       selector,
       intent,
       async (locator, timeout) => {
-        const actual = await locator.inputValue({ timeout });
-        detail['actual'] = actual;
-        if (actual !== expected) {
-          throw new Error(
-            `expected value ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
-          );
+        // `inputValue` throws on a button-based combobox (humi's custom
+        // select shows its choice as the trigger's text) — read what the
+        // control holds the way the entry rung does, then compare.
+        let actual: string;
+        try {
+          actual = await locator.inputValue({ timeout });
+        } catch (error) {
+          const held = await this.#readEntered(selector);
+          if (held === null) throw error;
+          actual = held;
+          detail['readVia'] = 'text';
         }
+        detail['actual'] = actual;
+        if (actual === expected) return;
+        // Trimmed, then the sheet's own normalisation (EH-05) — the LAST
+        // look, recorded, so "A - Permanent" held as "A — Permanent" is a
+        // pass that names the spelling rather than a defect.
+        if (actual.trim() === expected.trim()) {
+          detail['relaxation'] = 'case';
+          return;
+        }
+        if (foldedMatch(expected, actual) !== null) {
+          detail['relaxation'] = 'normalised';
+          this.bundle.note(
+            `expectValue ${selector}: the control holds ${JSON.stringify(actual)} where the claim says ` +
+              `${JSON.stringify(expected)} — accepted as a normalised difference; confirm the spelling if the claim rides on it`,
+          );
+          return;
+        }
+        throw new Error(
+          `expected value ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+        );
       },
       detail,
     );
@@ -3452,13 +4135,33 @@ export class SmartRunner {
     const netMark = this.#takeNetMark();
     const urlBefore = this.page.url();
     const headingsBefore = await this.#headingsNow();
-    const record = await this.#agent.run(this.page, goal, {
+    // `saveVariable` (OA-8): the agent's `save` action puts a value the page
+    // shows — the Employee ID a hire generated, a Version ID — into the
+    // run's variable store, so a later `fill … {{EMPLOYEE_ID}}` can use it.
+    // Typed as an extension here so the runner compiles before and after the
+    // agent's `RunOptions` grows the field.
+    const runOptions: Parameters<WorkflowAgent['run']>[2] & {
+      saveVariable?: ((name: string, value: string) => void) | undefined;
+    } = {
       memory: cacheAgentMemory(this.#cache),
       caseContext: this.#caseContext,
       ...(script === undefined ? {} : { script }),
       ...(this.#agentDbProbe() ?? {}),
       ...(this.#agentMaxSteps === undefined ? {} : { maxSteps: this.#agentMaxSteps }),
-    });
+      saveVariable: (name: string, value: string): void => {
+        this.variables.set(name, value);
+        this.bundle.note(`workflow: saved {{${name}}} = ${JSON.stringify(value.slice(0, 120))} from the page`);
+      },
+    };
+    const record = await this.#agent.run(this.page, goal, runOptions);
+    // What the agent READ (OA-14): the observations an observe-and-record
+    // leg exists for ("บันทึกค่าที่ระบบแสดง", ~250 rows) used to ride one
+    // history line and vanish. Read optionally — the record carries them
+    // once the agent's `AgentRecord.observations` lands.
+    const observations = (
+      record as { observations?: readonly { selector: string; text: string; url: string }[] | undefined }
+    ).observations;
+    const observed = observations !== undefined && observations.length > 0 ? observations.slice(0, 12) : undefined;
     const urlAfter = this.page.url();
     const headingsAfter = await this.#headingsNow();
     const traffic = this.#networkEvidence(netMark);
@@ -3529,11 +4232,18 @@ export class SmartRunner {
     // true of the page it was on, false of the page the step began on. The
     // note is what routes a reader to the gate finding instead of filing
     // "the control is missing" against a page that has it.
+    // By PAGE, not by URL (OA-9): humi mirrors the wizard step into
+    // `?step=2` on one route, and the note used to call an agent that had
+    // correctly clicked Next "displaced" (ec10-3x HIR-EC-002 leg 12). Only a
+    // different origin or pathname is displacement; a query or hash change
+    // is named neutrally.
     const displaced =
-      failed && !providerFailed && urlAfter !== urlBefore
+      failed && !providerFailed && differentPage(urlBefore, urlAfter)
         ? ` — note: the agent ended on ${urlAfter}, not the page this step began on (${urlBefore}); ` +
           'the control it reported on may exist on the original page'
-        : '';
+        : failed && !providerFailed && urlAfter !== urlBefore
+          ? ` — on the same page, now at ${queryAndHash(urlAfter) || urlAfter}`
+          : '';
 
     // The evidence of an agent leg is the control it was working on — the
     // last one it acted on successfully — outlined and scrolled into view,
@@ -3562,8 +4272,18 @@ export class SmartRunner {
         // tree's line for `observed-state`, or the bare claim — so a reader
         // can tell a proved leg from a trusted one in the report.
         ...(evidence === null && record.success && record.settledBy !== undefined
-          ? { settledBy: record.settledBy, evidence: record.settledEvidence ?? '' }
+          ? {
+              settledBy: record.settledBy,
+              evidence:
+                (record.settledEvidence ?? '') +
+                (observed === undefined
+                  ? ''
+                  : `${record.settledEvidence ? ' | ' : ''}observed: ${observed
+                      .map((o) => `${o.selector} = ${JSON.stringify(o.text.slice(0, 160))}`)
+                      .join(' | ')}`),
+            }
           : {}),
+        ...(observed === undefined ? {} : { observed }),
         // The before/after the agent produced, as data. Headings are what a
         // person reads to know which screen they are on; the diff of them is
         // "what appeared". Capped, like every other evidence list.
@@ -3761,6 +4481,12 @@ export class SmartRunner {
     intent: string | undefined,
     run: (locator: Locator, timeoutMs: number) => Promise<unknown>,
     detail?: Record<string, unknown>,
+    /**
+     * The step's own declared wait (`timeoutMs`, EH-07), already clamped:
+     * the patience rung's window instead of the healed timeout, and — when
+     * it expires — a verdict about time, with no healer or agent after it.
+     */
+    patience?: number | undefined,
   ): Promise<void> {
     const startedAt = new Date().toISOString();
     const started = Date.now();
@@ -3778,7 +4504,15 @@ export class SmartRunner {
         ENTRY_ACTIONS.has(action) && typeof detail?.['value'] === 'string'
           ? (detail['value'] as string)
           : undefined,
+        patience,
       );
+      // A rung's own reading (what a calendar entered as, which option a
+      // listbox picked) joins the record here — the ladder has no other
+      // channel to the bundle.
+      if (result.note !== undefined) detail = { ...(detail ?? {}), ...result.note };
+      if (patience !== undefined && (result.resolution === 'late' || result.resolution === 'fast')) {
+        detail = { ...(detail ?? {}), waitedMs: Date.now() - started };
+      }
       // The element the step just used, read before the shutter so the
       // record and the rectangle describe the same thing.
       const target = await this.#target(result.resolvedSelector);
@@ -3933,6 +4667,12 @@ export class SmartRunner {
           }
         }
       }
+      // A not-found stop is a verdict about the PAGE (EH-09): the heading is
+      // the evidence, and there is no wording for a judge to rule on — the
+      // stamp keeps the near-miss gate off it.
+      if (resolution?.attempts.some((line) => line.startsWith('not-found:'))) {
+        detail = { ...(detail ?? {}), verdict: 'not-found' };
+      }
       // A failed step may still HAVE a target: an assertion that found its
       // element and disagreed with its content. A short read of the authored
       // selector marks it in the still when it is there; a selector that
@@ -3977,7 +4717,7 @@ export class SmartRunner {
           (line) => line.startsWith('backend:') || line.startsWith('declined to heal:'),
         );
         if (!transient) {
-          this.#deadResolutions.set(CacheManager.key(this.page.url(), selector), {
+          this.#deadResolutions.set(await this.#deadEndKey(selector), {
             step: this.bundle.steps.length - 1,
             contentMiss: resolution.contentOnly,
           });
@@ -4051,6 +4791,27 @@ export class SmartRunner {
    * spent 20s+ per step walking the ladder, and three failed steps in a row
    * carried no network evidence at all while their neighbours did.
    */
+  /**
+   * The dead-end memo's key for this page state (EH-15). `CacheManager.key`
+   * already keeps the page-naming query params (`?step=2`, `scopeUrl`); a
+   * wizard that keeps its step OUT of the URL is told apart by the label of
+   * its stepper's `aria-current="step"` node — humi's `Stepper.tsx` — read
+   * once, bounded, only when the URL carries no step of its own. Two forms
+   * on one URL must not share one memo: a dead end on step 1 is not step 2's.
+   */
+  async #deadEndKey(selector: string): Promise<string> {
+    const key = CacheManager.key(this.page.url(), selector);
+    try {
+      if (/[?&]step=/.test(this.page.url())) return key;
+      const current = this.page.locator('nav [aria-current="step"]').first();
+      if ((await current.count()) === 0) return key;
+      const label = (await current.innerText({ timeout: ATTRIBUTE_READ_TIMEOUT_MS })).replace(/\s+/g, ' ').trim();
+      return label === '' ? key : `${key} @step:${label.slice(0, 60)}`;
+    } catch {
+      return key;
+    }
+  }
+
   /** The page's headings right now — the cheapest honest "which screen is this". */
   async #headingsNow(): Promise<string[]> {
     try {
@@ -4146,6 +4907,26 @@ export class SmartRunner {
         `"${relaxed}". The assertion holds; the selector was written tighter than the ` +
         'rendering. Quote what the page actually shows (or use the unquoted substring form) ' +
         'so the suite stops paying this rung every run.',
+      original,
+    );
+  }
+
+  async #flagOverExactName(original: string, relaxed: string): Promise<void> {
+    let shown: string | null = null;
+    try {
+      const text = await this.page.locator(relaxed).first().innerText({ timeout: 1_000 });
+      shown = text.trim().replace(/\s+/g, ' ').slice(0, 120) || null;
+    } catch {
+      shown = null;
+    }
+    this.#recordRuntimeDefect(
+      'functional',
+      'low',
+      `Accessible name was more exact than the page: ${original}`,
+      `"${original}" matches an element's WHOLE accessible name, and the page names it with ` +
+        `more around it${shown ? ` — it shows "${shown}"` : ''}. Matched instead as a whole word ` +
+        `inside the name ("${relaxed}"). The assertion holds; the selector was written tighter ` +
+        'than the rendering. Quote the name the page actually exposes so the suite stops paying this rung every run.',
       original,
     );
   }
@@ -4844,6 +5625,12 @@ export class SmartRunner {
      * rung below hands the agent, and what it reads back to decide.
      */
     entry?: string | undefined,
+    /**
+     * The step's own declared wait (EH-07): the patience window, and a stop
+     * — a declared wait that ran out is a verdict about time, not a selector,
+     * and no model is paid after it.
+     */
+    patience?: number | undefined,
   ): Promise<ResolveResult<unknown>> {
     const attempts: string[] = [];
     // Candidates the healer proposed and refused. Evidence about what was
@@ -4864,8 +5651,43 @@ export class SmartRunner {
       const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
       return { value, resolution: 'fast', resolvedSelector: selector };
     } catch (error) {
+      // A harness fault raised by the step itself — a fixture that is not on
+      // disk — is not a resolution problem: no rung can put a file on disk,
+      // and wrapping it in a ladder walk would score it a dead end against
+      // the application. Out, verbatim, so `classifyStepFailure` reads its name.
+      if (error instanceof Error && HARNESS_STEP_ERRORS.has(error.name)) throw error;
       noteInterception(error);
-      attempts.push(`fast "${selector}": ${describe(error)}`);
+      attempts.push(`fast "${selector}": ${describeAttempt(error)}`);
+    }
+
+    // 1.01. **The element resolved and the claim about its STATE was wrong.**
+    //
+    // A count of 51 where 3 were claimed, a button enabled where disabled was
+    // claimed: the control is on the page and the ladder has nothing to
+    // repair. No sanitiser, case relaxation, overlay clearing, healer or agent
+    // can turn that reading into a pass — they can only wander (ec10
+    // HIR-EC-029: 70 s of healer and agent after "found 51", then a dead end
+    // that read as a missing control, then eleven steps on the page the agent
+    // had left behind). The one thing that CAN change the answer is time — a
+    // list still filling, a button still validating — so the patience window
+    // is paid once, and then the reading stands as the verdict.
+    if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
+      try {
+        const value = await run(this.page.locator(selector), this.#healedTimeoutMs);
+        this.#recordRuntimeDefect(
+          'functional',
+          'medium',
+          `Slower than the fast-path budget: ${selector}`,
+          `This step only held when given ${this.#healedTimeoutMs}ms — the state settles, ` +
+            `but not within the ${this.#fastTimeoutMs}ms fast path. The feature works; the page ` +
+            'is slow. Worth fixing before the budget hides a real regression.',
+          selector,
+        );
+        return { value, resolution: 'late', resolvedSelector: selector };
+      } catch (error) {
+        attempts.push(`late "${selector}" (${this.#healedTimeoutMs}ms): ${describeAttempt(error)}`);
+      }
+      throw new StepResolutionError(selector, attempts);
     }
 
     // 1.02. **A read-only shell over the real input** (2026-09-02).
@@ -4950,6 +5772,60 @@ export class SmartRunner {
       throw failure;
     }
 
+    // 1.03. **A calendar behind a button** (EH-11, 2026-09-03).
+    //
+    // humi's `DateField` is a `<button aria-haspopup="dialog">` showing the
+    // date it holds; the value is chosen in a portaled `role=dialog` calendar
+    // — day buttons named by their number, month nav, a month view. `fill`
+    // on a button fails ("not an <input>"), `type` and `paste` are refused,
+    // the shell rung above applies only to a read-only INPUT, so every such
+    // date (BE Effective Start/End, PY-Config effective dates, probation
+    // Extended/Confirm dates — ~150 rows) went to the agent, one model call
+    // per field, guessing at day buttons. The driver (`engine/calendar.ts`)
+    // is deterministic: convert the value with the flow's locale, open, walk
+    // the months, click the day, read the trigger back. A day the picker
+    // disables is the page's rule about the date, a state verdict.
+    if (entry !== undefined && (action === 'fill' || action === 'type' || action === 'fillRetry')) {
+      const trigger = await this.#calendarTrigger(selector);
+      if (trigger !== null) {
+        const iso = isoDateOf(entry, this.#locale);
+        if (iso === null) {
+          attempts.push(
+            `calendar: "${selector}" opens a calendar dialog, but ${JSON.stringify(entry)} is not an unambiguous date ` +
+              `(accepted: YYYY-MM-DD, 1 Sep 2027, Sep 1, 2027, 15 ก.ย. 2569, dd/mm/yyyy under locale th/en-GB, {{date:today+30d}})`,
+          );
+        } else {
+          try {
+            const picked = await pickDateInDialog(this.page, trigger, iso, { timeout: this.#healedTimeoutMs });
+            this.bundle.note(
+              `${selector}: a calendar dialog — picked ${iso} via ${picked.via} (${picked.navigated} month step(s)); ` +
+                `the field now shows ${JSON.stringify(picked.shown ?? '')}` +
+                (picked.confirmed ? '' : ' — which does not read as that date'),
+            );
+            if (!picked.confirmed) {
+              attempts.push(
+                `calendar "${selector}": picked ${iso} but the field shows ${JSON.stringify(picked.shown ?? '')}, which does not render that date`,
+              );
+            } else {
+              return {
+                value: undefined,
+                resolution: 'narrow',
+                resolvedSelector: selector,
+                note: { enteredAs: picked.shown, enteredIso: iso, via: `calendar-${picked.via}` },
+              };
+            }
+          } catch (error) {
+            attempts.push(`calendar "${selector}": ${describeAttempt(error)}`);
+            // A disabled day is the picker's own verdict about the date
+            // (`DateOutOfRangeError`) — nothing below can move a min/max.
+            if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
+              throw new StepResolutionError(selector, attempts);
+            }
+          }
+        }
+      }
+    }
+
     // 1.05. Known dead end — $0, and a stop.
     //
     // This exact selector already exhausted the whole ladder on this exact
@@ -4959,7 +5835,9 @@ export class SmartRunner {
     // three-step login block through the full ladder three times over —
     // nine ladder walks and nine model calls for one fact. Never persisted:
     // the negative result belongs to this run's page, not to the next run's.
-    const deadKey = CacheManager.key(this.page.url(), selector);
+    // The key keeps `?step=2` and the stepper's current label (EH-15): two
+    // wizard forms on one route are two pages.
+    const deadKey = await this.#deadEndKey(selector);
     const priorDeadEnd = this.#deadResolutions.get(deadKey);
     if (priorDeadEnd !== undefined) {
       // A repeated CONTENT mismatch is not a dead end: the element resolves
@@ -5014,6 +5892,64 @@ export class SmartRunner {
         return { value, resolution: 'case', resolvedSelector: relaxed };
       } catch (error) {
         attempts.push(`case "${relaxed}": ${describe(error)}`);
+      }
+    }
+
+    // 1.25. **Collapsed section** — still $0, still the author's own selector.
+    //
+    // A form that folds its sections (an accordion card, a closed <details>,
+    // an inactive tab) has the control in the DOM and out of the tree: `role=`
+    // selectors skip hidden elements, and the healer reads the same tree the
+    // control is missing from, so it can only propose a control that is not
+    // there either. Live (ec10 HIR-EC-002, 2026-09-02): Gender sits inside the
+    // hire form's collapsed "Personal Information" card; the agent tried
+    // `button` and `combobox` by that name for five turns and stalled. If the
+    // selector matches once hidden elements are included, the disclosure that
+    // owns the hidden ancestor (aria-controls, the header beside it, the
+    // <summary>, the tab) is clicked — the click a person makes — and the
+    // author's own selector is run again. See `engine/reveal.ts`.
+    const revealed = await revealHidden(this.page, selector);
+    if (revealed !== null) {
+      const via = revealed.disclosures.join(', ');
+      if (revealed.revealed) {
+        try {
+          const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
+          this.bundle.note(`${selector}: inside a collapsed section — expanded "${via}" to reach it`);
+          return { value, resolution: 'reveal', resolvedSelector: selector };
+        } catch (error) {
+          attempts.push(`reveal (expanded "${via}") "${selector}": ${describe(error)}`);
+        }
+      } else {
+        attempts.push(`reveal: expanded "${via}" but "${selector}" stayed hidden`);
+      }
+    }
+
+    // 1.26. **The option lives in a closed popup** (EH-14, 2026-09-03).
+    //
+    // "VNM ไม่สามารถกดเลือกได้ (disabled)" (TC_SSO_038, TC_WT_032/035,
+    // TC_TAX_061, TC_SEV_026/034/037) is a claim about an option INSIDE a
+    // listbox that is not open, and the reveal rung above only opens
+    // disclosures. For an assertion headed by a popup-only role, the one
+    // closed popup trigger the intent names (or the only one on the page)
+    // is opened — a click a person makes — and the author's own selector is
+    // run again. The list is left open: an assertion reads it, and the next
+    // step's own guard knows an open trigger is not clicked twice.
+    if (
+      (action === 'expectDisabled' || action === 'expectEnabled' || action === 'expectVisible' || action === 'expectCount') &&
+      targetsPopupContent(selector)
+    ) {
+      const opened = await this.#openPopupFor(intent);
+      if (opened !== null) {
+        try {
+          const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
+          this.bundle.note(`${selector}: inside a closed popup — opened the "${opened}" list to read its options`);
+          return { value, resolution: 'reveal', resolvedSelector: selector };
+        } catch (error) {
+          attempts.push(`open-popup (opened "${opened}") "${selector}": ${describeAttempt(error)}`);
+          if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
+            throw new StepResolutionError(selector, attempts);
+          }
+        }
       }
     }
 
@@ -5160,6 +6096,72 @@ export class SmartRunner {
       }
     }
 
+    // 1.36. Over-exact accessible name — 1.35's mirror for role selectors.
+    //
+    // `role=option[name="New Hire" i]` demands an option whose WHOLE name is
+    // "New Hire"; humi renders it as "H_NEWHIRE — New Hire" (code and label),
+    // so the presence claim failed at every timeout, paid the healer and the
+    // agent, and dead-ended — three times in one case (ec10 HIR-EC-029,
+    // 2026-09-02) for options that were on screen. Presence assertions only,
+    // the same rule as 1.35, and the name is matched as a WHOLE WORD inside
+    // the longer name (unicode boundaries: "Male" is not inside "Female").
+    if (PRESENCE_ACTIONS.has(action) && !lastAttempt.includes('strict mode violation')) {
+      const loose = containsRoleName(selector);
+      if (loose) {
+        // Ambiguity is expected — "Migration" is a whole word in both "DM —
+        // DATA MIGRATION" and "HIREDM — HIRE - DATA MIGRATION" — and a
+        // presence claim is satisfied by any of them, so the first visible
+        // match is taken in the same breath, as 1.35 does.
+        for (const candidate of [loose, `${loose} >> visible=true >> nth=0`]) {
+          try {
+            const value = await run(this.page.locator(candidate), this.#fastTimeoutMs);
+            await this.#flagOverExactName(selector, candidate);
+            return { value, resolution: 'narrow', resolvedSelector: candidate };
+          } catch (error) {
+            attempts.push(`relax "${candidate}": ${describe(error)}`);
+          }
+        }
+      }
+    }
+
+    // 1.37. **A row named by one of its cells** (EH-04, 2026-09-03).
+    //
+    // Playwright's `role=row` accessible name is the concatenation of every
+    // cell, so `role=row[name="TH_MED_005"]` is over-exact by construction —
+    // and the sheets address rows by one cell on ~330 rows ("กดไอคอนดินสอ
+    // ของ Plan PL_07_01", "กด Open case ของ Employee ID …"). Rung 1.36 covers
+    // presence claims; an ACTING step (`click role=row[…] >> role=button`)
+    // dead-ended. The one loosening an acting step gets: the HEAD's name as
+    // a whole word, and only when exactly ONE row answers to it — two rows
+    // is still ambiguous, and acting on "whichever matched first" would
+    // change what the test exercises.
+    if (!PRESENCE_ACTIONS.has(action) && !lastAttempt.includes('strict mode violation')) {
+      const head = headRoleOf(selector);
+      if (head === 'row' || head === 'cell' || head === 'gridcell' || head === 'listitem') {
+        const loose = containsRoleName(selector);
+        if (loose) {
+          const headOnly = loose.split(/\s*>>\s*/)[0] ?? loose;
+          const rows = await this.page.locator(headOnly).count().catch(() => 0);
+          if (rows === 1) {
+            try {
+              const value = await run(this.page.locator(loose), this.#fastTimeoutMs);
+              this.bundle.note(
+                `${selector}: the ${head}'s name is every cell joined — matched ${JSON.stringify(selectorName(selector) ?? '')} ` +
+                  `as a whole word of the one ${head} that holds it (resolved as ${loose})`,
+              );
+              return { value, resolution: 'narrow', resolvedSelector: loose };
+            } catch (error) {
+              attempts.push(`row-scope "${loose}": ${describeAttempt(error)}`);
+            }
+          } else if (rows > 1) {
+            attempts.push(
+              `row-scope "${headOnly}": ${rows} ${head}s contain ${JSON.stringify(selectorName(selector) ?? '')} — ambiguous, so no ${head} was acted on`,
+            );
+          }
+        }
+      }
+    }
+
     // 1.5. Blocking-dialog recovery — still $0. A surprising share of
     // "selector" failures are really "something is blocking the page"
     // failures: a cookie banner, a promo modal, a newsletter signup,
@@ -5168,30 +6170,39 @@ export class SmartRunner {
     // here would either fail the same way, or worse, "successfully" repair
     // onto a control inside the dialog itself.
     //
-    // EXCEPT when the previous step was a click or a keypress: a dialog that
-    // opened off the flow's own action is almost always the intended context
-    // — an edit modal the step is trying to fill — and dismissing it destroys
-    // the very state the test built (seen live: the ladder closed a
-    // deliberately-opened "Edit rule" dialog, and every later step failed
-    // downstream of the wreckage). Left open, the failing step still fails
-    // honestly, and the healer then reads a tree that CONTAINS the dialog —
-    // which is exactly where the right candidate lives.
-    if (this.#lastAction === 'click' || this.#lastAction === 'press') {
+    // EXCEPT when the dialog is the flow's OWN context: one opened by the
+    // previous interaction — a click, a keypress, and since 2026-09-03
+    // (EH-02) a fill, a selectOption, a check inside it — or one that holds
+    // the very control this step is aimed at. Dismissing it destroys the
+    // state the test built (seen live: the ladder closed a deliberately-
+    // opened "Edit rule" dialog, and every later step failed downstream of
+    // the wreckage; BE's Create Plan popup discards the whole form on
+    // "Cancel"). Left open, the failing step still fails honestly, and the
+    // healer then reads a tree that CONTAINS the dialog — which is exactly
+    // where the right candidate lives.
+    {
       const openNow = await openDialogNow(this.page);
       if (openNow) {
-        attempts.push(
-          `dialog: a "${await describeDialog(openNow).catch(() => 'dialog')}" opened by the ` +
-            `previous ${this.#lastAction} is treated as the intended context, not a blocker — not dismissed`,
-        );
-      }
-    } else {
-      const dialog = await this.#dismissBlockingDialog();
-      if (dialog) {
-        try {
-          const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
-          return { value, resolution: 'dialog', resolvedSelector: selector, dialog };
-        } catch (error) {
-          attempts.push(`fast (after dismissing "${dialog.name}") "${selector}": ${describe(error)}`);
+        const context = dialogIsIntendedContext(this.#lastAction)
+          ? `opened by the previous ${this.#lastAction}`
+          : (await selectorInsideDialog(openNow, selector))
+            ? 'holding the very control this step is aimed at'
+            : null;
+        if (context !== null) {
+          attempts.push(
+            `dialog: a "${await describeDialog(openNow).catch(() => 'dialog')}" ${context} ` +
+              'is treated as the intended context, not a blocker — not dismissed',
+          );
+        } else {
+          const dialog = await this.#dismissBlockingDialog(openNow);
+          if (dialog) {
+            try {
+              const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
+              return { value, resolution: 'dialog', resolvedSelector: selector, dialog };
+            } catch (error) {
+              attempts.push(`fast (after dismissing "${dialog.name}") "${selector}": ${describe(error)}`);
+            }
+          }
         }
       }
     }
@@ -5207,6 +6218,32 @@ export class SmartRunner {
     // author's own selector retried once. Found live on homepro.co.th, whose
     // promo dimmer swallowed every click on the page behind it.
     if (intercepted !== null) {
+      // 1.55. **A fixed or sticky bar over the target — scroll clear of it.**
+      //
+      // Playwright scrolls a target into view before clicking, to the nearest
+      // edge — and a sticky top bar then sits exactly over it. The overlay
+      // rung below would press Escape (closing the very listbox the flow had
+      // just opened) and retry under the same bar. Live (ec10 HIR-EC-029,
+      // 2026-09-02): "div.humi-topbar intercepts pointer events" on the Event
+      // Reason trigger, four steps in a row. The bar is not a dialog and has
+      // nothing to dismiss; the target only needs to be in the middle of the
+      // viewport, which is where a person would have scrolled it.
+      const bar = await this.#stickyBar(intercepted);
+      if (bar !== null) {
+        try {
+          await this.page
+            .locator(selector)
+            .first()
+            .evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }), undefined, {
+              timeout: this.#fastTimeoutMs,
+            });
+          const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
+          this.bundle.note(`${selector}: was under the fixed "${bar}" bar — scrolled it to the middle of the viewport`);
+          return { value, resolution: 'scroll', resolvedSelector: selector };
+        } catch (error) {
+          attempts.push(`scroll (clear of "${bar}") "${selector}": ${describe(error)}`);
+        }
+      }
       const overlay = await this.#clearInterceptingOverlay(intercepted);
       if (overlay) {
         try {
@@ -5310,6 +6347,91 @@ export class SmartRunner {
       throw failure;
     }
 
+    // 2.62. **The application's own not-found page** (EH-09, 2026-09-03).
+    //
+    // A Next.js app answers a client-side click into a stale route with its
+    // `not-found.tsx` rendered IN PLACE, status 200 — humi's eyebrow "404 —
+    // ไม่พบหน้าที่ค้นหา", h1 "หน้านี้ถูกย้ายหรือลบไปแล้ว". `#judgeNavigationStatus`
+    // sees only a goto's HTTP status, so nothing read it: every step after
+    // "View Details → 404" (HIR-EC-002, BUG 71887) walked the whole ladder,
+    // the healer proposed the 404 page's own links, and the run read as
+    // "controls missing". The heading IS the finding: a `failed` verdict
+    // with the page as evidence, one defect per URL, no token spent.
+    const missing = await notFoundSurface(this.page);
+    if (missing !== null) {
+      attempts.push(
+        `not-found: the page is showing "${missing.heading}" at ${missing.url} — ` +
+          'the application navigated to a page it does not have; no repair attempted',
+      );
+      if (!this.#notFoundReported.has(missing.url)) {
+        this.#notFoundReported.add(missing.url);
+        this.#recordRuntimeDefect(
+          'functional',
+          'high',
+          `The application led the run to a missing page: ${missing.url}`,
+          `While resolving "${selector}" the page was showing ${JSON.stringify(missing.heading)} (read from its ${missing.via}). ` +
+            'The action before this step navigated to a route the application does not serve — a broken link ' +
+            'or a stale route in the app, not a selector problem. Every step on this page fails on the same evidence.',
+          selector,
+        );
+      }
+      const failure = new StepResolutionError(selector, attempts, {
+        verdict: 'the page is the application\'s not-found page',
+      });
+      failure.pageContext = [missing.heading];
+      throw failure;
+    }
+
+    // 2.65. **The text is nowhere on the page** (EH-06, 2026-09-03).
+    //
+    // A presence claim whose text is in no visible text of the page — after
+    // the quoted-text and whole-word rungs above have already conceded the
+    // shapes a page renders a value in — is either genuinely absent or held
+    // by an element that renders it in a way innerText cannot see. One $0
+    // read tells those apart, and the failure path was already making it —
+    // AFTER the healer (which can only echo, or propose a container) and the
+    // agent's look had been paid: 20–40 s per failing assertion, three per
+    // failing case (already-done.md, item 5). The page gets ONE patience
+    // window first, exactly the one rung 2.7 would have spent, so late text
+    // is never called absent; then the reading stands as the verdict.
+    // `expectAnyVisible` is left to rung 2.7: only its first selector reaches
+    // the ladder, and absence of ONE alternative says nothing about the rest.
+    const absenceWanted =
+      (PRESENCE_ACTIONS.has(action) && action !== 'expectAnyVisible') || action === 'expectCount'
+        ? action === 'expectText' && expected !== undefined
+          ? [expected]
+          : [selectorName(selector) ?? '']
+        : [];
+    const absenceNames = absenceWanted.map((w) => w.trim()).filter((w) => w !== '');
+    if (absenceNames.length > 0 && !(await this.#anyNameOnPage(absenceNames))) {
+      const window = patience ?? this.#healedTimeoutMs;
+      try {
+        const value = await run(this.page.locator(selector), window);
+        this.#recordRuntimeDefect(
+          'functional',
+          'medium',
+          `Slower than the fast-path budget: ${selector}`,
+          `This step only passed when given ${window}ms — the content renders, ` +
+            `but not within the ${this.#fastTimeoutMs}ms fast path. The feature works; the page ` +
+            'is slow (or hydrates late). Worth fixing before the budget hides a real regression.',
+          selector,
+        );
+        return { value, resolution: 'late', resolvedSelector: selector };
+      } catch (error) {
+        attempts.push(`late "${selector}" (${window}ms): ${describeAttempt(error)}`);
+        if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
+          throw new StepResolutionError(selector, attempts);
+        }
+      }
+      if (!(await this.#anyNameOnPage(absenceNames))) {
+        const quoted = absenceNames.map((w) => JSON.stringify(w)).join(', ');
+        attempts.push(
+          `absence: ${quoted} is not in the page's visible text — no repair can find it; the claim fails on the page as it stands`,
+        );
+        throw new StepResolutionError(selector, attempts, { verdict: 'the text is not on the page' });
+      }
+    }
+
     // 2.7. Patience — the author's own selector, one more window, free.
     //
     // A presence assertion against a hydrating page loses by construction:
@@ -5329,21 +6451,51 @@ export class SmartRunner {
     // ladder claims count > 0 (a zero-count expectation runs through
     // `#bareStep`, off the ladder entirely), which is a presence claim about
     // several things instead of one.
-    if (PRESENCE_ACTIONS.has(action) || action === 'waitFor' || action === 'expectCount') {
+    //
+    // A step that DECLARED its own patience (`timeoutMs`, EH-07) gets that
+    // window here instead of the healed timeout — a payroll run, an import
+    // that reports "Completed" minutes later — and when it expires the wait
+    // is the verdict: a declared wait that ran out is a fact about time, not
+    // about a selector, and neither the healer nor the agent is paid for it.
+    if (PRESENCE_ACTIONS.has(action) || action === 'waitFor' || action === 'expectCount' || patience !== undefined) {
+      const window = patience ?? this.#healedTimeoutMs;
       try {
-        const value = await run(this.page.locator(selector), this.#healedTimeoutMs);
+        const value = await run(this.page.locator(selector), window);
         this.#recordRuntimeDefect(
           'functional',
           'medium',
           `Slower than the fast-path budget: ${selector}`,
-          `This step only passed when given ${this.#healedTimeoutMs}ms — the content renders, ` +
+          `This step only passed when given ${window}ms — the content renders, ` +
             `but not within the ${this.#fastTimeoutMs}ms fast path. The feature works; the page ` +
             'is slow (or hydrates late). Worth fixing before the budget hides a real regression.',
           selector,
         );
         return { value, resolution: 'late', resolvedSelector: selector };
       } catch (error) {
-        attempts.push(`late "${selector}" (${this.#healedTimeoutMs}ms): ${describe(error)}`);
+        attempts.push(`late "${selector}" (${window}ms): ${describeAttempt(error)}`);
+        // The patience window resolved the element and read the claim wrong
+        // (HIR-EC-029: fast timed out while the list opened; late counted 51
+        // against 3). That reading is the verdict — see 1.01; nothing below
+        // can change it, and everything below costs time or a model call.
+        if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
+          throw new StepResolutionError(selector, attempts);
+        }
+        if (patience !== undefined) {
+          attempts.push(
+            `jit: skipped — the step declared its own patience (${patience}ms) and it expired; ` +
+              'a declared wait that ran out is a verdict about time, not a selector',
+          );
+          throw new StepResolutionError(selector, attempts, {
+            verdict: `the declared wait of ${patience}ms ran out`,
+          });
+        }
+        // Either/or (CG-08): every alternative was polled through the
+        // window as written; none showing is the answer, and a heal of the
+        // first alternative alone would prove nothing about the rest.
+        if (action === 'expectAnyVisible') {
+          attempts.push('jit: skipped — none of the alternatives is visible after the patience window; the request accepts either outcome and the page shows neither');
+          throw new StepResolutionError(selector, attempts, { verdict: 'none of the alternatives is visible' });
+        }
       }
     }
 
@@ -5392,8 +6544,17 @@ export class SmartRunner {
     // and was rightly refused. So a content miss skips it entirely and goes
     // to the agent, which can look at the page and answer where the value is.
     const contentMiss = attempts.length > 0 && attempts.every(isContentMiss);
+    // The healer reads a tree captured with every listbox CLOSED (EH-13): a
+    // selector headed by `option`/`menuitem`/`treeitem`, or a `selectOption`
+    // whose trigger did open, is a failure the healer can only echo or
+    // repair onto the trigger — HIR-EC-029 measured 70 s per such miss.
+    const popupTarget =
+      targetsPopupContent(selector) ||
+      (action === 'selectOption' && attempts.some((line) => /opened .* but no option named/.test(line)));
 
-    if (!contentMiss) {
+    if (!contentMiss && popupTarget) {
+      attempts.push('jit: skipped — the target lives inside a listbox the healer cannot open');
+    } else if (!contentMiss) {
       if (!this.#healer) {
         attempts.push('jit: healer disabled');
       } else {
@@ -5410,6 +6571,9 @@ export class SmartRunner {
             intent,
             failureReason,
             caseContext: this.#caseContext,
+            // The value an entry step is putting in: the replacement must be
+            // the control that takes it, never a static text (EH-13).
+            ...(entry === undefined ? {} : { entry }),
           });
         } catch (error) {
           if (error instanceof HealUnavailableError) {
@@ -5505,6 +6669,112 @@ export class SmartRunner {
    * beside it that the label really points at? Bounded, never throws — a page
    * that cannot answer is simply not this case.
    */
+  /**
+   * The `button[aria-haspopup="dialog"]` the selector resolves to — the
+   * trigger of a calendar dialog (humi `DateField`) — or null. The element
+   * itself first; then, when the author named the field's label and the
+   * selector landed on the label element, the trigger it labels. Bounded,
+   * never throws: a page that cannot answer is simply not this case.
+   */
+  async #calendarTrigger(selector: string): Promise<Locator | null> {
+    try {
+      const candidate = this.page.locator(selector).first();
+      if ((await candidate.count()) === 0) return null;
+      const facts = await candidate.evaluate(
+        (el) => {
+          const node = el as unknown as {
+            tagName?: string;
+            getAttribute(name: string): string | null;
+            control?: { getAttribute(name: string): string | null } | null;
+          };
+          const own = (node.getAttribute('aria-haspopup') ?? '').toLowerCase();
+          if (own === 'dialog') return 'self';
+          const labelled = node.control;
+          if (labelled && (labelled.getAttribute('aria-haspopup') ?? '').toLowerCase() === 'dialog') return 'control';
+          return null;
+        },
+        undefined,
+        { timeout: ATTRIBUTE_READ_TIMEOUT_MS },
+      );
+      if (facts === 'self') return candidate;
+      if (facts === 'control') return this.page.locator(`${selector} >> xpath=.. >> [aria-haspopup="dialog"]`).first();
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Open the one closed popup the step is about (rung 1.26): a trigger with
+   * `aria-haspopup` and `aria-expanded="false"` whose accessible name shares
+   * a field name with the intent — or the only such trigger on the page.
+   * Returns the trigger's name once clicked, else null; never guesses among
+   * several unnamed candidates.
+   */
+  async #openPopupFor(intent: string | undefined): Promise<string | null> {
+    try {
+      const triggers = this.page.locator(
+        '[aria-haspopup="listbox"][aria-expanded="false"], [aria-haspopup="menu"][aria-expanded="false"], [aria-haspopup="true"][aria-expanded="false"]',
+      );
+      const count = Math.min(await triggers.count(), 12);
+      if (count === 0) return null;
+      const names = fieldNamesIn(intent).map((n) => foldValue(n));
+      const labelled: { locator: Locator; name: string }[] = [];
+      for (let i = 0; i < count; i += 1) {
+        const one = triggers.nth(i);
+        if (!(await one.isVisible().catch(() => false))) continue;
+        const name = (
+          (await one.getAttribute('aria-label', { timeout: ATTRIBUTE_READ_TIMEOUT_MS }).catch(() => null)) ??
+          (await one.innerText({ timeout: ATTRIBUTE_READ_TIMEOUT_MS }).catch(() => ''))
+        )
+          .replace(/\s+/g, ' ')
+          .trim();
+        labelled.push({ locator: one, name });
+      }
+      const byName = labelled.filter((t) => names.some((n) => n !== '' && foldedIncludes(t.name, n)));
+      const chosen = byName.length === 1 ? byName[0]! : labelled.length === 1 ? labelled[0]! : null;
+      if (chosen === null) return null;
+      await chosen.locator.click({ timeout: this.#fastTimeoutMs });
+      await this.page.waitForTimeout(300);
+      return chosen.name || 'unnamed';
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Is any of `names` on the page — in its visible text, verbatim or by the
+   * sheet's own normalisation, or as a label, placeholder or title (an
+   * icon button's only name)? The absence rung's evidence (EH-06): a read
+   * that fails answers "yes" — a stop must never rest on a read that broke.
+   */
+  async #anyNameOnPage(names: readonly string[]): Promise<boolean> {
+    try {
+      const body = await this.page.evaluate(() => {
+        const doc = (globalThis as unknown as { document?: { body?: { innerText?: string } } }).document;
+        return doc?.body?.innerText ?? '';
+      });
+      const hay = body.replace(/\s+/g, ' ');
+      const folded = foldValue(hay);
+      for (const name of names) {
+        const needle = name.replace(/\s+/g, ' ').trim();
+        if (needle === '') continue;
+        if (hay.toLowerCase().includes(needle.toLowerCase())) return true;
+        if (folded.includes(foldValue(needle))) return true;
+        const halves = codeAndLabelOf(needle);
+        if (halves !== null && foldedIncludes(hay, halves.label)) return true;
+        const labelled =
+          (await this.page.getByLabel(needle, { exact: false }).count()) +
+          (await this.page.getByPlaceholder(needle, { exact: false }).count()) +
+          (await this.page.getByTitle(needle, { exact: false }).count());
+        if (labelled > 0) return true;
+      }
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
   async #readOnlyShell(
     selector: string,
   ): Promise<{ sibling: string | null; siblingType: string | null } | null> {
@@ -5827,6 +7097,19 @@ export class SmartRunner {
    * afterwards is what decides whether it worked; this only reports what was
    * done.
    */
+  /** The intercepting element's label when it is `position: fixed|sticky`, else null. */
+  async #stickyBar(intercepted: { css: string | null; label: string }): Promise<string | null> {
+    if (intercepted.css === null) return null;
+    const position = await this.page
+      .locator(intercepted.css)
+      .first()
+      .evaluate((el) => (globalThis as unknown as { getComputedStyle(e: unknown): { position: string } }).getComputedStyle(el).position, undefined, {
+        timeout: ATTRIBUTE_READ_TIMEOUT_MS,
+      })
+      .catch(() => null);
+    return position === 'fixed' || position === 'sticky' ? intercepted.label : null;
+  }
+
   async #clearInterceptingOverlay(intercepted: {
     css: string | null;
     label: string;
@@ -5851,10 +7134,16 @@ export class SmartRunner {
     }
   }
 
-  async #dismissBlockingDialog(): Promise<DialogRecord | null> {
-    const dialog = await openDialogNow(this.page);
+  async #dismissBlockingDialog(open?: Locator | null): Promise<DialogRecord | null> {
+    const dialog = open ?? (await openDialogNow(this.page));
     if (!dialog) return null;
-    const dismiss = await findDismissButton(dialog);
+    // The AUTOMATIC policy (EH-02): neutral names only — Close, Cancel, ปิด,
+    // ยกเลิก — and an affirmative one only on a consent/cookie notice. The
+    // unrequested rung once clicked "OK"/"Continue" and confirmed whatever
+    // the dialog asked; "Cancel" on humi's Create Plan popup discards the
+    // form, "ตกลง" on a delete confirm deletes. An explicit `closeModal`
+    // keeps searching both families — the author asked for it closed.
+    const dismiss = await findDismissButton(dialog, { policy: 'automatic' });
     if (!dismiss) return null;
 
     const name = await describeDialog(dialog);
@@ -6112,7 +7401,7 @@ export type FlowStep =
   | { action: 'uncheck'; selector: string; intent?: string | undefined }
   /** Type key by key — for autocomplete/typeahead/masked fields `fill` cannot wake. */
   | { action: 'type'; selector: string; value: string; intent?: string | undefined; valueSource?: StepValueSource | undefined }
-  | { action: 'waitFor'; selector: string; intent?: string | undefined }
+  | { action: 'waitFor'; selector: string; intent?: string | undefined; timeoutMs?: number | undefined }
   /**
    * Hand the browser to the agent until `goal` is satisfied. `script` is a
    * deterministic journey a previous successful run recorded on this very
@@ -6171,7 +7460,7 @@ export type FlowStep =
   /** Statement-statistics tier — correlational "called as planned", via pg_stat_statements. */
   | ({ action: 'expectDbCalled' } & FlowDbCalledSpec)
   // --- modals ---
-  | { action: 'expectModal'; name?: string | undefined; intent?: string | undefined }
+  | { action: 'expectModal'; name?: string | undefined; intent?: string | undefined; timeoutMs?: number | undefined }
   | { action: 'closeModal'; button?: string | undefined; intent?: string | undefined }
   // --- visual regression ---
   | { action: 'snapshot'; name: string; selector?: string | undefined }
@@ -6207,12 +7496,36 @@ export type FlowStep =
    * bilingual applications — see `SmartRunner.expectText`. Omit it to
    * enforce one specific rendering.
    */
-  | { action: 'expectText'; selector: string; value: string; anyOf?: string[] | undefined; intent?: string | undefined }
-  | { action: 'expectVisible'; selector: string; intent?: string | undefined }
-  | { action: 'expectHidden'; selector: string; intent?: string | undefined }
+  | { action: 'expectText'; selector: string; value: string; anyOf?: string[] | undefined; intent?: string | undefined; timeoutMs?: number | undefined }
+  | { action: 'expectVisible'; selector: string; intent?: string | undefined; timeoutMs?: number | undefined }
+  | { action: 'expectHidden'; selector: string; intent?: string | undefined; timeoutMs?: number | undefined }
   | { action: 'expectEnabled'; selector: string; intent?: string | undefined }
   | { action: 'expectDisabled'; selector: string; intent?: string | undefined }
-  | { action: 'expectCount'; selector: string; count: number | string; intent?: string | undefined }
+  | { action: 'expectCount'; selector: string; count: number | string; intent?: string | undefined; timeoutMs?: number | undefined }
+  /**
+   * Either/or: passes when ANY of the selectors is visible — an Expected line
+   * that offers alternatives ("สำเร็จหรือแสดง error … ไม่ crash"). Fails naming
+   * every selector that was not.
+   */
+  | { action: 'expectAnyVisible'; selectors: string[]; intent?: string | undefined; timeoutMs?: number | undefined }
+  /**
+   * The validation message shown FOR a named field (aria-errormessage /
+   * aria-describedby / the field's own container), optionally equal to `value`.
+   */
+  | { action: 'expectFieldError'; selector: string; value?: string | undefined; intent?: string | undefined }
+  /** Attach files to a file input, a dropzone, or a control that opens the chooser. */
+  | { action: 'upload'; selector: string; files: string[]; intent?: string | undefined }
+  /**
+   * Click `selector` and capture the download it starts; the saved path goes
+   * into the variable store as `{{as}}`. Capture only — see `SmartRunner.download`.
+   */
+  | { action: 'download'; selector: string; as: string; intent?: string | undefined }
+  /**
+   * Sign in as a named persona (`<HR_ADMIN_ACCOUNT>`, `MANAGER_ACCOUNT`, or a
+   * literal email that matches one) using `RunFlowOptions.personas`, signing
+   * out first when a session is live. Mid-flow persona hand-offs.
+   */
+  | { action: 'signIn'; as: string; url?: string | undefined; intent?: string | undefined }
   // --- cross-surface reconciliation (EN-2 audit): read one surface, compare
   // on another. `saveCount`/`saveText` write into the run's variable store;
   // a later expectCount/expectText carries `{{name}}`.
@@ -6260,6 +7573,8 @@ export const ASSERTION_ACTIONS = [
   'expectEnabled',
   'expectDisabled',
   'expectCount',
+  'expectAnyVisible',
+  'expectFieldError',
   'expectUrl',
   'expectValue',
   'expectScrollable',
@@ -6323,6 +7638,12 @@ export interface Flow {
    * whatever scope the request asked for.
    */
   scope?: 'unit' | 'e2e' | undefined;
+  /**
+   * How this flow's sheet writes dates (EH-03): `th` reads `dd/mm/yyyy`
+   * day-first and converts a Buddhist year; `en-US` month-first. Absent
+   * leaves an ambiguous `01/09/2027` unconverted — never guessed.
+   */
+  locale?: DateLocale | undefined;
   /** Prefixed to relative `goto` urls. */
   baseUrl?: string | undefined;
   /**
@@ -6424,7 +7745,11 @@ function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] 
       error.name === 'BackendDisabledError' ||
       // A 404 on a path the codebase declares no route for is the test asking
       // for a page that does not exist, never the application failing.
-      error.name === 'RouteNotFoundError')
+      error.name === 'RouteNotFoundError' ||
+      // A fixture the flow names that is not on disk, or a persona the run
+      // was not given (2026-09-03): the test's problem, never the app's.
+      error.name === 'FixtureMissingError' ||
+      error.name === 'PersonaUnknownError')
   ) {
     return 'error';
   }
@@ -6508,7 +7833,10 @@ function reconstructionFutile(error: unknown): boolean {
       // Nor can a rewrite give a run permission it was denied.
       error.name === 'BackendDisabledError' ||
       // Nor can a rewritten selector conjure a route the application lacks.
-      error.name === 'RouteNotFoundError')
+      error.name === 'RouteNotFoundError' ||
+      // Nor put a fixture on disk, nor invent an account.
+      error.name === 'FixtureMissingError' ||
+      error.name === 'PersonaUnknownError')
   ) {
     return true;
   }
@@ -6523,7 +7851,11 @@ function reconstructionFutile(error: unknown): boolean {
       line.startsWith('backend:') ||
       line.startsWith('declined to heal:') ||
       line.startsWith('authorization:') ||
-      line.startsWith('known dead end:'),
+      line.startsWith('known dead end:') ||
+      // A rebuilt selector cannot summon text that is nowhere on the page
+      // (EH-06), nor bring back a page the application does not have (EH-09).
+      line.startsWith('absence:') ||
+      line.startsWith('not-found:'),
   );
 }
 
@@ -7093,7 +8425,7 @@ async function executeStep(
         await runner.type(step.selector, step.value, step.intent, step.valueSource);
         break;
       case 'waitFor':
-        await runner.waitFor(step.selector, step.intent);
+        await runner.waitFor(step.selector, step.intent, step.timeoutMs);
         break;
       case 'workflow':
         await runner.workflow(step.goal, step.script);
@@ -7126,19 +8458,34 @@ async function executeStep(
         await runner.expectNotScrollable(step.selector, step.intent);
         break;
       case 'expectText':
-        await runner.expectText(step.selector, step.value, step.intent, step.anyOf);
+        await runner.expectText(step.selector, step.value, step.intent, step.anyOf, step.timeoutMs);
         break;
       case 'expectVisible':
-        await runner.expectVisible(step.selector, step.intent);
+        await runner.expectVisible(step.selector, step.intent, step.timeoutMs);
         break;
       case 'expectHidden':
-        await runner.expectHidden(step.selector, step.intent);
+        await runner.expectHidden(step.selector, step.intent, step.timeoutMs);
         break;
       case 'expectEnabled':
         await runner.expectEnabled(step.selector, step.intent);
         break;
       case 'expectDisabled':
         await runner.expectDisabled(step.selector, step.intent);
+        break;
+      case 'expectAnyVisible':
+        await runner.expectAnyVisible(step.selectors, step.intent, step.timeoutMs);
+        break;
+      case 'expectFieldError':
+        await runner.expectFieldError(step.selector, step.value, step.intent);
+        break;
+      case 'upload':
+        await runner.upload(step.selector, step.files, step.intent);
+        break;
+      case 'download':
+        await runner.download(step.selector, step.as, step.intent);
+        break;
+      case 'signIn':
+        await runner.signIn(step.as, step.url, step.intent);
         break;
       case 'expectCount': {
         // A string count is a `{{variable}}` already interpolated above — the
@@ -7150,7 +8497,7 @@ async function executeStep(
             `expectCount was given ${JSON.stringify(step.count)}, which is not a whole number after interpolation`,
           );
         }
-        await runner.expectCount(step.selector, n, step.intent);
+        await runner.expectCount(step.selector, n, step.intent, step.timeoutMs);
         break;
       }
       case 'saveCount':
@@ -7221,7 +8568,7 @@ async function executeStep(
         await runner.expectDbCalled(step);
         break;
       case 'expectModal':
-        await runner.expectModal(step.name, step.intent);
+        await runner.expectModal(step.name, step.intent, step.timeoutMs);
         break;
       case 'closeModal':
         await runner.closeModal(step.button, step.intent);
@@ -7319,6 +8666,13 @@ export interface RunFlowOptions {
    * sign-in serves the whole suite. See `engine/session-vault.ts`.
    */
   sessionVault?: SessionVault | undefined;
+
+  /** See `SmartRunnerOptions.personas`. */
+  personas?: Record<string, { email: string; password: string }> | undefined;
+  /** See `SmartRunnerOptions.locale`. Wins over `Flow.locale`. */
+  locale?: DateLocale | undefined;
+  /** See `SmartRunnerOptions.downloadDir`. */
+  downloadDir?: string | undefined;
 
   screenshots?: ScreenshotMode | undefined;
   /** See `SmartRunnerOptions.highlightTarget`. */
@@ -7674,6 +9028,9 @@ export function signsInItself(flow: Flow): boolean {
   const steps: FlowStep[] = [...(flow.setup ?? []), ...flow.steps];
   let onSignIn = false;
   for (const step of steps) {
+    // A `signIn` step IS the flow signing in (EH-10): the bootstrap must
+    // never race it, and an inherited session is never what it wants.
+    if (step.action === 'signIn') return true;
     if (step.action === 'goto') {
       onSignIn = looksLikeSignIn(step.url);
       continue;
@@ -7772,10 +9129,14 @@ export async function runFlow(
 
   // The one origin this flow tests, for the suite's session vault: banked
   // state is only ever injected into — and saved from — a matching origin.
+  // Keyed per ACCOUNT (EH-10): a suite alternating employee and manager
+  // cases used to hand a later case whichever account the previous one
+  // ended as. A run that knows who it means to be (`--as`) inherits only
+  // that account's banked session; one that does not takes the most recent.
   const vaultOrigin = flowOriginOf(flow);
   const bankedSession =
     options.sessionVault !== undefined && vaultOrigin !== null
-      ? (options.sessionVault.get(vaultOrigin) ?? undefined)
+      ? (options.sessionVault.get(vaultOrigin, options.credentials?.email) ?? undefined)
       : undefined;
 
   let runner: SmartRunner;
@@ -7798,6 +9159,10 @@ export async function runFlow(
       // password wants to be the account it types, not the one the browser
       // was left signed in as.
       inheritSession: options.inheritSession ?? !signsInItself(flow),
+      personas: options.personas,
+      locale: options.locale ?? flow.locale,
+      flowDir: options.flowDir,
+      downloadDir: options.downloadDir,
       flowSignsInItself: signsInItself(flow),
       screenshots: options.screenshots,
       highlightTarget: options.highlightTarget,
@@ -7859,7 +9224,9 @@ export async function runFlow(
       const url = runner.page.url();
       if (url.startsWith(vaultOrigin) && !looksLikeSignIn(url)) {
         const state = await runner.exportSession();
-        options.sessionVault.put(vaultOrigin, state);
+        // Under the account the run ENDED as: the last `signIn`'s email,
+        // else the `--as` account, else the anonymous slot.
+        options.sessionVault.put(vaultOrigin, state, runner.lastSignedInAs ?? options.credentials?.email);
       }
     } catch {
       // The context may already be gone (a run-level error) — nothing to bank.

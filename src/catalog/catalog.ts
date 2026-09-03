@@ -443,6 +443,34 @@ export function buildAuthoringPrompt(
         'take the exact value from there. Never invent a value neither the case nor ' +
         'the context states — if the cited value is genuinely absent from both, assert ' +
         'what the case itself states and nothing more.\n\n' +
+        // Rounds (CG-10): the sheet writes one row and means several runs of
+        // it — "รอบที่ 1 ใช้ TD-01 … รอบที่ 2 ใช้ TD-42" (HIR, 40 rows), "Case 1:
+        // งวดปกติ / Case 2: งวดพิเศษ" (PY, 31 sub-cases), "--Insert R1/R2/R3--"
+        // (BE), "Country/Min/Max ว่างทีละช่อง" (TC_SSO_009: one round per field
+        // left empty). Without this the model truncated to round 1 or folded
+        // the rounds into one agent leg; the DO-NOT-TRUNCATE rule has no round
+        // vocabulary. The parser lists them as "Rounds (N):" with per-round
+        // data; the case label carries the round so each is its own run.
+        'ROUNDS: when a case lists "Rounds (N):" — รอบที่ k, Case k:, ครั้งที่ k, Insert Rk, ' +
+        'or a "ว่างทีละช่อง" loop over several fields — write the FULL script once per round ' +
+        'as its own case, labelled with the case id and the round ("<caseId> รอบ k" for a ' +
+        'numbered round, "<caseId> ว่าง <field>" for a per-field loop), applying that ' +
+        'round\'s own data: the "[phase]" pairs in the Test data whose phase is that round, ' +
+        'the round\'s named data set (TD-21), and the overrides the Rounds line gives ' +
+        '(a value not overridden keeps round 1\'s). "ทำซ้ำขั้นตอนที่ A ถึง B" repeats steps ' +
+        'A–B for that round; a per-field loop is ONE case per field, each leaving only ' +
+        'that field empty and asserting the error under that field. Never fold the rounds ' +
+        'into one case and never stop after the first.\n\n' +
+        // The route (CG-11): every row opens with the sidebar path ("เข้าสู่
+        // เมนูที่กำหนด", "กด Menu > ME > …"); the PY rows put the destination
+        // URL and a tab in the steps instead. The parser normalises both to
+        // "Menu path:" and "Destination:"; this says what to do with them.
+        'MENU PATH AND DESTINATION: "Menu path: A > B > C" is the sidebar route to the page ' +
+        'under test — after the sign-in, click each crumb in order, as the tree names it; a ' +
+        'crumb that is a collapsed group is expanded by clicking its header first, then the ' +
+        'entry under it. "Destination: <url> (tab "X")" is the page named outright: goto that ' +
+        'URL, then click the tab. The first leg of every case is that route, never a path ' +
+        'guessed from a label.\n\n' +
         options.cases.join('\n\n'),
     );
   } else {

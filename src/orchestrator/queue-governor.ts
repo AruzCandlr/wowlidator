@@ -63,6 +63,15 @@ export function governorMode(env: NodeJS.ProcessEnv = process.env): GovernorMode
   return 'rules';
 }
 
+/**
+ * Whether the rules governor HOLDS (rather than notes) a pending case whose
+ * fixture a just-failed case likely consumed (OA-16). Off by default: a
+ * likelihood is not a verdict, and a hold on a guess starves the suite.
+ */
+export function governorHoldsConsumed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env['WOWLIDATOR_GOVERNOR_HOLD_CONSUMED'] ?? '').trim() === '1';
+}
+
 export function governorTurnBudget(env: NodeJS.ProcessEnv = process.env): number {
   const raw = Number((env['WOWLIDATOR_GOVERNOR_TURNS'] ?? '').trim());
   return Number.isFinite(raw) && raw >= 1 && raw <= 100 ? Math.floor(raw) : DEFAULT_GOVERNOR_TURNS;
@@ -75,11 +84,49 @@ export interface GovernorCaseFact {
   sections: readonly string[];
   /** Lanes: ms in flight. Ended cases: the reason line, '' when passed. */
   detail?: string | undefined;
+  /**
+   * The consumable fixtures the case's Test data names (OA-16): Position
+   * codes, plan/document codes, persona tokens, `TD-nn` data sets — from
+   * `fixtureTokens`. Two hires on one Position, or a delete and the read
+   * that expects the row, dispatch together today whenever their tables and
+   * sections differ, because the data locks serialise by TABLE, not record.
+   */
+  fixtures?: readonly string[] | undefined;
+}
+
+/**
+ * The identifier tokens a case's text names that another case could consume
+ * or poison (OA-16, pure): 8-digit Position codes (TD-01's 40106337 is shared
+ * by 19 EC-Hiring-3 cases), `CODE_LIKE-THIS` plan/document codes
+ * (TH_MED_005, SIT_DUP_DOC, PL_06_21), `<X_ACCOUNT>` persona tokens and
+ * `TD-nn` data sets. Deduplicated, in order of first mention. The caller
+ * (run-cases' schedule facts) decides what text to feed and may drop the
+ * case's own id.
+ */
+export function fixtureTokens(caseText: string): string[] {
+  const out: string[] = [];
+  const add = (token: string): void => {
+    if (!out.includes(token)) out.push(token);
+  };
+  for (const m of caseText.matchAll(/<([A-Z][A-Z0-9_]*_ACCOUNT)>/g)) add(`<${m[1] as string}>`);
+  for (const m of caseText.matchAll(/(?<![\d.])\d{8}(?![\d.])/g)) add(m[0]);
+  for (const m of caseText.matchAll(/\b[A-Z]{2,}[_-][A-Z0-9][A-Z0-9_-]*\b/g)) {
+    // `<X_ACCOUNT>` is read above with its brackets; the bare form is not a second fixture.
+    if (!/_ACCOUNT$/.test(m[0])) add(m[0]);
+  }
+  for (const m of caseText.matchAll(/\bTD-\d{1,3}\b/g)) add(m[0]);
+  return out;
 }
 
 export interface GovernorObservation {
   /** Why this turn is happening — the event, in one word. */
   event: 'suite-start' | 'case-ended' | 'queue-blocked';
+  /**
+   * The case that just ended, on a `case-ended` turn — its facts and, in
+   * `detail`, the non-pass reason ('' when it passed). Lets the rules
+   * governor tell the cases that share its fixtures (OA-16).
+   */
+  endedFact?: GovernorCaseFact | undefined;
   /**
    * The same queue/lanes as structured facts, for the rules governor. The
    * prose lines above them stay the model's food; parsing our own display
@@ -394,14 +441,58 @@ export class RuleGovernorModel implements GovernorModel {
   #saidKeys = new Set<string>();
   #timeoutFailures: number[] = [];
   #now: () => number;
+  /** Cases this governor holds for a fixture, and the in-flight writer each waits on. */
+  #heldFor = new Map<string, { fixture: string; writer: string }>();
+  #holdConsumed: boolean;
 
-  constructor(options: { now?: () => number } = {}) {
+  constructor(options: { now?: () => number; holdConsumed?: boolean | undefined } = {}) {
     this.#now = options.now ?? Date.now;
+    this.#holdConsumed = options.holdConsumed ?? governorHoldsConsumed();
   }
 
-  async decide(observation: GovernorObservation): Promise<GovernorAction> {
+  // The second parameter is the `GovernorModel` seam's — the rules never
+  // read a tool result, but a caller (and the test) may pass one.
+  async decide(observation: GovernorObservation, _lastToolResult: string | null = null): Promise<GovernorAction> {
+    // Rule 0 — a fixture can be held by one case at a time (OA-16). A pending
+    // case that names a fixture an in-flight WRITER names is held until that
+    // writer ends; a case held here is released the moment its writer is gone
+    // from the lanes. Any event: the holds must not wait for a blockage.
+    const flying = observation.flyingFacts ?? [];
+    const pending = observation.pendingFacts ?? [];
+    for (const [caseId, held] of this.#heldFor) {
+      if (!flying.some((f) => f.name === held.writer)) {
+        this.#heldFor.delete(caseId);
+        return { kind: 'release', caseId, reason: `"${held.writer}" has ended; fixture ${held.fixture} is free for "${caseId}"` };
+      }
+    }
+    for (const c of pending) {
+      if (this.#heldFor.has(c.name) || !c.fixtures || c.fixtures.length === 0) continue;
+      const writer = flying.find((f) => f.writes && f.name !== c.name && (f.fixtures ?? []).some((x) => c.fixtures!.includes(x)));
+      if (writer === undefined) continue;
+      const fixture = (writer.fixtures ?? []).find((x) => c.fixtures!.includes(x)) as string;
+      this.#heldFor.set(c.name, { fixture, writer: writer.name });
+      return { kind: 'hold', caseId: c.name, reason: `shares fixture ${fixture} with ${writer.name} in flight` };
+    }
     // Rule 2 first — health outranks commentary.
     if (observation.event === 'case-ended') {
+      // A case that ended without passing may have consumed or poisoned the
+      // fixture it named (a hire that took the Position, a delete that
+      // removed the row): the pending cases naming the same fixture are told
+      // once — a note by default, a hold when the operator asked for one
+      // (`WOWLIDATOR_GOVERNOR_HOLD_CONSUMED=1`), because "likely" is not a
+      // verdict and holding on a guess starves a suite.
+      const ended = observation.endedFact;
+      if (ended && (ended.detail ?? '') !== '' && ended.fixtures && ended.fixtures.length > 0) {
+        for (const c of pending) {
+          const shared = (c.fixtures ?? []).find((x) => ended.fixtures!.includes(x));
+          if (shared === undefined) continue;
+          const key = `consumed:${c.name}:${shared}`;
+          if (this.#saidKeys.has(key)) continue;
+          this.#saidKeys.add(key);
+          const reason = `likely blocked: fixture ${shared} consumed/poisoned by ${ended.name} (${ended.detail})`;
+          return this.#holdConsumed ? { kind: 'hold', caseId: c.name, reason } : { kind: 'note', reason: `"${c.name}" ${reason}` };
+        }
+      }
       const last = observation.recentFailures?.[observation.recentFailures.length - 1] ?? '';
       if (/timeout|timed out|Timeout \d+ms exceeded/i.test(last)) {
         const now = this.#now();

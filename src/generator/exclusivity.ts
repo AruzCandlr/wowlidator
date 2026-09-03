@@ -28,6 +28,16 @@
  */
 
 import type { FlowStep } from '../engine/runner.js';
+import { optionSetsIn, sectionOf, type OptionSet } from '../catalog/test-case-table.js';
+
+/**
+ * The option-set grammar (CG-14) is the parser's — `test-case-table.ts` owns
+ * every reading of a sheet cell — and is re-exported here so the prompt,
+ * the lint and the runner import one name from one place. The dependency
+ * runs one way: this module imports the parser, the parser imports nothing
+ * of the generator or the engine, so the leaf stays a leaf.
+ */
+export { optionSetsIn, type OptionSet };
 
 /**
  * Words that make a listing exhaustive. English needs word boundaries; Thai
@@ -60,19 +70,16 @@ export interface ExclusivityClaim {
 }
 
 /**
- * The Expected block of a case's text, or the whole text when it has none.
+ * The Expected block of a case's text, or null when it has none.
  *
- * Same split `expectedItemsIn` (flow-author.ts) uses, so both lints read the
- * same block. `Flow.caseContext` writes the block as "Expected:", the sheet
- * prompt as "Expected output:", the claims file inline as "— expected:".
+ * The parser's `sectionOf` (CG-15), so this lint, `expectedItemsIn`
+ * (flow-author.ts) and the prompt cut the block on ONE list of headings:
+ * `Flow.caseContext` writes it as "Expected:", the sheet prompt as
+ * "Expected output:", the claims file inline as "— expected:", and every
+ * later heading — Note (from the sheet), Option set, Rounds — ends it.
  */
 function expectedBlockOf(text: string): string | null {
-  const at = text.search(/(?:^|—)\s*Expected(?: output)?\s*:/im);
-  if (at === -1) return null;
-  const block = text
-    .slice(at)
-    .split(/^\s*(?:Note|Test data|Steps|Menu path|Login \/ persona|Preconditions|Actual)\b/im)[0];
-  return block ?? null;
+  return sectionOf(text, 'expected');
 }
 
 function enumeratedCount(line: string): number | null {
@@ -122,6 +129,18 @@ export function exclusivityClaimIn(text: string): ExclusivityClaim | null {
     const count = enumeratedCount(line);
     if (count === null) continue;
     return { marker, line, count };
+  }
+  // "แสดงตัวเลือก Benefit Category ครบถ้วน ดังนี้" + one member per line
+  // (PL_04_04, RU_03_06..26): "complete, as follows" is an exclusivity
+  // claim with no marker word on the line and its enumeration BELOW it, so
+  // the line-by-line scan above cannot see it. The parsed option set can
+  // (CG-14): its member count is the size a count must prove.
+  for (const set of optionSetsIn(block)) {
+    if (!set.exact) continue;
+    const size = set.count ?? (set.members.length >= 2 ? set.members.length : null);
+    if (size === null) continue;
+    if (!/ครบถ้วน\s*ดังนี้/u.test(set.line)) continue;
+    return { marker: 'ครบถ้วน ดังนี้', line: set.line, count: size };
   }
   return null;
 }

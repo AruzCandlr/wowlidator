@@ -1181,9 +1181,9 @@ describe('credentials in the panel', () => {
 
   it('both surfaces render a secret as a password input', async () => {
     const { renderWowUi } = await import('../src/ui/wow-ui-html.js');
-    const { renderApp } = await import('../src/ui/app-html.js');
+    const { renderLedger } = await import('../src/ui/ledger-html.js');
     assert.match(renderWowUi(), /type: 'password'/);
-    assert.match(renderApp(), /'secret' \? 'password'/);
+    assert.match(renderLedger(), /'secret' \? 'password'/);
   });
 });
 

@@ -76,19 +76,38 @@ export {
   DEFAULT_CDP_URL,
   DEFAULT_FAST_TIMEOUT_MS,
   DEFAULT_HEALED_TIMEOUT_MS,
+  MAX_STEP_TIMEOUT_MS,
   BrowserGoneError,
+  PersonaUnknownError,
   SessionLostError,
   SmartRunner,
   StepResolutionError,
   isBrowserGone,
+  isStateContradiction,
   executeFlow,
+  resolvePersona,
   runFlow,
+  signsInItself,
+  stepPatience,
   type Flow,
   type FlowStep,
   type RunFlowOptions,
   type ScreenshotMode,
   type SmartRunnerOptions,
+  type StepValueSource,
 } from './engine/runner.js';
+
+// The wave-2 engine helpers (2026-09-03): the deterministic drivers behind
+// selectOption, the calendar rung, expectFieldError, upload/download and the
+// not-found stop, plus the value and date rules every comparator shares.
+export { SessionVault, type StoredSession } from './engine/session-vault.js';
+export { codeAndLabelOf, foldValue, foldedIncludes, foldedMatch, valueEquivalents, type FoldedMatch } from './engine/normalise.js';
+export { dateBuiltin, formatDate, isoDateOf, resolveDateExpression, type DateLocale } from './engine/dates.js';
+export { selectFromListbox, type ListboxSelection, type SelectFromListboxOptions } from './engine/listbox.js';
+export { pickDateInDialog, DateOutOfRangeError, type PickDateResult } from './engine/calendar.js';
+export { readFieldError, readFieldRequired, type FieldError, type FieldRequired } from './engine/field-error.js';
+export { attachFiles, captureDownload, FixtureMissingError, type AttachResult, type CapturedDownload } from './engine/upload.js';
+export { NOT_FOUND_HEADING_PATTERN, notFoundSurface, type NotFoundSurface } from './engine/not-found.js';
 
 export {
   API_STEP_ACTIONS,

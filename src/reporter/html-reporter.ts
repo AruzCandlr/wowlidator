@@ -25,6 +25,20 @@ import { BACKEND_TIER_ACTIONS,
 } from '../engine/proof-bundle.js';
 import { buildVerdict, escalationTrace, type Verdict } from './verdict.js';
 import { describeDbChanges } from '../engine/proof-bundle.js';
+import {
+  RESOLUTION_EXPLANATIONS,
+  describeAgentAction,
+  describeResolution,
+  displayCaseId,
+  observedEvidence,
+  provenanceExtras,
+  recordedCaptures,
+  sheetLabel,
+  stepKindFacts,
+  stepTarget,
+  visibleDetail,
+  type AgentActionLike,
+} from './step-facts.js';
 import type {
   AgentRecord,
   StepDecision,
@@ -249,15 +263,18 @@ function ms(value: number): string {
  * run, not whoever maintains the ladder. `fast` has no label at all: "it
  * worked normally" is not information worth a badge on every green step.
  */
-const RESOLUTION_LABEL: Record<string, string> = {
-  case: 'matched ignoring letter-case',
-  narrow: 're-matched against the page text',
-  late: 'resolved late',
-  cache: 'reused an earlier repair',
-  jit: 'selector auto-repaired',
-  dialog: 'dialog dismissed first',
-  agent: 'agent cleared the way',
-};
+const RESOLUTION_LABEL: Record<string, string> = Object.fromEntries(
+  Object.entries(RESOLUTION_EXPLANATIONS).map(([rung, { label }]) => [rung, label]),
+);
+
+/**
+ * Every resolution's explanation, keyed by its reader-facing label — the
+ * half of the glossary that comes from `step-facts.ts`, so a rung added there
+ * (`reveal`, `scroll`, 2026-09-03) is explained here without a second edit.
+ */
+const RESOLUTION_GLOSSARY: Record<string, string> = Object.fromEntries(
+  Object.values(RESOLUTION_EXPLANATIONS).map(({ label, explanation }) => [label, explanation]),
+);
 
 /**
  * Plain-language expansion for every term of art the report still shows.
@@ -268,20 +285,16 @@ const RESOLUTION_LABEL: Record<string, string> = {
  * exactly the failure this section exists to fix.
  */
 export const GLOSSARY: Record<string, string> = {
+  // Every resolution rung's label, explained — see `RESOLUTION_EXPLANATIONS`.
+  ...RESOLUTION_GLOSSARY,
   'value generated':
     'The sheet left this value as a placeholder or a description, and no test data, document, repository or database source named a real one — so the author invented a well-formed stand-in. The step ran with it; judge the result knowing the input was not the sheet\'s.',
-  'matched ignoring letter-case':
-    'The selector matched once letter-case was ignored. Chrome and Playwright compute accessible names differently when CSS changes text case.',
   'matched as exact text':
     'A text selector that did not match as written, re-matched for free against what the page actually contains: an unquoted substring form narrowed to exact text when it hit several elements, or a quoted exact form relaxed to a substring when the page renders the value with formatting around it (a currency prefix, decimals). Either way the asserted text is on the page; the selector was written tighter or broader than the rendering.',
-  'reused an earlier repair':
-    'A selector repaired on a previous run was reused here, at no cost.',
-  'selector auto-repaired':
-    'The selector in the test did not match; a model proposed a replacement, which was verified to match exactly one element before being used. Worth updating the test.',
-  'dialog dismissed first':
-    'Something was covering the page — a cookie banner, a modal — so it was dismissed and the original selector retried.',
-  'agent cleared the way':
-    'The control was not reachable — behind a closed menu, below the fold, or on a view still loading — so an agent drove the browser until it was, and then the step ran the original selector. The test passed on its own terms; it just could not get there unaided. Add the steps that reveal the control.',
+  'recorded only':
+    'Every Expected line of this case says "record what the system shows" — an open question, not a claim — so nothing was asserted. The values the run captured are listed for a person to compare against the sheet; the case ends in review, never green.',
+  observed:
+    'What the workflow agent READ off the live page during this step, quoted verbatim. An observation is evidence the way a screenshot is; the agent\'s own summary of the leg is a claim.',
   'agent takeover':
     'A model drove the browser directly for this step, deciding one action at a time, rather than the runner following a selector the test supplied.',
   'agent decided':
@@ -391,9 +404,17 @@ function stepBadges(step: ProofStep, afterFailure = false): string {
   }
   // `fast` is deliberately unbadged: every ordinary step resolves that way, so
   // labelling it adds noise to exactly the steps that need no attention.
-  if (step.resolution && step.resolution !== 'fast') {
-    const label = RESOLUTION_LABEL[step.resolution] ?? step.resolution;
-    badges.push(`<span class="badge res-${esc(step.resolution)}">${term(label)}</span>`);
+  // A rung the label map has never heard of still gets a badge under its
+  // own name — with `describeResolution`'s one-line note as its explanation,
+  // so the glossary rule ("no badge without an entry") holds for it too.
+  const resolved = describeResolution(step.resolution);
+  if (resolved !== null) {
+    const label = RESOLUTION_LABEL[step.resolution ?? ''] ?? resolved.label;
+    badges.push(
+      `<span class="badge res-${esc(step.resolution)}">${
+        GLOSSARY[label] ? term(label) : `<abbr title="${esc(resolved.explanation)}">${esc(label)}</abbr>`
+      }</span>`,
+    );
   }
   if (step.agent) badges.push('<span class="badge res-agent">agent takeover</span>');
   if (step.backendHint) badges.push('<span class="badge">visual only</span>');
@@ -646,6 +667,18 @@ function networkBlock(calls: readonly NetworkCall[]): string {
  * separation would let a confident-sounding "I accepted the consent screen"
  * read as proof the step was sound.
  */
+/**
+ * The target cell of one agent turn: what it was aimed at, plus a note when
+ * the action's meaning is not in its target — `save` names the variable it
+ * filled, `signOut` has no selector at all, `read` quotes what it saw. One
+ * formatter for both trace tables, from `step-facts.ts`, so an action the
+ * agent gains later renders with its selector rather than as `—`.
+ */
+function agentTargetCell(a: AgentActionLike): string {
+  const { target, note } = describeAgentAction(a);
+  return `<code>${captured(target)}</code>${note === null ? '' : ` <span class="muted">${captured(note)}</span>`}`;
+}
+
 function decisionBlock(decision: StepDecision): string {
   const rows = decision.actions
     .map(
@@ -653,7 +686,7 @@ function decisionBlock(decision: StepDecision): string {
       <tr class="${a.ok ? '' : 'bad'}">
         <td class="num">${a.index + 1}</td>
         <td><span class="act">${esc(a.action)}</span></td>
-        <td><code>${esc(a.selector ?? a.value ?? '—')}</code></td>
+        <td>${agentTargetCell(a)}</td>
         <td class="reason-cell">${esc(a.reasoning)}${a.error ? `<div class="err">${esc(a.error)}</div>` : ''}</td>
       </tr>`,
     )
@@ -694,7 +727,7 @@ function agentBlock(agent: AgentRecord): string {
       <tr class="${a.ok ? '' : 'bad'}">
         <td class="num">${a.index + 1}</td>
         <td><span class="act">${esc(a.action)}</span></td>
-        <td><code>${esc(a.selector ?? a.value ?? '—')}</code></td>
+        <td>${agentTargetCell(a)}</td>
         <td class="reason-cell">${esc(a.reasoning)}${a.error ? `<div class="err">${esc(a.error)}</div>` : ''}</td>
         <td class="num">${ms(a.durationMs)}</td>
       </tr>`,
@@ -784,6 +817,69 @@ function pageContextBlock(step: ProofStep): string {
         ${step.pageContext.map((line) => `<li>${captured(line)}</li>`).join('')}
       </ul>
     </div>`;
+}
+
+/**
+ * What the workflow agent READ off the page — the evidence of an
+ * observe-and-record leg (OA-14). Quoted verbatim through `captured`, each
+ * with the selector it was read from and the URL it was read at, because
+ * "the agent says the status was Active" and "textbox "Status" held Active
+ * at /en/employees/42" are different amounts of evidence.
+ */
+function observedBlock(step: ProofStep): string {
+  const items = observedEvidence(step);
+  if (items.length === 0) return '';
+  return `
+    <div class="callout observed">
+      <div class="callout-title">${term('observed')} — ${items.length} value${items.length === 1 ? '' : 's'} read off the page</div>
+      <ul class="trace-list">
+        ${items
+          .map(
+            (o) =>
+              `<li><code>${captured(o.text)}</code>${o.selector ? `<span class="trace-detail">from ${captured(o.selector)}${o.url ? ` at ${esc(o.url)}` : ''}</span>` : o.url ? `<span class="trace-detail">at ${esc(o.url)}</span>` : ''}</li>`,
+          )
+          .join('')}
+      </ul>
+    </div>`;
+}
+
+/**
+ * The labelled facts a step kind carries beyond its selector — the
+ * alternatives of an `expectAnyVisible`, the files of an `upload`, the
+ * persona of a `signIn`, the author's own timeout. Always visible, like the
+ * comparison line: they ARE what the step was, and a step whose facts hide
+ * inside a collapsed body reads as an empty row.
+ */
+function stepFactsLine(step: ProofStep): string {
+  const facts = stepKindFacts(step);
+  if (facts.length === 0) return '';
+  return `<p class="step-facts">${facts
+    .map((f) => `<span class="fact"><span class="fact-k">${esc(f.label)}</span> ${captured(f.value).replace(/\n/g, '<br/>')}</span>`)
+    .join('')}</p>`;
+}
+
+/**
+ * A case the sheet gave no oracle for (CG-09): every Expected line said
+ * "record what the system shows", so the run asserted nothing and ends in
+ * review with what it captured. The captures ARE the deliverable — listed
+ * up front, before the timeline, where a reader comparing them to the
+ * sheet's open question looks first. Never green: a review colour of its own.
+ */
+function recordOnlyBlock(bundle: ProofBundle): string {
+  if (!provenanceExtras(bundle).recordOnly) return '';
+  const captures = recordedCaptures(bundle);
+  return `
+  <section class="verdict record-only">
+    <h2 class="verdict-headline">${term('recorded only')} — ${captures.length} value${captures.length === 1 ? '' : 's'} captured for review</h2>
+    <p class="verdict-line">The sheet's Expected lines record what the system shows rather than stating what it must show, so this run asserted nothing and a person must compare the captures below against the sheet.</p>
+    ${
+      captures.length === 0
+        ? '<p class="verdict-line muted">No values were captured — the case has nothing to hand a reviewer.</p>'
+        : `<dl class="kv wide">${captures
+            .map((c) => `<div><dt>${esc(c.name)}</dt><dd><code>${captured(c.value)}</code></dd></div>`)
+            .join('')}</dl>`
+    }
+  </section>`;
 }
 
 /**
@@ -979,17 +1075,17 @@ function polarityPill(bundle: ProofBundle): string {
 }
 
 function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): string {
-  const target = step.resolvedSelector ?? step.selector;
-  // `intent` gets its own dedicated line — don't also dump it into the generic
-  // detail list, that would just repeat the same sentence twice.
-  // `intent`, `expected` and `actual` each get a dedicated line — don't also
-  // dump them into the generic detail list, that would repeat them verbatim.
-  const detail = step.detail
-    ? Object.entries(step.detail).filter(
-        ([k, v]) => (k !== 'intent' || typeof v !== 'string') && k !== 'expected' && k !== 'actual',
-      )
-    : [];
+  // The resolved selector, the authored one, or — for a kind with no single
+  // selector (`expectAnyVisible`, `signIn`, `upload`) — what the record says
+  // it was aimed at. `—` only when the step truly names nothing (a `goto`).
+  const target = stepTarget(step);
+  // `intent`, `expected`, `actual`, the kind facts and the observations each
+  // get a dedicated line — the generic dump repeats none of them, and drops
+  // every credential-shaped key (a `signIn` records the persona it resolved;
+  // the report shows the label and never the address). See `visibleDetail`.
+  const detail = visibleDetail(step);
   const compare = expectedActualLine(step);
+  const facts = stepFactsLine(step);
 
   // Intent leads. A reader triaging a red run needs "what was this step for"
   // before "which selector expressed it"; the selector is one line down, and
@@ -1007,6 +1103,7 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
       <span class="chev" aria-hidden="true">&#9662;</span>
     </button>
     <p class="step-sub"><span class="action">${esc(step.action)}</span> <code class="target">${captured(target ?? '—')}</code>${step.target ? ` <span class="target-what" title="what the selector resolved to, read from the live element">→ ${captured(describeTarget(step.target) ?? '')}</span>` : ''}</p>
+    ${facts}
     ${compare}
     <div class="step-body" hidden>
       ${step.unsure ? `<div class="callout unsure"><div class="callout-title">Proved-? — a human must rule on this step</div><pre>${captured(step.unsure)}</pre></div>` : ''}
@@ -1032,6 +1129,7 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
       ${step.dialog ? dialogBlock(step.dialog) : ''}
       ${step.decision ? decisionBlock(step.decision) : ''}
       ${step.agent ? agentBlock(step.agent) : ''}
+      ${observedBlock(step)}
       ${step.snapshot ? snapshotBlock(step) : ''}
       ${step.dataCases ? dataBlock(step.dataCases) : ''}
       ${step.dataRetry ? dataRetryBlock(step.dataRetry) : ''}
@@ -1040,6 +1138,13 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
         <div><dt>url</dt><dd><code>${esc(step.url ?? '—')}</code></dd></div>
         <div><dt>authored selector</dt><dd><code>${esc(step.selector ?? '—')}</code></dd></div>
         <div><dt>resolved selector</dt><dd><code>${esc(step.resolvedSelector ?? '—')}</code></dd></div>
+        ${(() => {
+          const how = describeResolution(step.resolution);
+          return how === null ? '' : `<div><dt>resolved via</dt><dd>${esc(step.resolution ?? '')} — ${esc(how.label)}</dd></div>`;
+        })()}
+        ${stepKindFacts(step)
+          .map((f) => `<div><dt>${esc(f.label)}</dt><dd><code>${captured(f.value)}</code></dd></div>`)
+          .join('')}
         ${step.target ? `<div><dt>target</dt><dd>${captured(describeTarget(step.target) ?? '')}${step.screenshot ? ' <span class="muted">(outlined in red in the screenshot)</span>' : ''}</dd></div>` : ''}
         ${describeValueSource(step) ? `<div><dt>value</dt><dd>${esc(describeValueSource(step) ?? '')}</dd></div>` : ''}
         ${describeDbChanges(step.dbChanges).map((line) => `<div><dt>db</dt><dd>${esc(line)}</dd></div>`).join('')}
@@ -1121,6 +1226,16 @@ h1{font-size:21px;margin:0;font-weight:650;letter-spacing:-.01em}
 .step-compare{margin:2px 0 0;font-size:12px;color:var(--muted)}
 .step-compare code{font-size:12px}
 .step-compare .cmp-bad{color:var(--bad)}
+.step-facts{margin:-4px 0 0;padding:0 16px 8px 46px;font-size:12px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap}
+.step-facts .fact-k{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin-right:4px}
+.callout.observed{background:var(--agent-bg);border:1px solid color-mix(in srgb,var(--agent) 30%,transparent)}
+.callout.observed .callout-title{color:var(--agent)}
+.verdict.record-only{border-left-color:var(--info)}
+.verdict.record-only .verdict-headline{color:var(--info);font-size:15px}
+.sheet-id{font-size:11.5px;color:var(--muted);margin-left:8px}
+.sheet-id code{font-size:11.5px}
+.sheet-tag{display:inline-block;font-size:10.5px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;
+  padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted);margin-left:8px}
 .cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));margin-bottom:28px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
 .card .v{font-size:24px;font-weight:650;letter-spacing:-.02em}
@@ -1655,6 +1770,13 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
        </div>`
     : '';
 
+  // The sheet-side identity of a catalog case: the sheet's own spelling of
+  // the id when the run qualified it (CG-04), the sheet and category the row
+  // came from, and what the sheet itself recorded. Read structurally — see
+  // `provenanceExtras` — so the header is right the day the stamp lands.
+  const extras = provenanceExtras(bundle);
+  const caseId = displayCaseId(bundle.name.split(/\s+/)[0] ?? bundle.name, extras.sheetCaseId);
+  const sheetTag = sheetLabel(extras);
   const provenance = bundle.generatedBy
     ? `<div class="prov">
          <div class="callout-title">Autonomously generated</div>
@@ -1663,6 +1785,10 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
            <div><dt>model</dt><dd>${esc(bundle.generatedBy.model)}</dd></div>
            <div><dt>source page</dt><dd><code>${esc(bundle.generatedBy.sourceUrl)}</code></dd></div>
            <div><dt>generated</dt><dd>${esc(bundle.generatedBy.generatedAt)}</dd></div>
+           ${extras.sheet ? `<div><dt>sheet</dt><dd>${captured(extras.sheet)}</dd></div>` : ''}
+           ${extras.category ? `<div><dt>category</dt><dd>${captured(extras.category)}</dd></div>` : ''}
+           ${caseId.qualified ? `<div><dt>sheet case id</dt><dd><code>${captured(caseId.shown)}</code> <span class="muted">(run as ${esc(caseId.qualified)})</span></dd></div>` : ''}
+           ${extras.sheetVerdict ? `<div><dt>sheet recorded</dt><dd>${esc(extras.sheetVerdict)}</dd></div>` : ''}
          </dl>
          <p class="reason">${esc(bundle.generatedBy.rationale)}</p>
        </div>`
@@ -1680,7 +1806,11 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
 <div class="wrap">
   <header class="top">
     <div>
-      <h1>${esc(bundle.name)}</h1>
+      <h1>${esc(bundle.name)}${
+        caseId.qualified
+          ? `<span class="sheet-id" title="the sheet's own spelling of this case id — the run qualified it because the id repeats across or within sheets">sheet id <code>${captured(caseId.shown)}</code></span>`
+          : ''
+      }${sheetTag ? `<span class="sheet-tag" title="the workbook sheet and category this case came from">${captured(sheetTag)}</span>` : ''}</h1>
       <div class="sub">
         run <code>${esc(bundle.runId)}</code> &middot; ${esc(bundle.startedAt)}
         ${bundle.cdpUrl ? ` &middot; ${esc(bundle.cdpUrl)}` : ''}
@@ -1691,6 +1821,7 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
   </header>
 
   ${verdictBlock(verdict)}
+  ${recordOnlyBlock(bundle)}
 
   <section class="cards headline-cards">
     ${headlineCards.map((c) => `<div class="card"><div class="v">${esc(c.v)}</div><div class="k">${esc(c.k)}</div><div class="note">${esc(c.note)}</div></div>`).join('')}

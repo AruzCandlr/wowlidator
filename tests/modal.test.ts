@@ -290,3 +290,26 @@ describe('automatic blocking-dialog recovery (CDP)', { skip: skipBrowser }, () =
     assert.equal(defect?.severity, 'medium');
   });
 });
+
+// --- Dismiss vocabulary (EH-02, 2026-09-03) — pure, runs always ---------------
+
+describe('dismiss names: neutral vs affirmative, Thai included', () => {
+  it('keeps confirming words out of the neutral family the automatic rung uses', async () => {
+    const { AFFIRMATIVE_DISMISS_NAME_PATTERN, NEUTRAL_DISMISS_NAME_PATTERN, DISMISS_NAME_PATTERN, dialogIsIntendedContext } =
+      await import('../src/engine/modal.js');
+    for (const neutral of ['Close', 'Cancel', 'Dismiss', 'ปิด', 'ยกเลิก', 'ย้อนกลับ']) {
+      assert.ok(NEUTRAL_DISMISS_NAME_PATTERN.test(neutral), neutral);
+      assert.ok(!AFFIRMATIVE_DISMISS_NAME_PATTERN.test(neutral), neutral);
+    }
+    for (const affirmative of ['OK', 'Continue', 'Accept all', 'ตกลง', 'รับทราบ', 'ยอมรับ']) {
+      assert.ok(AFFIRMATIVE_DISMISS_NAME_PATTERN.test(affirmative), affirmative);
+      assert.ok(!NEUTRAL_DISMISS_NAME_PATTERN.test(affirmative), affirmative);
+      assert.ok(DISMISS_NAME_PATTERN.test(affirmative), 'an explicit closeModal still searches both');
+    }
+    assert.ok(!DISMISS_NAME_PATTERN.test('ยืนยันการปฏิเสธ'), 'a confirm-decline button is never a dismiss');
+    // A fill inside the modal the flow opened is context, not a blocker.
+    assert.ok(dialogIsIntendedContext('fill'));
+    assert.ok(dialogIsIntendedContext('selectOption'));
+    assert.ok(!dialogIsIntendedContext('goto'));
+  });
+});

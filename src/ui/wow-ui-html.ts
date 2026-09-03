@@ -216,6 +216,9 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .chip.doubt { background: var(--warn-bg); color: var(--warn); border: 1px dashed var(--warn); }
 .chip.escalated { background: var(--bad-bg); color: var(--bad); }
 .chip.blocked { background: var(--warn-bg); color: var(--warn); }
+/* Recorded only: its own colour — never the green of a proof; the case
+   claimed nothing and a person reads its captures. */
+.chip.record { background: var(--info-bg); color: var(--info); border: 1px dashed var(--info); }
 .chip.plain { background: var(--panel-2); color: var(--muted); }
 .badge {
   font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
@@ -794,15 +797,21 @@ function accuracyOf(items) {
     var key = (x && x.name) || (x && x.runId) || '';
     if (!seen[key]) { seen[key] = true; cases.push(x); }
   });
-  var agreed = 0, scored = 0, unscored = 0;
+  var agreed = 0, scored = 0, unscored = 0, sheetBlocked = 0;
   cases.forEach(function (x) {
     var known = x.generatedBy && x.generatedBy.knownResult;
+    /* The sheet's own Blocked / Pending deploy (knownResult 'blocked', CG-01):
+       a row the sheet could not score either — disclosed, never counted on
+       either side. */
+    if (known === 'blocked') { sheetBlocked += 1; unscored += 1; return; }
     if (known !== 'passed' && known !== 'failed') { unscored += 1; return; }
     scored += 1;
     var v = verdictKindOf(x);
-    if ((v === 'passed' && known === 'passed') || (v === 'failed' && known === 'failed')) agreed += 1;
+    /* verdictKindOf says 'testFailed', never 'failed' — the earlier spelling
+       here meant a correctly caught bug never counted as agreement. */
+    if ((v === 'passed' && known === 'passed') || (v === 'testFailed' && known === 'failed')) agreed += 1;
   });
-  return { agreed: agreed, scored: scored, unscored: unscored, percent: scored === 0 ? 0 : Math.round(agreed / scored * 100) };
+  return { agreed: agreed, scored: scored, unscored: unscored, sheetBlocked: sheetBlocked, percent: scored === 0 ? 0 : Math.round(agreed / scored * 100) };
 }
 
 /* "accuracy 40% (39/98 vs sheet · 10 unscored)". Shown only when the sheet
@@ -819,7 +828,7 @@ function accuracyLine(items) {
   var span = el('span', { class: a.percent === 100 ? 'ok' : '' });
   span.appendChild(document.createTextNode('accuracy '));
   span.appendChild(el('b', { text: a.percent + '%' }));
-  span.appendChild(document.createTextNode(' (' + a.agreed + '/' + a.scored + ' vs sheet' + (a.unscored > 0 ? ' · ' + a.unscored + ' unscored' : '') + ')'));
+  span.appendChild(document.createTextNode(' (' + a.agreed + '/' + a.scored + ' vs sheet' + (a.unscored > 0 ? ' · ' + a.unscored + ' unscored' : '') + (a.sheetBlocked > 0 ? ' · ' + a.sheetBlocked + ' sheet-blocked' : '') + ')'));
   node.appendChild(span);
   return node;
 }
@@ -1063,6 +1072,37 @@ function tail(path) {
 /* The sheet's wording vs the page's rendering — a BA call, not a machine
    verdict (EN-2: 29 of 31 real QA fails were this class). Rendered wherever
    the run is listed, so triage can filter for it. */
+/* The sheet's own spelling of the case id when the run qualified it (CG-04:
+   BE:PL_03_01 runs as one case, the sheet still says PL_03_01) — so a reader
+   holding the workbook finds the row, and the qualified id a --rerun-case
+   needs stays in the task name beside it. */
+function sheetIdTag(card) {
+  var g = card && card.generatedBy;
+  if (!g || !g.sheetCaseId) return null;
+  var id = caseIdOf(card.name);
+  if (!id || g.sheetCaseId === id) return null;
+  return el('span', {
+    class: 'chip plain mono', style: 'margin-left:6px',
+    title: 'the sheet\'s own spelling of this case id — the run qualified it to ' + id + ' because the id repeats across or within sheets',
+    text: 'sheet id ' + g.sheetCaseId
+  });
+}
+
+/* The workbook sheet and category the row came from ("EC · Hiring"). */
+function sheetTag(card) {
+  var g = card && card.generatedBy;
+  if (!g) return null;
+  var parts = [];
+  if (g.sheet) parts.push(g.sheet);
+  if (g.category) parts.push(g.category);
+  if (parts.length === 0) return null;
+  return el('span', {
+    class: 'chip plain', style: 'margin-left:6px',
+    title: 'the workbook sheet and category this case came from',
+    text: parts.join(' · ')
+  });
+}
+
 function specTag(specQuestion) {
   if (!specQuestion) return null;
   return el('span', {
@@ -1127,8 +1167,23 @@ function agentActionLog(acts) {
     var value = a.value
       ? ' = ' + (/password|passwd|pwd/i.test(a.selector || '') ? '\u2022\u2022\u2022\u2022 (' + a.value.length + ' chars)' : JSON.stringify(a.value))
       : '';
+    /* The two actions the agent gained on the humi benchmark (mirrors
+       describeAgentAction in reporter/step-facts.ts): "save" puts a value
+       the page shows into the run's variables \u2014 its "value" is the VARIABLE
+       NAME, not something typed \u2014 and "signOut" ends the session with no
+       selector at all. An action this log has never heard of still prints
+       with its selector; only its meaning is left to the reasoning line. */
+    if (a.action === 'save') {
+      target = (a.selector || '') + (a.value ? ' \u2192 {{' + a.value + '}}' : '');
+      value = '';
+    } else if (a.action === 'signOut') {
+      target = target || 'the current session';
+      value = '';
+    }
+    var observed = typeof a.observed === 'string' && a.observed !== '' ? '\n     observed ' + JSON.stringify(a.observed) : '';
     return (a.ok ? '\u2713' : '\u2717') + ' ' + (i + 1) + '. ' + a.action + ' ' + target + value +
       (a.durationMs !== undefined && a.durationMs !== null ? ' (' + fmtMs(a.durationMs) + ')' : '') +
+      observed +
       (a.reasoning ? '\n     ' + a.reasoning : '') +
       (a.error ? '\n     FAILED: ' + String(a.error).split('\n')[0] : '');
   }).join('\n');
@@ -1136,7 +1191,8 @@ function agentActionLog(acts) {
 
 function stepClaim(step) {
   if (step.intent) return step.intent;
-  return step.action + (step.selector ? ' ' + step.selector : '');
+  var target = stepTargetOf(step);
+  return step.action + (target ? ' ' + target : '');
 }
 
 /**
@@ -1894,6 +1950,10 @@ function taskRow(task) {
   else if (latest.status === 'needs-review' && !latest.review) chip = verdictChip('doubt', 'proved-? · confirm below');
   else if (latest.status === 'needs-review' && latest.review) chip = verdictChip(latestEff === 'passed' ? 'verified' : 'feedback', latestEff === 'passed' ? 'proved (human-confirmed)' : 'failed (human-confirmed)');
   else if (escalated) chip = verdictChip('escalated', 'needs a human');
+  /* A record-only case (CG-09): every Expected line said "record what the
+     system shows", so the run asserted nothing and is judged by its
+     captures. Its own colour — never the green of a proof. */
+  else if (latest.generatedBy && latest.generatedBy.recordOnly) chip = verdictChip('record', 'recorded only');
   else if (latest.status === 'passed-with-issues') chip = verdictChip('doubt', 'pass**');
   else if (!isPassing(latest.status)) chip = familyChip(latest.status);
   else if (latest.quarantined) chip = verdictChip('blocked', 'quarantined');
@@ -2005,6 +2065,8 @@ function taskRow(task) {
     el('div', { class: 'task-cell' }, [
       el('div', { class: 'task-name' }, [
         document.createTextNode(task.name),
+        sheetIdTag(latest),
+        sheetTag(latest),
         polarityTag(latest.polarity, latest.polaritySource),
         riskTag(latest.risk),
         specTag(latest.specQuestion)
@@ -2736,7 +2798,10 @@ function checksTable(bundle) {
     }
 
     var how = el('td', { style: 'color:var(--muted)' });
-    var repro = step.resolvedSelector || step.selector ||
+    /* stepTargetOf, not step.selector: an either/or assertion has a LIST of
+       selectors, a sign-in a persona, an upload its file names — and a row
+       whose selector cell reads "—" for those is the empty row. */
+    var repro = stepTargetOf(step) ||
       (step.request ? step.request.method + ' ' + step.request.url : null);
     how.appendChild(repro ? el('code', { text: repro }) : document.createTextNode('—'));
     if (failedCalls.length > 0) {
@@ -2938,23 +3003,44 @@ function evidenceError(panel, bundle, step) {
   var kv = el('div', {});
   [
     ['action', step.action],
-    ['selector as written', step.selector || '—'],
-    ['selector that resolved', step.resolvedSelector || '—'],
+    ['selector as written', step.selector || stepTargetOf(step) || '—'],
+    ['selector that resolved', step.resolvedSelector || '—']
+  ].concat(
+    /* The kind's own facts — an either/or's alternatives, an upload's file
+       NAMES, a sign-in's persona LABEL, the author's timeout — as rows, so a
+       step with no single selector is still a step a reader can read. */
+    stepFactsOf(step).map(function (f) { return [f.label, f.value]; })
+  ).concat([
     /* What the selector WAS on the page — role, name, box — read live at the
        step; the step's screenshot outlines exactly this box in red. */
     ['target', describeTarget(step.target)],
     /* Where the typed value came from when the sheet did not state it; a
        GENERATED value is the author's stand-in and the reader must know. */
     ['value', describeValueSource(step)],
-    ['rung', step.resolution || 'no selector to resolve'],
+    ['rung', resolutionNote(step.resolution)],
     ['took', fmtMs(step.durationMs)],
     ['page', step.url || '—']
-  ].forEach(function (pair) {
+  ]).forEach(function (pair) {
     /* A fact the step does not have is left out, not printed as "null". */
     if (pair[1] === null || pair[1] === undefined) return;
     kv.appendChild(el('div', { class: 'kv' }, [el('b', { text: pair[0] + ': ' }), document.createTextNode(String(pair[1]))]));
   });
   panel.appendChild(kv);
+
+  /* What the agent READ off the page on an observe-and-record leg — the
+     evidence such a leg has (OA-14), quoted verbatim with where it was read. */
+  var observed = observedOf(step);
+  if (observed.length > 0) {
+    panel.appendChild(el('div', { class: 'cap', text: 'Observed — ' + observed.length + ' value(s) read off the page' }));
+    var obsBox = el('div', {});
+    observed.forEach(function (o) {
+      obsBox.appendChild(el('div', { class: 'kv' }, [
+        el('code', { text: o.text }),
+        document.createTextNode((o.selector ? ' from ' + o.selector : '') + (o.url ? ' at ' + o.url : ''))
+      ]));
+    });
+    panel.appendChild(obsBox);
+  }
 
   var dbLines = describeDbChanges(step.dbChanges);
   if (dbLines.length > 0 || step.dbProbeError) {
@@ -2965,9 +3051,13 @@ function evidenceError(panel, bundle, step) {
     panel.appendChild(dbBox);
   }
 
-  if (step.detail && Object.keys(step.detail).length > 0) {
+  /* Never a credential: the dump drops every credential-shaped key (a signIn
+     records the persona it resolved; the panel shows the label, above, and
+     never the address). Mirrors visibleDetail in reporter/step-facts.ts. */
+  var recorded = redactedDetail(step);
+  if (Object.keys(recorded).length > 0) {
     panel.appendChild(el('div', { class: 'cap', text: 'What the step recorded' }));
-    panel.appendChild(el('div', { class: 'repro', text: JSON.stringify(step.detail, null, 2) }));
+    panel.appendChild(el('div', { class: 'repro', text: JSON.stringify(recorded, null, 2) }));
   }
 }
 
@@ -2999,6 +3089,136 @@ function describeTarget(t) {
   var label = t.name || t.text;
   var out = label ? what + ' ' + JSON.stringify(label) : what;
   if (t.box) out += ' \u00b7 ' + t.box.width + '\u00d7' + t.box.height + ' at (' + t.box.x + ',' + t.box.y + ')';
+  return out;
+}
+
+/* ---- the step-kind facts, mirrored from reporter/step-facts.ts ----------
+   The four step kinds the harness gained on the humi benchmark (2026-09-03)
+   have no single selector: expectAnyVisible (a list), expectFieldError (a
+   field and the message under it), upload (files), signIn (a persona). Each
+   mirror below reads the same record fields the reporter does, so the panel
+   and the report cannot disagree about what a step WAS. Two rules travel
+   with them: never a credential (a persona is its LABEL; an address is
+   withheld), never file contents (names only). */
+var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+var CONTAINS_EMAIL_RE = /[^\s@"']+@[^\s@"']+\.[^\s@"']+/;
+var CREDENTIAL_KEY_RE = /password|passwd|pwd|secret|token|credential|signedIn|personas|^email$|^as$/i;
+function namesOf(value) {
+  if (!Array.isArray(value)) return typeof value === 'string' && value !== '' ? [value] : [];
+  var out = [];
+  value.forEach(function (v) {
+    if (typeof v === 'string') { if (v !== '') out.push(v); return; }
+    if (v && typeof v === 'object') {
+      var n = typeof v.name === 'string' ? v.name : typeof v.path === 'string' ? v.path : typeof v.selector === 'string' ? v.selector : null;
+      if (n) out.push(n);
+    }
+  });
+  return out;
+}
+function fileNameOf(path) {
+  var cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  return cut === -1 ? path : path.slice(cut + 1);
+}
+function anyVisibleSelectorsOf(step) {
+  var d = step.detail || {};
+  var listed = namesOf(d.selectors);
+  if (listed.length > 0) return listed;
+  var joined = step.selector || '';
+  if (joined.indexOf(' | ') >= 0) return joined.split(' | ').map(function (s) { return s.trim(); }).filter(function (s) { return s !== ''; });
+  return joined === '' ? [] : [joined];
+}
+function uploadedFileNamesOf(step) {
+  var d = step.detail || {};
+  var listed = namesOf(d.files);
+  var named = listed.length > 0 ? listed : namesOf(d.fileNames || d.file);
+  return named.map(fileNameOf);
+}
+function signInPersonaOf(step) {
+  var d = step.detail || {};
+  var raw = d.as || d.persona || d.personaLabel;
+  if (typeof raw !== 'string' || raw === '') return null;
+  return EMAIL_RE.test(raw) ? 'an account named by its email (withheld from the panel)' : raw;
+}
+/* What the step was aimed at: the resolved selector, the authored one, or
+   the record's own account for a kind with none. Null for a goto. */
+function stepTargetOf(step) {
+  var selector = step.resolvedSelector || step.selector || null;
+  if (selector) return selector;
+  if (step.action === 'expectAnyVisible') { var s = anyVisibleSelectorsOf(step); return s.length ? s.join(' | ') : null; }
+  if (step.action === 'signIn') { var p = signInPersonaOf(step); return p ? 'persona ' + p : null; }
+  if (step.action === 'upload') { var f = uploadedFileNamesOf(step); return f.length ? f.join(', ') : null; }
+  return null;
+}
+function stepFactsOf(step) {
+  var d = step.detail || {};
+  var facts = [];
+  if (step.action === 'expectAnyVisible') {
+    var sels = anyVisibleSelectorsOf(step);
+    if (sels.length) facts.push({ label: 'any of', value: sels.map(function (s, i) { return (i + 1) + '. ' + s; }).join('  ') });
+    var matched = d.matched || d.visible || d.satisfiedBy;
+    if (typeof matched === 'string' && matched !== '') facts.push({ label: 'satisfied by', value: matched });
+  } else if (step.action === 'expectFieldError') {
+    if (step.selector) facts.push({ label: 'field', value: step.selector });
+    var via = d.via || d.readVia;
+    if (typeof via === 'string' && via !== '') facts.push({ label: 'message read via', value: via });
+  } else if (step.action === 'upload') {
+    var files = uploadedFileNamesOf(step);
+    if (files.length) facts.push({ label: files.length === 1 ? 'file' : 'files', value: files.join(', ') });
+    var attached = d.via || d.attachedVia;
+    if (typeof attached === 'string' && attached !== '') facts.push({ label: 'attached via', value: attached });
+  } else if (step.action === 'signIn') {
+    var persona = signInPersonaOf(step);
+    if (persona) facts.push({ label: 'persona', value: persona });
+  }
+  if (typeof d.timeoutMs === 'number' && isFinite(d.timeoutMs) && d.timeoutMs > 0) {
+    facts.push({ label: 'timeout', value: (d.timeoutMs >= 1000 ? (d.timeoutMs / 1000).toFixed(d.timeoutMs % 1000 === 0 ? 0 : 1) + 's' : Math.round(d.timeoutMs) + 'ms') + ' (set by the author)' });
+  }
+  return facts;
+}
+/* The rung by name, then what it did — reveal and scroll explain themselves. */
+var RESOLUTION_NOTES = {
+  'case': 'matched ignoring letter-case',
+  narrow: 're-matched against the page text',
+  reveal: 'a collapsed section was opened first, then the author\'s own selector re-run',
+  scroll: 'scrolled clear of a fixed bar that intercepted the pointer, then the same selector acted',
+  kin: 'the claim held against the control\'s container (a label whose value sits beside it)',
+  'agent-read': 'the agent pointed at the answer; the harness re-ran the author\'s comparison',
+  late: 'resolved late — given the longer healed window',
+  cache: 'reused an earlier repair',
+  jit: 'selector auto-repaired by a model, verified to one element',
+  dialog: 'a dialog was dismissed first',
+  agent: 'the agent cleared the way, then the original selector ran'
+};
+function resolutionNote(resolution) {
+  if (!resolution) return 'no selector to resolve';
+  if (resolution === 'fast') return 'fast';
+  return resolution + (RESOLUTION_NOTES[resolution] ? ' — ' + RESOLUTION_NOTES[resolution] : '');
+}
+/* What the agent read off the page (detail.observed, else the record's own
+   observations) — {selector, text, url}, strings accepted too. */
+function observedOf(step) {
+  var raw = step.detail && Array.isArray(step.detail.observed) ? step.detail.observed
+    : step.agent && Array.isArray(step.agent.observations) ? step.agent.observations : [];
+  var out = [];
+  raw.forEach(function (o) {
+    if (typeof o === 'string') { if (o !== '') out.push({ selector: null, text: o, url: null }); return; }
+    if (!o || typeof o !== 'object') return;
+    var text = typeof o.text === 'string' ? o.text : typeof o.value === 'string' ? o.value : '';
+    if (text === '') return;
+    out.push({ selector: typeof o.selector === 'string' && o.selector !== '' ? o.selector : null, text: text, url: typeof o.url === 'string' && o.url !== '' ? o.url : null });
+  });
+  return out;
+}
+/* The generic detail dump minus every credential-shaped key, and on a signIn
+   minus any string that is an email whatever its key. */
+function redactedDetail(step) {
+  var out = {};
+  var d = step.detail || {};
+  Object.keys(d).forEach(function (k) {
+    if (CREDENTIAL_KEY_RE.test(k)) return;
+    if (step.action === 'signIn' && typeof d[k] === 'string' && CONTAINS_EMAIL_RE.test(d[k])) return;
+    out[k] = d[k];
+  });
   return out;
 }
 
@@ -3352,10 +3572,19 @@ function renderHistory(main) {
  */
 function groupHeader(group, runs) {
   var shut = !!S.shutGroups[group.id];
-  var passed = 0, failed = 0, quarantined = 0;
+  /* Four buckets, counted APART (mirrors RunGroup in ui/proofs.ts): the
+     subject failed the case; a person still has to rule (proved-? or
+     recorded only); the harness alone broke and delivered no verdict. The
+     first cut lumped the last two under "failed", and a catalog whose
+     harness fell over on twenty rows read as twenty product defects. */
+  var passed = 0, failed = 0, review = 0, noVerdict = 0, quarantined = 0;
   runs.forEach(function (r) {
     if (r.quarantined) { quarantined += 1; return; }
-    if (isPassing(r.status)) passed += 1; else failed += 1;
+    var k = verdictKindOf(r);
+    if (k === 'passed') passed += 1;
+    else if (k === 'needsReview') review += 1;
+    else if (k === 'systemError') noVerdict += 1;
+    else failed += 1;
   });
   var sub = group.kind + ' · ' + runs.length + ' run' + (runs.length === 1 ? '' : 's');
   if (group.authoredAt) sub += ' · authored ' + shortTime(group.authoredAt);
@@ -3376,6 +3605,8 @@ function groupHeader(group, runs) {
       el('b', { class: passed === runs.length ? 'ok' : '', text: String(passed) }),
       document.createTextNode(' passed'),
       failed ? el('b', { class: 'bad', text: ' · ' + failed + ' failed' }) : document.createTextNode(''),
+      review ? el('b', { class: 'info', title: 'awaiting a person: a wording near-miss to rule on, or a record-only case judged by its captures', text: ' · ' + review + ' awaiting review' }) : document.createTextNode(''),
+      noVerdict ? el('b', { class: 'warn', title: 'the harness or its models broke; nothing was learned about the application', text: ' · ' + noVerdict + ' no verdict' }) : document.createTextNode(''),
       group.defects ? el('span', { class: 'muted', text: ' · ' + group.defects + ' defect(s)' }) : document.createTextNode(''),
       document.createTextNode(' · '),
       tallyLine(tallyOf(runs), runs.length),

@@ -64,8 +64,14 @@ function flatten(list: readonly FlowStep[]): FlowStep[] {
   );
 }
 
-/** Word-bounded delete talk in a workflow goal — the one prose read, and it only ever NARROWS. */
-const DELETE_VERB = /\b(delet(e|es|ing)|remov(e|es|ing)|purg(e|es|ing)|drop(s|ping)?)\b/i;
+/**
+ * Delete talk in a workflow goal — the one prose read, and it only ever
+ * NARROWS. Word-bounded in English; the Thai alternation (`ลบ` delete,
+ * `นำออก` remove) sits outside the `\b` because Thai has no ASCII word
+ * boundaries (CG-16: a "ลบ Plan" goal read as a reader and shared the pool
+ * with the case counting that plan).
+ */
+const DELETE_VERB = /\b(delet(e|es|ing)|remov(e|es|ing)|purg(e|es|ing)|drop(s|ping)?)\b|ลบ|นำออก/iu;
 
 /** The `/en/admin/benefits/plans` → `route:admin/benefits` family key, or `*`. */
 export function routeSectionOf(url: string): string | null {

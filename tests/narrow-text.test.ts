@@ -239,10 +239,17 @@ describe('narrow-text resolution (CDP)', { skip: skipBrowser }, () => {
       healer: null,
     });
 
-    // A selector no rung could resolve is a dead end, not a plain failure —
-    // the distinction the ladder already draws. The point here is only that
-    // narrowing did not turn absence into a pass.
-    assert.equal(bundle.status, 'dead-end');
+    // The point here is only that narrowing did not turn absence into a pass.
+    // Since the absence stop rung (EH-06, enhancedX) text that is nowhere in
+    // the page is a FAILED verdict rather than a dead end — the ladder stops
+    // because it has read the page and answered, not because it ran out of
+    // things to try — so either status satisfies this test, and a pass never
+    // does.
+    assert.notEqual(bundle.status, 'passed');
+    assert.ok(
+      bundle.status === 'failed' || bundle.status === 'dead-end',
+      `absence must be a verdict, got ${bundle.status}`,
+    );
     const step = bundle.steps.find((s) => s.action === 'expectText');
     assert.equal(step?.resolution, null);
   });

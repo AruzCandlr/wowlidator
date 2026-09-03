@@ -36,6 +36,8 @@ import { access, constants } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 
+import { poolMember } from './pool.js';
+
 const run = promisify(execFile);
 
 export const DEFAULT_CHROME_PROFILE = '/tmp/wowlidator-chrome-profile';
@@ -358,6 +360,42 @@ export async function ensureChrome(options: EnsureOptions): Promise<EnsureResult
   }
   await ensureTab(cdpUrl);
   return { status: 'started', cdpUrl, startedByUs: true, message: `started Chrome on port ${port}` };
+}
+
+/** One browser of a pool, with where it lives so it can be stopped later. */
+export interface PoolMember extends EnsureResult {
+  profile: string;
+}
+
+/**
+ * A pool of browsers for a parallel run — the primary on `options.cdpUrl`
+ * plus `count - 1` more on the ports after it, each on its own profile
+ * (`poolMember`). Every member goes through `ensureChrome`, so a stale one is
+ * recycled and one that belongs to somebody else is reported and left alone,
+ * exactly as the primary is.
+ *
+ * The extras run headless unless a window was explicitly asked for
+ * (`--no-headless`): with no preference stated the primary is left as it is,
+ * but four more windows nobody asked for is not "as it is". Members are
+ * started in parallel — Chrome boots in seconds and a pool of five booted one
+ * after another would cost the run what it exists to save.
+ */
+export async function ensureChromePool(options: EnsureOptions, count: number): Promise<PoolMember[]> {
+  const profile = options.profile ?? DEFAULT_CHROME_PROFILE;
+  const wanted = Math.max(1, Math.floor(count));
+  const members = Array.from({ length: wanted }, (_, i) => poolMember(options.cdpUrl, profile, i));
+  return Promise.all(
+    members.map(async (member, i) => {
+      const result = await ensureChrome({
+        ...options,
+        cdpUrl: member.cdpUrl,
+        profile: member.profile,
+        headless: i === 0 ? options.headless : options.headless ?? true,
+        onLog: options.onLog ? (line): void => options.onLog?.(i === 0 ? line : `[browser ${i + 1}] ${line}`) : undefined,
+      });
+      return { ...result, profile: member.profile };
+    }),
+  );
 }
 
 /**
