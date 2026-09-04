@@ -125,7 +125,7 @@ Four rules make it safe enough to exist:
 
 **A run that has been bounced to a sign-in page cannot answer the question it was asked, so it stops.** This is the only fatal error in the engine, and it exists because the alternative is actively misleading rather than merely useless: every later step is asserted against the login screen, so some fail for the wrong reason — and the healer *rescues* others by repairing them onto whatever the login page offers, verifying that the new selector resolves, and reporting them green. Seen exactly that way in PB_01_01: `waitFor role=heading[name="Sign in"] … passed (jit)`. A pile of defects about an application that was working perfectly.
 
-`assertSessionHeld()` runs before every step. Three conditions, all required, so a flow that *means* to be on a sign-in page is never stopped: the page is on a sign-in URL now; no `goto` in this run asked for one; and the last `goto` asked for a different page, so being here was not the plan. A `click` is exempt — following a "Sign out" control is a legitimate way to arrive.
+`assertSessionHeld()` runs before every step **except a `signIn`** (HIR-EC-009, below: a sign-in page is exactly where a `signIn` expects to be). Three conditions, all required, so a flow that *means* to be on a sign-in page is never stopped: the page is on a sign-in URL now; no `goto` in this run asked for one; and the last `goto` asked for a different page, so being here was not the plan. A `click` is exempt — following a "Sign out" control is a legitimate way to arrive.
 
 **`#strandedMessage()` is split out from the assertion so the ladder can consult it without stopping the run.** A step whose page was redirected *while it ran* could not have been caught beforehand, and there the rule is narrower: it is an ordinary failed step, but it **must not heal** — same shape as the backend rung, where a repair can only fail identically or succeed against the wrong thing, and the second is strictly worse.
 
@@ -153,7 +153,7 @@ A test-case-table catalog's rows are frequently pure UI scripts of one screen �
 
 The recovery: when a `goto` asked for an ordinary page and landed on a sign-in URL, the run holds `--as` credentials, the flow contains **no sign-in of its own** (`signsInItself` — the same predicate that decides session inheritance; the bootstrap must never race a flow's own login or a persona test stops testing its persona), and it has not been tried this run — the runner performs the deterministic sign-in and re-navigates to the page the flow asked for. Establishing a documented precondition is preparation, not the claim: the same contract as the agent rung, done with the person's own account, no model anywhere. It is recorded three ways — `sessionEstablished: <email>` on the goto's detail, a run note, and a `usability`/`low` finding saying to author the sign-in into setup — and a consent gate met on arrival is accepted as part of it. When it cannot act, nothing changes: no credentials leaves the honest fatal, which now names the fix ("pass --as <email>:<password> and the run will establish the session itself"); a sign-in that does not take is a note, never a fake session.
 
-**A persona switch signs out the way a user does, and marks the flow end-to-end** (`performSignOut`, the `signOut` action, `switchesPersona` / `groundPersonaSwitches` in `flow-author.ts`). A flow that signs in as two different people is a journey across the application's session machinery whatever scope was asked for, so `Flow.scope` is stamped `'e2e'` at assembly — in the file, like `polarity`, so re-runs and repairs keep it. The switch itself must travel the application's own sign-out path: never fill a login form while still signed in (the app hides it from signed-in users), never substitute `clearStorage` (a cookie-backed session survives the wipe and the form never appears). `performSignOut` finds a name-gated sign-out control (`SIGN_OUT_NAME` — menuitem/button/link, never an anonymous link) on the page and then behind ARIA-marked identity disclosures (`aria-haspopup`, the probe's safety model — a bare button is never opened); the runner's `signOut` step falls back to clearing cookies+storage with the step's `detail` saying the real path was NOT exercised. The prompt asks for `signOut` before every switch; `groundPersonaSwitches` is the guarantee — segmented by `goto` so a two-step login stays one segment, identity = the first email-shaped value typed — splicing `{ action: 'signOut' }` in front of the switch's sign-in `goto` (after `groundCredentialFills`, so a stranded block has its goto by then), disclosed on notes. A `signOut` landing on the sign-in page is exempted by the session guard the same way a click is: the run means to be there.
+**A persona switch is a browser switch; the flow is end-to-end either way (2026-09-03).** `SmartRunner` holds one `PersonaSession` per person it has signed in as — browser, context, page, recording, caption, network observer, the session guard's memory — and `page`/`#context` are getters over the active one, so the fifty-odd step implementations follow a switch without knowing. `signIn` decides in order: a persona who already has a session is switched to (no sign-out, no login — `keptSession`; only a session the app has since expired logs in again, on that same browser); the first `signIn` of the run binds to the primary (`signsInItself` already starts it with an empty jar); a new persona with a spare Chrome in `personaBrowsers` gets a context of its own there, seeded from the suite's vault under that account (`sessionStates`) and never from the pool member's leftover default context; and with no spare browser the single-browser path stays byte for byte — `performSignOut` on the active page, then the login. Per-page things are re-armed per session (`keepCaption`, the network observer, the cursor overlay, a pinned `setClock`), the API transport is rebuilt on a switch so a `request` runs as the person active, `#deadResolutions` keys carry the persona so an employee's 403 does not short-circuit the manager on the same URL, and `close()` seals every session's film (the primary's cut at the break, a persona's whole) and closes every context it owns — which also ends the leak where an isolated, unfilmed context was only disconnected from. A persona's Chrome that answers nothing is `PersonaBrowserUnavailableError`: harness-class, the case blocked, no app defect, no reconstruction. The proof carries `persona` and `browser` on every step (`ProofBundleBuilder.setActor`), one `videos[]` entry per persona beside the primary `video`, and the vault banks each session under its own email (`exportSessions`). Authoring emits one `signIn` per hand-off and no `signOut` before it (`flow-author.ts`'s sign-in rules); `switchesPersona` still marks such a flow `e2e`.
 
 **One procedure, three callers.** `performSignIn` / `acceptConsentGate` moved to the engine and the journey capture and navigation-map learner delegate to them — a sign-in that works for a capture works for a run by construction. The procedure is everything the live application taught: a hydration settle, the two-step form (identity + Next before any password field exists), a wait on the URL actually leaving the sign-in page, one hydration replay, and a name-gated consent accept. `tests/session-bootstrap.test.ts` proves it at the browser tier against a real two-step fixture, including the never-races-the-flow half.
 
@@ -312,7 +312,7 @@ Judged **after** the session bootstrap and the consent gate, never before: eithe
 
 `nearestRoutes` (`context/route-match.ts`) scores segment-wise — a matched leading prefix is worth most, a `:param` less than a literal — and requires **at least one literal segment in common**. Without that rule a pattern of nothing but `:param` matches every path of its length, so `/en/totally/made/up` "resembles" three routes and a reader learns to skip the line. The same function serves the authoring lint `ungroundedGoto`, so both halves give one answer about one codebase.
 
-**`runFlow` forwards to `SmartRunner.connect` field by field.** A field added to `RunFlowOptions` and not listed there reaches the runner as `undefined` and its guard silently never fires. Both `backend` and `declaredRoutes` were added and not listed; the 404 test caught it by seeing `routes=0` inside the runner, and `assertBackendAllowed` would otherwise have been dead code shipped green.
+**`runFlow` forwards to `SmartRunner.connect` field by field.** A field added to `RunFlowOptions` and not listed there reaches the runner as `undefined` and its guard silently never fires. Both `backend` and `declaredRoutes` were added and not listed; the 404 test caught it by seeing `routes=0` inside the runner, and `assertBackendAllowed` would otherwise have been dead code shipped green. `personaBrowsers` and `sessionStates` (one Chrome per persona) are listed there too — a missing `personaBrowsers` silently degrades every hand-off to the single-browser sign-out path.
 
 
 ## A visible that resolved on nothing proves nothing (S5, 2026-08-28)
@@ -355,6 +355,9 @@ pacing. Asked for universally: "View actual flow" in the report and wowUI now
 plays on every run, not only the ones that broke. The cost is bundle size —
 the film is embedded in the proof JSON — and `--video off` remains the
 opt-out (also the way to inherit the attached browser's own context).
+Superseded in part 2026-09-04: `'on'` now keeps the film's ACTION MOMENTS
+rather than its wall clock — see "The film keeps the moments, not the clock"
+below; `'always'` is where the whole film still lives.
 
 ## The step's target, and the red rectangle (`src/engine/target.ts`, 2026-09-02)
 
@@ -502,3 +505,272 @@ shell rung tries the input named by the field the intent speaks of
 sibling. Delivered on typecheck alone at the user's request; the CDP fixture in
 `tests/form-actions.test.ts` covers the rung, the rest is untested until the
 next run.
+
+## The film keeps the moments, not the clock (2026-09-04)
+
+**Incident.** A run's film was its wall clock: Playwright's recorder writes a
+constant 25 fps VP8 stream (measured on three catalog films under
+`reports/*-media`: 25.0 fps throughout, a keyframe every 128 frames = 5.12 s,
+each keyframe 60–90 KB at 960 wide, each idle second another 5–8 KB of
+"nothing changed" frames). A 59 s film with a dozen moments in it weighed
+1.6 MB and was 59 s to watch; a run whose steps walked the ladder or waited
+on a model produced a film that was minutes of a page doing nothing, embedded
+base64 in every proof bundle and report.
+
+**Rule.** Under the default `video: 'on'` the sealed film is **condensed to
+its action moments**: the instant each filmed step COMPLETED (its
+`videoOffsetMs + durationMs` — a step that walked the ladder for forty seconds
+keeps the second in which it finally acted, not the forty), and the instant
+each action the workflow agent took inside a `workflow` step landed
+(`AgentAction.finishedAt`, new; `wait`/`read`/`save`/`finish`/`fail` mark no
+moment — nothing happened on screen). Each moment is held `VIDEO_ACTION_LEAD_MS`
+(400) before and `VIDEO_ACTION_DWELL_MS` (1000, `videoDwellMs` on
+`RunFlowOptions`/`SmartRunnerOptions`) after, at real speed. A failure keeps
+the film through the break exactly as before: the cut (`#videoCut`) still
+decides where the film ENDS, and the condensing only drops idle before it.
+`ProofBundleBuilder.videoMoments(persona)` lists the moments per film;
+persona films (`videos[]`) are condensed on their own clock the same way.
+`'always'` is the opt-out — the whole wall-clock film, uncondensed, plus
+viewer pacing; `'off'` still films nothing.
+
+**How, with no encoder.** `condenseWebm` (`webm.ts`) keeps frames, never
+makes them: a VP8 frame decodes against everything back to the last
+keyframe, so every kept span opens on the most recent keyframe at or before
+its moment and runs frame for frame, in source order, through the dwell. The
+codec-forced pre-roll between that keyframe and the moment (0–5.12 s) is
+re-timed to play at `IDLE_PLAYBACK_SPEED` (8×); the frames outside every
+span are gone. Clusters are rebuilt (one per keyframe / 30 s), `SeekHead`
+voided, `Cues` dropped, `Duration` and the segment size patched, and the
+result re-parsed (`verify`) — a film that cannot be condensed faithfully is
+handed over WHOLE, never doubtful. The recording carries `condensed`
+(`sourceDurationMs`, `sourceBytes`, `moments`, `dwellMs`, and the clock map
+`segments`); `setVideo`/`addPersonaVideo` move every step's `videoOffsetMs`
+onto the condensed clock (`mapToCondensed`) so "play from here", the
+failure pre-seek and the subtitle bar keep working unchanged. Playwright's
+own bundled ffmpeg (`ms-playwright/ffmpeg-*`) could re-encode to exactly one
+second per moment with no keyframe pre-roll; not taken on because it is a
+native process and a generation loss — the pure cut is the floor: each kept
+span costs one keyframe (~70 KB) plus its dwell.
+
+**Fixed on the way.** `addStep` derived `videoOffsetMs` from the bare step
+argument, which never carries the persona the builder stamps on the record —
+so every persona step was measured from the PRIMARY film's first frame, and
+seeks on a persona film were off by however long after it that film began.
+
+**Measured** (`idle.flow.json`: goto, two asserts, a click whose effect lands
+4 s later, one selector that walks the ladder for 18.8 s, one more assert; no
+healer, no agent; same run, before = the whole film as `'on'` used to keep):
+
+| | bytes | film | wall | steps | resolutions |
+|---|---|---|---|---|---|
+| before (whole film) | 184,732 | 24.3 s | 24.0 s | 5/6 | fast, fast, late, —, fast |
+| after (condensed, 6 moments) | 71,111 | 5.2 s | 24.0 s | 5/6 | same |
+
+On a real catalog film (`be100-rip … pl-07-04.webm`, 58.9 s, 1,629,364 B)
+with seven synthetic moments: 979,918 B, 12.5 s.
+
+**Pinned by** `tests/video.test.ts`: "condensing a recording to its action
+moments" (real Playwright fixture, two keyframes — the pre-roll case), "the
+action moments of a film" (steps + agent actions, persona films, the offset
+remap), and CDP-gated "the condensed film plays in the browser, for as long
+as the bundle says" — a container that re-parses is not the same fact as
+one Chrome's demuxer accepts and seeks to its last frame.
+
+## A two-persona benchmark, and what it measures (2026-09-04)
+
+Every other `.flow.json` in the repository signs in exactly once (15 files,
+none with more than one `signIn`), so the browser lease, the session guard's
+per-persona memory and the sign-in bootstrap had no before/after to be measured
+against. `examples/two-persona/` is that row: a dependency-free fixture of the
+live application's shape (two-screen login, a session cookie carrying WHICH
+account, `#who` on the protected page) and a flow that hands off and comes back.
+
+Measured, headless, two consecutive runs stable to ~10 ms: `passed` 8/8 in
+**7.2 s at 0 tokens**, `fast=6` and no other resolution — of which the three
+`signIn` steps are **6.4 s** (1623 + 2387 + 2408 ms) and everything else is
+0.15 s. **89% of a two-persona case is its sign-ins, and none of it appears in
+any model-latency view**, because a switch spends no tokens; `signIn`'s own
+`durationMs` on the step is the only place it shows.
+
+Two facts the benchmark exposed, both worth knowing before reading its numbers:
+
+- **`wowlidator run` cannot give a persona its own Chrome.** `personaBrowsers`
+  is set in exactly one place — `cli/run-cases.ts`, the suite and catalog path,
+  where a case leases a lane per persona. A single-flow `run` passes `personas`
+  and never `personaBrowsers`, so every switch there is a sign-out and a fresh
+  sign-in on one browser, and `--browsers 2` does not change it (measured: both
+  runs stayed on one endpoint and recorded `signedOutVia`). The kept-session
+  path — `keptSession: true`, no login form — is reachable only through a
+  catalog run and is covered by the CDP-gated assertions in
+  `tests/session-bootstrap.test.ts`. The 2.4 s return above is therefore the
+  *worst* case, and closing that gap in `run` is the largest win this benchmark
+  can show.
+- **`signIn.url` is not resolved against `baseUrl`, although `goto` is.** A
+  flow with `{ "action": "signIn", "url": "/login" }` dies on
+  `Cannot navigate to invalid URL` while `{ "action": "goto", "url": "/app" }`
+  one line later resolves fine. The example's URL is absolute for that reason.
+
+## A `signIn` is allowed to stand on the sign-in page (HIR-EC-009, 2026-09-04)
+
+**Incident.** The authored setup was `goto <app page>` then
+`signIn as <HR_ADMIN_ACCOUNT>`. The flow contains a `signIn`, so
+`signsInItself` is true, `inheritSession` is false and the context starts with
+an empty jar — the first `goto` bounces to the login page, and all three
+`#strandedMessage` conditions then hold at the top of `executeSteps`' step
+loop: on a sign-in URL now, the most recent `goto` did not ask for one, and it
+asked for a different page. The run died `SessionLostError` **on the step
+whose entire job is to sign in**, one step short of the session it was about
+to establish, and filed a high `functional` defect about an application that
+was fine. `#bootstrapSession` could not rescue it either: it bails on
+`#flowSignsInItself`, precisely so it never races a flow's own login.
+
+**Rule.** `executeSteps` skips `assertSessionHeld()` for a step whose action
+is `signIn`, and for nothing else.
+
+The exemption is at the **call site**, not inside `#strandedMessage`. That
+predicate is also consulted by the ladder (rung 2.5, "declined to heal"),
+where "the next planned step" is not a meaningful notion and where relaxing
+the answer would let a repair land on login furniture — the PB_01_01 failure
+(`waitFor role=heading[name="Sign in"] … passed (jit)`) the predicate exists
+for. Widening the predicate would have needed either new mutable state on the
+runner or a parameter one of its two callers can never supply; the call-site
+form needs neither, and `step` is already in scope there.
+
+It is per step, never per run: the step AFTER the `signIn` is guarded exactly
+as before, so a sign-in that does not take still stops the run one step later
+rather than spending the body on the login screen. `signOut` is NOT exempt —
+it has its own, different exemption (`#lastAction === 'signOut'`, which
+exempts the step that follows one). `#strandedMessage`'s three conditions,
+the `click` exemption and the `signInDidNotTake` branch are untouched, as is
+`#bareStep`, which `signIn` runs through and which never consults the guard.
+
+**Measured** (the incident's setup shape against `examples/two-persona/`'s
+fixture — `/app` bounces an unauthenticated visitor to `/login` — one Chrome,
+`--no-heal --no-agent`):
+
+| | verdict | steps | wall | defects | tokens |
+|---|---|---|---|---|---|
+| before | `failed`, exit 1 | 1/1 recorded, 3 never ran | 0.6 s | 1 high functional, "lost its session" | 0 |
+| after | `passed`, exit 0 | 4/4, `fast=2` | 2.2 s | 0 | 0 |
+
+The persona benchmark is unmoved: `examples/two-persona/handoff.flow.json`
+`passed` 8/8 in 7.06 s at `fast=6` against its 7.2 s baseline. Its three
+`signIn` steps each follow a `goto /app` that did NOT bounce, so the guard
+answered `null` there before the change and is simply not asked now.
+
+**Blast radius, counted rather than guessed.** 178 `.flow.json` on disk (this
+repository plus `valst-output/`), 5 of them containing a `signIn`, 7 `signIn`
+occurrences in total: 2 have no preceding `goto` at all (`#lastGotoPath` is
+null, the guard could never fire), 3 follow a `goto` that asked for a sign-in
+URL (`#lastGotoAskedSignIn` already exempted them), and 2 are the two-persona
+benchmark's hand-offs, which change only in the world where the application
+had already dropped the session. No flow gains a step it did not have, and no
+step becomes healable that was not: a `signIn` is a `#bareStep` off the
+ladder, so nothing on its path can be repaired onto login furniture.
+
+**One residual edge, disclosed.** `#signInDidNotTake` is set only by the
+hand-authored credential path (`noteSignInOutcome`), never by the `signIn`
+step. A flow that types a login by hand, fails it, and then runs a `signIn`
+now reaches the `signIn`, and if that succeeds the stale verdict still stops
+the run on the NEXT step with the "sign-in did not take effect" message. It
+stops either way — no run goes green that did not before — so clearing the
+flag on a successful `signIn` was left out of this change rather than widened
+into it.
+
+**Pinned by** `tests/session-bootstrap.test.ts`: "a goto bounced to login
+followed by a signIn signs in rather than dying session-lost" (red before the
+change, with the incident's own message as the failure) and its negative,
+"the exemption is the signIn step only: an ordinary step after the same
+bounce still stops" — green both before and after, which is what proves the
+exemption did not become run-wide.
+
+## The film performs like a person, and cuts like an edit (2026-09-04)
+
+**Incident.** PL_07_06's film (`valst-output/proofs/7271deea-….json`, 48.4 s
+condensed to 13.8 s, 12 moments) was called glitchy, and its frames say why
+(`webm.ts`'s own reader; no ffmpeg here): 188 of its 511 frames were **5 ms
+apart** — the 8× pre-roll of the first condensing (`IDLE_PLAYBACK_SPEED`) on
+a 25 fps stream, which a browser presents one frame in three of, so every
+keyframe-forced pre-roll (up to 5.12 s of source) was a 0.2–0.6 s strobe of
+the page jumping about; a 2-frame "idle" between two windows 40 ms apart
+became a **5 ms sliver** (source 3560–3600 → output 3525–3530); and every cut
+(source 9520 → 25600, 30600 → 40960) was a jump between two page states with
+**one frame period** between them. On top of that the actions themselves were
+teleports: Playwright's `click` moves the pointer to the control and presses
+in one event, so the drawn pointer appeared on the button in the frame it was
+pressed, and `fill` set the whole value in one frame (`runner.ts` `click`/
+`fill` closures; the agent's `#act` in `workflow-agent.ts` did the same).
+
+**Rule, the cut (`webm.ts` `condense`).** Still no encoder and no frame is
+ever made or reordered; only the clock changes. Three things replaced the 8×
+speed: an idle run (a keyframe's pre-roll, or the gap between two moments on
+one keyframe) is **packed into `IDLE_BURST_MS` (160)** — never faster than
+one unit a frame, never faster than it happened — so it reads as a cut, not
+a scrub; the **last frame before every cut is held `CUT_HOLD_MS` (400)** —
+before a new span opens on its keyframe and before a moment gives way to
+idle — a beat on the state that was reached, then the jump; and two moments
+closer than **`BRIDGE_MS` (1000)** are one stretch at real speed (the pointer
+travelling between two controls), so no sliver. Every span still opens on
+the most recent keyframe at or before its window; output timestamps are
+strictly increasing integers; `frameIndex()` exposes the frames as a player
+sees them so tests can check both. `CondenseOptions` carries the three
+knobs; `mapToCondensed` and the `segments` map are unchanged.
+
+**Rule, the performance (`humanize.ts`, new leaf module).** One knob:
+`humanize` on `SmartRunnerOptions`/`RunFlowOptions` (forwarded in `runFlow`),
+`--humanize on|off`, `WOWLIDATOR_HUMANIZE=1|0`; **default on while filming,
+off with `--video off`**, so an unfilmed run pays nothing (pinned: an
+unfilmed run records no `performedMs`). Everything in it is a PRELUDE to the
+author's own action, never a replacement: `approach()` moves the mouse along
+an eased, slightly bowed path (`pointerPath`, `HUMAN_POINTER_STEPS` × 16 ms)
+to the box of the locator the rung resolved, hovers `HUMAN_HOVER_MS`, and
+then that same locator is clicked with what is left of the step's timeout
+(`remainingTimeout` — the look is bounded by `HUMAN_LOOK_MS` (250) and
+deducted, so a missing element still fails inside ONE fast window, with
+Playwright's own error). `humanFill` inserts the value character by
+character through `Keyboard.insertText` with `keyDelays` (30–80 ms,
+shrunk to `HUMAN_TYPING_BUDGET_MS`), then READS IT BACK; a field that does
+not hold exactly the value is filled by the ordinary `fill`. Two ladder
+facts are kept literally: **`fill` still fires no keydown** (insertText is
+what Playwright's `fill` uses; the clear is a `select()`, not `fill('')`,
+which presses Delete), and a field whose ARIA says its keys drive a popup
+(`combobox`/`searchbox`, `aria-autocomplete`, `aria-haspopup`,
+`aria-controls`, `list`) is never typed into — a suggestion list opened by
+the film's typing would cover the next control. `type` keeps real keys and
+only jitters the pace (`humanKeys`); `scrollTo` and the agent's screen
+scroll do a smooth scroll first and the instant one as the action of record;
+`goto` puts the pointer back on the new document (no pause — a real 350 ms
+beat moved the ladder's clock and flipped the patience rung's fixtures from
+`late` to `fast`, so the film's dwell is the beat). The workflow agent's
+`#act` goes through the same functions (`WorkflowAgentOptions.humanize`,
+`RunOptions.humanize`, passed by the runner on every `run`), so an agent leg
+looks like the steps around it. The approach runs BEFORE the popup listener
+is armed in `click` — the grace window must not count during it (two popup
+tests caught that).
+
+**The film keeps the performance.** A humanised step writes
+`detail.performedMs`; `videoActionMoments()` gives each moment a lead of the
+fixed `VIDEO_ACTION_LEAD_MS` plus that (an agent action that landed: plus its
+`durationMs`), capped at `VIDEO_LEAD_CAP_MS` (5 s); `actionWindows` and the
+offset remap take `ActionMoment` as well as a number. Without it the typing
+and the pointer's travel would have been the idle the condensing drops.
+
+**Measured.** Fixture film (`tests/fixtures/recording.webm`, moments 2.5 s
+and 6 s): pre-roll segments 624 ms + 440 ms → 156 ms + 154 ms, one 400 ms
+hold, every frame after a hold a keyframe. Catalog film `pl-07-04.webm`
+(58.9 s, seven synthetic moments), played back in Chrome: old 5 ms cadence —
+14.0 s, 1 stall, 282 dropped of 745; new — 13.3 s, 7 stalls of ~25 ms
+(decoder catching up on a 1 ms burst; total overrun 170 ms), 432 dropped —
+the burst frames, which is the point. A humanised click on a local page
+performs in ~400 ms; a humanised fill of 16 characters in ~1.1 s; a missing
+element under a humanised click fails in < 1.8 s against a 1 s window.
+
+**Pinned by** `tests/video.test.ts` ("packs the forced pre-roll into a
+burst", "never emits a frame spacing under one unit, and never a sliver",
+"holds the last frame before every cut, and every cut lands on a keyframe",
+"keeps a performed step's whole performance ahead of its moment") and
+`tests/humanize.test.ts` (the path and delay planners; humanize off is the
+single call the step always made; CDP: no keydown + read-back + a combobox
+filled in one move, the click lands where the plain one would and a miss
+fails in one window, a filmed run performs and an unfilmed one does not, with
+identical resolutions).

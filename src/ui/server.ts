@@ -46,7 +46,16 @@ import {
 } from '../config.js';
 import { DEFAULT_CONTEXT_CACHE_FILE } from '../context/context-engine.js';
 import { listRepos } from '../context/repo-registry.js';
-import { COMMANDS, UiCommandError, buildArgv, buildEnvOverlay, commandById } from './commands.js';
+import {
+  COMMANDS,
+  UiCommandError,
+  buildArgv,
+  buildEnvOverlay,
+  commandById,
+  personasValueToMap,
+  type CommandSpec,
+} from './commands.js';
+import { PersonaAccountStore, type PersonaAccountRef } from './persona-accounts.js';
 import { JobRunner } from './jobs.js';
 import { FAILED_RUNS_FILE, FailedRunLog } from './failed-runs.js';
 import { DbStatus } from './db-status.js';
@@ -72,7 +81,7 @@ import {
   type UploadKind,
 } from './uploads.js';
 import { ARCHIVED_DIR, readProof, readProofIndex, readProofWithPath, groupRuns } from './proofs.js';
-import { listCatalogRuns } from './catalog-runs.js';
+import { listCatalogRuns, missingPersonaPasswords } from './catalog-runs.js';
 import { ledgerPathFor } from '../cli/suite-progress.js';
 import { CATALOG_REPORT_DIR } from '../reporter/catalog-report.js';
 import { buildVerdict } from '../reporter/verdict.js';
@@ -98,6 +107,37 @@ interface ServerContext {
   usageCap: UsageCapGuard;
   /** The database's configuration, last probe, and repo-derived hints. See `ui/db-status.ts`. */
   db: DbStatus;
+  /** Which addresses each persona label has been run as — see `ui/persona-accounts.ts`. */
+  personaAccounts: PersonaAccountStore;
+}
+
+/**
+ * The accounts a submission signs in as, **label and address only**.
+ *
+ * The password is dropped here, at the one point where a form value becomes
+ * something the panel remembers: `personasValueToMap` is the same parse the
+ * env overlay just did (pure, and already validated on this path), and only
+ * the `email` of each entry crosses into the store. Nothing downstream is ever
+ * handed a persona map, so there is no shape in which a password could be
+ * written by accident.
+ *
+ * A command without a `personas` field, an absent value, or a value the parse
+ * refuses all mean "nothing to remember" — this teaches the store, it never
+ * decides a run.
+ */
+function personaAccountsOf(spec: CommandSpec, values: Record<string, unknown>): PersonaAccountRef[] {
+  const field = spec.fields.find((one) => one.name === 'personas');
+  if (field === undefined) return [];
+  const raw = values['personas'];
+  if (raw === undefined || raw === null || raw === '') return [];
+  try {
+    return Object.entries(personasValueToMap(raw, field.label)).map(([label, entry]) => ({
+      label,
+      email: entry.email,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -407,6 +447,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
         ...ctx.models.envOverlay(),
         ...buildEnvOverlay(spec, body.values ?? {}),
       });
+      // The panel remembers WHICH address each account was run as, so the next
+      // launcher offers it instead of asking for it again — the password is
+      // never stored and is always typed afresh. Here rather than in the
+      // claims phase because this covers every command that offers `personas`,
+      // and does not wait for a run to get as far as writing a ledger; and on
+      // this path only, because a submission refused with 400 or 409 started
+      // nothing and should teach the store nothing. Never fatal.
+      await ctx.personaAccounts.remember(personaAccountsOf(spec, body.values ?? {}));
       json(res, { job: summariseJob(job) }, 201);
     } catch (error) {
       const status = error instanceof UiCommandError ? 400 : 409;
@@ -541,7 +589,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
     }
 
     if (req.method === 'GET') {
-      json(res, { job });
+      json(res, { job: detailJob(job) });
       return;
     }
   }
@@ -570,7 +618,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   // flag the person chose), else it is rebuilt from the ledger's own `launch`
   // record through the command whitelist.
   if (path === '/api/catalog-runs/resume' && req.method === 'POST') {
-    let body: { ledgerPath?: string; mode?: string; caseId?: string; caseIds?: string[]; as?: string };
+    let body: { ledgerPath?: string; mode?: string; caseId?: string; caseIds?: string[]; as?: string; personaPasswords?: Record<string, unknown> };
     try {
       body = ((await readBody(req)) as typeof body) ?? {};
     } catch (error) {
@@ -654,7 +702,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
       const inherited = priorJobs[priorJobs.length - 1]?.secretEnv;
       const supplied = typeof body.as === 'string' && body.as.includes(':') ? body.as : null;
       const secretEnv: Record<string, string> =
-        supplied !== null ? { WOWLIDATOR_AS: supplied } : inherited ?? {};
+        supplied !== null ? { WOWLIDATOR_AS: supplied, ...(inherited ?? {}) } : { ...(inherited ?? {}) };
+      if (supplied !== null) secretEnv['WOWLIDATOR_AS'] = supplied;
       const persona = launch?.persona;
       if (persona !== undefined && secretEnv['WOWLIDATOR_AS'] === undefined && process.env['WOWLIDATOR_AS'] === undefined) {
         json(
@@ -668,11 +717,54 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
         );
         return;
       }
+      // …and the same rule for every OTHER account the run signs in as. A
+      // catalog whose rows change hands names more than one, the ledger has
+      // recorded them all along, and until now nothing read it: the resume
+      // started with the first account's password and none of the others, so
+      // every case needing the second person died at its `signIn`.
+      //
+      // The client sends passwords BY LABEL; each is paired with the email the
+      // LEDGER recorded, so it hands over the secret half and cannot redirect
+      // the run at a different account.
+      const suppliedPasswords =
+        typeof body.personaPasswords === 'object' && body.personaPasswords !== null && !Array.isArray(body.personaPasswords)
+          ? (Object.fromEntries(
+              Object.entries(body.personaPasswords as Record<string, unknown>).filter(
+                ([, value]) => typeof value === 'string' && value !== '',
+              ),
+            ) as Record<string, string>)
+          : {};
+      const accounts = missingPersonaPasswords(launch, inherited, process.env, suppliedPasswords);
+      if (accounts.missing.length > 0) {
+        json(
+          res,
+          {
+            error:
+              `this run also signs in as ${accounts.missing.map((one) => one.label).join(', ')}; ` +
+              'their passwords are not kept between panel sessions — enter them to continue',
+            needsCredentials: true,
+            // The single-persona key stays, so a client written before this
+            // still gets the answer it understands.
+            ...(persona === undefined ? {} : { persona }),
+            personas: accounts.missing,
+          },
+          409,
+        );
+        return;
+      }
+      if (Object.keys(accounts.personas).length > 0) {
+        secretEnv['WOWLIDATOR_PERSONAS'] = JSON.stringify(accounts.personas);
+      }
       const next = ctx.jobs.start(spec, argv, {
         ...ctx.keys.envOverlay(ctx.config),
         ...ctx.models.envOverlay(),
         ...secretEnv,
       });
+      // Same memory, same rule: the addresses came from the LEDGER, the
+      // passwords from this request, and only the addresses are kept.
+      await ctx.personaAccounts.remember(
+        Object.entries(accounts.personas).map(([label, entry]) => ({ label, email: entry.email })),
+      );
       json(res, { job: summariseJob(next) }, 201);
     } catch (error) {
       json(res, { error: error instanceof Error ? error.message : String(error) }, 409);
@@ -856,6 +948,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   // The panel writes these itself rather than asking for a path, because the
   // file being tested from usually lives wherever a browser download put it.
   // Names are rebuilt on the way in — see `uploads.ts`.
+  // What the launcher offers as an account for each persona label. Read where
+  // the launcher already loads its data (beside the documents fetch), never on
+  // a poll — this changes only when a run starts. Addresses and stamps: there
+  // is no password in the store, so there is none in the answer.
+  if (path === '/api/persona-accounts' && req.method === 'GET') {
+    json(res, { accounts: await ctx.personaAccounts.read() });
+    return;
+  }
+
   if (path === '/api/documents' && req.method === 'GET') {
     const kind = (url.searchParams.get('kind') ?? 'context') as UploadKind;
     json(res, { documents: await listDocuments(kind === 'catalog' ? 'catalog' : 'context') });
@@ -1335,6 +1436,26 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   text(res, 'not found', 404);
 }
 
+/**
+ * One job, in full, minus the one field that may never leave this process.
+ *
+ * The list route sheds `secretEnv` in `summariseJob` and says why; this route
+ * is the other half of that rule and did not have it. `GET /api/jobs/<id>`
+ * answered with the raw `Job`, so the password a run was started with — the
+ * `--as` credential, a database URL, and (once a catalog names more than one
+ * account) every persona's password — was published to any page that asked.
+ * Both surfaces ask constantly: `awaitJob` polls this route every 700 ms while
+ * the launcher reads a catalog, and `outputSection` fetches it on first expand.
+ *
+ * Unlike `summariseJob` this keeps `lines` and `cases` whole — the collapsed
+ * console under a finished run is exactly what the detail route is for. Only
+ * the secret goes.
+ */
+function detailJob(job: ReturnType<JobRunner['list']>[number]): Record<string, unknown> {
+  const { secretEnv: _secret, ...rest } = job;
+  return rest;
+}
+
 function summariseJob(job: ReturnType<JobRunner['list']>[number]): Record<string, unknown> {
   // `secretEnv` is stripped here, beside `lines` and `cases`, because this
   // object is spread wholesale into a JSON response: a field added to `Job`
@@ -1386,6 +1507,7 @@ export async function startUi(options: StartUiOptions = {}): Promise<{ url: stri
     failedRuns,
     db: new DbStatus(),
     usageCap: new UsageCapGuard(jobs),
+    personaAccounts: new PersonaAccountStore(),
   };
   // A hold left by an earlier panel process stands until reset; then the
   // guard polls on the quota's own TTL for the life of the server.

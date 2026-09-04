@@ -136,3 +136,126 @@ correct `role=…[name=… i]` two turns earlier. `normaliseAgentSelector`
 (`src/engine/selector.ts`) rewrites the line to the role selector before the
 grounding guard sees it, in `LlmAgentModel.decide`, for the decision and every
 planned step alike — see the engine CLAUDE.md for the rule and its siblings.
+
+## A leg off its page has a small allowance (`wanderedOffPage`, `AGENT_OFF_PAGE_TURNS`, 2026-09-03)
+
+Live (HIR-EC-002, 2026-09-03 13:00 run): steps 16 "Reopen the saved New Hire"
+and 19 "Leave the New Hire form" burned 903 s of a 1,377 s case. Each leg left
+the step's page (/en/admin/hire/draft → /en/requests → on through the admin
+area) and every goto or click onto a fresh page was progress by the no-progress
+judge's own rule (`advanced`: an ok interaction, or a goto to an unvisited
+URL), so nothing but `DEFAULT_AGENT_MAX_STEPS` (60) ended them, at ~7 s a
+turn. The judge that should have fired did not exist: no rule distinguished a
+journey from a wander.
+
+`wanderedOffPage(goal, startUrl, url)` (`goal-evidence.ts`, pure): the page is
+on a different origin or path from the step's start (`differentPage` — a
+`?step=` change is the same page) **and** not at the destination the goal
+names (`goalDestination`/`atGoalDestination`; a goal naming none has nowhere
+off its page that counts). While that holds, the loop spends
+`AGENT_OFF_PAGE_TURNS` (8) — a turn counts when it moved the page again or only
+clicked; a turn that lands a **first-time form entry** (`FORM_ENTRY_ACTIONS`:
+fill, type, paste, selectOption, check, uncheck) off the page is free, because
+"open the form and fill it" legitimately lives off its start page for fifteen
+turns and a literal turn budget would cut a passing leg. Returning to the
+start page resets the allowance; a consent URL is the gate rung's to clear and
+is never counted (`CONSENT_GATE_URL_PATTERN`); arriving at a named destination
+still ends the leg by the destination rule before this one is consulted. Past
+the allowance the leg ends with `agent wandered: left the step's page … spent N
+turn(s) elsewhere … without reaching …`, naming the page it is on. Lifted to
+`AGENT_NO_PROGRESS_OFF_TURNS` when early-stop is off, like the other two
+judges (`#offPageTurns`). Why it cannot slow a passing leg: a journey to a
+named destination is two to four page moves and arrives before the eighth; a
+leg whose work is on one other page pays nothing for the entries. Tests:
+`tests/goal-evidence.test.ts` (`wanderedOffPage`), `tests/agent-guards.test.ts`
+(the constant's place among the ceilings). Measured on the HIR-EC-002
+benchmark (`e2e-02/02-…flow.json`, 2026-09-03 12:59 UTC, both rails, agent on
+opus): 558 s / 56 agent requests / 1.03M in-tokens / agent 296 s, longest
+leg 57 s — against the 13:00 run's 1,377 s / 182 requests / 3.55M / 1,188 s
+with steps 16 and 19 at 425 s and 478 s. The former wanderers (now steps 18
+and 20) ended in 56 s and 38 s by the agent's own `unreachable`; the
+allowance's stop message itself did not fire on either benchmark, and on ec09
+HIR-EC-009 (job-3, 12:39 UTC) no leg wandered at all.
+
+## The same control on the same page is not progress (`reactivation`, 2026-09-03)
+
+Live twice in one day. ec09 HIR-EC-009 job-3 leg [14]: 320 s / ~60 turns
+re-clicking section headers on one wizard page — every click ok, every ok
+click resetting the no-progress judge, and `repeatedToggleClick` (three per
+selector, whole run) worth thirty-six free turns across a dozen headers. Then
+job-2, the Position / Employee Sub-Group picker: 122 agent requests and 18
+minutes of ok `fill` into `role=textbox[name="Search options" i]` with a
+different search string each time ("40106337", "401063", "MKB12.12", "",
+"4010", …), between failed `selectOption`s on the button and ok re-clicks of
+it. The judge saw an ok interaction on every turn.
+
+`reactivation(decision, url, activatedHere)` (`agent-guards.ts`, pure) reads an
+ok activation (`ACTIVATION_ACTIONS`: click, press, hover, check, uncheck, fill,
+type, paste, selectOption) against the selectors already ok-activated **on
+that URL this leg** (`activationKey`; a miss records nothing, and the same
+selector on another page is a new control): `first`, `repeat` (a click-shaped
+re-activation), or `text-again` (another fill/type/paste into the same field).
+`reactivationAdvanced(kind, treeChanged)`: `first` is progress as before;
+`repeat` is progress **only if the full tree changed after it** — the loop
+re-reads the tree for that case alone and charges the credit to
+`AGENT_TREE_CHANGE_CREDITS`, shared with the scroll/wait looks, so a control
+that toggles forever still ends the leg; `text-again` is **never** progress,
+because the typed value is echoed into the tree's `value=` and would pass a
+change test on its own evidence (the picker's six strings would each have
+been credited). A turn not credited for this reason tells the model so in the
+history. `repeatedToggleClick` is untouched — it refuses the fourth activation
+outright; this rule only decides whether an ok one counted. Why it cannot slow
+a passing leg: a multi-select re-opened once per pick changes the tree and is
+credited; a search box used twice has a pick between the fills, and the pick
+is `first`. Tests: `tests/agent-guards.test.ts` (`reactivation`, with both
+legs' action sequences as fixtures). Measured on ec09 HIR-EC-009 (panel
+job-3, 2026-09-03 12:39 UTC, agent on opus): case 533 s / 55 agent calls /
+1.43M in-tokens, agent time 262 s, the five workflow legs 14–77 s each and
+every one ended by the agent's own honest `unreachable` — against the morning
+run's 1,090 s / 122 calls / 3.4M in / 763 s agent time (old prompt, old
+loop). The stall message itself never fired: the history note handed back
+on a re-activation was enough for the model to stop hunting. Job-2 in between
+(new prompt, old loop) had cut leg [14] to 40 s but was at 122 requests on
+the Position picker when it was interrupted.
+
+## The agent runs as whoever is active (2026-09-03)
+
+`SmartRunner.workflow` hands the agent `this.page`, and `page` is a view of the active `PersonaSession` — so after `signIn MANAGER_ACCOUNT` the leg runs in the manager's own Chrome, and the step's record carries `persona` and `browser`. Nothing in the loop changed; OA-15 stands: a goal naming two people is still refused, and the authored form is two legs with a `signIn` between them.
+
+## Two people, one address (2026-09-04)
+
+Two corrections to the loop, both from the same case shape: a catalog row that
+changes hands — the manager submits a probation review, the approver approves
+the same case — where both legs start on the same URL with near-identical goal
+wording.
+
+**The replay memory is keyed by persona.** `replayKey(startUrl, goal, persona)`
+takes the active persona's LABEL, fed from `RunOptions.persona`, which the
+runner supplies from `activePersona` at every `#agent.run` call site that passes
+`memory` (the `workflow` step, the entry rung, the heal pass). Without it the
+second leg replays the first person's recorded journey on the second person's
+browser, at zero model turns, and reports success — the very hazard
+`#deadResolutions` was already keyed by persona to avoid, its comment saying so
+outright: *an employee's 403 page and the manager's real page share a URL and
+nothing else*. The agent's memory had not been given the same treatment.
+
+The label is used for the key and for nothing else. It is never put in a
+prompt, never offered to the model, and carries no email and no password — the
+agent has no sign-in verb and no credentials by design, and this must not
+become the hole in that. A run with no personas passes `undefined` and its keys
+are byte-identical to before, so no cache entry written earlier is orphaned.
+The trade is deliberate: on a multi-persona run a leg that could have replayed
+another person's journey now pays the model instead. Correctness over a saved
+turn, and only where two people are actually involved.
+
+**A refused goal is an authoring fault, not a broken feature.**
+`multiPersonaSummary`'s `multi-persona goal:` prefix was declared to be "the
+protocol `run-cases` reads so it can file this as an authoring refusal" and had
+no reader anywhere in `src/`. The refused leg fell through to the ordinary
+failed-leg path and became `functional` / `high`, "Workflow goal not reached" —
+a fact about how the goal was worded, filed as a defect in the application under
+test. `personaRefusal(summary)` in `goal-evidence.ts` is the reader; the runner
+branches on it beside the provider refusal, records the step `error`, files **no
+defect**, and throws a message naming the fix. Like `agentModelUnavailable`, it
+can only be true of a summary produced by a return that happens before turn 1,
+so it can never change the outcome of a leg that actually ran.

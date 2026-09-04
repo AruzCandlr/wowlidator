@@ -32,7 +32,7 @@ function job(over: Partial<Job> = {}): Job {
       { stream: 'err', text: 'wowlidator: cannot reach http://localhost:3000/en/login — is the app running?' },
     ],
     artifacts: [],
-    progress: { done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0 },
+    progress: { done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0, startedMs: null },
     cases: [],
     ...over,
   };

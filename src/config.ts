@@ -344,6 +344,8 @@ export interface WowlidatorConfig {
   screenshots: ScreenshotMode | undefined;
   /** Film the run, with a drawn-in pointer. See `engine/video.ts`. */
   video: VideoMode;
+  /** Perform like a person while filming; undefined follows the recording. `WOWLIDATOR_HUMANIZE`. */
+  humanize: boolean | undefined;
   /** Pause before each screenshot, so the page has painted. See `evidence.ts`. */
   captureDelayMs: number;
   healing: boolean;
@@ -430,6 +432,7 @@ const envSchema = z.object({
   WOWLIDATOR_DISABLE_REPORT: z.string().optional(),
   WOWLIDATOR_SCREENSHOTS: screenshotEnvSchema.optional(),
   WOWLIDATOR_VIDEO: videoSchema.optional(),
+  WOWLIDATOR_HUMANIZE: z.string().optional(),
   WOWLIDATOR_CAPTURE_DELAY_MS: z.coerce.number().int().min(0).max(30_000).optional(),
   WOWLIDATOR_DISABLE_HEALING: z.string().optional(),
   WOWLIDATOR_DISABLE_AGENT: z.string().optional(),
@@ -704,6 +707,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
     reportEnabled: e.WOWLIDATOR_DISABLE_REPORT !== '1',
     screenshots: e.WOWLIDATOR_SCREENSHOTS === 'auto' ? undefined : e.WOWLIDATOR_SCREENSHOTS,
     video: e.WOWLIDATOR_VIDEO ?? 'on',
+    humanize: e.WOWLIDATOR_HUMANIZE === undefined || e.WOWLIDATOR_HUMANIZE === '' ? undefined : e.WOWLIDATOR_HUMANIZE !== '0' && e.WOWLIDATOR_HUMANIZE !== 'off',
     captureDelayMs: e.WOWLIDATOR_CAPTURE_DELAY_MS ?? DEFAULT_CAPTURE_DELAY_MS,
     healing: e.WOWLIDATOR_DISABLE_HEALING !== '1',
     agentEnabled: e.WOWLIDATOR_DISABLE_AGENT !== '1',

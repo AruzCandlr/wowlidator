@@ -82,7 +82,7 @@ describe('describing a target', () => {
 
   it('reaches the CLI step line as its own row', () => {
     const line = formatStepLine(step({ target: TARGET }));
-    assert.match(line, /\n {6}target: button "Sign in" · 120×40 at \(30,200\)/);
+    assert.match(line, /\n {8}target: button "Sign in" · 120×40 at \(30,200\)/);
     assert.ok(!formatStepLine(step({})).includes('target:'));
   });
 

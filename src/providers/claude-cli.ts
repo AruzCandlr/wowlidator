@@ -59,8 +59,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
-import { askWarm, closeClaudeSessions, sessionTurnBudget } from './claude-cli-session.js';
+import {
+  askWarm,
+  CLAUDE_CLI_ANSWER_TIMEOUT_MS,
+  closeClaudeSessions,
+  sessionTurnBudget,
+} from './claude-cli-session.js';
 import { recordClaudeCliCall } from './claude-cli-usage-log.js';
+import {
+  answerErrorOf,
+  answerTextOf,
+  ClaudeAnswerError,
+  raisedOutputCap,
+  usageOf,
+  type ClaudeResultEvent,
+} from './claude-envelope.js';
 import {
   claudeRetrievalCorpusSize,
   ensureClaudeRetrievalServer,
@@ -89,8 +102,13 @@ export const CLAUDE_CLI_WARM = process.env['WOWLIDATOR_CLAUDE_CLI_WARM'] !== '0'
 
 export { closeClaudeSessions };
 
-/** How long one completion may take. An authoring prompt is large and slow. */
-export const CLAUDE_CLI_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * How long one completion may take — the same budget as the warm session's,
+ * on purpose (see `CLAUDE_CLI_ANSWER_TIMEOUT_MS`): an authoring answer of
+ * 24k tokens measured 595.8 s cold, 5 s under the old 10 min, and the warm
+ * copy of it had already been abandoned at 5 min.
+ */
+export const CLAUDE_CLI_TIMEOUT_MS = CLAUDE_CLI_ANSWER_TIMEOUT_MS;
 /** The reasoning effort every role gets unless its own env var says otherwise. */
 export const DEFAULT_CLAUDE_CLI_EFFORT =
   process.env['WOWLIDATOR_CLAUDE_CLI_EFFORT'] ||
@@ -300,20 +318,6 @@ export function flattenPrompt(prompt: LanguageModelV4CallOptions['prompt']): {
   return { system: system.join('\n\n'), text: turns.join('\n\n') };
 }
 
-/** What the CLI prints under `--output-format json`. */
-interface CliEnvelope {
-  result?: string;
-  is_error?: boolean;
-  total_cost_usd?: number;
-  num_turns?: number;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_read_input_tokens?: number;
-    cache_creation_input_tokens?: number;
-  };
-}
-
 export interface ClaudeCliOptions {
   /** `fable`, `opus`, `sonnet`, `haiku`, or a full id. */
   modelId: string;
@@ -412,208 +416,243 @@ export function createClaudeCli(options: ClaudeCliOptions): LanguageModelV4 {
       // never saw refuses its next call here. TTL-cached; throws only on a
       // confirmed trip, worded as a provider refusal (an environment fact).
       await assertUnderUsageCap();
-      const startedMs = Date.now();
       const { system, text } = flattenPrompt(call.prompt);
+      const wantsJson = call.responseFormat?.type === 'json';
       // The CLI validates against the schema itself, so it is not restated
       // in the prompt. `$schema` is dropped as a courtesy — it tells the CLI
       // nothing it needs — not because it was ever the problem.
       const schema =
-        CLAUDE_CLI_NATIVE_SCHEMA &&
-        call.responseFormat?.type === 'json' &&
-        call.responseFormat.schema !== undefined
+        CLAUDE_CLI_NATIVE_SCHEMA && wantsJson && call.responseFormat?.type === 'json' && call.responseFormat.schema !== undefined
           ? JSON.stringify(withoutSchemaKeyword(call.responseFormat.schema))
           : null;
       // The BM25 search tool, when this role has it and there is a corpus.
       const retrieval = await retrievalArgs(options.retrieval ?? false, resolvedAllowedTools);
-      // THE `claude -p` COMMAND. Edit this array to change what runs.
-      const args = [
-        '-p',
-        '--model',
-        options.modelId,
-        '--effort',
-        effort,
-        '--output-format',
-        'json',
-        // Replaced, never appended — see the note at the top of this file.
-        '--system-prompt',
-        system === ''
-          ? 'You answer exactly what is asked, with no preamble and no commentary.'
-          : system,
-        '--strict-mcp-config',
-        // No settings, hooks, plugins or skills: nothing outside the prompt
-        // may steer an answer, and none of it is paid for at startup.
-        '--setting-sources',
-        '',
-        '--disable-slash-commands',
-        // A per-call transcript on disk serves nobody — the proof bundle is
-        // the record — and skipping it removes a write per turn.
-        '--no-session-persistence',
-        // `=` form on purpose: these flags are variadic, and the space form
-        // with an empty value swallows the positional prompt (measured —
-        // "Input must be provided either through stdin or as a prompt").
-        ...(resolvedTools !== null ? [`--tools=${resolvedTools}`] : []),
-        ...(retrieval.allowedTools !== null ? [`--allowed-tools=${retrieval.allowedTools}`] : []),
-        ...(resolvedDisallowedTools !== null ? [`--disallowed-tools=${resolvedDisallowedTools}`] : []),
-        ...(retrieval.mcpConfig === null ? [] : [`--mcp-config=${retrieval.mcpConfig}`]),
-        ...(schema === null ? [] : ['--json-schema', schema]),
-        text,
-      ];
+      const label = `claude-cli:${options.modelId}`;
+      const role = options.role ?? 'unattributed';
 
-      // **The warm path.** A process already running answers in about a fifth
-      // of the time, because the startup was paid by an earlier call. Any
-      // failure here falls through to the one-shot path below rather than
-      // failing the call: a reused process is an optimisation, never a new
-      // way for a run to break.
-      if (CLAUDE_CLI_WARM) {
-        try {
-          const warm = await askWarm(
-            {
-              binary,
-              cwd: neutralCwd(),
-              modelId: options.modelId,
-              effort,
-              system,
-              schema,
-              tools: resolvedTools,
-              allowedTools: retrieval.allowedTools,
-              disallowedTools: resolvedDisallowedTools,
-              mcpConfig: retrieval.mcpConfig,
-            },
-            text,
-            // Per-role: authoring asks are independent of each other and pay
-            // for every earlier row they carry — see `sessionTurnBudget`.
-            sessionTurnBudget(options.role),
-          );
-          usage.calls += 1;
-          usage.costUsd += warm.costUsd;
-          usage.wallMs += Date.now() - startedMs;
-          usage.inputTokens += warm.inputTokens;
-          usage.cachedInputTokens += warm.cachedInputTokens;
-          usage.outputTokens += warm.outputTokens;
-          const warmRole = roleBucket(options.role ?? 'unattributed');
-          warmRole.calls += 1;
-          warmRole.costUsd += warm.costUsd;
-          warmRole.inputTokens += warm.inputTokens;
-          warmRole.cachedInputTokens += warm.cachedInputTokens;
-          warmRole.outputTokens += warm.outputTokens;
-          // The cross-process ledger — fire-and-forget; see its module header.
-          void recordClaudeCliCall({
-            ts: new Date().toISOString(),
-            modelId: options.modelId,
-            path: 'warm',
-            costUsd: warm.costUsd,
-            inputTokens: warm.inputTokens,
-            cachedInputTokens: warm.cachedInputTokens,
-            cacheWriteTokens: warm.cacheWriteTokens,
-            outputTokens: warm.outputTokens,
-            wallMs: Date.now() - startedMs,
-            pid: process.pid,
-            turns: warm.turns,
-            ...(options.role === undefined ? {} : { role: options.role }),
-          });
-          // A JSON answer is unwrapped from fences/prose before the SDK
-          // parses it — packaging repair only; see `extractStructuredJson`.
-          const warmText =
-            call.responseFormat?.type === 'json' ? extractStructuredJson(warm.text) : warm.text;
-          return {
-            content: warmText === '' ? [] : [{ type: 'text', text: warmText }],
-            finishReason: { unified: 'stop', raw: 'stop' },
-            usage: {
-              inputTokens: {
-                total: warm.inputTokens + warm.cachedInputTokens + warm.cacheWriteTokens,
-                noCache: warm.inputTokens,
-                cacheRead: warm.cachedInputTokens,
-                cacheWrite: warm.cacheWriteTokens,
-              },
-              outputTokens: { total: warm.outputTokens, text: warm.outputTokens, reasoning: 0 },
-            },
-            warnings: [],
-          };
-        } catch {
-          // Fall through and ask the cold way.
-        }
-      }
-
-      let envelope: CliEnvelope;
-      try {
-        const { stdout } = await run(binary, args, {
-          cwd: neutralCwd(),
-          timeout,
-          maxBuffer: 32 * 1024 * 1024,
-          // The version check and telemetry are network calls inside the
-          // 3.4-4.3s startup this provider pays; a model call needs neither.
-          env: { ...process.env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+      /** Book a completed (or cut) answer on the meter and in the ledger. */
+      const book = (
+        path: 'warm' | 'cold',
+        startedMs: number,
+        spent: {
+          costUsd: number;
+          inputTokens: number;
+          cachedInputTokens: number;
+          cacheWriteTokens: number;
+          outputTokens: number;
+          turns: number;
+        },
+        finish?: 'length' | 'error',
+      ): void => {
+        usage.calls += 1;
+        usage.costUsd += spent.costUsd;
+        usage.wallMs += Date.now() - startedMs;
+        usage.inputTokens += spent.inputTokens;
+        usage.cachedInputTokens += spent.cachedInputTokens;
+        usage.outputTokens += spent.outputTokens;
+        const bucket = roleBucket(role);
+        bucket.calls += 1;
+        bucket.costUsd += spent.costUsd;
+        bucket.inputTokens += spent.inputTokens;
+        bucket.cachedInputTokens += spent.cachedInputTokens;
+        bucket.outputTokens += spent.outputTokens;
+        // The cross-process ledger — fire-and-forget; see its module header.
+        void recordClaudeCliCall({
+          ts: new Date().toISOString(),
+          modelId: options.modelId,
+          path,
+          costUsd: spent.costUsd,
+          inputTokens: spent.inputTokens,
+          cachedInputTokens: spent.cachedInputTokens,
+          cacheWriteTokens: spent.cacheWriteTokens,
+          outputTokens: spent.outputTokens,
+          wallMs: Date.now() - startedMs,
+          pid: process.pid,
+          turns: spent.turns,
+          ...(options.role === undefined ? {} : { role: options.role }),
+          ...(finish === undefined ? {} : { finish }),
         });
-        envelope = JSON.parse(stdout) as CliEnvelope;
-      } catch (error) {
-        // Worded as a provider fact. `generateStructured` and the healer both
-        // key off "the provider refused the call" to keep a model outage from
-        // being filed as an application defect.
-        throw new Error(
-          `claude CLI could not be asked — the provider refused the call: ${
-            error instanceof Error ? error.message.split('\n')[0] : String(error)
-          }`,
-        );
-      }
-      if (envelope.is_error === true) {
-        throw new Error(`claude CLI could not be asked — the provider refused the call: ${envelope.result ?? 'unknown error'}`);
-      }
+      };
 
-      // Same packaging repair as the warm path — the two vectors stay in step.
-      const answer =
-        call.responseFormat?.type === 'json'
-          ? extractStructuredJson(String(envelope.result ?? ''))
-          : String(envelope.result ?? '');
-      usage.calls += 1;
-      usage.costUsd += envelope.total_cost_usd ?? 0;
-      usage.wallMs += Date.now() - startedMs;
-      const input = envelope.usage?.input_tokens ?? 0;
-      const cacheRead = envelope.usage?.cache_read_input_tokens ?? 0;
-      const cacheWrite = envelope.usage?.cache_creation_input_tokens ?? 0;
-      const output = envelope.usage?.output_tokens ?? 0;
-
-      usage.inputTokens += input;
-      usage.cachedInputTokens += cacheRead;
-      usage.outputTokens += output;
-      const coldRole = roleBucket(options.role ?? 'unattributed');
-      coldRole.calls += 1;
-      coldRole.costUsd += envelope.total_cost_usd ?? 0;
-      coldRole.inputTokens += input;
-      coldRole.cachedInputTokens += cacheRead;
-      coldRole.outputTokens += output;
-
-      // Same ledger as the warm path — one row per `claude -p` call.
-      void recordClaudeCliCall({
-        ts: new Date().toISOString(),
-        modelId: options.modelId,
-        path: 'cold',
-        costUsd: envelope.total_cost_usd ?? 0,
-        inputTokens: input,
-        cachedInputTokens: cacheRead,
-        cacheWriteTokens: cacheWrite,
-        outputTokens: output,
-        wallMs: Date.now() - startedMs,
-        pid: process.pid,
-        turns: envelope.num_turns ?? 1,
-        ...(options.role === undefined ? {} : { role: options.role }),
-      });
-
-      return {
+      const result = (answer: string, spent: { inputTokens: number; cachedInputTokens: number; cacheWriteTokens: number; outputTokens: number }): LanguageModelV4GenerateResult => ({
         content: answer === '' ? [] : [{ type: 'text', text: answer }],
         finishReason: { unified: 'stop', raw: 'stop' },
         usage: {
           // `total` includes what was served from cache: it is what the call
           // actually weighed, which is the number a token budget is about.
           inputTokens: {
-            total: input + cacheRead + cacheWrite,
-            noCache: input,
-            cacheRead,
-            cacheWrite,
+            total: spent.inputTokens + spent.cachedInputTokens + spent.cacheWriteTokens,
+            noCache: spent.inputTokens,
+            cacheRead: spent.cachedInputTokens,
+            cacheWrite: spent.cacheWriteTokens,
           },
-          outputTokens: { total: output, text: output, reasoning: 0 },
+          outputTokens: { total: spent.outputTokens, text: spent.outputTokens, reasoning: 0 },
         },
         warnings: [],
+      });
+
+      /**
+       * One ask at one CLI output cap (`null` = the operator's environment as
+       * is). Warm first; a TRANSPORT failure there falls through to the cold
+       * one-shot, an ANSWER failure (the CLI replied `is_error`) is thrown as
+       * it is — re-sending the identical prompt cold could only fail
+       * identically, at the price of the whole prompt again.
+       */
+      const askOnce = async (maxOutputTokens: number | null): Promise<LanguageModelV4GenerateResult> => {
+        const startedMs = Date.now();
+        // **The warm path.** A process already running answers in about a
+        // fifth of the time, because the startup was paid by an earlier
+        // call. A transport failure here falls through to the one-shot path
+        // below rather than failing the call: a reused process is an
+        // optimisation, never a new way for a run to break.
+        if (CLAUDE_CLI_WARM) {
+          try {
+            const warm = await askWarm(
+              {
+                binary,
+                cwd: neutralCwd(),
+                modelId: options.modelId,
+                effort,
+                system,
+                schema,
+                tools: resolvedTools,
+                allowedTools: retrieval.allowedTools,
+                disallowedTools: resolvedDisallowedTools,
+                mcpConfig: retrieval.mcpConfig,
+                maxOutputTokens,
+              },
+              text,
+              // Per-role: authoring asks are independent of each other and pay
+              // for every earlier row they carry — see `sessionTurnBudget`.
+              sessionTurnBudget(options.role),
+            );
+            book('warm', startedMs, warm);
+            // The CLI-validated object when there is one, else the text with
+            // its fences/prose stripped — packaging repair only; see
+            // `answerTextOf` and `extractStructuredJson`.
+            const warmText = wantsJson
+              ? extractStructuredJson(answerTextOf({ result: warm.text, structured_output: warm.structuredOutput }, true))
+              : warm.text;
+            return result(warmText, warm);
+          } catch (error) {
+            if (error instanceof ClaudeAnswerError) {
+              // The model was asked and the CLI reported the answer failed.
+              // What it cost is booked; the caller decides whether a raised
+              // cap is worth one more ask.
+              if (error.usage !== null) book('warm', startedMs, error.usage, error.finishReason);
+              throw error;
+            }
+            // A transport fact (session died, pool full, no answer in time):
+            // say so, because the cold copy below re-pays the prompt and the
+            // ledger's cold rows were otherwise unexplained.
+            process.stderr.write(
+              `[wowlidator] ${label} warm session could not answer (${
+                error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)
+              }) — asking cold\n`,
+            );
+          }
+        }
+
+        // THE `claude -p` COMMAND. Edit this array to change what runs.
+        const args = [
+          '-p',
+          '--model',
+          options.modelId,
+          '--effort',
+          effort,
+          '--output-format',
+          'json',
+          // Replaced, never appended — see the note at the top of this file.
+          '--system-prompt',
+          system === ''
+            ? 'You answer exactly what is asked, with no preamble and no commentary.'
+            : system,
+          '--strict-mcp-config',
+          // No settings, hooks, plugins or skills: nothing outside the prompt
+          // may steer an answer, and none of it is paid for at startup.
+          '--setting-sources',
+          '',
+          '--disable-slash-commands',
+          // A per-call transcript on disk serves nobody — the proof bundle is
+          // the record — and skipping it removes a write per turn.
+          '--no-session-persistence',
+          // `=` form on purpose: these flags are variadic, and the space form
+          // with an empty value swallows the positional prompt (measured —
+          // "Input must be provided either through stdin or as a prompt").
+          ...(resolvedTools !== null ? [`--tools=${resolvedTools}`] : []),
+          ...(retrieval.allowedTools !== null ? [`--allowed-tools=${retrieval.allowedTools}`] : []),
+          ...(resolvedDisallowedTools !== null ? [`--disallowed-tools=${resolvedDisallowedTools}`] : []),
+          ...(retrieval.mcpConfig === null ? [] : [`--mcp-config=${retrieval.mcpConfig}`]),
+          ...(schema === null ? [] : ['--json-schema', schema]),
+          text,
+        ];
+
+        let envelope: ClaudeResultEvent;
+        try {
+          const { stdout } = await run(binary, args, {
+            cwd: neutralCwd(),
+            timeout,
+            maxBuffer: 32 * 1024 * 1024,
+            // The version check and telemetry are network calls inside the
+            // 3.4-4.3s startup this provider pays; a model call needs neither.
+            // The output cap, when a re-ask raised it — same dial as the warm
+            // session's, so the two vectors stay in step.
+            env: {
+              ...process.env,
+              CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+              ...(maxOutputTokens === null ? {} : { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxOutputTokens) }),
+            },
+          });
+          envelope = JSON.parse(stdout) as ClaudeResultEvent;
+        } catch (error) {
+          // Worded as a provider fact. `generateStructured` and the healer both
+          // key off "the provider refused the call" to keep a model outage from
+          // being filed as an application defect.
+          throw new Error(
+            `claude CLI could not be asked — the provider refused the call: ${
+              error instanceof Error ? error.message.split('\n')[0] : String(error)
+            }`,
+          );
+        }
+        const totalCost = typeof envelope.total_cost_usd === 'number' ? envelope.total_cost_usd : 0;
+        const turns = typeof envelope.num_turns === 'number' ? envelope.num_turns : 1;
+        const spent = usageOf(envelope, totalCost, turns);
+        if (envelope.is_error === true) {
+          // Same typed error as the warm path, so a cut at the cap reads as
+          // `finish=length` whichever vector answered.
+          const failure = answerErrorOf(envelope, spent);
+          book('cold', startedMs, spent, failure.finishReason);
+          throw failure;
+        }
+        book('cold', startedMs, spent);
+        // Same packaging repair as the warm path — the two vectors stay in step.
+        const answer = wantsJson ? extractStructuredJson(answerTextOf(envelope, true)) : answerTextOf(envelope, false);
+        return result(answer, spent);
       };
+
+      // **An answer cut at the CLI's output cap is re-asked ONCE at a raised
+      // cap, never at the same one.** At temperature 0 the identical request
+      // is cut at the identical place; what changes is the budget, doubled
+      // toward the model's own ceiling (`raisedOutputCap` — 32,000 → 64,000
+      // on opus, measured 2026-09-04). At the ceiling there is nothing to
+      // raise and the failure says so with `finish=length` on line one,
+      // through `generateStructured`'s existing seam. Nothing here can alter
+      // an answer that arrived whole: a whole answer never enters this branch.
+      let cap: number | null = null;
+      for (;;) {
+        try {
+          return await askOnce(cap);
+        } catch (error) {
+          if (!(error instanceof ClaudeAnswerError)) throw error;
+          const raised: number | null = cap === null ? raisedOutputCap(error) : null;
+          if (raised === null) throw error;
+          process.stderr.write(
+            `[wowlidator] ${label} answer was cut at the CLI output cap of ${error.outputCap} tokens — ` +
+              `re-asking once with CLAUDE_CODE_MAX_OUTPUT_TOKENS=${raised} (model ceiling ${error.modelCeiling})\n`,
+          );
+          cap = raised;
+        }
+      }
     },
 
     doStream(): never {

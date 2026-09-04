@@ -31,6 +31,7 @@ import {
   parseClaimsFile,
   toClaimsFile,
   type CatalogClaim,
+  groupClaimsByRow,
 } from '../src/catalog/catalog.js';
 import { jsonModel } from './helpers.js';
 
@@ -457,7 +458,9 @@ import {
   beyondHarnessReason,
   describeCase,
   parseTestCaseTable,
+  realignRow,
   recordedResult,
+  tablePersonas,
   tableToClaims,
 } from '../src/catalog/test-case-table.js';
 
@@ -489,6 +492,64 @@ describe('the test-case table, read whole', () => {
     assert.ok(rows);
     const [claim] = tableToClaims(rows);
     assert.match(claim?.claim ?? '', /— note: KNOWN FAIL: code uses 119/);
+  });
+
+  it('names the accounts the whole document signs in as, with the cases that need each', () => {
+    // The motivating shape: a probation review that changes hands. Two of its
+    // five steps name an account, and neither of them is in the claim text —
+    // `claimTextOf` reads the title, the expectation and the note, never the
+    // Steps column. Without this roll-up nothing downstream could tell a
+    // catalog needing two logins from one needing none until the authoring
+    // loop refused a row, with a browser already open.
+    const rows = parseTestCaseTable(
+      `${HEADER}\n` +
+        '1,PR_01,Probation,PR_01_01,Positive,High,manager submits and HRBP approves,,,,,' +
+        '"1. Login ด้วย <MANAGER_ACCOUNT>\n2. กด Submit\n3. Login ด้วย <HRBP_ACCOUNT>\n4. กด Approve",' +
+        'status is Probation Passed,\n' +
+        '2,PR_01,Probation,PR_01_02,Positive,Medium,manager alone can submit,,,,,' +
+        '"1. Login ด้วย <MANAGER_ACCOUNT>\n2. กด Submit",the case is queued,',
+    );
+    assert.ok(rows);
+    const needs = tablePersonas(rows);
+    assert.deepEqual(needs, [
+      { label: 'MANAGER_ACCOUNT', cases: ['PR_01_01', 'PR_01_02'] },
+      { label: 'HRBP_ACCOUNT', cases: ['PR_01_01'] },
+    ]);
+
+    // …and it reaches the claims file, which is what a surface actually reads.
+    const file = toClaimsFile(
+      'probation.csv',
+      { summary: 's', documentNote: '', claims: tableToClaims(rows), model: 'read from the sheet', latencyMs: 0 },
+      '2026-09-04T00:00:00.000Z',
+      undefined,
+      needs,
+    );
+    assert.deepEqual(file.personas?.map((p) => p.label), ['MANAGER_ACCOUNT', 'HRBP_ACCOUNT']);
+    // Labels and case ids ONLY. This file is plain JSON a person opens, edits
+    // and mails around; a credential has no business in it, and an email is a
+    // credential's other half.
+    // (`:` is JSON's own punctuation here — what must be absent is an
+    // address or a secret, in any field.)
+    assert.doesNotMatch(JSON.stringify(file.personas), /@|password|passwd|secret/i);
+    for (const need of file.personas ?? []) assert.deepEqual(Object.keys(need).sort(), ['cases', 'label']);
+  });
+
+  it('says nothing at all when no row names an account, rather than saying none', () => {
+    const rows = parseTestCaseTable(
+      `${HEADER}\n1,X_01,Plain,X_01_01,Positive,Low,the page renders,,,,,1. open it,it renders,`,
+    );
+    assert.ok(rows);
+    assert.deepEqual(tablePersonas(rows), []);
+    const file = toClaimsFile(
+      'plain.csv',
+      { summary: 's', documentNote: '', claims: tableToClaims(rows), model: 'm', latencyMs: 0 },
+      '2026-09-04T00:00:00.000Z',
+      undefined,
+      tablePersonas(rows),
+    );
+    // Absent, not `[]`: "nobody looked" and "nobody is needed" are different
+    // facts, and a surface has to be able to tell them apart.
+    assert.equal('personas' in file, false);
   });
 
   it('marks a row whose steps stop services as beyond the harness, boundary named', () => {
@@ -735,5 +796,97 @@ describe('the sheet grammar reaches the author', () => {
     assert.equal(claimsOf(rows)[3]!.testable, true, 'without a start URL the host is not judged');
     assert.equal(sheetGateReason(rows[1]!), 'the sheet records this case as Blocked — bug ticket #71906');
     assert.equal(sheetGateReason(rows[0]!), null);
+  });
+});
+
+describe('a row that slipped against its header (ec09.csv, 2026-09-03)', () => {
+  const HEADER =
+    'No,Category,Scenario ID,Test Scenario,Test Case ID,Positive/Negative,Priority,Test Case,' +
+    'Test Data,Menu,Test Script / Steps,Expected Output,Test Status,Test Date,Test by,Bug ticket,Note';
+
+  it('realigns a row shifted one cell right by dropping the blank the writer skipped', () => {
+    
+    const cells = ['9', 'Hiring', '', 'E2E-09', 'Hiring | Keyin', 'HIR-EC-009', 'Positive', 'High', 'title', 'data', 'menu', '1. steps', 'expected', 'Failed', '', 'QA', '72079'];
+    const { cells: fixed, shift } = realignRow(cells, 5);
+    assert.equal(shift, 1);
+    assert.equal(fixed[2], 'E2E-09');
+    assert.equal(fixed[3], 'Hiring | Keyin');
+    assert.equal(fixed[4], 'HIR-EC-009');
+    assert.equal(fixed[5], 'Positive');
+    assert.equal(fixed[15], '72079');
+  });
+
+  it('leaves an aligned row, and a row with no polarity nearby, exactly as they are', () => {
+    
+    const aligned = ['1', 'A', 'S1', 'scenario', 'ID-1', 'Negative', 'Low'];
+    assert.deepEqual(realignRow(aligned, 5), { cells: aligned, shift: 0 });
+    const none = ['1', 'A', 'S1', 'scenario', 'ID-1', '', 'Low'];
+    assert.deepEqual(realignRow(none, 5), { cells: none, shift: 0 });
+  });
+
+  it('reads the shifted sheet as a table — one case, its columns where the header says', () => {
+    const rows = parseTestCaseTable(
+      `${HEADER}\n` +
+        '9,Hiring,,E2E-09,"Hiring | Keyin - Success",HIR-EC-009,Positive,High,' +
+        '"ตรวจสอบการจ้างพนักงานใหม่",- Entry Route = Keyin,EC > Hire,"1. Login\n2. Key in","EC\n- shows DVT fields",Failed,,QA-Thitiya,"72079\n72090"',
+    );
+    assert.ok(rows, 'the sheet is a test-case table, not a document for the model');
+    assert.equal(rows.length, 1);
+    const row = rows[0]!;
+    assert.equal(row.caseId, 'HIR-EC-009');
+    assert.equal(row.scenarioId, 'E2E-09');
+    assert.equal(row.polarity, 'Positive');
+    assert.match(row.steps, /^1\. Login/);
+    assert.match(row.expected, /DVT fields/);
+    assert.equal(row.actual, 'Failed');
+    assert.equal(row.bugTicket, '72079\n72090');
+  });
+});
+
+describe('one row is one case, even when a model split it', () => {
+  
+  const text =
+    '## row 2\nTest Case ID: HIR-EC-009\nExpected Output:\n  - creates the employee\n  - shows 9 DVT fields\n\n' +
+    '## row 3\nTest Case ID: HIR-EC-010\nExpected Output:\n  - rejects the duplicate';
+
+  it('merges the testable claims of a row into one, keeping context lines and other rows apart', () => {
+    const grouped = groupClaimsByRow(
+      [
+        { claim: 'The case runs as HR admin.', priority: 'low', source: 'HIR-EC-009', testable: false },
+        { claim: 'The system creates the employee.', priority: 'medium', source: 'HIR-EC-009', testable: true },
+        { claim: 'The system shows 9 DVT fields.', priority: 'high', source: 'HIR-EC-009', testable: true },
+        { claim: 'The system rejects the duplicate.', priority: 'medium', source: 'HIR-EC-010', testable: true },
+      ],
+      text,
+    );
+    assert.equal(grouped.length, 3);
+    assert.equal(grouped[0]!.testable, false);
+    assert.deepEqual(grouped[1], {
+      claim: 'The system creates the employee; The system shows 9 DVT fields',
+      priority: 'high',
+      source: 'HIR-EC-009',
+      testable: true,
+    });
+    assert.equal(grouped[2]!.source, 'HIR-EC-010');
+  });
+
+  it('places a claim by the words it quoted when the source is not an id, and leaves an unplaceable one alone', () => {
+    const grouped = groupClaimsByRow(
+      [
+        { claim: 'a', priority: 'medium', source: 'shows 9 DVT fields', testable: true },
+        { claim: 'b', priority: 'medium', source: 'creates the employee', testable: true },
+        { claim: 'c', priority: 'medium', source: 'nowhere in the sheet', testable: true },
+      ],
+      text,
+    );
+    assert.equal(grouped.length, 2);
+    assert.equal(grouped[0]!.source, 'HIR-EC-009');
+    assert.equal(grouped[0]!.claim, 'a; b');
+    assert.equal(grouped[1]!.claim, 'c');
+  });
+
+  it('returns a prose document’s claims untouched', () => {
+    const claims = [{ claim: 'x', priority: 'medium', source: '1.1', testable: true }];
+    assert.deepEqual(groupClaimsByRow(claims, '# Spec\n1.1 x'), claims);
   });
 });

@@ -89,7 +89,7 @@ export function isLoginProof(step: FlowStep): boolean {
  * attempted. The narrower `isLoginProof` (expectHidden only) let all three
  * count as substantive, so the flow sailed past this module's own lint.
  */
-const LOGIN_FORM_CONTROL = /work email|username|sign[ -]?in|log[ -]?in|เข้าสู่ระบบ|อีเมล/i;
+const LOGIN_FORM_CONTROL = /\bemail\b|username|user ?name|sign[ -]?in|log[ -]?in|เข้าสู่ระบบ|อีเมล/i;
 
 function isLoginFormSurface(step: FlowStep): boolean {
   if (step.action !== 'expectVisible' && step.action !== 'expectEnabled' && step.action !== 'expectDisabled') {

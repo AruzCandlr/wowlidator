@@ -118,7 +118,7 @@ export class ApiActions {
   /** Values saved by `request` steps, for `{{name}}` interpolation later. */
   readonly variables: VariableStore;
 
-  readonly #transport: ApiTransport;
+  #transport: ApiTransport;
   readonly #bundle: ProofBundleBuilder;
   readonly #redaction: RedactionPolicy;
   readonly #currentUrl: () => string | null;
@@ -131,6 +131,15 @@ export class ApiActions {
 
   /** The most recent response — what `expectStatus`/`expectJson` assert against. */
   #lastResponse: ApiResponse | null = null;
+
+  /**
+   * Swap the transport — a browser transport is bound to one context's
+   * cookie jar, and a run that switches persona (one Chrome per person) must
+   * send its next `request` as the person now active, not the first one.
+   */
+  setTransport(transport: ApiTransport): void {
+    this.#transport = transport;
+  }
 
   constructor(options: ApiActionsOptions) {
     this.variables = options.variables ?? new VariableStore();

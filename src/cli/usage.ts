@@ -61,6 +61,11 @@ Options:
                                                          (default ./${DEFAULT_REPORT_DIR}/)
   --report-dir <dir>   Directory for reports when --report has no path
   --no-report          Skip HTML report generation
+  --humanize <on|off>  Perform like a person for the film: the pointer
+                       travels to each control and hovers before the press,
+                       values go in character by character, navigations get
+                       a beat. Default: on while filming, off with --video
+                       off. Never changes what a step resolves or asserts.
   --video <mode>       on | always | off  (default on)
                        Every run keeps its film — "View actual flow" plays
                        it in the report and the panel, pass or fail. Under
@@ -219,7 +224,7 @@ catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mm
   --rerun-failed       Re-run every failed / dead-end case with autoheal; implies --resume --repair
   --rerun-case <id>    Re-author the named case from its sheet row and re-run it, whatever its
                        verdict; repeatable; implies --resume. A case id the workbook
-                       repeats is qualified (TM:PL_03_01, TSH_01_01#2) — use that spelling.
+                       repeats is qualified (SHEET:CASE_ID, CASE_ID#2) — use that spelling.
   --sheet <name>       (workbook) Only this worksheet — EC, BE, TM, PY; repeatable,
                        case-insensitive. The claims file, the ledger and the report
                        are then this slice's.
@@ -286,7 +291,12 @@ Browser lifecycle (wowlidator starts and checks Chrome itself — no wrapper scr
                        least-busy one. One browser's main thread queues every
                        lane's renderer, encoder and CDP session, so with
                        --concurrency above 3 or so this is where the time goes.
-                       --stop-chrome stops every one this run started.
+                       A case that signs in as several people (--persona) gets
+                       one Chrome per person, sessions kept for the whole case;
+                       the pool grows on demand when this is unset. With
+                       --no-headless --browsers 2 you watch employee and
+                       manager side by side. --stop-chrome stops every one
+                       this run started.
   --stop-chrome        Quit the browser afterwards, but only if this run started it.
   --wait-for <url>     Wait until this responds before starting — for a dev
                        server that is still booting.

@@ -45,13 +45,25 @@ describe('the Ledger page', () => {
       assert.equal((html.match(new RegExp(`function ${name}\\(`, 'g')) ?? []).length, 1, name);
     }
     // The evidence machinery ships unchanged: the checks table, the drawer, the launcher gate, the live console.
-    for (const name of ['checksTable', 'evidencePanel', 'claimsGate', 'recomputeLanes', 'agentActionLog', 'streamJob', 'outputSection', 'jobForRun', 'progressBar', 'tqdmReadout', 'renderGroup', 'taskRow', 'renderKeys', 'renderRepos', 'renderHistory', 'renderHealed', 'renderReports', 'workQueueBox', 'confirmDeleteGroup']) {
+    for (const name of ['checksTable', 'evidencePanel', 'claimsGate', 'recomputeLanes', 'agentActionLog', 'streamJob', 'outputSection', 'jobForRun', 'progressBar', 'tqdmReadout', 'renderGroup', 'taskRow', 'renderKeys', 'renderRepos', 'renderHistory', 'renderHealed', 'renderReports', 'workQueueBox', 'confirmDeleteGroup', 'personaBlock', 'personasUnanswered', 'personaValues', 'accountPicker', 'rememberedAccounts', 'personaLabelKey', 'loadPersonaAccounts']) {
       assert.match(html, new RegExp(`function ${name}\\(`), name);
     }
     // And the layout is declared again, later, so the base calls land here.
     for (const name of ['render', 'show', 'renderSidebar', 'pageHead', 'renderRuns', 'statsStrip', 'attentionItems', 'renderAttention', 'boot']) {
       assert.equal((ledgerPart.match(new RegExp(`\\nfunction ${name}\\(`, 'g')) ?? []).length, 1, `${name} is redeclared once`);
     }
+  });
+
+  it('inherits the per-account credential block instead of owning a second copy of it', () => {
+    // `renderCatalogTab` is not among the functions Ledger declares again, so
+    // the one call site inside it serves both surfaces. If Ledger ever
+    // redeclares that function, this is the test that should stop the launcher
+    // quietly losing the block on one page and keeping it on the other.
+    assert.equal((html.match(/function renderCatalogTab\(/g) ?? []).length, 1);
+    assert.doesNotMatch(ledgerPart, /function renderCatalogTab\(/);
+    assert.match(html, /if \(M\.claims\) \{ var accounts = personaBlock\(M\); if \(accounts\) box\.appendChild\(accounts\); \}/);
+    // And no password typed into it is remembered anywhere on this page either.
+    assert.doesNotMatch(html, /localStorage[^\n]*personaCreds|personaCreds[^\n]*localStorage/);
   });
 
   it('is six tabs on a top bar, and every address the older surfaces wrote still lands', () => {
@@ -122,6 +134,46 @@ describe('the Ledger page', () => {
     for (const term of ['pass\\*\\*', 'proved-\\?', 'dead-end', 'quarantined', 'spec\\?', 'rung', 'ledger', 'bundle', 'vacuous', 'polarity']) {
       assert.match(html, new RegExp(`term: '${term}'`), term);
     }
+  });
+
+  it('reads command output through wowUI\'s one console view — pinned here so it survives /wow retiring', () => {
+    // The view itself is asserted in detail in tests/wow-ui.test.ts; what
+    // Ledger must keep is that it composes the same one (once), that both
+    // homes of a job's output use it, and the parts a person relies on.
+    assert.equal((html.match(/function consoleView\(/g) ?? []).length, 1);
+    assert.equal((html.match(/function classifyLine\(/g) ?? []).length, 1);
+    assert.doesNotMatch(html, /function outLine\(/);
+    assert.match(html, /detail\.appendChild\(outputSection\(job\.id, job\)\)/, 'the live job row');
+    assert.match(html, /detail\.appendChild\(outputSection\(card\.runId, producedBy\)\)/, 'the finished run card');
+    assert.match(html, /pane\.appendChild\(consoleView\(lines\)\.node\)/, 'a case\'s own pane');
+    for (const part of ["text: 'Copy raw'", "placeholder: 'find in output'", "'printed on stderr'", "getItem('wow-console-filter')", 'function conFold(row, c)']) {
+      assert.ok(html.includes(part), part);
+    }
+    assert.match(html, /\.con-case \{[^}]*position: sticky/);
+  });
+
+  it('explains every status word on the row and in the glossary from one map, so the two cannot disagree', () => {
+    // The map ships once, in the composed wowUI script, ahead of VOCAB.
+    assert.equal((html.match(/var STATUS_MEANING = \{/g) ?? []).length, 1);
+    assert.ok(html.indexOf('var STATUS_MEANING = {') < html.indexOf('var VOCAB = ['));
+    // Every status term in VOCAB reads its meaning from the map — no second sentence to drift.
+    for (const key of ['passed', 'passed-with-issues', 'needs-review', 'human-confirmed', 'failed', 'dead-end', 'error', 'blocked', 'no verdict', 'quarantined', 'needs a human', 'recorded only', 'spec?']) {
+      assert.match(ledgerPart, new RegExp(`meaning: STATUS_MEANING\\['${key.replace('?', '\\?')}'\\]`), key);
+    }
+    assert.doesNotMatch(ledgerPart, /meaning: '[^']*(?:harness|dead-end|never resolved)[^']*'/, 'no status sentence is written twice');
+    // The words themselves, served on the page.
+    for (const text of [
+      'the harness, a model, a key or the environment broke — no verdict about the application was delivered',
+      'a control or content the case needed never resolved — the page did not offer what the case expected',
+      'not run and not failed: the case needed something that was not in place',
+    ]) assert.ok(html.includes(text), text);
+    // The glossary still renders every entry's meaning, and the rows still get their line.
+    assert.match(ledgerPart, /VOCAB\.forEach\(function \(v\) \{/);
+    assert.match(ledgerPart, /el\('div', \{ text: v\.meaning \}\)/);
+    assert.match(html, /function meaningLine\(key, detail\)/);
+    assert.match(html, /isRunning \? null : runMeaningLine\(latest, why\)/);
+    assert.match(html, /meaningLine\(entry\.status, entry\.reason\)/);
+    assert.match(html, /\.meaning \{\n  grid-column: 1 \/ -1;/);
   });
 
   it('carries the whole manual as data, every section by title', () => {

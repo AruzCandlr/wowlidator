@@ -213,7 +213,7 @@ describe('form actions against a real page (CDP)', { skip: skipBrowser }, () => 
     const started = Date.now();
     const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'shell.json'), healer: null });
     assert.equal(bundle.status, 'passed', bundle.error ?? 'the shell rung should fill the input beneath');
-    const fill = bundle.steps.find((s) => s.action === 'fill' && s.selector.includes('Select date'));
+    const fill = bundle.steps.find((s) => s.action === 'fill' && (s.selector ?? '').includes('Select date'));
     assert.equal(fill?.resolution, 'narrow');
     assert.match(fill?.resolvedSelector ?? '', /input:not\(\[readonly\]\)/);
     assert.ok((bundle.notes ?? []).some((n) => n.includes('read-only display over the real input') && n.includes('2027-09-01')));

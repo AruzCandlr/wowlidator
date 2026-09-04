@@ -34,6 +34,7 @@ import {
   valueShownIn,
   valueSpellings,
   differentPage,
+  wanderedOffPage,
   queryAndHash,
   urlMoveNote,
   wizardStepHint,
@@ -227,6 +228,34 @@ describe('sign-in detection', () => {
   it('spots a goal that asks for authentication', () => {
     assert.equal(goalMentionsSignIn('Enter password hrbp2026 and click Sign in'), true);
     assert.equal(goalMentionsSignIn('Open every probation case in turn'), false);
+  });
+});
+
+describe('wanderedOffPage — the HIR-EC-002 wander (2026-09-03)', () => {
+  // Steps 16 "Reopen the saved New Hire" and 19 "Leave the New Hire form":
+  // 903 s of 1,377 s, each leg off /en/admin/hire/draft onto /en/requests and
+  // on through the admin area, every fresh page scored as progress.
+  const START = 'http://localhost:3005/en/admin/hire/draft';
+  const REOPEN = 'Reopen the saved New Hire draft from the drafts list and continue the form';
+
+  it('is true off the start page when the goal names no destination', () => {
+    assert.equal(wanderedOffPage(REOPEN, START, 'http://localhost:3005/en/requests'), true);
+    assert.equal(wanderedOffPage(REOPEN, START, 'http://localhost:3005/en/admin/employees'), true);
+  });
+
+  it('is false on the start page, and a ?step= change is still the start page', () => {
+    assert.equal(wanderedOffPage(REOPEN, START, START), false);
+    assert.equal(wanderedOffPage(REOPEN, START, `${START}?step=2`), false, 'the wizard mirrors its step into the query');
+  });
+
+  it('is false at the destination the goal names, and true anywhere else off the page', () => {
+    const LEAVE = 'Leave the New Hire form and go to the requests list at /en/requests';
+    assert.equal(wanderedOffPage(LEAVE, START, 'http://localhost:3005/en/requests'), false);
+    assert.equal(wanderedOffPage(LEAVE, START, 'http://localhost:3005/en/admin/employees'), true);
+  });
+
+  it('is false on another origin only if it is the destination — a different host is a wander otherwise', () => {
+    assert.equal(wanderedOffPage(REOPEN, START, 'http://elsewhere.test/en/admin/hire/draft'), true);
   });
 });
 

@@ -472,3 +472,378 @@ carries the same rule, with the shape to write: open the control, count its
 options, then assert each named value; an `ไม่แสดง X` line is an `expectHidden`
 on top of the count, never instead of it. Tests: `tests/flow-author.test.ts`
 (`unboundedExclusivityClaim`).
+
+## What a model hands back is unwrapped before it is typed (`cleanModelValue`, 2026-09-03)
+
+Live (ec09 HIR-EC-009, panel jobs 2 and 3): the value resolver reached its last rung for `National ID / Tax ID = <VALID_NATIONAL_ID>` (no sheet value; the column is sensitive so the database is never asked) and typed the model's answer verbatim — which was the reply envelope nested inside the value, `{"value": "1999900123459"}`, because the system prompt said "output only the value" while the user prompt said "Reply {"value": …}". `cleanModelValue` now runs on every string a resolver model returns (`generated`, `fromRepo`): code fences, a JSON object whose `value` (or lone) key holds the answer — nested envelopes too — surrounding quotes and trailing prose are stripped; a plain value is untouched; a generated value that still contains `{}[]"` falls back to `candidateFor`. The generate prompt no longer contradicts its own reply shape. This is packaging repair only — it knows nothing about any field. (The number itself then failed the app's mod-11 checksum; a field-keyed checksum generator was tried and rejected the same day as hardcoding — a generated value's validity is the app's verdict, shown in the report as `generated`.) Tests: `tests/value-resolution.test.ts` ("what a model hands back is unwrapped…").
+
+## A persona hand-off is one `signIn`, never a `signOut` first (2026-09-03)
+
+Each persona now gets a Chrome of their own for the length of the case and keeps their session (see `src/engine/CLAUDE.md`, "A persona switch is a browser switch"), so the prompt's sign-in rules say: one `signIn` per hand-off, no `signOut` before it, and a `signIn` naming a persona who already signed in earlier returns to their browser with the session intact. `signOut` is authored only when the case itself says to sign out. `groundPersonaSwitches` never spliced a `signOut` before a `signIn`-based switch (it grounds hand-typed credential blocks only), so the change is in the prompt and the refusal wording; `multiPersonaWorkflow` still refuses one workflow goal naming two people.
+
+## The tree is read with the row's tab selected, and the opening click only from that state (2026-09-04, PY-1 TC_SSO_001_001)
+
+The sheet's step 2 says `กดปุ่ม "Add" / "+"`; the flow clicked
+`role=button[name="Add Rate" i]` with the intent admitting it — *(rendered as
+"Add Rate")* — and every field after it was the RATE form's (Employee Rate (%),
+Save (Ctrl+Enter)). The run proved the page: after the flow's own click of the
+"SSO Branch Registration" tab, "Add Rate" was absent (`the page's button is
+named "SSO Branch Rate"`), and in-run reconstruction had to click BACK to the
+"SSO Branch Rate" tab to find it. Not two controls in one tree: the panels
+render one at a time, and the Registration panel's own Add control was in no
+tree the author ever saw.
+
+The chain was the capture, not the model. `captureJourneyTree`
+(`cli/commands/authoring.ts`) read `/admin/config/sso` in its LANDING state —
+the default tab — although `destinationOf` had already parsed the row's tab
+(`เลือกแท็บ "…"`), and the prompt merely told the model "the row selects the tab
+X — click it before reading". Then `captureAfterOpening` matched the script's
+`"Add"` by prefix to the default panel's `"Add Rate"`, clicked it, and captured
+the wrong form as the row's. Every lint and the $0 audit passed, because
+everything the flow named WAS in the tree; the tree was of a state the script
+never visits. A grounding lint cannot recover evidence that was never captured,
+so nothing changed in either author file; the fix is where the evidence is made:
+
+- **The row's tab is selected on the capture tab before the tree is read**
+  (`selectNamedTab`, matched by accessible name in whatever role the strip
+  renders it — here buttons). The section header says the tree was read WITH
+  that tab selected and that the flow must click it first.
+- **The opening click runs only from the state the script clicks it in.** A
+  row that names a tab this capture could not select gets NO opening capture
+  (logged), and the header says the tab was not selected and that a control
+  the script names which is absent below is *not captured*, never absent — a
+  workflow goal in the script's words is the honest shape for that leg. No
+  tree beats a tree of the wrong panel: the first hands the author a thin
+  claim the run can settle; the second handed it a false one that passed
+  every check.
+- **One matcher for both clicks** (`controlNamedIn`, pure, exported): whole
+  name, then prefix, then containment, clickable roles only — so "which
+  control did the sheet mean" cannot mean two things. The prefix rule stays;
+  it is right on the right panel.
+
+Evaluated and rejected as generator rules: (a) marking the selected tab in the
+tree — the strip here is buttons, the tree is flat, and a state flag would
+raise every healer call's token bill for a signal this app does not emit;
+(b) "an exact tree match for the script's quoted name beats a longer name" —
+it refuses a true claim in this very flow (`กด "Save"` is correctly
+`Save (Ctrl+Enter)` on the modal wherever a page-level "Save" also exists), and
+a rule that can refuse a true claim is wrong; (c) a lint comparing the flow's
+clicks against the capture's click path — a filter clicked between arriving and
+opening is legitimate, and with the capture fix the header is consistent by
+construction. Tests: `tests/flow-author.test.ts` ("journey capture reads the
+tab the row selects, before the opening click").
+
+## One author again (2026-09-04)
+
+For a day the CLI ran `flow-author_original.ts` while every test ran `flow-author.ts` — ~1,750 diff lines apart, the hardcode guard skipping the live one by name. The CLI, `src/index.ts` and `cli/options.ts` now import `flow-author.ts`; the older file is a reference artifact at `docs/artifacts/flow-author_original.ts` (outside `src/`, compiled and imported by nothing, and no longer on the no-hardcode SKIP list). Seven prompt tests that pinned the old file's SHOUTED headings were re-pointed at the live prompt's sentences for the same rules (persona sign-in by label, menu path as the first leg, one pair per line, date phrases, `[RECORD ONLY]`, option sets counted with the list open once, wait-until, `expectFieldError`, `expectAnyVisible`, evidence independent of the agent, the disclosure corollary, `request`, one page state, the captured second page, both scopes). No rule was dropped: each was found reworded before its test was changed. Tests: `tests/author-wave2.test.ts`, `tests/flow-author.test.ts`.
+
+## The resolver's vocabulary is data: `value-rules.ts` and `.wowlidator/value-rules.json` (2026-09-04)
+
+The whole QA workbook (`QA_Task_Tracking_Cycle1.xlsx`, 1,286 rows, 8,225 Test data pairs) was read cell by cell through the resolver's own functions. Of the 1,409 pairs that turn out to be needs, the resolver knew tokens, date phrases, reused keys and described values; it did NOT know five shapes the sheet writes constantly, and typed each verbatim:
+
+- a value followed by a remark — `Employee Sub Group = 10 ตามชุดข้อมูล` (HIR-EC-015), `Work Schedule = D05H0830 ตามที่ Position กำหนด`, a bound `Personnel Grade = 11 ขึ้นไป` (PRB-EC-038), a quoted literal with a comment `"32/13/2026" (วันที่ผิดรูปแบบ)` (PL_10_41) — 457 pairs;
+- a blank word — `Payment Method = Blank` (HIR-EC-059), `DVT Project = null`, `Transfer out to = เว้นว่างในเคสนี้ …` (HIR-EC-139) — 107;
+- a mask standing for a value made elsewhere — `Employee ID = EMXXXX (จาก E2E-01)` (PRB-EC-036), `Benefit plan ID = BE-XXX-999 (ไม่มีในระบบ)` (PL_10_54) — 57;
+- an invalid value described by its own examples — `status = ค่าอื่นที่ไม่ถูกต้อง เช่น "Active", "X"` (PL_10_40) — 28; and a text described only by its length — `ข้อความความยาวเกิน 255 ตัวอักษร` (PL_10_48);
+- date phrases outside the grammar — `31-Dec-9999`, `13 เมษายน`, `1 มกราคมของปีก่อนหน้า`, `< Current Date`, `วันก่อนวันที่จ้าง`, `Age = 60 พอดี ณ Hire Date`, `ทำให้อายุ ณ Hire Date เท่ากับ 59 ปี 11 เดือน`, `ย้อนหลังจากวันที่ทดสอบ 5`, `วันที่ทดสอบ บวก 30 วัน`, and a value that IS another date field's label (`Probationary Period End Date = Hire Date`, PRB-EC-066) — 85 date misses became 73, and the 73 left are unresolvable in-row (the Hire Date lives in another case's data set, `วันแรกของงวดเวลาปัจจุบัน` needs a payroll calendar, a `Payroll Period Cycle` is not a date) and are left as written, exactly as before.
+
+Every one of those readings rests on a VOCABULARY, and the user's standing rule is no field-, phrase- or locale-keyed fix. So the mechanisms are structural and live in `value-resolution.ts` — `writtenValueOf` (a trailing clause after an introducer, a trailing bound, one parenthetical after a space, a leading quoted literal, the first quoted example after an example introducer), `MASK_VALUE`, `labelOfDatePair`, an anchor clause (`ณ <label>`) and a relation prefix (`< X`, `วันก่อน X`) in the date grammar, a length format — and the WORDS are data in `value-rules.ts`: `DEFAULT_VALUE_RULES`, a zod `ValueRulesSchema`, `loadValueRules()` (built-ins merged with `.wowlidator/value-rules.json`; an invalid file is one stderr warning and the built-ins, never a throw), `saveValueRules()` (validate, temp-file + rename), `compileValueRules()` (the one place the regexes are built: every word is escaped and anchored the way the built-in was — Latin on a word boundary, Thai as a substring, a blank word as the whole value; a bad entry is rejected by list and index). `ValueResolutionContext.rules` injects a rule set; `resolveValues` loads the file once per call when none is given, so the CLI and the panel need no new flag, and the panel can edit the file without a TypeScript change. Externalised from code into the file: key-field words, QA key prefixes, non-existing / described / already-exists wordings, blank words, note introducers, bound words, example introducers, format words, the date vocabulary (today/tomorrow/yesterday/future/past, month words, before/after, anchor prepositions, filler prefixes, exact words, back/forward, units, birth-field and age words, age comparators, age anchor fields), field aliases (`Hire Date` ~ `วันที่จ้าง`), and per-field defaults (a value is recorded as `valueSource.kind = 'rules'`, never as the sheet's word; a format shapes the stand-in).
+
+Why it cannot make a result worse: every new shape is single-source — cleaned, blanked or computed from the case's own words, or left as written; no new shape reaches a model. A `selectOption` keeps its parenthetical (an option's label may BE `CDS (C001)`); a value with several parentheticals, a bracket glued to a name (`Permanent(7-16)-(12/31/9999)`), a lowercase `<runtime>`, a range (`07 ถึง 10`) and an option label that reads like a phrase are all typed as written, pinned. The 34 tests that existed pass unchanged under the built-ins; the file's lists REPLACE the built-in list wholesale (a word can be removed), so a tester's edit is exact. Tests: `tests/value-resolution.test.ts` ("the workbook's own cell shapes", "value rules") — every value quoted from a real cell with its case id.
+
+## A visual snapshot is not authorable (2026-09-04, ec09 HIR-EC-009)
+
+Step 58 of the live HIR-EC-009 run was `snapshot record_oq_hir_78`: the author's reading of the [RECORD ONLY] rule ("snapshot a region when it is a state"). A `snapshot` writes its baseline on the first run and diffs every later run against it, so the second run of the same case failed the step `changed` (10% of pixels — the data the run itself had typed) and a record-only observation became a red step about nothing. `snapshot` is out of `AUTHOR_ACTIONS` (so the schema refuses it and narrowing never sees it), out of the vocabulary list, and the rule now says a state is `saveText` of the region that shows it — the film and the per-step screenshot already keep the picture. The engine action stays for hand-written flows (`src/visual/`). A flow already on disk with a snapshot step keeps it until re-authored. Test: `tests/author-wave2.test.ts` (CG-09, "a visual snapshot is not authorable").
+
+## Two lints no flow could satisfy, and a loop that kept asking (2026-09-04, multirole HIR-EC-001)
+
+Panel jobs 3 and 15 spent three opus calls a row (264 s, 21.7k output tokens,
+~$0.95 each) on HIR-EC-001 and blocked it — `authoring refused (attempt 1)`,
+which is the RESUME-cap counter, not the model-attempt count — and a `--resume`
+would have paid three more for the same result, since `lenientGrounding`
+relaxes only `ungroundedTextExpectation`. Read against the sheet, two of the
+four refusals were unsatisfiable by construction, one was reading a note
+instead of a claim, and one was right.
+
+- **One exclusivity detector.** `FlowAuthor.author` called BOTH the legacy
+  `unboundedExclusivityClaim` and `exclusivity.ts`'s `unprovedExclusivity`. The
+  legacy `only` regex had no word boundary and read *Time Management Status และ
+  O.T. Flag เป็น Read-only และ HR ไม่สามารถแก้ไขเองได้* as a closed set, demanding
+  `expectCount role=option` of options that do not exist; the shared detector
+  had already said null (nothing enumerated). The legacy call is gone; the
+  export is a view over `unprovedExclusivity` so nothing else moves; and
+  `ENGLISH_MARKER` is `(?<![\w-])only\b` — a hyphen-joined "only" is a compound
+  adjective (read-only, view-only), one thing's mode, never a set's size.
+- **An empty `expectValue` is the cleared-field claim.** *เมื่อเปลี่ยน Province
+  ระบบเคลียร์ District / Sub-District / Postal Code เดิม* is a claim that a field
+  holds NOTHING; the model wrote `expectValue ""`, narrowing dropped it
+  ("expectValue needs a value"), and the drop was refused fatally — a shape the
+  vocabulary offered no way to write. The engine compares `inputValue` to `""`,
+  which fails on any textbox still holding something, so the pass can fail.
+  The one control that cannot carry it is a dropdown the tree lists as a
+  button: the engine falls back to the trigger's own text (its placeholder) and
+  the step would be red against a correctly cleared dropdown. That shape alone
+  is dropped, with `EMPTY_VALUE_ON_BUTTON_REASON` naming the legal ones
+  (`expectText` of the trigger's wording, `expectHidden` of the cleared choice);
+  the vocabulary line says the same.
+- **The fixture lint reads the claim, never the note, and knows a derived
+  field.** `ungroundedFixtureAssertion` stringified the whole step, intent
+  included — and the prompt itself tells the model to write *skipped step 4:
+  unconfirmed test data — Policy Profile = … ดู CF-SIT-19*, so any
+  `expectVisible` carrying that note was refused for "asserting CF-SIT-19".
+  The intent is now excluded; `fixtureFacts` skips `OPEN_QUESTION`-shaped ids
+  (a question's name is never a fixture — `assertsOpenQuestion` owns that
+  shape, and now also reads `role=…[name="…"]` and past a `>> nth=N` chain);
+  and an `expectText`/`expectValue` anchored on a value-holding control after
+  a body `fill`/`selectOption`/`type` is the application's answer to what was
+  entered — *ระบบดึงข้อมูลจาก Department ได้แก่ … Store/Branch Location*, Branch
+  `T153_1733` after selecting the Department — which the run settles. A
+  `text=` presence, a row click, a DB where-clause and a count stay judged:
+  those are the be100 shapes the lint was written for, and a lookup BEFORE
+  anything was entered is still refused.
+- **An open-question id beside a value is a reference.** `Policy Profile = CDS
+  ใช้แทน CDS ที่เคยระบุ ดู CF-SIT-19` was classified unconfirmed on the raw cell
+  (`unconfirmedValue`, `catalog/test-case-table.ts`) although `writtenValueOf`
+  already reads it as `CDS` and the same data set lists `[TD-01] Policy Profile
+  = CDS`; the author was told to skip the field and `usesUnconfirmedValue`
+  would have refused `selectOption "CDS"` into it. The OQ/CF alternative now
+  counts only at the START of the value (`? CF-HIR-08 OQ-HIR-50`, `OQ-HIR-13`
+  stay unconfirmed) — the rule `fixtureFacts` already applies to a case id
+  after "same as". No vocabulary was added; the note introducer that strips
+  the remark (` ใช้`) was already data in `value-rules.ts`.
+- **The same fatal refusal twice is not re-asked.** The loop had no notion of
+  a refusal the flow cannot satisfy. In the `catch` of `FlowAuthor.author`,
+  when this attempt's fatal `refusalShape` set equals the previous attempt's,
+  the loop stops and throws the refusal prefixed *refused identically on N
+  attempts — a rule the model cannot satisfy or a lint that misreads the case;
+  review the lint*, and the repeat is NOT counted by `#rememberRefusals` (so an
+  unsatisfiable rule cannot become suite memory; a rule now travels only once
+  two ROWS broke it). Weak refusals are untouched — they are meant to be
+  re-asked, then accepted. Why it cannot make the result worse: the outcome is
+  the BLOCKED the budget would have reached anyway, one attempt earlier, and
+  the ledger line now says whether to look at the lint or at the model. It
+  cannot detect an unsatisfiable rule on the first attempt; only the lint
+  fixes above do that.
+- **What was right:** `unperformedScriptSteps` (the flow stopped at step 7 of 8).
+  The earlier run reached step 8 unprompted; with one item of feedback instead
+  of four the re-ask has a chance to converge. Kept fatal.
+
+Measured offline on the real row through the lints: `unconfirmedTestData` empty,
+`fixtureFacts` without the three OQ/CF ids, both exclusivity detectors null, the
+skip-note and derived-Branch shapes accepted, `usesUnconfirmedValue` null for
+`selectOption "CDS"`. Expected on the panel: one or two attempts instead of
+three-and-blocked. Tests: `tests/flow-author.test.ts` (`unboundedExclusivityClaim`
+"Read-only", the fixture and `assertsOpenQuestion` HIR-EC-001 cases, "stops after
+two identical fatal refusals", the memory test now needing two rows),
+`tests/author-wave2.test.ts` ("narrows an empty expectValue …"),
+`tests/value-resolution.test.ts` ("an open-question id beside a value is a
+reference"). Cost is out of this module's hands: the 92k "in" per attempt is the
+claude-cli session's cache re-written per call (`provider-expert`), and the 264 s
+is 21.7k output tokens; `WOWLIDATOR_GENERATOR_RETRY_MODEL` and
+`WOWLIDATOR_AUTHOR_ATTEMPTS` are the dials, unmeasured.
+
+## The lints' words are data, and a choice is made by clicking (2026-09-04, multirole PRB-EC-001 / ML_01_04)
+
+Two lint defects read off the multirole run, and the audit they forced. The
+user's standing rule (2026-09-03) is the frame: no field-, phrase- or
+locale-keyed fix; a lint keys on STRUCTURE — a role from the tree, a step
+shape, an action kind, a line's numbering, a `= ?` beside an id — and the
+words it reads that structure through belong in data, in both of the
+languages the sheets use.
+
+- **`skipsAuthoredScript` has three tiers, and each names what performs it.**
+  `เลือก` / select / choose sat in the TYPING tier, satisfied only by
+  `INPUT_ACTIONS` — no `click` — while the refusal told the model a click
+  counts. PRB-EC-001's `click role=radio[name="Pass probation (normal)"]` was
+  refused for a script it had performed. Now: TYPING (`กรอก`, `คีย์`, fill,
+  key in …) is performed by a fill / fillRetry / type / setValue / upload — and
+  a selectOption / check, a chosen cascade being data entered (HIR-EC-001,
+  kept); CHOOSING (`เลือก`, `ติ๊ก`, select, choose, tick …) by those, or a
+  `click` whose selector role is a choice role (`CHOICE_ROLES`: radio, option,
+  checkbox, switch, menuitemradio, menuitemcheckbox, tab, treeitem), or a
+  `click` that another body step follows — a choice made by clicking is the
+  ordinary shape and the step after it is what the choice was for; ACTING
+  (`กด`, `ยอมรับ`, `ประกาศ`, click, accept, publish, sign in …) by any action
+  or a workflow leg, as before. Tiers are judged in that order, the result
+  carries the `tier`, and the refusal prints `describeScriptDemand(tier)` —
+  the sentence lives beside the sets it describes, so the message and the
+  code cannot say two things.
+- **`unperformedScriptSteps` reads three carriers.** It read only an intent's
+  `step N`. A `workflow` step's GOAL is where an agent leg names its script
+  step (the carrier rule `unassertedExpectedItems` already applies), and the
+  sheet's own sub-numbering at the head of an intent (`5.4 กด Approve`) cites
+  step 5 — excluding any id that is an EXPECTED line's (`expectedItemsIn`), so
+  the two numberings cannot be confused, and only for a number the script has.
+  `skipped step N: <why>` still marks a skip. The step and skip words are data
+  (`authoring.script.stepWords` / `skipWords`: step / ขั้นตอน / ข้อ, skip /
+  ข้าม).
+- **`expectedItemsIn` anchors an id at the line's head.** "Requested hours :
+  0.52 hrs" was read as Expected item `0.52` and demanded an assertion. A
+  decimal id or a bare `N.` counts only after optional whitespace and a
+  bullet, never mid-line.
+- **`ENGLISH_MARKER` keeps its `(?<![\w-])` lookbehind** (read-only, view-only
+  are one thing's mode).
+
+**`value-rules.ts` now exists** — the section above ("The resolver's
+vocabulary is data") described it before the file did; the resolver's
+`VOCABULARY` was an inline constant. It is one module with two halves under one
+zod schema: `values` (the resolver's vocabulary, moved there verbatim and
+re-exported by `value-resolution.ts` under its old name) and `authoring` (the
+lints' and gates' words). `loadValueRules()` merges the built-ins with
+`.wowlidator/value-rules.json` — a present list REPLACES the built-in one
+wholesale so a word can be removed, an absent key keeps the built-in, an
+unknown key or an invalid file is one stderr line and the built-ins, never a
+throw. Loaded once per process (`VALUE_RULES`, `AUTHORING`), which is once per
+panel job since the panel runs `dist/cli.js` per run; not per call, and there is
+no `ValueResolutionContext.rules` — the earlier section overstated both.
+`compileAuthoringRules` is the one place the lint regexes are built: Latin on a
+word boundary, Thai as a substring after a line start / space / bullet / step
+number (the anchoring the lints always used), longest word first.
+
+Moved into data (`DEFAULT_AUTHORING_RULES`), every list Thai + English:
+`script.typing` / `choosing` / `acting` (was `SCRIPT_DEMANDS_INPUT` /
+`SCRIPT_DEMANDS_ACTION`), `script.routeLine` (was inline in
+`withoutRouteLabels`), `script.stepWords` / `skipWords` (was the citation
+regex), `wordingClaim` (was `WORDING_CLAIM`), `matchClaim.agree` /
+`unchanged` / `readings` / `quantities` (was `unreconciledMatchClaim`'s
+regex — the shape, an agree-word within a clause of a reading or an
+unchanged-word within a clause of a quantity in either order, stays in code),
+`openQuestionPrefixes` (was `OQ|CF` in three files), `sheetNote.cancelled` /
+`notYet` / `retest` (was `sheetGateReason`'s regexes in
+`catalog/test-case-table.ts`, whose English-only cancelled list gained the
+Thai phrases). The catalog parser now imports this one leaf module of the
+generator; it imports nothing of the parser, so the dependency still runs one
+way.
+
+Became structural: **an open question is any id the case writes after its
+`?`** (`openQuestionIdsIn`) — `OQ-`/`CF-` were one workbook's convention;
+`assertsOpenQuestion` takes the case text and `fixtureFacts` reads it too, the
+prefixes staying as a configurable fallback; **a sibling case id is one whose
+skeleton (digits blanked, `HIR-EC-#`) matches the case's own id or an id the
+row cites as a case** — `fixtureFacts`' `caseIdShape` was a literal list of
+one workbook's suffixes (EC / BE / TM / PY), and `เคส <id>` now counts as a
+case citation beside `same as`; **`unconfirmedValue`** reads the open-question
+prefix at the START of a value through the same rules. Prompt examples that
+steered toward one application were generalised or marked: the procedure
+opens by saying every quoted name in its examples is an illustration from some
+other application; "an OQ-/CF- id" is "the id the sheet writes after its
+`= ?`"; "Login web humi" is "Login web <app>"; the placeholder-token refusal
+no longer names an 8-digit Employee ID. `vacuous.ts`'s `LOGIN_FORM_CONTROL`
+reads `email` rather than one application's `work email`.
+
+Left alone, on purpose: `beyondHarnessReason`'s `brew services stop` family
+(shell commands, language-neutral); `referencedSources` (bilingual already, in
+the catalog); the four inline claim shapes `ALTERNATIVE_CLAIM` / `DELTA_CLAIM`
+/ `FIELD_ERROR_CLAIM` / `WAIT_UNTIL_CLAIM` (bilingual and symmetric; moving
+them is mechanical and owed); `LOGIN_CONTROL` / `LOGIN_URL_PATTERN` (the
+documented sign-in generic); `ageAnchorFields` / `fieldAliases` (data already,
+now overridable); and, in the catalog parser, `CASE_ID` / `DATA_REF` /
+`GENERATED_NAME` / `personasOf`'s role words / `OTHER_TEAM_RE` — one
+workbook's id prefixes, QA name prefixes, persona words and a Thai-only
+"handed to another team" list, each needing the whole table's ids or a driver
+row in the other language to replace structurally; named here so they are not
+mistaken for generic.
+
+Probed offline on the PRB shape: the radio / Submit / signIn / Approve /
+workflow body passes, a body of assertions is refused `choosing`, a goal-only
+`Step 5:` and a `5.4 …` intent each clear step 5, a flow citing 1–4 alone is
+still refused, `0.52` is no longer an item. Tests: `tests/flow-author.test.ts`
+("a choice is made by clicking", "a citation in a goal or in the sheet's
+sub-numbering", "an id is at the head of its line", "the authoring vocabulary
+is data").
+
+## The last word is a rewrite, not a refusal (2026-09-04, multirole HIR-EC-001 / PRB-EC-001)
+
+Read against the panel's two multirole runs. The 07:10 ledger blocked HIR-EC-001
+with the two refusals the section above had already fixed at 14:28 local
+(`only` inside `Read-only`; `expectValue ""` dropped) — the panel runs
+`dist/cli.js`, and dist was built after both runs, so the report was the OLD
+author's; and the ledger's `(attempt 1)` is the RESUME-cap counter, not the
+model-attempt count (the loop asked three times, then stopped identically).
+The 05:46 run blocked PRB-EC-001 — not HIR-EC-001 — with *depends on E2E-01,
+which is not in this catalog*: `E2E-01` is the SCENARIO ID of HIR-EC-001, two
+rows above it, and `linkDependencies` resolved references against Test Case
+IDs only. ML_01_04's "no verdict" is `status: error` on
+`expectVisible text=Full day` straight after the date-picking `workflow` leg —
+the agent leg's outcome, `orchestrator-optimizer`'s, not an authoring shape
+(the assertion after the leg is exactly what `unsettledWorkflowClaim` asks
+for). What changed, all in `flow-author.ts` unless named:
+
+- **A scenario id is a name the table may hold** (`catalog/test-case-table.ts`
+  `linkDependencies`): a reference resolves against Test Case IDs first, then
+  the Scenario ID column — the row's OWN scenario is itself (never a
+  dependency), another scenario in the table is its first row of the same
+  sheet (`dependsOn`), and only a scenario the table lacks is `externalRefs`.
+  Structural: the ids come from the table's own columns. The parser also had a
+  literal NUL byte inside three template-literal keys (`grep` read the whole
+  file as binary and found nothing in it); it is the `\u0000` escape now.
+- **A step the harness cannot run is rewritten before it is dropped**
+  (`repairAuthoredStep`, in `LlmFlowAuthorModel`'s narrowing, $0): the nearest
+  runnable form from the evidence the model was given — `expectValue ""` on a
+  dropdown BUTTON becomes `expectText` of the trigger's own wording as a tree
+  line names it (the cleared state; no tree line, no rewrite); an `expectText`
+  / `expectCount` / `expectAttribute` with no value takes the intent's own
+  `= value` pair (digits for a count) or narrows to `expectVisible` of the same
+  control and says it is thinner; a `type` / `selectOption` with no value takes
+  the Test data pair the control is named after, `valueSource.kind =
+  'test-data'`; a one-alternative `expectAnyVisible` is the `expectVisible` it
+  meant. `fill ""` is never touched — clearing a field is a real step. Every
+  rewrite ends the step's intent with `[generated: <how> — the authored
+  <action> could not run: <reason>]` (`markGenerated`; the HEAD of the intent
+  stays, so `unperformedScriptSteps` and `expectedItemsIn` still read their
+  citations), lands on `AuthorResult.substituted`, is logged `substituted …`
+  beside `dropped …`, and is written to the flow's `notes` — the report reads
+  what was substituted for what. Found on the way: `expectCount ""` narrowed to
+  **count 0** (`Number('')`), a claim the model never made that passes on any
+  empty list; digits are required now.
+- **`Violation.settle`** — the structural fallback a fatal lint may carry, run
+  by `settleViolations` at the LAST WORD only: the budget's final attempt, or
+  the attempt whose fatal shapes equal the previous attempt's (the identical
+  refusal, one attempt earlier). Every fatal complaint with a grounded rewrite
+  performs it in place — the step objects are shared between `steps` and
+  `cases`, and `insertStepBefore` / `removeStep` edit both — and the flow goes
+  out with the covered steps as written and each uncovered claim in `notes`;
+  one fatal complaint that cannot be settled keeps the whole refusal, so a
+  FALSE claim is still never handed over. Weak complaints keep their notes.
+  The five that settle: `unprovedExclusivity` → `settleExclusivity` inserts
+  `expectCount role=<item role> = N` before the first member presence, the
+  role read from the tree/probe lines that name EVERY enumerated member under
+  one role (a member in no tree is no evidence, null — the same phantom
+  `ungroundedCountRole` refuses); `unperformedScriptSteps` → `not covered:
+  script step(s) N (<text>)`; `assertsOpenQuestion` → the step is removed
+  unless it is the only assertion; `ungroundedTextExpectation` → the step is
+  annotated with the nearest renderings and left for the run (what
+  `lenientGrounding` did one resume later); `ungroundedSelectorRole` →
+  `settleSelectorRole` repoints the role to the tree's own line for the SAME
+  name, never a different one and never a disabled control. Without a
+  fallback, as before: vacuity, no assertion, a script performed by assertions
+  alone, a placeholder token typed, a credential echoed, a login proof on the
+  login page, an unpinned date, an unindexed verb, a goto to no route, a
+  fixture asserted as fact, a wording claim on a data row, an unreconciled
+  match — each is a false claim, and `CLAUDE.md`'s premise 3 says refusing it
+  is the right answer. Owed, if a live row shows them refusing a true claim:
+  a `settle` for `unpinnedDateEntry` (a `setClock` of the run's own `now`) and
+  for `countPinnedName` (the name without its count).
+- **The procedure says to cover every claim in one answer** and names the
+  accepted forms for the two shapes the row tripped on (a cleared textbox is
+  `expectValue ""`; a closed set is `expectCount` + presences), so the first
+  ask rarely needs the fallback.
+
+Why it cannot make the result worse: a rewrite reads a tree line, the intent's
+own pair, or the sheet's own Test data — never a guess — and a settlement is
+either the lint's OWN remedy performed from the evidence (the count, the
+tree's role) or a note that names what is not covered; a refusal with no
+grounded rewrite is the refusal the budget would have reached anyway. Long
+Test data cells were checked, not fixed: `describeCase` renders the whole cell
+(HIR-EC-001's 1,550 characters, one pair per line); only the RUNTIME card
+(`caseCard`) cuts at 420, and the exclusivity fragment came from the
+word-boundary bug, not from truncation. Not verified live: the authoring
+itself (opus via `claude-cli`, whose output side `provider-expert` is changing
+today); verified offline through the lints and the parser on the real rows.
+Tests: `tests/sheet-grammar.test.ts` (CG-12, "resolves a reference against
+the Scenario ID column"), `tests/author-wave2.test.ts` ("a step the harness
+cannot run as written is rewritten and marked"; CG-08's one-alternative case
+re-pinned), `tests/flow-author.test.ts` ("the last word is a rewrite, not a
+refusal": `settleViolations`, the step-7-of-8 hand-over, the identical
+refusal settled on attempt 2, a token still refused, the ungrounded text
+annotated, `settleSelectorRole`, `settleExclusivity`).

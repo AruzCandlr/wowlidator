@@ -19,6 +19,7 @@ import {
   PLACEHOLDER_TOKEN,
   absoluteDateOf,
   candidateFor,
+  cleanModelValue,
   fieldLabelOf,
   findUnresolvedValues,
   formatStatedFor,
@@ -262,6 +263,46 @@ describe('the sources, in order', () => {
     const steps = [tokenStep()];
     assert.ok(PLACEHOLDER_TOKEN.test((steps[0] as { value: string }).value));
     assert.deepEqual(typesPlaceholderToken(steps), { index: 0, token: '<NON_EXISTING_EMPLOYEE_ID>', action: 'fill' });
+  });
+});
+
+describe('what a model hands back is unwrapped before it is typed', () => {
+  it('unwraps the live envelope, fences, quotes and trailing prose; leaves a plain value alone', () => {
+    // ec09 HIR-EC-009, 2026-09-03: the National ID box received this string verbatim.
+    assert.equal(cleanModelValue('{"value": "1999900123459"}'), '1999900123459');
+    assert.equal(cleanModelValue('{"value": {"value": "29999999"}}'), '29999999', 'an envelope inside an envelope');
+    assert.equal(cleanModelValue('```json\n{"value": "ABC-1"}\n```'), 'ABC-1');
+    assert.equal(cleanModelValue('"29999999"'), '29999999');
+    assert.equal(cleanModelValue('29999999\nThis is a synthetic id.'), '29999999');
+    assert.equal(cleanModelValue('  29999999 '), '29999999');
+    assert.equal(cleanModelValue('A - Permanent'), 'A - Permanent');
+    assert.equal(cleanModelValue('{"id": "X1"}'), 'X1', 'a lone key of any name');
+    assert.equal(cleanModelValue('{"a": "1", "b": "2"}'), '{"a": "1", "b": "2"}', 'two keys and no value: not an envelope');
+  });
+
+  it('a generated value that still looks like JSON falls back to the deterministic candidate', async () => {
+    const out = await resolveValues([], [tokenStep()], {
+      caseText: CASE,
+      model: model({ generate: async () => ({ value: '{"value": "{\\"value\\": 1}"}' }) }),
+    });
+    assert.match((out.steps[0] as { value: string }).value, /^2\d{7}$/);
+  });
+
+  it('an enveloped generated value is typed as the value it meant', async () => {
+    const out = await resolveValues([], [tokenStep()], {
+      caseText: CASE,
+      model: model({ generate: async () => ({ value: '{"value": "28888888"}' }) }),
+    });
+    assert.equal((out.steps[0] as { value: string }).value, '28888888');
+  });
+
+  it('a repo answer wrapped in an envelope is still grounded against the passage', async () => {
+    const out = await resolveValues([], [describedStep()], {
+      caseText: CASE,
+      projectContext: 'seed: Replaced Employee ID 23456789 exists for replacement',
+      model: model({ fromPassages: async () => ({ value: '{"value": "23456789"}', evidence: 'seed line' }) }),
+    });
+    assert.equal(out.resolved[0]!.value, '23456789');
   });
 });
 
@@ -513,5 +554,406 @@ describe('unique per run', () => {
     assert.equal((out.steps[0] as { value: string }).value, 'PL_06_21');
     assert.equal(out.resolved.length, 0);
     assert.equal(findUnresolvedValues([], [planStep('TH_MED_001')], BE, { caseId: 'PL_06_21' }).length, 0);
+  });
+});
+
+// --- the workbook's own cell shapes (QA_Task_Tracking_Cycle1.xlsx, read whole on 2026-09-04) --------
+//
+// Every value below is quoted from a real cell, the case id in the test name.
+// The rule under test is structural (a trailing clause, a quoted example, a
+// mask, a label reference, an anchor clause) over the built-in vocabulary.
+
+import {
+  describesOwnField,
+  exampleValuesIn,
+  isDescription,
+  labelOfDatePair,
+  normalLabel,
+  writtenValueOf,
+  MASK_VALUE,
+} from '../src/generator/value-resolution.js';
+
+const fill = (field: string, value: string, action: 'fill' | 'selectOption' = 'fill'): FlowStep =>
+  ({ action, selector: `role=textbox[name="${field}" i]`, value, intent: `key ${field}` }) as FlowStep;
+type Out = { value: string; intent: string; valueSource?: { kind: string; detail: string } };
+
+describe("the workbook's own cell shapes", () => {
+  it('a value followed by a note or a bound is cleaned in place, never handed to a model (HIR-EC-015, PRB-EC-038, HIR-EC-135)', async () => {
+    const calls: string[] = [];
+    const out = await resolveValues(
+      [],
+      [fill('Employee Sub Group', '10 ตามชุดข้อมูล'), fill('Personnel Grade', '11 ขึ้นไป'), fill('Work Schedule', 'D05H0830 ตามที่ Position กำหนด'), fill('Employee Group', 'A - Permanent')],
+      { caseText: 'nothing', model: model({ calls }), now: NOW },
+    );
+    const steps = out.steps as Out[];
+    assert.deepEqual(steps.map((s) => s.value), ['10', '11', 'D05H0830', 'A - Permanent']);
+    assert.equal(steps[0]!.valueSource?.kind, 'test-data');
+    assert.match(steps[0]!.valueSource!.detail, /the case writes "10 ตามชุดข้อมูล"; the value is "10"/);
+    assert.equal(steps[3]!.valueSource, undefined, 'a plain value is not a need');
+    assert.deepEqual(calls, [], 'cleaning is single-source: no model, ever');
+    assert.equal(out.resolved.length, 3);
+  });
+
+  it('a blank word leaves the field empty — typed, or stated in the Test data (HIR-EC-059, HIR-EC-001, HIR-EC-139)', async () => {
+    const calls: string[] = [];
+    const out = await resolveValues(
+      [],
+      [fill('Payment Method', 'Blank'), fill('DVT Project', 'null'), fill('Transfer out to', 'เว้นว่างในเคสนี้ เพราะเป็นการรับพนักงานเข้า ไม่ใช่การโอนออก'), fill('Account Number', '<ACCOUNT>')],
+      { caseText: 'Test data: Account Number = Blank', model: model({ calls }), now: NOW },
+    );
+    const steps = out.steps as Out[];
+    assert.deepEqual(steps.map((s) => s.value), ['', '', '', '']);
+    assert.match(steps[0]!.valueSource!.detail, /leave it blank: "Blank"/);
+    assert.match(steps[3]!.valueSource!.detail, /leave it blank: "Account Number = Blank"/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('a mask is a need with its own format and the cited case; a non-existing mask stays non-existing (PRB-EC-036, PL_10_54)', async () => {
+    const need = findUnresolvedValues([], [fill('Employee ID', 'EMXXXX (จาก E2E-01)')], 'nothing')[0]!;
+    assert.equal(need.token, 'EMXXXX');
+    assert.equal(need.format?.mask, 'EMXXXX');
+    assert.equal(need.reference, 'E2E-01');
+    assert.equal(need.nonExisting, false);
+    const out = await resolveValues([], [fill('Employee ID', 'EMXXXX (จาก E2E-01)')], { caseText: 'nothing', model: null });
+    const step = out.steps[0] as Out;
+    assert.match(step.value, /^EM\d{4}$/, 'the letters of the mask are kept, the X digits invented');
+    assert.equal(step.valueSource?.kind, 'generated');
+    const absent = findUnresolvedValues([], [fill('Benefit plan ID', 'BE-XXX-999 (ไม่มีในระบบ)')], 'nothing')[0]!;
+    assert.equal(absent.token, 'BE-XXX-999');
+    assert.equal(absent.nonExisting, true);
+    assert.match(candidateFor(absent.format), /^BE-\d{3}-999$/);
+    assert.equal(MASK_VALUE.test('MedicalReimbursement--XXX(XXX-XXX)-A'), false, 'a name that merely contains XXX is not a mask');
+  });
+
+  it('a described invalid value with its own examples types the first example (PL_10_40)', async () => {
+    const cell = 'ค่าอื่นที่ไม่ถูกต้อง เช่น "Active", "X"';
+    assert.deepEqual(exampleValuesIn(cell), ['Active', 'X']);
+    const calls: string[] = [];
+    const out = await resolveValues([], [fill('status', cell)], { caseText: `Test data: status = ${cell}`, model: model({ calls }), now: NOW });
+    assert.equal((out.steps[0] as Out).value, 'Active');
+    assert.deepEqual(calls, []);
+    // Through a token on the same field, the Test data line answers with the example too.
+    const viaToken = await resolveValues([], [fill('status', '<INVALID_STATUS>')], { caseText: `Test data: status = ${cell}`, model: null });
+    assert.equal((viaToken.steps[0] as Out).value, 'Active');
+    assert.equal((viaToken.steps[0] as Out).valueSource?.kind, 'test-data');
+  });
+
+  it('a stated length is a format, and the stand-in has that length (PL_10_48)', async () => {
+    const cell = 'ข้อความความยาวเกิน 255 ตัวอักษร';
+    assert.deepEqual(formatStatedFor('Benefit name EN', `Benefit name EN/TH = ${cell}`), { length: 255, lengthRelation: 'over' });
+    assert.equal(candidateFor({ length: 255, lengthRelation: 'over' }).length, 256);
+    assert.equal(candidateFor({ length: 50, lengthRelation: 'under' }).length, 49);
+    assert.equal(candidateFor({ length: 10, lengthRelation: 'exact' }).length, 10);
+    const out = await resolveValues([], [fill('Benefit name EN', cell)], { caseText: `Test data: Benefit name EN/TH = ${cell}`, model: null });
+    const step = out.steps[0] as Out;
+    assert.equal(step.value.length, 256);
+    assert.equal(step.valueSource?.kind, 'generated');
+    assert.match(step.valueSource!.detail, /over 255 characters/);
+  });
+
+  it('a quoted literal keeps its exact text and drops the remark; a concrete value beside an OQ pointer is still the value (PL_10_41, HIR-EC-120)', async () => {
+    assert.equal(writtenValueOf('"32/13/2026" (วันที่ผิดรูปแบบ)'), '32/13/2026');
+    assert.equal(writtenValueOf('"N",ว่าง'), 'N');
+    const out = await resolveValues([], [fill('Effective Start Date', '"32/13/2026" (วันที่ผิดรูปแบบ)')], { caseText: 'nothing', model: null, now: NOW });
+    assert.equal((out.steps[0] as Out).value, '32/13/2026', 'a deliberately malformed date is typed exactly, never computed');
+    const pairs = [{ phase: null, key: 'Division', value: '20000248 (ยังไม่พบช่องชื่อ Division บนหน้าจอ ดู OQ-HIR-138)' }];
+    const need = findUnresolvedValues([], [fill('Division', '<DIVISION>')], 'nothing', { pairs })[0]!;
+    assert.equal(fromTestData(need, 'nothing', pairs)?.value, '20000248');
+  });
+
+  it('the date grammar the workbook needed (RU_05_24, HIR-EC-041, HIR-EC-030, HIR-EC-005, HIR-EC-070, HIR-EC-006, HIR-EC-071, HIR-EC-015, HIR-EC-072, HIR-EC-019, HIR-EC-075)', () => {
+    const k = { 'hire date': '2026-09-03' };
+    const at = (p: string) => resolveDatePhrase(p, env(k));
+    assert.equal(at('31-Dec-9999')?.iso, '9999-12-31');
+    assert.equal(at('13 เมษายน')?.iso, '2026-04-13', 'a day and month with no year is this year');
+    assert.equal(at('1 มกราคมของปีก่อนหน้า')?.iso, '2025-01-01');
+    assert.equal(at('< Current Date')?.iso, '2026-09-02');
+    assert.match(at('< Current Date')!.detail, /the day before/);
+    assert.equal(at('วันก่อน Hire Date')?.iso, '2026-09-02');
+    assert.equal(at('Age = 60 พอดี ณ Hire Date')?.iso, '1966-09-03');
+    assert.match(at('Age = 60 พอดี ณ Hire Date')!.detail, /^Age = 60 พอดี ณ Hire Date = 1966-09-03 \(age 60 y at Hire Date 2026-09-03\)$/);
+    assert.equal(at('ทำให้อายุ ณ Hire Date เท่ากับ 59 ปี 11 เดือน')?.iso, '1966-10-03');
+    assert.equal(at('ทำให้อายุมากกว่า 60 ปี ณ Hire Date')?.iso, '1966-03-03');
+    assert.equal(at('ย้อนหลังจากวันที่ทดสอบ 5')?.iso, '2026-08-29');
+    assert.equal(at('วันที่ทดสอบ บวก 30 วัน')?.iso, '2026-10-03');
+    assert.equal(at('วันในอนาคต')?.iso, '2026-09-04');
+    assert.equal(at('Hire Date + 60 วัน ให้มาก่อน Probationary Period End Date')?.iso, '2026-11-02', 'a trailing instruction is set aside');
+    assert.equal(at('Hire Date + 90 Day (หรือมากกว่า แต่ไม่เกิน 119 Day)')?.iso, '2026-12-02');
+    assert.equal(at('Age = 60 ณ Contract Date'), null, 'an anchor the case never set is a refusal, not today');
+    assert.equal(at('3 วันก่อน')?.iso, '2026-08-31', 'still: N days before');
+    assert.equal(at('3 days ago')?.iso, '2026-08-31');
+  });
+
+  it("an alias finds the field, and a value that is another date field's label follows it (HIR-EC-070, PRB-EC-066)", async () => {
+    const pairs = [
+      { phase: null, key: 'Hire Date', value: 'Today' },
+      { phase: null, key: 'วันหมดอายุใบอนุญาตทำงาน', value: 'วันก่อนวันที่จ้าง' },
+      { phase: null, key: 'Probationary Period End Date', value: 'Hire Date' },
+    ];
+    assert.equal(labelOfDatePair('Hire Date', pairs)?.key, 'Hire Date');
+    assert.equal(labelOfDatePair('Hire Date', [pairs[2]!]), null, 'a label pointing at itself is nothing');
+    const out = await resolveValues(
+      [],
+      [fill('วันหมดอายุใบอนุญาตทำงาน', '<EXPIRY>'), fill('Probationary Period End Date', 'Hire Date'), fill('Employee Group', 'Hire Date', 'selectOption')],
+      { caseText: 'nothing', model: null, now: NOW, testDataPairs: pairs },
+    );
+    const steps = out.steps as Out[];
+    assert.equal(steps[0]!.value, '2026-09-02', 'วันที่จ้าง is Hire Date by alias');
+    assert.equal(steps[0]!.valueSource?.kind, 'relative-date');
+    assert.equal(steps[1]!.value, '2026-09-03');
+    assert.equal(steps[2]!.value, 'Hire Date', 'an option label is never a phrase');
+  });
+
+  it('what is deliberately left alone (PL_08_06, RU_06_04, HIR-EC-048, PRB-EC-036)', async () => {
+    const untouched = [
+      fill('Company', 'CDS (C001), B2S (C006), RBS (C002)'),
+      fill('Rule name', 'MedicalReimbursement--XXX(XXX-XXX)-A - Permanent(7-16)-(12/31/9999)'),
+      fill('Employee ID', '<runtime>'),
+      fill('Personnel Grade', '07 ถึง 10'),
+      fill('Company', 'CDS (C001)', 'selectOption'),
+    ];
+    const out = await resolveValues([], untouched, { caseText: 'nothing', model: null, now: NOW });
+    assert.deepEqual(
+      (out.steps as Out[]).map((s) => s.value),
+      untouched.map((s) => (s as { value: string }).value),
+      'a list, a glued bracket (a phrase by its 9999, understood by nothing), a lowercase token, a range and an option label are typed as written',
+    );
+    assert.equal(out.resolved.length, 0);
+    assert.deepEqual(findUnresolvedValues([], [fill('Company', 'CDS (C001)')], 'nothing').map((n) => n.written), ['CDS'], 'a fill drops the code in brackets, as the test-data source always did');
+    assert.equal(isDatePhrase('<runtime>'), false);
+    assert.equal(isDatePhrase('07 ถึง 10'), false);
+  });
+});
+
+// --- the workbook read a second time (QA_Task_Tracking_Cycle1.xlsx, 2026-09-04) --------------
+//
+// Every pair of the 1,286 rows was classified through the resolver's own
+// functions (8,225 pairs). The classes below are the ones the first pass typed
+// verbatim or answered wrongly; each test quotes the real cell with its case id.
+
+describe("the workbook's value classes, second pass", () => {
+  it('a concrete value that CITES an open question is the value; one that IS the question stays (HIR-EC-114, HIR-EC-044, HIR-EC-001)', async () => {
+    const out = await resolveValues(
+      [],
+      [
+        fill('Department', '30009285 (คีย์ที่ช่อง Organization ดู OQ-HIR-138)'),
+        fill('Personnel Grade (PG)', '11 ใช้แทน 10 ที่เคยระบุ เพราะ CPN ไม่มี Position ว่าง Personnel Grade (PG) 10 ดู CF-SIT-07'),
+        fill('Probationary Period End Date', '? CF-HIR-08 OQ-HIR-50'),
+        fill('Note', 'see OQ-HIR-78'),
+      ],
+      { caseText: 'nothing', model: null, now: NOW },
+    );
+    const steps = out.steps as Out[];
+    assert.deepEqual(steps.map((s) => s.value), ['30009285', '11', '? CF-HIR-08 OQ-HIR-50', 'see OQ-HIR-78']);
+    assert.equal(steps[0]!.valueSource?.kind, 'test-data');
+    assert.equal(steps[2]!.valueSource, undefined, 'a value that IS an open question is nobody\'s to resolve');
+    assert.equal(steps[3]!.valueSource, undefined, 'a note that only points at a question is left alone');
+  });
+
+  it('a remark after a connective is set aside: แก้จาก, ซึ่ง, ถ้า, แต่, เป็น (HIR-EC-002, HIR-EC-057, PRB-EC-067, PRB-EC-059, HIR-EC-007)', () => {
+    assert.equal(writtenValueOf('D05H0830 แก้จากเดิมที่ระบุ D05H0800_02 ซึ่งไม่มีในตาราง ดู CF-SIT-11'), 'D05H0830');
+    assert.equal(writtenValueOf('40004936 ซึ่งสังกัด Company C004 คนละ Company กับที่กรอก'), '40004936');
+    assert.equal(writtenValueOf('Yes ถ้า field แสดง'), 'Yes');
+    assert.equal(writtenValueOf('A Permanent แต่ Employee Sub Group เป็นชุด Piecework X7 ถึง XB'), 'A Permanent');
+    assert.equal(writtenValueOf('UC เป็น Employee Sub Group ค่าเดียวที่ตาราง FO ผูกไว้กับกลุ่ม B ดู OQ-HIR-104'), 'UC');
+    assert.equal(writtenValueOf('7 หาก Dropdown มีค่าให้เลือก'), '7');
+    assert.equal(writtenValueOf('C - ต่างชาติมาทำงานไทย'), 'C - ต่างชาติมาทำงานไทย', 'a connective glued inside a Thai label is not a remark');
+    assert.equal(writtenValueOf('H - บุคคลภายนอกที่จ่ายเงิน'), 'H - บุคคลภายนอกที่จ่ายเงิน');
+  });
+
+  it('alternatives mean any one of them, and the first is typed; a slash inside one value is not a list (HIR-EC-003, PL_06_25, PRB-EC-082, RU_07_02, PL_03_07, HIR-EC-005)', async () => {
+    assert.equal(writtenValueOf('Yes / No'), 'Yes');
+    assert.equal(writtenValueOf('PL_06_25 / PL_06_25_70813'), 'PL_06_25');
+    assert.equal(writtenValueOf('Job Change หรือ Salary Adjustment'), 'Job Change');
+    assert.equal(writtenValueOf('Reimbursement: Employee/HR'), 'Reimbursement: Employee/HR');
+    assert.equal(writtenValueOf('01/02/2021'), '01/02/2021');
+    const out = await resolveValues(
+      [],
+      [fill('Copy Address from Employee', 'Yes / No'), fill('Effective Date', 'ว่าง/วันที่ในอดีต/วันที่ปัจจุบัน หรืออนาคต'), fill('Type', 'Reimbursement: Employee/HR', 'selectOption')],
+      { caseText: 'nothing', model: null, now: NOW },
+    );
+    const steps = out.steps as Out[];
+    assert.equal(steps[0]!.value, 'Yes');
+    assert.equal(steps[1]!.value, '', 'the first alternative is the blank word, so the field is left empty');
+    assert.equal(steps[2]!.value, 'Reimbursement: Employee/HR');
+  });
+
+  it('a list of nothing but quoted literals is a boundary set; the first is typed, with the outer quotes the block reader stripped (PL_10_43, RU_03_15)', async () => {
+    assert.deepEqual(exampleValuesIn('abc", "-30", "0", "900'), ['abc', '-30', '0', '900']);
+    assert.deepEqual(exampleValuesIn('"abc", "1.5", "-", "+", "!@#"'), ['abc', '1.5', '-', '+', '!@#']);
+    assert.deepEqual(exampleValuesIn('CDS (C001), B2S (C006)'), [], 'an unquoted list is not one — it may be a multi-select');
+    const out = await resolveValues([], [fill('Eligible Claim date', 'abc", "-30", "0", "900')], { caseText: 'nothing', model: null, now: NOW });
+    assert.equal((out.steps[0] as Out).value, 'abc');
+  });
+
+  it('a space word is one space, typed on purpose; a blank word as the remark of a placeholder is blank (PL_06_17, RU_05_28, PL_06_16)', async () => {
+    const calls: string[] = [];
+    const out = await resolveValues([], [fill('Benefit Name', 'เว้นวรรค'), fill('Effective End Date', 'Select Date (ไม่ระบุ)')], { caseText: 'nothing', model: model({ calls }), now: NOW });
+    const steps = out.steps as Out[];
+    assert.equal(steps[0]!.value, ' ');
+    assert.match(steps[0]!.valueSource!.detail, /the value is a space/);
+    assert.equal(steps[1]!.value, '');
+    assert.match(steps[1]!.valueSource!.detail, /leave it blank/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('an instruction in the cell is a description, never typed: the value is looked up or a flagged stand-in (HIR-EC-001, HIR-EC-008)', async () => {
+    assert.equal(isDescription('District', 'เลือกเขตที่อยู่ในกรุงเทพมหานคร'), true);
+    assert.equal(isDescription('Postal Code', 'ตาม Sub-District ที่เลือก'), true);
+    assert.equal(isDescription('Employee Group', 'A - Permanent'), false);
+    assert.equal(isDescription('Entry Route', 'Keyin'), false);
+    const out = await resolveValues(
+      [],
+      [fill('District', 'เลือกเขตที่อยู่ในกรุงเทพมหานคร'), fill('Postal Code', 'ตาม Sub-District ที่เลือก'), fill('Passport', 'ใช้แทน National ID 13 หลัก')],
+      { caseText: 'Test data: District = เลือกเขตที่อยู่ในกรุงเทพมหานคร; Postal Code = 10110', model: null, now: NOW },
+    );
+    const steps = out.steps as Out[];
+    assert.equal(steps[0]!.valueSource?.kind, 'generated', 'its own line is the same instruction and answers nothing');
+    assert.doesNotMatch(steps[0]!.value, /เลือก/);
+    assert.equal(steps[1]!.value, '10110', 'the Test data line with a concrete value answers');
+    assert.equal(steps[1]!.valueSource?.kind, 'test-data');
+    assert.match(steps[2]!.value, /^\d{13}$/, 'the format the instruction itself states shapes the stand-in');
+  });
+
+  it("a value that names its own field and goes on in prose is a description; an option label that merely contains the field's word is not (HIR-EC-017, HIR-EC-026, HIR-EC-032, PL_03_07, PL_07_01)", async () => {
+    assert.equal(describesOwnField('Replaced Employee ID', 'Employee ID ที่ลาออกแล้วและเคยครอง Position 40001378'), true);
+    assert.equal(describesOwnField('National ID', 'National ID เดียวกับพนักงานเดิม'), true);
+    assert.equal(describesOwnField('Contract End Date', 'Contract End Date จริง'), true);
+    assert.equal(describesOwnField('Country', 'Mock Country (TH)'), false);
+    assert.equal(describesOwnField('Enrollment', 'Manual Enrollment'), false);
+    assert.equal(describesOwnField('Employee ID', 'Employee ID'), false);
+    const out = await resolveValues([], [fill('Replaced Employee ID', 'Employee ID ที่ลาออกแล้วและเคยครอง Position 40001378')], { caseText: 'nothing', model: null, now: NOW });
+    const step = out.steps[0] as Out;
+    assert.equal(step.valueSource?.kind, 'generated');
+    assert.match(step.value, /^\d{8}$/);
+  });
+
+  it('a credential token is never invented: the Test data may answer, a stand-in may not (HIR-EC-044 and 130 more rows)', async () => {
+    const calls: string[] = [];
+    const log: string[] = [];
+    const out = await resolveValues([], [fill('Login', '<HR_ADMIN_ACCOUNT>'), fill('Employee ID', '<EMPLOYEE_ID>')], { caseText: 'nothing', model: model({ calls }), now: NOW, onLog: (l) => log.push(l) });
+    const steps = out.steps as Out[];
+    assert.equal(steps[0]!.value, '<HR_ADMIN_ACCOUNT>', 'left as authored, for the lint and the persona sign-in');
+    assert.equal(steps[0]!.valueSource, undefined);
+    assert.ok(log.some((l) => /credential — never generated/.test(l)), log.join('\n'));
+    assert.equal(steps[1]!.valueSource?.kind, 'generated', 'an ordinary token still gets its stand-in');
+    assert.ok(calls.includes('generated'), 'the generate call was made for the id, not the login');
+    assert.equal(calls.filter((c) => c === 'generated').length, 1);
+    const stated = await resolveValues([], [fill('Login', '<HR_ADMIN_ACCOUNT>')], { caseText: 'Test data: Login = hr.admin', model: null, now: NOW });
+    assert.equal((stated.steps[0] as Out).value, 'hr.admin');
+    assert.equal(findUnresolvedValues([], [fill('Login', '<HR_ADMIN_ACCOUNT>')], 'nothing')[0]!.credential, true);
+  });
+
+  it("a format stated on another key field's line is not this field's (PRB-EC-088)", async () => {
+    const caseText = ['Test data:', '- Reason for fail probation : <TEST_VALUE> ระบุข้อความจริงตอนเล่นเคส', '- พนักงาน Employee ID : EMXXXX (จาก E2E-45)', '- Thailand Format = N-NNNN-NNNNN-NN-N'].join('\n');
+    assert.equal(formatStatedFor('Reason for fail probation', caseText)?.mask, 'N-NNNN-NNNNN-NN-N', 'a line keyed by something that is not a field still counts');
+    assert.equal(formatStatedFor('Employee ID', caseText)?.mask, 'EMXXXX');
+    const only = ['Test data:', '- Reason for fail probation : <TEST_VALUE> ระบุข้อความจริงตอนเล่นเคส', '- พนักงาน Employee ID : EMXXXX (จาก E2E-45)'].join('\n');
+    assert.equal(formatStatedFor('Reason for fail probation', only), null);
+    const out = await resolveValues([], [fill('Reason for fail probation', '<TEST_VALUE> ระบุข้อความจริงตอนเล่นเคส')], { caseText: only, model: null, now: NOW });
+    assert.doesNotMatch((out.steps[0] as Out).value, /^EM/, "the Employee ID's mask does not shape the Reason");
+  });
+
+  it('the date grammar the second pass needed (HIR-EC-037, HIR-EC-020, HIR-EC-134, HIR-EC-042, HIR-EC-046, HIR-EC-083)', () => {
+    const k = { 'hire date': '2026-09-03' };
+    const at = (p: string) => resolveDatePhrase(p, env(k));
+    assert.equal(at('วันที่ 20')?.iso, '2026-09-20', 'a bare day is that day of this month');
+    assert.equal(at('วันที่ 25 ของเดือนปัจจุบัน')?.iso, '2026-09-25', 'still');
+    assert.equal(at('วันที่ก่อน Hire Date 1 ปี')?.iso, '2025-09-03', 'a relation with an amount');
+    assert.equal(at('2 weeks after Hire Date')?.iso, '2026-09-17');
+    assert.equal(at('14 เมษายน รันคู่กับ E2E-41 เพื่อตรวจขอบเขตวันที่')?.iso, '2026-04-14', 'a complete date, then a remark across a gap');
+    assert.match(at('14 เมษายน รันคู่กับ E2E-41')!.detail, /remark set aside/);
+    assert.equal(at('วันที่ตั้งแต่ 1 มิถุนายน 2025 เป็นต้นไป')?.iso, '2025-06-01');
+    assert.equal(at('สิ้นเดือนแบบถอยหลัง P98'), null, 'a remark glued to the date is an expression nobody understands');
+    assert.equal(at('วันที่ 1 ถึงสิ้นเดือน'), null, 'a range is not a date');
+    assert.equal(at('Today + 3 วัน ถึง'), null, 'one trailing word is not a remark');
+    assert.equal(normalLabel('Hire Date >'), 'hire date', 'a stray symbol on a Test data key is not part of the label');
+    assert.equal(isDatePhrase('วันที่ 20'), true);
+  });
+
+  it("an age anchored on a key the sheet wrote with a stray symbol still finds it (HIR-EC-020)", async () => {
+    const pairs = [
+      { phase: null, key: 'Hire Date >', value: 'Today' },
+      { phase: null, key: 'Date of Birth', value: 'Age = 60 พอดี ณ Hire Date' },
+    ];
+    const out = await resolveValues([], [fill('Date of Birth', 'Age = 60 พอดี ณ Hire Date')], { caseText: 'nothing', model: null, now: NOW, testDataPairs: pairs });
+    assert.equal((out.steps[0] as Out).value, '1966-09-03');
+  });
+});
+
+// --- the whole workbook, through the reader the CLI uses ---------------------------------------
+//
+// `tests/fixtures/qa-task-tracking-cycle1.xlsx` is the real 1,286-row QA
+// workbook. Every Test data pair of every row is turned into a fill and
+// resolved with no model and no database, and the invariants below are what
+// the second pass guarantees over the sheet as a whole — a regression table,
+// not a per-cell oracle.
+
+import { readFileSync } from 'node:fs';
+import { extractWorkbookSheets } from '../src/catalog/extract.js';
+import { parseWorkbookCases, testDataPairs } from '../src/catalog/test-case-table.js';
+
+describe('the QA workbook, every pair resolved offline', () => {
+  it('holds the second-pass invariants over all 8,225 pairs', async () => {
+    const rows = parseWorkbookCases(extractWorkbookSheets(readFileSync(new URL('./fixtures/qa-task-tracking-cycle1.xlsx', import.meta.url)))) ?? [];
+    assert.equal(rows.length, 1286);
+    const tally = { pairs: 0, cleaned: 0, dates: 0, credentialsKept: 0, blanks: 0, typedInstruction: 0, typedQuestionRemark: 0, typedAlternatives: 0, generatedOnCredential: 0 };
+    for (const row of rows) {
+      const pairs = testDataPairs(row.testData);
+      const steps = pairs.map((p) => fill(p.key.replace(/"/g, ''), p.value));
+      const out = await resolveValues([], steps, { caseText: `Test data:\n${row.testData}\nSteps:\n${row.steps}`, model: null, now: NOW, runKey: 'wb@2026-09-04t00-00-00-000z', caseId: row.caseId, testDataPairs: pairs });
+      for (const [i, step] of (out.steps as Out[]).entries()) {
+        tally.pairs += 1;
+        const written = pairs[i]!.value;
+        const kind = step.valueSource?.kind;
+        if (kind === 'relative-date') tally.dates += 1;
+        if (kind === 'test-data' && step.value === '') tally.blanks += 1;
+        if (kind === 'test-data' && step.value !== '' && step.value !== written.trim()) tally.cleaned += 1;
+        if (PLACEHOLDER_TOKEN.test(step.value) && /ACCOUNT/.test(step.value)) tally.credentialsKept += 1;
+        if (kind === 'generated' && /account|login/i.test(pairs[i]!.key)) tally.generatedOnCredential += 1;
+        if (kind === undefined && /^(?:กรอก|ระบุ|เลือก|ใช้|ตาม)\s/u.test(step.value)) tally.typedInstruction += 1;
+        if (kind === undefined && /\(.*ดู OQ-[A-Z]+-\d+\)$/.test(step.value)) tally.typedQuestionRemark += 1;
+        if (kind === undefined && /\S\s+\/\s+\S/.test(step.value)) tally.typedAlternatives += 1;
+      }
+    }
+    assert.equal(tally.pairs, 8225);
+    assert.ok(tally.cleaned >= 600, `cleaned ${tally.cleaned}`);
+    assert.ok(tally.dates >= 420, `dates ${tally.dates}`);
+    assert.ok(tally.blanks >= 100, `blanks ${tally.blanks}`);
+    assert.equal(tally.credentialsKept, 131, 'every account token is left for the persona sign-in');
+    assert.equal(tally.generatedOnCredential, 0);
+    assert.equal(tally.typedInstruction, 0, 'no instruction is typed as a value');
+    assert.equal(tally.typedQuestionRemark, 0, 'no value is typed with its open-question pointer');
+    assert.equal(tally.typedAlternatives, 0, 'no list of alternatives is typed whole');
+  });
+});
+
+// --- an open question cited beside a value is a reference, not the value (multirole.csv HIR-EC-001, 2026-09-04) ---
+//
+// The Test data reads "Business Unit = CDG (10000075) Policy Profile = CDS ใช้แทน
+// CDS ที่เคยระบุ ดู CF-SIT-19": the value IS CDS, and the remark says which
+// confirmation question settled it. The classifier read the raw cell and, on
+// the id alone, told the author to skip the field the same data set lists as
+// "[TD-01] Policy Profile = CDS". An OQ-/CF- id makes a value unconfirmed only
+// when it IS the value — at the start, or after the sheet's own "?".
+
+import { unconfirmedValue as unconfirmedCell } from '../src/catalog/test-case-table.js';
+
+describe('an open-question id beside a value is a reference (HIR-EC-001)', () => {
+  it('keeps a concrete value that cites a confirmation question, and still reads the value as written', () => {
+    const cell = 'CDS ใช้แทน CDS ที่เคยระบุ ดู CF-SIT-19';
+    assert.equal(unconfirmedCell(cell), false);
+    assert.equal(writtenValueOf(cell), 'CDS');
+    assert.equal(unconfirmedCell('20000248 (ดู OQ-HIR-138)'), false);
+  });
+
+  it('still refuses a value that IS the question', () => {
+    // HIR-EC-001, Expected output: "Probationary Period End Date = ? CF-HIR-08 OQ-HIR-50"
+    // and "สูตร/เงื่อนไข Rule Table = ? OQ-HIR-13".
+    assert.equal(unconfirmedCell('? CF-HIR-08 OQ-HIR-50'), true);
+    assert.equal(unconfirmedCell('OQ-HIR-13'), true);
+    assert.equal(unconfirmedCell('  CF-SIT-19'), true);
+    assert.equal(unconfirmedCell('? รอตาราง Rule Table'), true);
+    assert.equal(unconfirmedCell('TBC'), true);
   });
 });

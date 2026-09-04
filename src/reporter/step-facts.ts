@@ -47,11 +47,15 @@ export interface StepLike {
   selector?: string | null | undefined;
   resolvedSelector?: string | null | undefined;
   detail?: Record<string, unknown> | undefined;
+  /** Who the step ran as and on which Chrome — see `ProofStep.persona` / `.browser`. */
+  persona?: string | undefined;
+  browser?: string | undefined;
   /** The agent record, when the step was a workflow leg; `observations` (OA-14) is read off it structurally. */
   agent?: object | undefined;
 }
 
-const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+/** A persona LABEL and nothing else: no address, no `LABEL=email:password` remnant. See `signInPersona`. */
+const LABEL_ONLY = /^[^@:]+$/;
 /** An address anywhere in a string — the rule for a `signIn` step's detail, where any string may carry the account. */
 const CONTAINS_EMAIL = /[^\s@"']+@[^\s@"']+\.[^\s@"']+/;
 
@@ -98,15 +102,26 @@ export function uploadedFileNames(step: StepLike): string[] {
 }
 
 /**
- * The persona a `signIn` step signed in as — its LABEL. When the author wrote
- * a literal email that matched a persona, the label is withheld: an address
- * is a credential's other half and the report must not carry it.
+ * The persona a `signIn` step signed in as — its LABEL, and only ever a label.
+ *
+ * A label is what the flow is supposed to carry (`<MANAGER_ACCOUNT>`, `HR
+ * admin`). Anything holding an `@` or a `:` is not one: an address is a
+ * credential's other half, and a colon is the persona wire format's own
+ * separator (`LABEL=email:password`), so everything after it is a password.
+ * Both are withheld.
+ *
+ * The previous rule tested for a well-formed address, which let two shapes
+ * through that a person actually produces: a value with no dot in the domain
+ * (`mgr@intranet:pw`) and a label with a password appended (`HRBP_ACCOUNT:pw`).
+ * Structure decides this, not well-formedness — the cost of withholding a
+ * legitimate label is one generic phrase in the report, and the cost of
+ * printing is a password.
  */
 export function signInPersona(step: StepLike): string | null {
   const detail = step.detail ?? {};
   const raw = detail['as'] ?? detail['persona'] ?? detail['personaLabel'];
   if (typeof raw !== 'string' || raw === '') return null;
-  return EMAIL.test(raw) ? 'an account named by its email (withheld from the report)' : raw;
+  return LABEL_ONLY.test(raw) ? raw : 'an account named by its credentials (withheld from the report)';
 }
 
 /** The author's own timeout on a step, when they set one (`timeoutMs` on the FlowStep, recorded on the detail). */
@@ -176,14 +191,36 @@ export function stepKindFacts(step: StepLike): StepFact[] {
     case 'signIn': {
       const persona = signInPersona(step);
       if (persona !== null) facts.push({ label: 'persona', value: persona });
+      // One Chrome per persona: a switch back to a person already signed
+      // in keeps their session; a new person got a browser of their own.
+      if (detail['keptSession'] === true) facts.push({ label: 'session', value: 'kept — switched to this persona\'s own browser, no login' });
+      else if (detail['inheritedSession'] === true) facts.push({ label: 'session', value: 'inherited from the suite, no login' });
+      else if (typeof detail['openedBrowser'] === 'string') facts.push({ label: 'session', value: 'new — on a browser of its own' });
       break;
     }
     default:
       break;
   }
+  const browser = browserFact(step);
+  if (browser !== null) facts.push({ label: 'browser', value: browser });
   const timeout = authoredTimeout(step);
   if (timeout !== null) facts.push({ label: 'timeout', value: `${timeout} (set by the author)` });
   return facts;
+}
+
+/**
+ * Which Chrome a step ran on, as its port (`9223`), when the run spread
+ * personas over more than one — the step's own stamp, else the `signIn`
+ * detail that opened or switched to it. Null on a single-browser run,
+ * where "browser 9222" on every line would be noise.
+ */
+export function browserFact(step: StepLike): string | null {
+  const detail = step.detail ?? {};
+  const raw = step.browser ?? detail['browser'] ?? detail['switchedTo'] ?? detail['openedBrowser'];
+  if (typeof raw !== 'string' || raw === '') return null;
+  const port = raw.match(/:(\d+)\/?$/)?.[1];
+  const who = step.persona !== undefined && step.persona !== '' ? ` (${step.persona})` : '';
+  return `${port ?? raw}${who}`;
 }
 
 /**

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -11,7 +11,6 @@ import {
   formatToolArg,
   flattenPrompt,
   withoutSchemaKeyword,
-  DEFAULT_CLAUDE_CLI_EFFORT,
 } from '../src/providers/claude-cli.js';
 import {
   askWarm,
@@ -22,6 +21,15 @@ import {
   MAX_TURNS_PER_SESSION,
   type SessionKey,
 } from '../src/providers/claude-cli-session.js';
+import {
+  answerErrorOf,
+  answerTextOf,
+  modelOutputCeilingOf,
+  outputCapOf,
+  raisedOutputCap,
+  usageOf,
+  type ClaudeResultEvent,
+} from '../src/providers/claude-envelope.js';
 import { extractStructuredJson } from '../src/providers/model-output.js';
 
 describe('claude-cli helper functions', () => {
@@ -276,6 +284,168 @@ describe('sessionTurnBudget', () => {
         AUTHORING_TURNS_PER_SESSION,
         `"${bad}" should fall back to the default`,
       );
+    }
+  });
+});
+
+/**
+ * The CLI's own output cap (2026-09-04, measured on CLI 2.1.260 with
+ * CLAUDE_CODE_MAX_OUTPUT_TOKENS=40): the result event is `is_error: true`,
+ * `terminal_reason: "api_error"`, no `stop_reason`, and the whole answer is
+ * the sentence naming the cap. The model's ceiling rides in `modelUsage`.
+ */
+describe('claude-envelope: reading the result event', () => {
+  const cut: ClaudeResultEvent = {
+    is_error: true,
+    result:
+      "API Error: Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
+    total_cost_usd: 0.005,
+    num_turns: 1,
+    usage: { input_tokens: 4386, output_tokens: 160, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    modelUsage: { 'claude-opus-5': { maxOutputTokens: 64000 } },
+  };
+
+  it('reads the cap and the model ceiling off the event', () => {
+    assert.equal(outputCapOf(cut), 32000);
+    assert.equal(modelOutputCeilingOf(cut), 64000);
+    assert.equal(outputCapOf({ is_error: false, result: '{"a":1}' }), null);
+    assert.equal(outputCapOf({ is_error: true, result: 'API Error: 429 rate limited' }), null);
+  });
+
+  it('prefers the CLI-validated structured_output over a prose result for a JSON call', () => {
+    const event: ClaudeResultEvent = {
+      result: 'Here is the flow:\n```json\n{"ok":true}\n```',
+      structured_output: { ok: true, steps: [] },
+    };
+    assert.equal(answerTextOf(event, true), '{"ok":true,"steps":[]}');
+    assert.equal(answerTextOf(event, false), event.result);
+    assert.equal(answerTextOf({ result: 'plain' }, true), 'plain');
+  });
+
+  it('types a cut as finish=length with the cap, the ceiling and what it cost', () => {
+    const error = answerErrorOf(cut, usageOf(cut, 0.005, 1));
+    assert.equal(error.name, 'ClaudeAnswerError');
+    assert.equal(error.finishReason, 'length');
+    assert.equal(error.outputCap, 32000);
+    assert.equal(error.modelCeiling, 64000);
+    assert.equal(error.usage?.outputTokens, 160);
+    assert.match(error.message, /CUT OFF at the CLI's own output cap of 32000/);
+    assert.match(error.message, /finish=length/);
+    // Words that would misfile it as transport or as a key failure.
+    assert.doesNotMatch(error.message, /timeout|timed out|terminated|quota|rate.?limit/i);
+    assert.equal(raisedOutputCap(error), 64000, 'one doubling toward the ceiling');
+  });
+
+  it('raises nothing at the model ceiling, and keeps the refusal wording for other errors', () => {
+    const atCeiling = answerErrorOf({ ...cut, modelUsage: { 'claude-haiku-4-5': { maxOutputTokens: 32000 } } });
+    assert.equal(raisedOutputCap(atCeiling), null);
+    assert.match(atCeiling.message, /model's ceiling/);
+    const other = answerErrorOf({ is_error: true, result: 'API Error: 429 rate limited' });
+    assert.equal(other.finishReason, 'error');
+    assert.match(other.message, /could not be asked — the provider refused the call: API Error: 429/);
+    assert.equal(raisedOutputCap(other), null);
+  });
+
+  it('makes the output cap part of the warm session identity', () => {
+    const base: SessionKey = { binary: 'claude', cwd: '/tmp', modelId: 'opus', effort: 'high', system: 's', schema: null };
+    assert.notEqual(sessionKeyOf(base), sessionKeyOf({ ...base, maxOutputTokens: 64000 }));
+    assert.equal(sessionKeyOf(base), sessionKeyOf({ ...base, maxOutputTokens: null }));
+  });
+});
+
+describe('claude-cli: an answer cut at the CLI cap is re-asked once at a raised cap, never re-sent cold', () => {
+  // A fake `claude` that behaves like the real one under a cap: with no
+  // CLAUDE_CODE_MAX_OUTPUT_TOKENS in its environment it answers the cap
+  // error; with one it answers a prose `result` beside a validated
+  // `structured_output`. A cold (`-p` without `--input-format`) invocation
+  // leaves a marker file, so "was the prompt re-sent cold" is a fact on disk.
+  const dir = mkdtempSync(join(tmpdir(), 'wowlidator-fake-claude-cap-'));
+  const binary = join(dir, 'fake-claude.cjs');
+  writeFileSync(
+    binary,
+    `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const warm = process.argv.includes('--input-format');
+const cap = process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+const ceiling = Number(process.env.FAKE_CLAUDE_CEILING || 64000);
+function event() {
+  if (cap === undefined || cap === '') {
+    return { type: 'result', is_error: true, terminal_reason: 'api_error',
+      result: "API Error: Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
+      total_cost_usd: 0.005, num_turns: 1,
+      usage: { input_tokens: 4, output_tokens: 160, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      modelUsage: { 'claude-opus-5': { maxOutputTokens: ceiling } } };
+  }
+  return { type: 'result', is_error: false, stop_reason: 'tool_use',
+    result: 'Here it is: {"ok":true}', structured_output: { ok: true, cap: Number(cap) },
+    total_cost_usd: 0.01, num_turns: 2,
+    usage: { input_tokens: 4, output_tokens: 900, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
+}
+if (warm) {
+  require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+    if (line.trim() !== '') process.stdout.write(JSON.stringify(event()) + '\\n');
+  });
+} else {
+  fs.writeFileSync(path.join(process.env.FAKE_CLAUDE_MARK_DIR, 'cold-' + process.pid), '');
+  process.stdout.write(JSON.stringify(event()));
+}
+`,
+    'utf8',
+  );
+  chmodSync(binary, 0o755);
+  const coldCalls = (): number => readdirSync(dir).filter((name) => name.startsWith('cold-')).length;
+  const call = {
+    prompt: [{ role: 'user', content: [{ type: 'text', text: 'author it' }] }],
+    responseFormat: { type: 'json', schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } },
+  } as unknown as Parameters<ReturnType<typeof createClaudeCli>['doGenerate']>[0];
+
+  after(() => closeClaudeSessions());
+
+  it('raises the cap toward the model ceiling and returns the CLI-validated object', async () => {
+    process.env['WOWLIDATOR_CLAUDE_CLI_USAGE'] = 'off';
+    process.env['FAKE_CLAUDE_MARK_DIR'] = dir;
+    delete process.env['CLAUDE_CODE_MAX_OUTPUT_TOKENS'];
+    try {
+      closeClaudeSessions();
+      const before = claudeCliUsage();
+      const model = createClaudeCli({ modelId: 'opus', effort: 'high', binary, role: 'generator' });
+      const result = await model.doGenerate(call);
+      const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
+      // structured_output, not the prose `result` — and at the raised cap.
+      assert.equal(text, '{"ok":true,"cap":64000}');
+      assert.equal(coldCalls(), 0, 'the identical prompt must never be re-sent cold');
+      // Both asks are booked: the cut (its thinking was billed) and the answer.
+      const spent = claudeCliUsageSince(before);
+      assert.equal(spent.byRole['generator']?.calls, 2);
+      assert.ok(Math.abs((spent.byRole['generator']?.costUsd ?? 0) - 0.015) < 1e-9);
+    } finally {
+      delete process.env['WOWLIDATOR_CLAUDE_CLI_USAGE'];
+      delete process.env['FAKE_CLAUDE_MARK_DIR'];
+    }
+  });
+
+  it('at the model ceiling fails as finish=length, once, with nothing re-sent', async () => {
+    process.env['WOWLIDATOR_CLAUDE_CLI_USAGE'] = 'off';
+    process.env['FAKE_CLAUDE_MARK_DIR'] = dir;
+    process.env['FAKE_CLAUDE_CEILING'] = '32000';
+    delete process.env['CLAUDE_CODE_MAX_OUTPUT_TOKENS'];
+    try {
+      closeClaudeSessions();
+      const before = claudeCliUsage();
+      const model = createClaudeCli({ modelId: 'opus', effort: 'high', binary, role: 'generator' });
+      await assert.rejects(async () => { await model.doGenerate(call); }, (error: Error) => {
+        assert.equal(error.name, 'ClaudeAnswerError');
+        assert.match(error.message, /CUT OFF/);
+        assert.match(error.message, /finish=length/);
+        return true;
+      });
+      assert.equal(coldCalls(), 0);
+      assert.equal(claudeCliUsageSince(before).byRole['generator']?.calls, 1, 'the cut is booked, once');
+    } finally {
+      delete process.env['WOWLIDATOR_CLAUDE_CLI_USAGE'];
+      delete process.env['FAKE_CLAUDE_MARK_DIR'];
+      delete process.env['FAKE_CLAUDE_CEILING'];
     }
   });
 });

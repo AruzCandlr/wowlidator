@@ -45,6 +45,22 @@
  * Never fatal: a source that throws is a source that did not answer, and the
  * stage as a whole leaves a step untouched when nothing answered — the lint
  * then refuses it, as before.
+ *
+ * **The sheet's own shapes** (2026-09-04). Read over the 1,286-row QA workbook,
+ * the sheet writes a value several more ways than a token: a value followed
+ * by a note (`10 ตามชุดข้อมูล`, `D05H0830 ตามที่ Position กำหนด`), a bound
+ * (`11 ขึ้นไป`), a blank word (`Blank`, `ว่าง`, `null`), a mask standing for a
+ * value made elsewhere (`EMXXXX (จาก E2E-01)`, `BE-XXX-999 (ไม่มีในระบบ)`), an
+ * invalid value with its own examples (`ค่าอื่นที่ไม่ถูกต้อง เช่น "Active", "X"`),
+ * a length (`ข้อความความยาวเกิน 255 ตัวอักษร`), a quoted literal with a remark
+ * (`"32/13/2026" (วันที่ผิดรูปแบบ)`), and dates in many grammars — `31-Dec-9999`,
+ * `13 เมษายน`, `1 มกราคมของปีก่อนหน้า`, `< Current Date`, `วันก่อนวันที่จ้าง`,
+ * `Age = 60 พอดี ณ Hire Date`, `ย้อนหลังจากวันที่ทดสอบ 5`, a value that IS another
+ * date field's label. Each is handled by a STRUCTURAL mechanism here (a
+ * trailing clause, a quoted example, a label reference, an anchor clause)
+ * over the built-in `VOCABULARY` below, compiled once into `R`. The
+ * single-source rule holds for every shape: a written value is cleaned or
+ * left as written, never handed to a model.
  */
 
 import { z } from 'zod';
@@ -58,24 +74,259 @@ import { redactValue } from '../db/redact-row.js';
 import type { FlowStep } from '../engine/runner.js';
 import { lenientObject } from '../providers/model-output.js';
 import { generateStructuredForModel, type ModelSource } from '../providers/llm-factory.js';
+import { unconfirmedValue } from '../catalog/test-case-table.js';
+import { AUTHORING, VALUE_RULES, type Vocabulary } from './value-rules.js';
 
 /** The sheet's angle-bracket placeholder: `<NON_EXISTING_EMPLOYEE_ID>`. */
 export const PLACEHOLDER_TOKEN = /<[A-Z][A-Z0-9_\- ]{2,}>/;
-/** A token (or an intent) that asks for something that must NOT exist. */
-const NON_EXISTING = /NON[_\- ]?EXIST|NOT[_\- ]?EXIST|INVALID|UNKNOWN|NOT[_\- ]?FOUND|ไม่มีอยู่จริง|ไม่ถูกต้อง/i;
-/** A description standing where a value should be: "an existing …", "ของ…ที่มีอยู่จริง". */
-const DESCRIBED_VALUE = /ที่มีอยู่จริง|มีอยู่แล้ว|existing|any valid|a valid|ของพนักงาน/i;
+/**
+ * A mask standing for a value made elsewhere: `EMXXXX` (the id E2E-01 will
+ * create), `BE-XXX-999`, `N-NNNN-NNNNN-NN-N`. Three or more `X`/`N` in a run,
+ * with at most a short literal prefix/suffix — a rule NAME that merely
+ * contains `XXX` is not one.
+ */
+export const MASK_VALUE = /^(?:[A-Z]{1,4}[-_]?)?[NX]{3,}(?:[-_][NX0-9]{1,6}){0,4}$|^[NX]{1,4}(?:-[NX]{1,6}){2,}$/;
 /** Columns whose values are never handed out as test input, whatever the redaction rule says. */
 const SENSITIVE_COLUMN = /pass(word|wd)?|secret|token|hash|salt|\bssn\b|national_?id|citizen|passport|card_?(no|number)|cvv|pin\b/i;
 /** The open-question marker — asserted never, typed never; not this module's business. */
-const OPEN_QUESTION = /\b(?:OQ|CF)-[A-Za-z]+-\d+\b/;
+const OPEN_QUESTION = AUTHORING.openQuestion;
+/** A quoted literal, the sheet's way of saying "this exact string": `"32/13/2026"`, `"N"`. */
+const QUOTED = /"([^"]*)"|“([^”]*)”|'([^']*)'/g;
+/** The other case a value comes from: `(จาก E2E-01)`, `(from TC-12)`. */
+const CASE_REFERENCE = /\b([A-Z][A-Z0-9]{1,5}-[A-Z0-9]{1,4}(?:-\d{1,4})?|[A-Z]{2,6}_\d{2,3}(?:_\d{2,3})*)\b/;
 
-/** The wording that says a key value must ALREADY be in the system — a duplicate case, never a create. */
-const ALREADY_EXISTS = /มีอยู่แล้ว|มีในระบบ|ที่มีอยู่|ซ้ำกับ|already exists?|duplicate|existing/i;
-/** A field whose value is a key the app keeps unique: an id, a code, a name. Thai has no `\b`. */
-const KEY_FIELD = /\b(?:ID|Code|Name|Key|No\.?)\b|รหัส|ชื่อ/i;
-/** The sheet's own QA-owned key prefixes. */
-const QA_KEY = /^(?:QA-|SIT_)/i;
+// --- the vocabulary -----------------------------------------------------------------
+//
+// The words that mean "today", "leave it blank", "and above", "does not
+// exist" when a sheet's cell is read. The MECHANISMS below are structural (a
+// word class, a trailing clause, a quoted example, a label reference); the
+// words are listed here once, compiled once into `R`, and no entry names a
+// field of one catalog, a case id or a test-data literal. Every word is a
+// LITERAL: regex-escaped, then anchored the way its class needs — Latin on a
+// word boundary, Thai as a substring, a blank word as the whole value.
+
+/** A label or a Test data key, normalised for matching: no `*`, no parenthetical, no trailing colon, one space. */
+export function normalLabel(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\s*\([^)]*\)/g, '')
+    .replace(/\*/g, '')
+    .replace(/:$/, '')
+    .replace(/[^\p{L}\p{M}\p{N})]+$/u, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** The key names the field, or the field qualified (`Invalid Replaced Employee ID`), or the field names the key. */
+export function keyMatchesLabel(key: string, label: string): boolean {
+  if (key === '' || label === '') return false;
+  return key === label || key.endsWith(` ${label}`) || label.endsWith(` ${key}`);
+}
+
+/**
+ * The vocabulary is DATA (`value-rules.ts`, 2026-09-04): the built-ins merged
+ * with `.wowlidator/value-rules.json`, loaded once per process. Kept under its
+ * old name so every function below reads as it always did.
+ */
+export const VOCABULARY: Vocabulary = VALUE_RULES.values;
+
+const escape = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const isWordChar = (ch: string): boolean => /[A-Za-z0-9]/.test(ch);
+const hasThai = (w: string): boolean => /\p{Script=Thai}/u.test(w);
+/** A Latin word sits on word boundaries; Thai has none, so a Thai word is a substring. */
+function bounded(w: string): string {
+  const body = escape(w);
+  const head = isWordChar(w[0]!) ? '\\b' : '';
+  const tail = isWordChar(w[w.length - 1]!) ? '\\b' : '';
+  return `${head}${body}${tail}`;
+}
+/** Longest first, so `ก่อนหน้า` is tried before `ก่อน` and `next day` before `next`. */
+const longestFirst = (list: readonly string[]): string[] => [...new Set(list)].sort((a, b) => b.length - a.length);
+/** `(?:a|b|c)` of bounded literals; `(?!)` (matches nothing) when the list is empty. */
+function alternation(list: readonly string[], each: (w: string) => string = bounded): string {
+  const parts = longestFirst(list).map(each);
+  return parts.length === 0 ? '(?!)' : `(?:${parts.join('|')})`;
+}
+/**
+ * A literal whose spaces, hyphens and underscores may be any of them or
+ * nothing, matched as a substring: `non-existing` reads `NON_EXISTING_ID` and
+ * `NonExisting` too. No boundaries — a token glues the word to what follows
+ * (`<NOT_FOUND_ID>`).
+ */
+const flexible = (w: string): string => escape(w).replace(/[-_ ]+/g, '[_\\- ]?');
+/** A word relation (`before`, `วันก่อน`) is a bounded literal; a symbol one (`<`) must be followed by a space, so `<runtime>` is never a date. */
+const relationWord = (w: string): string => (/\p{L}/u.test(w[0]!) ? bounded(w) : `${escape(w)}(?=\\s)`);
+/** A symbol word (`<`, `>=`) is a bare literal; a Latin one is bounded. */
+const symbolOrWord = (w: string): string => (isWordChar(w[0]!) ? bounded(w) : escape(w));
+/** Thai month names, full and abbreviated, as the sheet writes them. */
+const THAI_MONTH_ALT =
+  '(?:ม\\.?ค\\.?|ก\\.?พ\\.?|มี\\.?ค\\.?|เม\\.?ย\\.?|พ\\.?ค\\.?|มิ\\.?ย\\.?|ก\\.?ค\\.?|ส\\.?ค\\.?|ก\\.?ย\\.?|ต\\.?ค\\.?|พ\\.?ย\\.?|ธ\\.?ค\\.?|มกราคม|กุมภาพันธ์|มีนาคม|เมษายน|พฤษภาคม|มิถุนายน|กรกฎาคม|สิงหาคม|กันยายน|ตุลาคม|พฤศจิกายน|ธันวาคม)';
+
+interface CompiledVocabulary {
+  keyField: RegExp;
+  qaKey: RegExp;
+  nonExisting: RegExp;
+  describedValue: RegExp;
+  alreadyExists: RegExp;
+  /** The whole value (Latin) or its start (Thai) says "leave it blank". */
+  blankValue: RegExp;
+  /** The whole value says "a space". */
+  spaceValue: RegExp;
+  /** The value opens with an input verb or a note introducer: an instruction, not a value. */
+  describedHead: RegExp;
+  credential: RegExp;
+  /** Where a value's trailing note begins: ` ตามชุดข้อมูล`, ` as per …`. */
+  noteStart: RegExp;
+  /** A trailing bound: ` ขึ้นไป`, ` or more`. */
+  boundTail: RegExp;
+  /** An example introducer, after which quoted strings are the examples. */
+  exampleIntroducer: RegExp;
+  format: { digits: RegExp; leading: RegExp; length: RegExp; over: RegExp; under: RegExp };
+  date: {
+    today: RegExp;
+    tomorrow: RegExp;
+    yesterday: RegExp;
+    future: RegExp;
+    past: RegExp;
+    /** The month word after `ของเดือน` / `of … month`; group 1. */
+    monthWord: string;
+    thisMonth: RegExp;
+    nextMonth: RegExp;
+    previousMonth: RegExp;
+    before: RegExp;
+    after: RegExp;
+    /** `ณ <label>` anywhere in a phrase; group 1 is the label. */
+    atClause: RegExp;
+    prefix: RegExp;
+    exactTail: RegExp;
+    back: RegExp;
+    forward: RegExp;
+    /** Alternations (no anchors) of the unit words, per kind and all together. */
+    unitAlt: { day: string; week: string; month: string; year: string; any: string };
+    /** Which kind a unit word is; `day` when the word is none of them (`Next day + 1`). */
+    unitKindOf(word: string): 'day' | 'week' | 'month' | 'year';
+    birthField: RegExp;
+    ageWord: string;
+    ageOp: string;
+    ageTail: string;
+    ageUnder: RegExp;
+    ageOver: RegExp;
+    ageAtLeast: RegExp;
+    ageAtMost: RegExp;
+    ageAnchorFields: readonly string[];
+    /** The shapes a typed value must take to be read as a date phrase at all. */
+    phraseShapes: RegExp[];
+  };
+  /** Every label that names the same field as `label`, normalised, `label` itself first. */
+  aliasesOf(label: string): string[];
+}
+
+/** The regexes and tables the resolver runs, built once from the vocabulary. Pure. */
+function compileVocabulary(v: Vocabulary): CompiledVocabulary {
+  const d = v.dates;
+  const f = v.formatWords;
+  const monthWord = `(${alternation([...d.thisMonth, ...d.nextMonth, ...d.previousMonth], escape)})`;
+  const unit = alternation([...d.units.day, ...d.units.week, ...d.units.month, ...d.units.year]);
+  const ageOp = alternation([...d.ageUnder, ...d.ageOver, ...d.ageAtLeast, ...d.ageAtMost, ...d.ageExact], symbolOrWord);
+  const groups = v.fieldAliases.map((g) => g.map(normalLabel));
+  const aliasIndex = new Map<string, string[]>();
+  for (const g of groups) for (const label of g) aliasIndex.set(label, g);
+  const wordThenGap = (w: string): string => (hasThai(w) ? `${escape(w)}(?=\\s|$|\\p{Script=Thai})` : `${bounded(w)}`);
+  /** The whole value (Latin) or its start (Thai) is one of the words. */
+  const wholeOrThaiHead = (list: readonly string[]): RegExp =>
+    new RegExp(`^(?:${alternation(list.filter((w) => !hasThai(w)), escape)}\\s*$|${alternation(list.filter(hasThai), escape)})`, 'iu');
+  const anchored = (list: readonly string[]): RegExp => new RegExp(`^${alternation(list, symbolOrWord)}$`, 'iu');
+  return {
+    keyField: new RegExp(alternation(v.keyFieldWords), 'iu'),
+    qaKey: new RegExp(`^${alternation(v.qaKeyPrefixes, escape)}`, 'iu'),
+    nonExisting: new RegExp(alternation(v.nonExistingWords, flexible), 'iu'),
+    describedValue: new RegExp(alternation(v.describedValueWords, escape), 'iu'),
+    alreadyExists: new RegExp(alternation(v.alreadyExistsWords, escape), 'iu'),
+    blankValue: wholeOrThaiHead(v.blankWords),
+    spaceValue: wholeOrThaiHead(v.spaceWords),
+    describedHead: new RegExp(`^${alternation([...v.inputVerbs, ...v.noteIntroducers], wordThenGap)}`, 'iu'),
+    credential: new RegExp(alternation(v.credentialWords, flexible), 'iu'),
+    noteStart: new RegExp(`\\s+${alternation(v.noteIntroducers, wordThenGap)}`, 'iu'),
+    boundTail: new RegExp(`\\s+${alternation(v.boundWords)}\\s*$`, 'iu'),
+    exampleIntroducer: new RegExp(alternation(v.exampleIntroducers, (w) => (hasThai(w) ? escape(w) : `${isWordChar(w[0]!) ? '\\b' : ''}${escape(w)}`)), 'iu'),
+    format: {
+      digits: new RegExp(`(\\d{1,3})\\s*-?\\s*${alternation(f.digitUnits)}`, 'iu'),
+      leading: new RegExp(`${alternation(f.leadingDigit)}\\s*(\\d)`, 'iu'),
+      length: new RegExp(`(\\d{1,4})\\s*${alternation(f.lengthUnits)}`, 'iu'),
+      over: new RegExp(alternation(f.over, symbolOrWord), 'iu'),
+      under: new RegExp(alternation(f.under, symbolOrWord), 'iu'),
+    },
+    date: {
+      today: new RegExp(`^${alternation(d.today)}`, 'iu'),
+      tomorrow: new RegExp(`^${alternation(d.tomorrow)}`, 'iu'),
+      yesterday: new RegExp(`^${alternation(d.yesterday)}`, 'iu'),
+      future: new RegExp(`^${alternation(d.future)}\\s*$`, 'iu'),
+      past: new RegExp(`^${alternation(d.past)}\\s*$`, 'iu'),
+      monthWord,
+      thisMonth: new RegExp(`^${alternation(d.thisMonth, escape)}$`, 'iu'),
+      nextMonth: new RegExp(`^${alternation(d.nextMonth, escape)}$`, 'iu'),
+      previousMonth: new RegExp(`^${alternation(d.previousMonth, escape)}$`, 'iu'),
+      before: new RegExp(`^${alternation(d.before, relationWord)}\\s*`, 'iu'),
+      after: new RegExp(`^${alternation(d.after, relationWord)}\\s*`, 'iu'),
+      atClause: new RegExp(`(?:^|\\s)${alternation(d.at)}\\s*([\\p{L}\\p{M}\\p{N} /().'*-]+?)(?=\\s*(?:${ageOp}|\\d)|\\s*$)`, 'iu'),
+      prefix: new RegExp(`^${alternation(d.prefixes)}\\s*`, 'iu'),
+      exactTail: new RegExp(`\\s*${alternation(d.exact)}\\s*$`, 'iu'),
+      back: new RegExp(`^${alternation(d.back)}`, 'iu'),
+      forward: new RegExp(`^${alternation(d.forward)}`, 'iu'),
+      unitAlt: {
+        day: alternation(d.units.day),
+        week: alternation(d.units.week),
+        month: alternation(d.units.month),
+        year: alternation(d.units.year),
+        any: unit,
+      },
+      unitKindOf: (word) => {
+        const w = word.trim();
+        for (const kind of ['month', 'year', 'week'] as const) {
+          if (new RegExp(`^${alternation(d.units[kind])}$`, 'iu').test(w)) return kind;
+        }
+        return 'day';
+      },
+      birthField: new RegExp(alternation(d.birthFieldWords), 'iu'),
+      ageWord: alternation(d.ageWords),
+      ageOp,
+      ageTail: alternation([...d.ageAtLeast, ...d.ageAtMost, ...d.ageExact], symbolOrWord),
+      ageUnder: anchored(d.ageUnder),
+      ageOver: anchored(d.ageOver),
+      ageAtLeast: anchored(d.ageAtLeast),
+      ageAtMost: anchored(d.ageAtMost),
+      ageAnchorFields: d.ageAnchorFields.map(normalLabel),
+      phraseShapes: [
+        new RegExp(`^${alternation([...d.today, ...d.tomorrow, ...d.yesterday, ...d.future, ...d.past])}`, 'iu'),
+        new RegExp(`^${alternation(d.prefixes)}`, 'iu'),
+        new RegExp(`^${alternation([...d.before, ...d.after], relationWord)}\\s*\\S`, 'iu'),
+        new RegExp(`^${alternation(d.back)}`, 'iu'),
+        new RegExp(`(?:^|\\s)${alternation(d.at)}\\s`, 'iu'),
+        /วันนี้|วันถัดไป|วันพรุ่งนี้|พรุ่งนี้|เมื่อวาน|วันที่ปัจจุบัน|ย้อนหลัง|วันก่อน|ล่วงหน้า|ของเดือน|สิ้นเดือน|ต้นเดือน|วันสุดท้าย|วันแรก|ของปี|อายุ/u,
+        /^วันที่\s*\d{1,2}\s*$/u,
+        new RegExp(`^${alternation(d.ageWords)}\\s*(?:${ageOp})`, 'iu'),
+        /\b9999\b/,
+        new RegExp(`[+\\-−]\\s*\\d+\\s*${unit}`, 'iu'),
+        /\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s+\d{4}\b/i,
+        /\b\d{1,2}-(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*-\d{4}\b/i,
+        /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/i,
+        new RegExp(`^\\d{1,2}\\s*${THAI_MONTH_ALT}\\s*(?:พ\\.?ศ\\.?\\s*)?\\d{2,4}$`, 'u'),
+        new RegExp(`^\\d{1,2}\\s*${THAI_MONTH_ALT}(?:\\s|$|ของ)`, 'u'),
+        /^\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?$/i,
+        /\b(?:day \d{1,2}|last day|first day|end|start|beginning) of (?:this|the|next|previous|last|current)\b/i,
+        /\b\d{1,2}(?:st|nd|rd|th) of (?:this|the|next|previous|last|current) month\b/i,
+      ],
+    },
+    aliasesOf: (label) => {
+      const want = normalLabel(label);
+      const group = aliasIndex.get(want);
+      return group === undefined ? [want] : [want, ...group.filter((l) => l !== want)];
+    },
+  };
+}
+
+/** The vocabulary, compiled once — what every function below reads. */
+const R = compileVocabulary(VOCABULARY);
 
 export type ValueSourceKind = 'relative-date' | 'unique-per-run' | 'test-data' | 'repo' | 'db' | 'generated';
 
@@ -119,14 +370,41 @@ export interface ValueNeed {
    * already exist, the step is left as authored.
    */
   uniqueKey?: string | undefined;
+  /**
+   * The value as written says to leave the field EMPTY (`Blank`, `ว่าง`,
+   * `null`). Resolved to the empty string from the case's own word; no other
+   * source is asked.
+   */
+  blank?: boolean | undefined;
+  /** The value as written is ONE SPACE (`เว้นวรรค`): a whitespace-only value, typed on purpose. */
+  space?: boolean | undefined;
+  /**
+   * The token or the field names a credential (`<HR_ADMIN_ACCOUNT>`, `Login`).
+   * The Test data, a document or the database may answer; a stand-in is
+   * never invented — a made-up login fails for a reason no case asked about.
+   */
+  credential?: boolean | undefined;
+  /**
+   * The value as written carries the value plus a remark — a trailing note
+   * (`10 ตามชุดข้อมูล`), a bound (`11 ขึ้นไป`), a parenthetical, a quoted
+   * literal with a comment (`"32/13/2026" (วันที่ผิดรูปแบบ)`), or an example
+   * list (`เช่น "Active", "X"`). `written` is the value with the remark
+   * removed; only that cleaning may answer, never a model.
+   */
+  written?: string | undefined;
+  /** The other case the value comes from, when the sheet cites one (`EMXXXX (จาก E2E-01)`). */
+  reference?: string | undefined;
 }
 
 /** What the case says a well-formed value looks like. */
 export interface ValueFormat {
   digits?: number | undefined;
   leading?: string | undefined;
-  /** A literal pattern the case quotes, e.g. `N-NNNN-NNNNN-NN-N`. */
+  /** A literal pattern the case quotes, e.g. `N-NNNN-NNNNN-NN-N`, `EMXXXX`. */
   mask?: string | undefined;
+  /** A text length the case states (`เกิน 255 ตัวอักษร`, `at most 50 characters`). */
+  length?: number | undefined;
+  lengthRelation?: 'over' | 'under' | 'exact' | undefined;
 }
 
 export interface ResolvedValue {
@@ -201,38 +479,26 @@ export function fieldLabelOf(step: FlowStep): string {
   return typeof selector === 'string' ? selector : 'value';
 }
 
-/** A label or a Test data key, normalised for matching: no `*`, no parenthetical, no trailing colon, one space. */
-function normalLabel(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/\s*\([^)]*\)/g, '')
-    .replace(/\*/g, '')
-    .replace(/:$/, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-/** The key names the field, or the field qualified (`Invalid Replaced Employee ID`), or the field names the key. */
-function keyMatchesLabel(key: string, label: string): boolean {
-  if (key === '' || label === '') return false;
-  return key === label || key.endsWith(` ${label}`) || label.endsWith(` ${key}`);
-}
-
 /**
  * The format the case states for a field: `8 หลัก` / `8 digits`, `หลักแรกเป็น 2` /
- * `starts with 2`, or a quoted mask like `N-NNNN-NNNNN-NN-N`. Looked for near
- * the field's words first, then anywhere in the case.
+ * `starts with 2`, a quoted mask like `N-NNNN-NNNNN-NN-N` or `EMXXXX`, or a
+ * length (`เกิน 255 ตัวอักษร`, `at most 50 characters`). Looked for near the
+ * field's words first, then anywhere in the case.
  */
 export function formatStatedFor(field: string, caseText: string): ValueFormat | null {
   const read = (text: string): ValueFormat | null => {
-    const digits = /(\d{1,3})\s*(?:หลัก|-?\s*digits?\b)/i.exec(text);
-    const leading = /(?:หลักแรก(?:เป็น|คือ)?|starts? with|first digit(?: is)?|leading digit(?: is)?)\s*(\d)/i.exec(text);
-    const mask = /\b([NX](?:[NX\-]){4,})\b/.exec(text);
-    if (!digits && !leading && !mask) return null;
+    const digits = R.format.digits.exec(text);
+    const leading = R.format.leading.exec(text);
+    const mask = /(?:^|[\s=:"'(])((?:[A-Z]{1,4}[-_]?)?[NX]{3,}(?:[-_][NX0-9]{1,6}){0,4}|[NX]{1,4}(?:-[NX]{1,6}){2,})(?=$|[\s,;)"'])/.exec(text);
+    const length = R.format.length.exec(text);
+    if (!digits && !leading && !mask && !length) return null;
+    const before = length ? text.slice(Math.max(0, length.index - 24), length.index) : '';
+    const relation = !length ? undefined : R.format.over.test(before) ? 'over' : R.format.under.test(before) ? 'under' : 'exact';
     return {
       ...(digits ? { digits: Number(digits[1]) } : {}),
       ...(leading ? { leading: leading[1] } : {}),
       ...(mask ? { mask: mask[1] } : {}),
+      ...(length ? { length: Number(length[1]), lengthRelation: relation } : {}),
     };
   };
   const words = field.split(/\s+/).filter((w) => w.length > 2).map((w) => w.replace(/[^\p{L}\p{N}]/gu, ''));
@@ -242,13 +508,143 @@ export function formatStatedFor(field: string, caseText: string): ValueFormat | 
       if (near !== null) return near;
     }
   }
-  return read(caseText);
+  // Anywhere else in the case — but never on ANOTHER key field's own `Key =
+  // value` line: the Employee ID's `EMXXXX` mask is not the Reason's format.
+  // A line keyed by something that is not a field (`Thailand Format = N-NNNN…`)
+  // still counts.
+  const elsewhere = caseText
+    .split('\n')
+    .filter((line) => {
+      const sep = /\s*(?:=|:\s)/.exec(line);
+      if (sep === null || sep.index === 0) return true;
+      const key = normalLabel(line.slice(0, sep.index).replace(/^\s*(?:[-•*]|\d+[.)])\s*/, ''));
+      return key === '' || key.split(' ').length > 6 || !R.keyField.test(key) || keyMatchesLabel(key, normalLabel(field));
+    })
+    .join('\n');
+  return read(elsewhere);
+}
+
+/**
+ * The example values a description offers — the quoted strings after an
+ * example introducer: `ค่าอื่นที่ไม่ถูกต้อง เช่น "Active", "X"` → `["Active", "X"]`.
+ * Empty when there is no introducer or nothing quoted after it.
+ */
+export function exampleValuesIn(text: string): string[] {
+  const quoted = (span: string): string[] => {
+    const out: string[] = [];
+    for (const q of span.matchAll(QUOTED)) {
+      const v = (q[1] ?? q[2] ?? q[3] ?? '').trim();
+      if (v !== '') out.push(v);
+    }
+    return out;
+  };
+  const m = R.exampleIntroducer.exec(text);
+  if (m !== null) return quoted(text.slice(m.index + m[0].length));
+  // A list that is NOTHING but quoted literals — `"abc", "-30", "0", "900"`
+  // — is its own example list, the sheet's boundary set for one field. The
+  // block reader strips a cell's outer quotes, so the list arrives as
+  // `abc", "-30", "0", "900`; re-wrapping restores the shape either way.
+  const t = text.trim();
+  const wrapped = t.includes('", "') && !t.startsWith('"') ? `"${t}"` : t;
+  const items = quoted(wrapped);
+  if (items.length >= 2 && wrapped.replace(QUOTED, '').replace(/[\s,;]/g, '') === '') return items;
+  return [];
+}
+
+/**
+ * A cell offering ALTERNATIVES — `Yes / No`, `Inactive / Terminated`,
+ * `PL_06_25 / PL_06_25_70813`, `ว่าง/วันที่ในอดีต`, `Job Change หรือ Salary
+ * Adjustment` — means any one of them; the first is typed. A slash counts
+ * only with spaces around it or Thai on a side: `Employee/HR` and
+ * `01/02/2021` are one value.
+ */
+const ALTERNATIVES = /\s+\/\s+|(?<=\p{Script=Thai})\/|\/(?=\p{Script=Thai})|\s+หรือ\s+/u;
+
+/**
+ * The value a written cell means, with its remark removed: the first quoted
+ * example when the cell gives examples; else a leading quoted literal; else
+ * the first of several alternatives (`Yes / No`); else
+ * the text before a parenthetical, a double-space tail, a trailing note
+ * (` ตามชุดข้อมูล`, ` as per …`) or a trailing bound (` ขึ้นไป`, ` or more`),
+ * trailing punctuation dropped and whole-value quotes unwrapped. Returns the
+ * input unchanged (trimmed) when nothing applies, so a caller can compare.
+ */
+export function writtenValueOf(raw: string, options: { keepParenthetical?: boolean | undefined } = {}): string {
+  let text = raw.trim();
+  const examples = exampleValuesIn(text);
+  if (examples.length > 0) return examples[0]!;
+  const leadQuote = /^(?:"([^"]*)"|“([^”]*)”)/.exec(text);
+  if (leadQuote !== null) return (leadQuote[1] ?? leadQuote[2] ?? '').trim();
+  text = text.split(ALTERNATIVES)[0]!.trim();
+  for (let guard = 0; guard < 4; guard += 1) {
+    const before = text;
+    // A remark in parentheses after a space: `CDG (10000075)`, `43 (3 หน้า)`.
+    // Not a bracket glued to a name (`Permanent(7-16)-(12/31/9999)`), not one
+    // of several in a list (`CDS (C001), B2S (C006)`), and an option's label
+    // may BE `CDS (C001)`, so a selectOption keeps its parenthetical.
+    if (options.keepParenthetical !== true && (text.match(/\(/g) ?? []).length === 1) text = text.replace(/\s+\([^()]*\)\s*$/, '').trim();
+    text = text.split(/\s{2,}/)[0]!.trim();
+    text = text.split(R.noteStart)[0]!.trim();
+    text = text.replace(R.boundTail, '').trim();
+    text = text.replace(/[,;]+$/, '').trim();
+    if (text === before) break;
+  }
+  const whole = /^(?:"([^"]*)"|“([^”]*)”)$/.exec(text);
+  if (whole !== null) text = (whole[1] ?? whole[2] ?? '').trim();
+  return text;
+}
+
+/**
+ * A value that names its OWN field and goes on in prose — `Replaced Employee
+ * ID = Employee ID ที่ลาออกแล้วและเคยครอง Position 40001378`, `National ID =
+ * National ID เดียวกับพนักงานเดิม`, `Contract End Date = Contract End Date
+ * จริง` — describes the value instead of giving it. The label (or a two-word
+ * tail of it) must appear whole, and what remains must be words, not a code:
+ * `Country = Mock Country (TH)` and `Enrollment = Manual Enrollment` are
+ * option labels and stay.
+ */
+export function describesOwnField(field: string, value: string): boolean {
+  const label = normalLabel(field);
+  const v = normalLabel(value);
+  if (label === '' || v === '' || v === label) return false;
+  const words = label.split(' ');
+  const tails = words.map((_, i) => words.slice(i).join(' ')).filter((_, i) => i === 0 || words.length - i >= 2);
+  for (const tail of tails) {
+    const at = v.indexOf(tail);
+    if (at < 0) continue;
+    const before = v[at - 1];
+    const after = v[at + tail.length];
+    if ((before !== undefined && /[\p{L}\p{N}]/u.test(before)) || (after !== undefined && /[A-Za-z0-9]/.test(after))) continue;
+    const rest = `${v.slice(0, at)} ${v.slice(at + tail.length)}`;
+    if (/\p{Script=Thai}/u.test(rest)) return true;
+  }
+  return false;
+}
+
+/**
+ * A cleaned value that DESCRIBES the value instead of giving it: "an existing
+ * …", "ค่าอื่นที่ไม่ถูกต้อง", a text described only by its length ("ข้อความความยาว
+ * เกิน 255 ตัวอักษร"), an instruction ("เลือกแขวงที่อยู่ใน District ที่เลือก",
+ * "ตาม Sub-District ที่เลือก"), or a value naming its own field. One predicate,
+ * so the need finder and the Test data reader cannot disagree about it.
+ */
+export function isDescription(field: string, cleaned: string): boolean {
+  return R.describedValue.test(cleaned) || R.format.length.test(cleaned) || R.describedHead.test(cleaned) || describesOwnField(field, cleaned);
+}
+
+/** The case another value comes from — `(จาก E2E-01)` — when the cell cites one. */
+function referenceIn(raw: string): string | null {
+  const paren = /\(([^()]*)\)\s*$/.exec(raw.trim());
+  const m = CASE_REFERENCE.exec(paren?.[1] ?? '');
+  return m === null ? null : m[1]!;
 }
 
 /** What `findUnresolvedValues` needs beyond the steps to see the two concrete-value needs. */
 export interface NeedOptions {
   /** The row's case id: a typed value equal to it (any `-`/`_` spelling, or with the sheet's `_R1` tail) is a reused key. */
   caseId?: string | undefined;
+  /** The Test data pairs, so a value that IS another date field's label (`Probationary Period End Date = Hire Date`) is seen as a date. */
+  pairs?: readonly TestDataPair[] | undefined;
 }
 
 /** `PL_06_21`, `PL-06-21`, `pl_06_21_R3` → `PL_06_21` — the sheet's own spellings of one case id. */
@@ -265,15 +661,20 @@ function keySpelling(value: string): string {
 export function isReusedKeyValue(value: string, field: string, caseId: string | undefined): boolean {
   const text = value.trim();
   if (text === '' || text.length > 80 || PLACEHOLDER_TOKEN.test(text)) return false;
-  if (!KEY_FIELD.test(field)) return false;
-  if (QA_KEY.test(text)) return true;
+  if (!R.keyField.test(field)) return false;
+  if (R.qaKey.test(text)) return true;
   if (caseId === undefined || caseId.trim() === '') return false;
   const want = keySpelling(caseId);
   const have = keySpelling(text);
   return have === want || new RegExp(`^${want.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_R\\d{1,2}$`).test(have);
 }
 
-/** Every input step whose value is a token, a description in place of a value, a date phrase, or a reused key. */
+/**
+ * Every input step whose value is a token, a mask, a description in place of
+ * a value (a described value, an instruction, a value naming its own field),
+ * a date phrase (or another date field's label), a reused key, a blank or a
+ * space word, or a value written with a remark or alternatives.
+ */
 export function findUnresolvedValues(
   setup: readonly FlowStep[],
   steps: readonly FlowStep[],
@@ -281,40 +682,102 @@ export function findUnresolvedValues(
   options: NeedOptions = {},
 ): ValueNeed[] {
   const needs: ValueNeed[] = [];
+  let pairs: readonly TestDataPair[] | null = options.pairs ?? null;
+  const pairsOf = (): readonly TestDataPair[] => (pairs ??= testDataPairsOf(caseText));
   const scan = (section: ValueSection, list: readonly FlowStep[]): void => {
     for (const [index, step] of list.entries()) {
       if (!INPUT_ACTIONS.has(step.action)) continue;
       const value = (step as { value?: unknown }).value;
       const intent = (step as { intent?: unknown }).intent;
       const text = typeof value === 'string' ? value : '';
-      if (OPEN_QUESTION.test(text)) continue;
-      const token = PLACEHOLDER_TOKEN.exec(text)?.[0] ?? null;
+      // A value that IS an open question (`? OQ-HIR-13`, `TBD`) is nobody's
+      // to resolve; one that merely CITES a question beside a concrete value
+      // (`30009285 (คีย์ที่ช่อง Organization ดู OQ-HIR-138)`) is a value.
+      if (unconfirmedValue(text)) continue;
+      const field = fieldLabelOf(step);
+      const cleaned = writtenValueOf(text, { keepParenthetical: step.action === 'selectOption' });
+      if (OPEN_QUESTION.test(cleaned)) continue;
+      // A mask (`EMXXXX`, `BE-XXX-999`) stands for a value made elsewhere,
+      // the same need a token is; the format it states travels with it.
+      const mask = MASK_VALUE.test(cleaned) ? cleaned : null;
+      const token = PLACEHOLDER_TOKEN.exec(text)?.[0] ?? mask;
       // A date phrase left as written (`Today`, `Hire Date + 119 Day`) is a
       // need of its own kind: computed, never looked up. A selectOption's
       // value is an option label, which may legitimately read "Next day".
-      const field = fieldLabelOf(step);
-      const phrase = token === null && step.action !== 'selectOption' && isDatePhrase(text, field) ? text.trim() : null;
+      // A value that IS another date field's label is a phrase too.
+      const phrase =
+        token === null && step.action !== 'selectOption' && (isDatePhrase(cleaned, field) || labelOfDatePair(cleaned, pairsOf()) !== null)
+          ? cleaned
+          : null;
       const uniqueKey = token === null && phrase === null && isReusedKeyValue(text, field, options.caseId) ? text.trim() : null;
-      const described = token === null && phrase === null && uniqueKey === null && (text === '' || DESCRIBED_VALUE.test(text));
-      if (token === null && phrase === null && uniqueKey === null && !described) continue;
+      // A blank word as the value (`Blank`, `ว่าง`) or as the remark beside a
+      // placeholder (`Select Date (ไม่ระบุ)`): the field is left empty.
+      const remark = /\(([^()]*)\)\s*$/.exec(text.trim())?.[1]?.trim() ?? '';
+      const blank = token === null && phrase === null && uniqueKey === null && text.trim() !== '' && (R.blankValue.test(text.trim()) || (remark !== '' && R.blankValue.test(remark)));
+      const space = token === null && phrase === null && uniqueKey === null && !blank && R.spaceValue.test(text.trim());
+      // A description in place of a value — "an existing …", "ค่าอื่นที่ไม่ถูกต้อง",
+      // a text described only by its length ("ข้อความความยาวเกิน 255 ตัวอักษร"),
+      // an instruction ("เลือกแขวงที่อยู่ใน District ที่เลือก"), or a value that
+      // names its own field and goes on in prose. Judged on the cleaned value,
+      // so a remark beside a concrete value cannot make it a description.
+      const described =
+        token === null &&
+        phrase === null &&
+        uniqueKey === null &&
+        !blank &&
+        !space &&
+        (text === '' || isDescription(field, cleaned));
+      // A remark beside the value (`10 ตามชุดข้อมูล`, `"N" (comment)`) or a
+      // list of alternatives is cleaned off; the value itself is what the sheet wrote.
+      const written = token === null && phrase === null && uniqueKey === null && !blank && !space && !described && cleaned !== '' && cleaned !== text.trim() ? cleaned : null;
+      if (token === null && phrase === null && uniqueKey === null && !blank && !space && !described && written === null) continue;
       // An empty value is only a need when something SAYS a value belongs here.
-      if (token === null && phrase === null && uniqueKey === null && text === '' && !(typeof intent === 'string' && DESCRIBED_VALUE.test(intent))) continue;
+      if (token === null && phrase === null && uniqueKey === null && !blank && !space && written === null && text === '' && !(typeof intent === 'string' && R.describedValue.test(intent))) continue;
       const around = `${token ?? ''} ${text} ${typeof intent === 'string' ? intent : ''}`;
+      const credential = (token !== null || described) && R.credential.test(`${token ?? ''} ${field}`);
+      const reference = referenceIn(text);
+      // The cell's own words state the format first (`ใช้แทน National ID 13 หลัก`), then the case.
+      const stated = formatStatedFor(field, `${text}\n${caseText}`);
+      const format = mask === null ? stated : { ...(stated ?? {}), mask };
       needs.push({
         section,
         index,
         field,
         token,
-        nonExisting: NON_EXISTING.test(around),
-        format: formatStatedFor(field, caseText),
+        nonExisting: R.nonExisting.test(around),
+        format,
         ...(phrase === null ? {} : { phrase }),
         ...(uniqueKey === null ? {} : { uniqueKey }),
+        ...(blank ? { blank: true } : {}),
+        ...(space ? { space: true } : {}),
+        ...(credential ? { credential: true } : {}),
+        ...(written === null ? {} : { written }),
+        ...(reference === null ? {} : { reference }),
       });
     }
   };
   scan('setup', setup);
   scan('steps', steps);
   return needs;
+}
+
+/**
+ * The Test data pair whose KEY the value names, when that pair holds a date
+ * (`Probationary Period End Date = Hire Date`, with `Hire Date = Today`
+ * elsewhere in the block). Aliases count. Null otherwise.
+ */
+export function labelOfDatePair(value: string, pairs: readonly TestDataPair[]): TestDataPair | null {
+  const want = normalLabel(value);
+  if (want === '' || want.length > 60 || /\d/.test(want)) return null;
+  const names = R.aliasesOf(want);
+  for (const pair of pairs) {
+    const key = normalLabel(pair.key);
+    if (!names.includes(key)) continue;
+    const rhs = pair.value.trim();
+    if (rhs === '' || normalLabel(rhs) === want) continue;
+    if (ISO_DATE_VALUE.test(rhs) || absoluteDateOf(rhs) !== null || isDatePhrase(writtenValueOf(rhs), pair.key)) return pair;
+  }
+  return null;
 }
 
 /** The case's lines that mention the field. */
@@ -396,27 +859,62 @@ export function testDataPairsOf(caseText: string): TestDataPair[] {
   return pairs;
 }
 
-/** The pair naming this field — first in sheet order — when its value is concrete. */
+/** The pair naming this field — first in sheet order — when its value is concrete (or says "blank"). */
 function pairFor(need: ValueNeed, pairs: readonly TestDataPair[]): TestDataPair | null {
   const label = normalLabel(need.field);
   for (const pair of pairs) {
     if (!keyMatchesLabel(normalLabel(pair.key), label)) continue;
-    // A non-existing need must not take the VALID id's line and vice versa.
-    if (NON_EXISTING.test(pair.key) !== need.nonExisting) continue;
+    // A non-existing need must not take the VALID id's line and vice versa;
+    // the line says which it is on its key (`Invalid Replaced Employee ID`)
+    // or its value (`ค่าอื่นที่ไม่ถูกต้อง เช่น "Active"`).
+    if (R.nonExisting.test(`${pair.key} ${pair.value}`) !== need.nonExisting) continue;
     const rhs = pair.value;
-    if (rhs === '' || PLACEHOLDER_TOKEN.test(rhs) || OPEN_QUESTION.test(rhs) || /^\?/.test(rhs) || DESCRIBED_VALUE.test(rhs)) continue;
+    if (rhs === '') continue;
+    if (R.blankValue.test(rhs.trim())) return pair;
+    // The remark beside a value is not the value: `20000248 (ดู OQ-HIR-138)`
+    // is a concrete id with a pointer to an open question, not an open one.
+    const cleaned = writtenValueOf(rhs);
+    // An unconfirmed value (`= ? รอตาราง…`, an OQ- id, TBD, an instruction)
+    // is not a value: the field stays unresolved and its step is skipped. A
+    // description with its own examples (`เช่น "Active"`) is one.
+    if (cleaned === '' || PLACEHOLDER_TOKEN.test(cleaned) || OPEN_QUESTION.test(cleaned) || unconfirmedValue(cleaned)) continue;
+    if (isDescription(need.field, cleaned) && exampleValuesIn(rhs).length === 0) continue;
     return pair;
   }
   return null;
 }
 
-/** `Field = value` on a line of the case, when the value is concrete. */
+/**
+ * The unconfirmed Test data pair a field's label names EXACTLY, or null. Used
+ * by the author's `usesUnconfirmedValue` lint: a fill into "DVT: Course of
+ * Time" while the sheet says `Course of Time = ? ยังไม่ยืนยันหน่วย/รูปแบบ` is
+ * a value the model invented for a field nobody has a value for. Exact after
+ * normalising (a `Prefix: ` on the label stripped, `*` and parentheticals
+ * dropped) — never the resolver's looser suffix match, because an unconfirmed
+ * key such as `Type` would otherwise claim every "Contract Type" and
+ * "Employee Type" on the form.
+ */
+export function unconfirmedFieldIn(field: string, pairs: readonly TestDataPair[]): TestDataPair | null {
+  const label = normalLabel(field);
+  const unprefixed = label.replace(/^[^:]{1,30}:\s*/, '');
+  for (const pair of pairs) {
+    if (!unconfirmedValue(pair.value)) continue;
+    const key = normalLabel(pair.key);
+    if (key === label || key === unprefixed) return pair;
+  }
+  return null;
+}
+
+/** `Field = value` on a line of the case, when the value is concrete — the remark beside it removed. */
 export function fromTestData(need: ValueNeed, caseText: string, pairs?: readonly TestDataPair[]): ResolvedValue | null {
   const pair = pairFor(need, pairs ?? testDataPairsOf(caseText));
   if (pair === null) return null;
-  const value = pair.value.split(/\s{2,}|\s+\(/)[0]!.trim();
-  if (value === '') return null;
   const stated = `${pair.phase === null ? '' : `[${pair.phase}] `}${pair.key} = ${pair.value}`;
+  if (R.blankValue.test(pair.value.trim())) {
+    return { need, value: '', source: { kind: 'test-data', detail: `the case says to leave it blank: "${stated.slice(0, 100)}"` } };
+  }
+  const value = writtenValueOf(pair.value);
+  if (value === '') return null;
   return { need, value, source: { kind: 'test-data', detail: `the case states "${stated.slice(0, 100)}"` } };
 }
 
@@ -477,21 +975,29 @@ function gregorianYear(raw: string, thai: boolean): number | null {
 }
 
 /**
- * A date written out — `31 Dec 9999`, `Dec 31, 9999`, `25 ธันวาคม 2569`,
- * `25 ธ.ค. 69`, `2026-09-03` — as Y-M-D, or null when it is not unambiguously
- * one. `01/09/2027` is left alone on purpose: whether that is January or
- * September depends on who wrote it (the engine's own rule, `isoDateOf`), with
- * the single exception of the sheet's `31/12/9999` sentinel, which reads the
- * same either way round.
+ * A date written out — `31 Dec 9999`, `31-Dec-9999`, `Dec 31, 9999`,
+ * `25 ธันวาคม 2569`, `25 ธ.ค. 69`, `2026-09-03`, and, when `now` is given, a
+ * day and month with no year (`13 เมษายน`, `13 April`) in the current year —
+ * as Y-M-D, or null when it is not unambiguously one. `01/09/2027` is left
+ * alone on purpose: whether that is January or September depends on who wrote
+ * it (the engine's own rule, `isoDateOf`), with the single exception of the
+ * sheet's `31/12/9999` sentinel, which reads the same either way round.
  */
-export function absoluteDateOf(text: string): Ymd | null {
+export function absoluteDateOf(text: string, now?: Ymd): Ymd | null {
   const t = text.trim();
   const iso = ISO_DATE_VALUE.exec(t);
   if (iso) return { y: Number(iso[1]), m: Number(iso[2]), d: Number(iso[3]) };
   if (/^(?:31\/12\/9999|12\/31\/9999|9999-12-31)$/.test(t)) return { y: 9999, m: 12, d: 31 };
-  const dmy = /^(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/.exec(t);
-  const mdy = /^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$/.exec(t);
-  const en = dmy ? { d: dmy[1]!, mon: dmy[2]!, y: dmy[3]! } : mdy ? { d: mdy[2]!, mon: mdy[1]!, y: mdy[3]! } : null;
+  const dmy = /^(\d{1,2})[\s-]+([A-Za-z]{3,9})\.?,?[\s-]+(\d{4})$/.exec(t);
+  const mdy = /^([A-Za-z]{3,9})\.?[\s-]+(\d{1,2}),?[\s-]+(\d{4})$/.exec(t);
+  const dm = now === undefined ? null : /^(\d{1,2})[\s-]+([A-Za-z]{3,9})\.?$/.exec(t);
+  const en = dmy
+    ? { d: dmy[1]!, mon: dmy[2]!, y: dmy[3]! }
+    : mdy
+      ? { d: mdy[2]!, mon: mdy[1]!, y: mdy[3]! }
+      : dm
+        ? { d: dm[1]!, mon: dm[2]!, y: String(now!.y) }
+        : null;
   if (en) {
     const m = EN_MONTHS[en.mon.slice(0, 4).toLowerCase()] ?? EN_MONTHS[en.mon.slice(0, 3).toLowerCase()];
     const y = gregorianYear(en.y, false);
@@ -500,43 +1006,33 @@ export function absoluteDateOf(text: string): Ymd | null {
     return d >= 1 && d <= daysInMonth(y, m) ? { y, m, d } : null;
   }
   const th = /^(\d{1,2})\s*([\p{Script=Thai}.]{2,12})\s*(?:พ\.?ศ\.?\s*)?(\d{2}|\d{4})$/u.exec(t);
-  if (th) {
-    const m = TH_MONTHS.find(([re]) => re.test(th[2]!))?.[1];
-    const y = gregorianYear(th[3]!, true);
+  const thNoYear = now === undefined ? null : /^(\d{1,2})\s*([\p{Script=Thai}.]{2,12})$/u.exec(t);
+  const thai = th ? { d: th[1]!, mon: th[2]!, y: th[3]! } : thNoYear ? { d: thNoYear[1]!, mon: thNoYear[2]!, y: String(now!.y) } : null;
+  if (thai) {
+    const m = TH_MONTHS.find(([re]) => re.test(thai.mon))?.[1];
+    const y = gregorianYear(thai.y, true);
     if (m === undefined || y === null) return null;
-    const d = Number(th[1]);
+    const d = Number(thai.d);
     return d >= 1 && d <= daysInMonth(y, m) ? { y, m, d } : null;
   }
   return null;
 }
 
-/** The shapes a date phrase takes — the gate for treating a typed value as one. */
-const DATE_PHRASE_SHAPES: RegExp[] = [
-  /^(?:today|tomorrow|yesterday|next\s?day|now|current date|the current date)\b/i,
-  /วันนี้|วันถัดไป|วันพรุ่งนี้|พรุ่งนี้|เมื่อวาน|วันที่ปัจจุบัน|ย้อนหลัง|วันก่อน|ล่วงหน้า|ของเดือน|สิ้นเดือน|ต้นเดือน|วันสุดท้าย|วันแรก|ของปี|อายุ/u,
-  /^age\s*(?:[<>=≤≥]|under|over|below|above|at least|at most)/i,
-  /\b9999\b/,
-  /[+\-]\s*\d+\s*(?:(?:days?|d|weeks?|months?|years?)\b|วัน|สัปดาห์|เดือน|ปี)/iu,
-  /\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s+\d{4}\b/i,
-  /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/i,
-  /^\d{1,2}\s*[\p{Script=Thai}.]{2,12}\s*(?:พ\.?ศ\.?\s*)?\d{2,4}$/u,
-  /\b(?:day \d{1,2}|last day|first day|end|start|beginning) of (?:this|the|next|previous|last|current)\b/i,
-  /\b\d{1,2}(?:st|nd|rd|th) of (?:this|the|next|previous|last|current) month\b/i,
-];
-
-/** A field that holds a birth date, where `35 ปี 6 เดือน` is an age and not a duration. */
-const BIRTH_FIELD = /birth|\bdob\b|เกิด|\bage\b|อายุ/i;
-
 /**
  * True when a typed value is a date phrase the resolver computes, not a value
- * to type as written. The bare `N ปี M เดือน` form is an age only on a
- * birth-date field — on a claim period it is the duration it says.
+ * to type as written. The shapes come from the rules' date vocabulary; a
+ * leading filler (`ทำให้`) and an anchor clause (`ณ Hire Date`) are set aside
+ * first, and neither is a shape on its own. The bare `N ปี M เดือน` form is an
+ * age only on a birth-date field — on a claim period it is the duration it
+ * says.
  */
 export function isDatePhrase(text: string, field?: string): boolean {
-  const t = text.trim();
+  let t = text.trim();
   if (t === '' || t.length > 80 || ISO_DATE_VALUE.test(t)) return false;
-  if (DATE_PHRASE_SHAPES.some((re) => re.test(t))) return true;
-  return field !== undefined && BIRTH_FIELD.test(field) && /^\d{1,3}\s*(?:ปี|years?)(?:\s*\d{1,2}\s*(?:เดือน|months?))?$/iu.test(t);
+  t = t.replace(R.date.prefix, '').replace(R.date.atClause, ' ').trim();
+  if (t === '') return false;
+  if (R.date.phraseShapes.some((re) => re.test(t))) return true;
+  return field !== undefined && R.date.birthField.test(field) && new RegExp(`^\\d{1,3}\\s*${R.date.unitAlt.year}(?:\\s*\\d{1,2}\\s*${R.date.unitAlt.month})?$`, 'iu').test(t);
 }
 
 /** What the resolver knows when it computes a phrase: today, and the fields already resolved by label. */
@@ -555,119 +1051,184 @@ export interface ResolvedDate {
 type MonthWord = 'this' | 'next' | 'previous';
 function monthWordOf(text: string | undefined): MonthWord {
   if (text === undefined) return 'this';
-  // `ก่อนหน้า` (previous) contains `หน้า` (next): the previous test goes first.
-  if (/ก่อน|ที่แล้ว|previous|last/i.test(text)) return 'previous';
-  if (/ถัดไป|หน้า|next/i.test(text)) return 'next';
+  const w = text.trim();
+  if (R.date.previousMonth.test(w)) return 'previous';
+  if (R.date.nextMonth.test(w)) return 'next';
   return 'this';
 }
 const monthOffset = (word: MonthWord): number => (word === 'next' ? 1 : word === 'previous' ? -1 : 0);
 
-const OFFSET_UNIT = /(?:days?|d|weeks?|w|months?|years?|y)\b|วัน|สัปดาห์|เดือน|ปี/iu;
 function applyOffset(date: Ymd, sign: number, n: number, unit: string): Ymd {
-  if (/^(?:months?|เดือน)$/iu.test(unit)) return addMonths(date, sign * n);
-  if (/^(?:years?|y|ปี)$/iu.test(unit)) return addMonths(date, sign * n * 12);
-  if (/^(?:weeks?|w|สัปดาห์)$/iu.test(unit)) return addDays(date, sign * n * 7);
+  const kind = R.date.unitKindOf(unit);
+  if (kind === 'month') return addMonths(date, sign * n);
+  if (kind === 'year') return addMonths(date, sign * n * 12);
+  if (kind === 'week') return addDays(date, sign * n * 7);
   return addDays(date, sign * n);
 }
 
 /**
  * `Age < 60`, `อายุน้อยกว่า 60 ปี`, `อายุ 60 ปีขึ้นไป`, `อายุพอดี 60 ปีเป๊ะ`,
- * `35 ปี 6 เดือน` — a DATE OF BIRTH such that the age holds at the anchor (the
- * Hire Date the case set, else today). Strict bounds land half a year inside
+ * `35 ปี 6 เดือน`, `อายุ เท่ากับ 59 ปี 11 เดือน` — a DATE OF BIRTH such that the
+ * age holds at the anchor: the clause the phrase names (`ณ Hire Date`, passed
+ * in), else the first anchor field the rules name that this case set (Hire
+ * Date, by any alias), else today. Strict bounds land half a year inside
  * (`< 60` → 59 y 6 m): the sheet's `Age < 60` rows (82 of them) are about the
  * under-60 branch of the SSO rule, not its boundary, and the boundary rows say
  * `พอดี`/`เป๊ะ`/`=` and get the exact day.
  */
-function ageDateOf(phrase: string, env: DateEnvironment): ResolvedDate | null {
-  const m =
-    /^(?:age|อายุ)?\s*(<=|>=|=|<|>|≤|≥|น้อยกว่า|ต่ำกว่า|ไม่ถึง|มากกว่า|เกิน|ตั้งแต่|พอดี|ครบ|under|below|over|above|at least|at most|exactly)?\s*(\d{1,3})\s*(?:ปี|years?|y)?\s*(?:(\d{1,2})\s*(?:เดือน|months?))?\s*(ขึ้นไป|เป๊ะ|พอดี|ลงมา|or (?:more|older|above|over)|or (?:less|younger|below|under)|and (?:above|over|older)|and (?:below|under|younger))?\s*$/iu.exec(
-      phrase.trim(),
-    );
+function ageDateOf(phrase: string, env: DateEnvironment, anchorClause: string | null, written = phrase): ResolvedDate | null {
+  const text = phrase.trim();
+  const m = new RegExp(
+    `^(?:${R.date.ageWord})?\\s*(${R.date.ageOp})?\\s*(\\d{1,3})\\s*(?:${R.date.unitAlt.year})?\\s*(?:(\\d{1,2})\\s*(?:${R.date.unitAlt.month}))?\\s*(${R.date.ageTail})?\\s*$`,
+    'iu',
+  ).exec(text);
   if (!m) return null;
-  if (!/^(?:age|อายุ)/iu.test(phrase.trim()) && m[3] === undefined) return null;
+  const saysAge = new RegExp(`^${R.date.ageWord}`, 'iu').test(text);
+  if (!saysAge && m[3] === undefined) return null;
   const years = Number(m[2]);
   const months = m[3] === undefined ? null : Number(m[3]);
   const op = `${m[1] ?? ''} ${m[4] ?? ''}`.trim();
-  const anchorLabel = ['hire date', 'วันที่เข้างาน', 'วันเริ่มงาน', 'start date'].find((l) => env.lookup(l) !== null);
-  const anchorIso = anchorLabel === undefined ? null : env.lookup(anchorLabel);
-  const anchor = anchorIso === null ? ymdOf(env.now) : absoluteDateOf(anchorIso) ?? ymdOf(env.now);
+  let anchorLabel: string | null = null;
+  let anchorIso: string | null = null;
+  if (anchorClause !== null) {
+    anchorIso = env.lookup(anchorClause);
+    if (anchorIso !== null) anchorLabel = anchorClause;
+    else if (R.date.today.test(anchorClause)) anchorLabel = null;
+    else return null;
+  } else {
+    anchorLabel = R.date.ageAnchorFields.find((l) => env.lookup(l) !== null) ?? null;
+    anchorIso = anchorLabel === null ? null : env.lookup(anchorLabel);
+  }
+  const anchor = anchorIso === null ? ymdOf(env.now) : (absoluteDateOf(anchorIso) ?? ymdOf(env.now));
   let relation: 'under' | 'exact' | 'over' = 'exact';
   if (months === null) {
-    if (/^(?:<|น้อยกว่า|ต่ำกว่า|ไม่ถึง|under|below)$/iu.test(op)) relation = 'under';
-    else if (/^(?:>|มากกว่า|เกิน|over|above)$/iu.test(op)) relation = 'over';
+    if (R.date.ageUnder.test(op)) relation = 'under';
+    else if (R.date.ageOver.test(op)) relation = 'over';
   }
   const back = years * 12 + (months ?? 0) + (relation === 'under' ? -6 : relation === 'over' ? 6 : 0);
   const dob = addMonths(anchor, -back);
   const shown = relation === 'under' ? `${years - 1} y 6 m` : relation === 'over' ? `${years} y 6 m` : months === null ? `${years} y` : `${years} y ${months} m`;
   const at = anchorIso === null ? `today ${isoOf(anchor)}` : `${anchorLabel} ${anchorIso}`;
-  return { iso: isoOf(dob), detail: `${phrase.trim()} = ${isoOf(dob)} (age ${shown} at ${at})` };
+  return { iso: isoOf(dob), detail: `${written.trim()} = ${isoOf(dob)} (age ${shown} at ${at})` };
 }
 
 /**
  * The phrase as a date. Grammar, all deterministic: a BASE — today / next day
- * / yesterday, `31 Dec 9999`, a written date (Thai months and Buddhist years
- * included), `วันที่ N ของเดือน(ปัจจุบัน|ถัดไป)`, `วันสุดท้ายของเดือนถัดไป`,
- * `01/01 ของปีก่อนหน้า`, or an earlier field by label (`Hire Date`) — then any
- * number of OFFSETS: `+ 119 Day`, `- 1 Day`, `+ 1 Year`, `ย้อนหลัง 3 วัน`,
- * `Next day + 1`. An age expression is its own shape. Null when a word is not
- * understood, so nothing half-computed is ever typed.
+ * / yesterday / a future or past date, `31 Dec 9999`, a written date (Thai
+ * months and Buddhist years included, a day-month with no year in the current
+ * year), `วันที่ N ของเดือน(ปัจจุบัน|ถัดไป)`, `วันสุดท้ายของเดือนถัดไป`, `01/01
+ * ของปีก่อนหน้า`, `1 มกราคมของปีก่อนหน้า`, `ย้อนหลังจากวันที่ทดสอบ 5`, or an
+ * earlier field by label (`Hire Date`, any alias) — optionally under a
+ * RELATION (`< Current Date`, `ก่อน Hire Date`, `the day after …`: one day
+ * either side) — then any number of OFFSETS: `+ 119 Day`, `- 1 Day`, `+ 1
+ * Year`, `ย้อนหลัง 3 วัน`, `Next day + 1`. An age expression is its own shape,
+ * with an optional anchor clause (`ณ Hire Date`). A trailing remark
+ * (`(หรือมากกว่า…)`, `ให้มาก่อน …`) is set aside first. Null when a word is not
+ * understood, so nothing half-computed is ever typed. Every word comes from
+ * the rules' date vocabulary.
  */
 export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 0): ResolvedDate | null {
-  let text = phrase.trim().replace(/\s*\([^)]*\)\s*$/, '').replace(/\s*(?:พอดี|เป๊ะ)\s*$/u, '').trim();
+  let text = writtenValueOf(phrase).replace(R.date.prefix, '').trim();
   if (text === '' || depth > 3) return null;
-  const age = ageDateOf(text, env);
+  let anchorClause: string | null = null;
+  const at = R.date.atClause.exec(text);
+  if (at !== null) {
+    anchorClause = at[1]!.trim();
+    text = `${text.slice(0, at.index)} ${text.slice(at.index + at[0].length)}`.replace(/\s+/g, ' ').trim();
+  }
+  text = text.replace(R.date.exactTail, '').trim();
+  if (text === '') return null;
+  const age = ageDateOf(text, env, anchorClause, phrase);
   if (age !== null) return age;
 
   const today = ymdOf(env.now);
   const notes: string[] = [];
   let base: Ymd | null = null;
   let fromToday = true;
+  // Whether the last piece taken ended at whitespace — a remark may follow a
+  // date only across a gap (`14 เมษายน รันคู่กับ …`), never glued to it
+  // (`สิ้นเดือนแบบถอยหลัง` is one expression nobody here understands).
+  let gap = false;
   const take = (re: RegExp): RegExpExecArray | null => {
     const m = re.exec(text);
-    if (m) text = text.slice(m[0].length).trim();
+    if (m) {
+      const rest = text.slice(m[0].length);
+      gap = /\s$/.test(m[0]) || /^\s/.test(rest) || rest === '';
+      text = rest.trim();
+    }
     return m;
   };
+  const MW = R.date.monthWord;
+  const unitRe = R.date.unitAlt.any;
+  const backRe = alternation(VOCABULARY.dates.back);
+  const forwardRe = alternation(VOCABULARY.dates.forward);
+
+  // --- relation: one day before or after the base
+  let relation = 0;
+  if (take(R.date.before)) relation = -1;
+  else if (take(R.date.after)) relation = 1;
 
   // --- base
   let m: RegExpExecArray | null;
-  if (take(/^(?:today|now|current date|the current date|วันนี้|วันที่ปัจจุบัน|ปัจจุบัน)/iu)) base = today;
-  else if (take(/^(?:tomorrow|next\s?day|วันถัดไป|วันพรุ่งนี้|พรุ่งนี้)/iu)) base = addDays(today, 1);
-  else if (take(/^(?:yesterday|เมื่อวาน(?:นี้)?|วันก่อนหน้า)/iu)) base = addDays(today, -1);
-  else if ((m = take(/^(?:วันที่\s*(\d{1,2})\s*ของเดือน\s*(ปัจจุบัน|นี้|ถัดไป|หน้า|ก่อนหน้า|ก่อน|ที่แล้ว)?|day\s+(\d{1,2})\s+of\s+(?:the\s+)?(this|current|next|previous|last)\s+month|(\d{1,2})(?:st|nd|rd|th)\s+of\s+(?:the\s+)?(this|current|next|previous|last)\s+month)/iu))) {
-    const day = Number(m[1] ?? m[3] ?? m[5]);
-    const month = addMonths({ ...today, d: 1 }, monthOffset(monthWordOf(m[2] ?? m[4] ?? m[6])));
-    if (day < 1 || day > daysInMonth(month.y, month.m)) return null;
-    base = { ...month, d: day };
-  } else if ((m = take(/^(?:วันสุดท้ายของเดือน\s*(ปัจจุบัน|นี้|ถัดไป|หน้า|ก่อนหน้า|ก่อน|ที่แล้ว)?|สิ้นเดือน\s*(ปัจจุบัน|นี้|ถัดไป|หน้า|ก่อนหน้า|ก่อน|ที่แล้ว)?|(?:last day|end)\s+of\s+(?:the\s+)?(this|current|next|previous|last)\s+month|month\s+end)/iu))) {
-    const month = addMonths({ ...today, d: 1 }, monthOffset(monthWordOf(m[1] ?? m[2] ?? m[3])));
-    base = { ...month, d: daysInMonth(month.y, month.m) };
-  } else if ((m = take(/^(?:วันแรกของเดือน\s*(ปัจจุบัน|นี้|ถัดไป|หน้า|ก่อนหน้า|ก่อน|ที่แล้ว)?|ต้นเดือน\s*(ปัจจุบัน|นี้|ถัดไป|หน้า|ก่อนหน้า|ก่อน|ที่แล้ว)?|(?:first day|start|beginning)\s+of\s+(?:the\s+)?(this|current|next|previous|last)\s+month)/iu))) {
-    base = addMonths({ ...today, d: 1 }, monthOffset(monthWordOf(m[1] ?? m[2] ?? m[3])));
-  } else if ((m = take(/^(\d{1,2})\/(\d{1,2})\s*ของปี\s*(ก่อนหน้า|ที่แล้ว|นี้|ปัจจุบัน|ถัดไป|หน้า)/u))) {
-    // `01/01 ของปีก่อนหน้า` — day/month, the Thai reading.
-    const y = today.y + monthOffset(monthWordOf(m[3]));
-    const mm = Number(m[2]);
-    const dd = Number(m[1]);
-    if (mm < 1 || mm > 12 || dd < 1 || dd > daysInMonth(y, mm)) return null;
-    base = { y, m: mm, d: dd };
-  } else if ((m = take(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+of\s+(?:the\s+)?(this|current|next|previous|last)\s+year/i))) {
-    const y = today.y + monthOffset(monthWordOf(m[3]));
-    const mm = EN_MONTHS[m[2]!.slice(0, 4).toLowerCase()] ?? EN_MONTHS[m[2]!.slice(0, 3).toLowerCase()];
-    const dd = Number(m[1]);
-    if (mm === undefined || dd < 1 || dd > daysInMonth(y, mm)) return null;
-    base = { y, m: mm, d: dd };
-  } else if ((m = take(/^(?:31\/12\/9999|12\/31\/9999|9999-12-31|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\.?,?\s+\d{4}|[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\s*[\p{Script=Thai}.]{2,12}\s*(?:พ\.?ศ\.?\s*)?\d{2,4})(?=$|\s)/u))) {
-    base = absoluteDateOf(m[0]);
+  if (take(R.date.today)) base = today;
+  else if (take(R.date.tomorrow)) base = addDays(today, 1);
+  else if (take(R.date.yesterday)) base = addDays(today, -1);
+  else if (take(R.date.future)) {
+    base = addDays(today, 1);
+    notes.push('a future date: tomorrow');
+  } else if (take(R.date.past)) {
+    base = addDays(today, -1);
+    notes.push('a past date: yesterday');
+  } else if ((m = take(new RegExp(`^วันที่\\s*(\\d{1,2})(?:\\s*ของเดือน\\s*${MW}?)?(?=\\s|$)`, 'iu')))) {
+    // `วันที่ 25 ของเดือนปัจจุบัน`; a bare `วันที่ 20` is that day of this month.
+    base = dayOfMonth(today, Number(m[1]), monthWordOf(m[2]));
     if (base === null) return null;
+  } else if ((m = take(new RegExp(`^day\\s+(\\d{1,2})\\s+of\\s+(?:the\\s+)?${MW}\\s+month`, 'iu')))) {
+    base = dayOfMonth(today, Number(m[1]), monthWordOf(m[2]));
+    if (base === null) return null;
+  } else if ((m = take(new RegExp(`^(\\d{1,2})(?:st|nd|rd|th)\\s+of\\s+(?:the\\s+)?${MW}\\s+month`, 'iu')))) {
+    base = dayOfMonth(today, Number(m[1]), monthWordOf(m[2]));
+    if (base === null) return null;
+  } else if ((m = take(new RegExp(`^(?:วันสุดท้ายของเดือน|สิ้นเดือน)\\s*${MW}?`, 'iu')))) {
+    const month = addMonths({ ...today, d: 1 }, monthOffset(monthWordOf(m[1])));
+    base = { ...month, d: daysInMonth(month.y, month.m) };
+  } else if ((m = take(new RegExp(`^(?:(?:last day|end)\\s+of\\s+(?:the\\s+)?${MW}\\s+month|month\\s+end)`, 'iu')))) {
+    const month = addMonths({ ...today, d: 1 }, monthOffset(monthWordOf(m[1])));
+    base = { ...month, d: daysInMonth(month.y, month.m) };
+  } else if ((m = take(new RegExp(`^(?:วันแรกของเดือน|ต้นเดือน)\\s*${MW}?`, 'iu')))) {
+    base = addMonths({ ...today, d: 1 }, monthOffset(monthWordOf(m[1])));
+  } else if ((m = take(new RegExp(`^(?:first day|start|beginning)\\s+of\\s+(?:the\\s+)?${MW}\\s+month`, 'iu')))) {
+    base = addMonths({ ...today, d: 1 }, monthOffset(monthWordOf(m[1])));
+  } else if ((m = take(new RegExp(`^(\\d{1,2})\\/(\\d{1,2})\\s*ของปี\\s*${MW}`, 'iu')))) {
+    // `01/01 ของปีก่อนหน้า` — day/month, the Thai reading.
+    base = dayMonthOfYear(today.y + monthOffset(monthWordOf(m[3])), Number(m[2]), Number(m[1]));
+    if (base === null) return null;
+  } else if ((m = take(new RegExp(`^(\\d{1,2})\\s*([\\p{Script=Thai}.]{2,12}?)\\s*(?:ของ)?ปี\\s*${MW}`, 'iu')))) {
+    // `1 มกราคมของปีก่อนหน้า`.
+    const mm = TH_MONTHS.find(([re]) => re.test(m![2]!))?.[1];
+    base = mm === undefined ? null : dayMonthOfYear(today.y + monthOffset(monthWordOf(m[3])), mm, Number(m[1]));
+    if (base === null) return null;
+  } else if ((m = take(new RegExp(`^(\\d{1,2})\\s+([A-Za-z]{3,9})\\.?\\s+of\\s+(?:the\\s+)?${MW}\\s+year`, 'iu')))) {
+    const mm = EN_MONTHS[m[2]!.slice(0, 4).toLowerCase()] ?? EN_MONTHS[m[2]!.slice(0, 3).toLowerCase()];
+    base = mm === undefined ? null : dayMonthOfYear(today.y + monthOffset(monthWordOf(m[3])), mm, Number(m[1]));
+    if (base === null) return null;
+  } else if ((m = peekAbsolute(text, today)) !== null) {
+    // A written date; `3 วันก่อน` and `3 days ago` look like one and are not,
+    // so the shape is only taken when it reads as a real date.
+    gap = /^\s/.test(text.slice(m[0].length)) || text.length === m[0].length;
+    text = text.slice(m[0].length).trim();
+    base = absoluteDateOf(m[0], today);
     fromToday = false;
-  } else if ((m = take(/^(?:ย้อนหลัง|ล่วงหน้า|อีก|in)\s*(\d+)\s*(?:วัน|days?)/iu))) {
-    // `ย้อนหลัง 3 วัน` on its own: three days back from today.
-    const back = /^(?:ย้อนหลัง)/u.test(m[0]);
-    base = addDays(today, (back ? -1 : 1) * Number(m[1]));
-  } else if ((m = take(/^(\d+)\s*(?:วันก่อน(?:หน้า)?|days?\s+ago|days?\s+back)/iu))) {
-    base = addDays(today, -Number(m[1]));
-  } else if ((m = take(/^([\p{L}][\p{L}\p{M}\p{N} /().'*-]{1,40}?)(?=\s*(?:[+\-]\s*\d|ย้อนหลัง|ล่วงหน้า|$))/u))) {
-    // An earlier field by label: `Hire Date + 119 Day`.
+  } else if ((m = take(new RegExp(`^(${backRe}|${forwardRe})(?:\\s*(?:จาก|from)\\s*|\\s*)(?:${alternation(VOCABULARY.dates.today)}\\s*)?(\\d+)\\s*(?:${unitRe})?`, 'iu')))) {
+    // `ย้อนหลัง 3 วัน`, `ย้อนหลังจากวันที่ทดสอบ 5`, `in 3 days`: from today.
+    const back = new RegExp(`^${backRe}`, 'iu').test(m[1]!);
+    const unit = /\S+$/.exec(m[0].slice(m[0].indexOf(m[2]!) + m[2]!.length))?.[0] ?? '';
+    base = applyOffset(today, back ? -1 : 1, Number(m[2]), unit);
+  } else if ((m = take(new RegExp(`^(\\d+)\\s*(${unitRe})\\s*(?:${backRe})`, 'iu')))) {
+    // `3 วันก่อน`, `3 days ago`.
+    base = applyOffset(today, -1, Number(m[1]), m[2]!);
+  } else if ((m = take(new RegExp(`^([\\p{L}][\\p{L}\\p{M}\\p{N} /().'*-]{1,40}?)(?=\\s*(?:[+\\-−]\\s*\\d|${backRe}|${forwardRe}|$)${relation === 0 ? '' : `|\\s+\\d+\\s*(?:${unitRe})(?=\\s|$)`})`, 'iu')))) {
+    // An earlier field by label: `Hire Date + 119 Day`, `วันที่จ้าง`.
     const label = m[1]!.trim();
     const iso = env.lookup(label);
     if (iso === null) return null;
@@ -680,18 +1241,34 @@ export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 
 
   // --- offsets, any number, in order
   let date = base;
+  let o: RegExpExecArray | null;
+  if (relation !== 0 && (o = take(new RegExp(`^(\\d+)\\s*(${unitRe})(?=\\s|$)`, 'iu')))) {
+    // `วันที่ก่อน Hire Date 1 ปี`, `2 weeks after Today`: the relation names
+    // the direction and the amount follows the base.
+    date = applyOffset(base, relation, Number(o[1]), o[2]!);
+    notes.push(`${relation < 0 ? 'minus' : 'plus'} ${o[1]} ${o[2]}`);
+  } else if (relation !== 0) {
+    date = addDays(base, relation);
+    notes.push(relation < 0 ? 'the day before' : 'the day after');
+  }
   let guard = 0;
   while (text !== '' && guard++ < 8) {
-    let o: RegExpExecArray | null;
-    if ((o = take(new RegExp(`^([+\\-−])\\s*(\\d+)\\s*(${OFFSET_UNIT.source})?`, 'iu')))) {
+    if ((o = take(new RegExp(`^([+\\-−])\\s*(\\d+)\\s*(${unitRe})?`, 'iu')))) {
       // `Next day + 1` with no unit is a day, the sheet's own shorthand.
-      date = applyOffset(date, o[1] === '+' ? 1 : -1, Number(o[2]), (o[3] ?? 'day').toLowerCase());
-    } else if ((o = take(/^(?:ย้อนหลัง)\s*(\d+)\s*(วัน|สัปดาห์|เดือน|ปี)/u))) {
+      date = applyOffset(date, o[1] === '+' ? 1 : -1, Number(o[2]), o[3] ?? VOCABULARY.dates.units.day[0] ?? 'day');
+    } else if ((o = take(new RegExp(`^${backRe}\\s*(\\d+)\\s*(${unitRe})`, 'iu')))) {
       date = applyOffset(date, -1, Number(o[1]), o[2]!);
-    } else if ((o = take(/^(?:ล่วงหน้า|อีก)\s*(\d+)\s*(วัน|สัปดาห์|เดือน|ปี)/u))) {
+    } else if ((o = take(new RegExp(`^${forwardRe}\\s*(\\d+)\\s*(${unitRe})`, 'iu')))) {
       date = applyOffset(date, 1, Number(o[1]), o[2]!);
     } else if (take(/^(?:และ|and)\b/iu)) {
       continue;
+    } else if (gap && text.split(/\s+/).length >= 2 && !/[+\-−]\s*\d/.test(text) && !new RegExp(`^(?:${backRe}|${forwardRe})`, 'iu').test(text)) {
+      // A complete date followed by words that are not an offset — `14 เมษายน
+      // รันคู่กับ E2E-41` — is a date with a remark; the remark is set aside.
+      // One trailing word (`ถึงสิ้นเดือน`, a range) is not understood, and
+      // nothing half-computed is typed.
+      notes.push(`remark set aside: ${JSON.stringify(text)}`);
+      text = '';
     } else {
       return null;
     }
@@ -699,9 +1276,29 @@ export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 
   const iso = isoOf(date);
   // `Next day + 1 = 2026-09-05 (today = 2026-09-03)` — the reader can check it;
   // `Today = 2026-09-03` needs no second telling.
-  const bareToday = /^(?:today|now|วันนี้|วันที่ปัจจุบัน)$/iu.test(phrase.trim());
+  const bareToday = new RegExp(`^${alternation(VOCABULARY.dates.today)}$`, 'iu').test(phrase.trim());
   const tail = [...notes, ...(fromToday && !bareToday ? [`today = ${isoOf(today)}`] : [])];
   return { iso, detail: `${phrase.trim()} = ${iso}${tail.length ? ` (${tail.join(', ')})` : ''}` };
+}
+
+/** The written-date shapes at the head of a phrase, when they read as a date; null otherwise. */
+function peekAbsolute(text: string, today: Ymd): RegExpExecArray | null {
+  const m =
+    /^(?:31\/12\/9999|12\/31\/9999|9999-12-31|\d{4}-\d{2}-\d{2}|\d{1,2}[\s-]+[A-Za-z]{3,9}\.?,?[\s-]+\d{4}|[A-Za-z]{3,9}\.?[\s-]+\d{1,2},?[\s-]+\d{4}|\d{1,2}\s*[\p{Script=Thai}.]{2,12}\s*(?:พ\.?ศ\.?\s*)?\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\.?|\d{1,2}\s*[\p{Script=Thai}.]{2,12})(?=$|\s)/u.exec(
+      text,
+    );
+  return m !== null && absoluteDateOf(m[0], today) !== null ? m : null;
+}
+
+/** Day N of this/next/previous month, or null when the month has no such day. */
+function dayOfMonth(today: Ymd, day: number, word: MonthWord): Ymd | null {
+  const month = addMonths({ ...today, d: 1 }, monthOffset(word));
+  if (day < 1 || day > daysInMonth(month.y, month.m)) return null;
+  return { ...month, d: day };
+}
+function dayMonthOfYear(y: number, m: number, d: number): Ymd | null {
+  if (m < 1 || m > 12 || d < 1 || d > daysInMonth(y, m)) return null;
+  return { y, m, d };
 }
 
 /**
@@ -725,29 +1322,37 @@ export function fromRelativeDate(
     now,
     lookup: (label) => lookupDate(label, all, known, now, 0),
   };
-  const phrase = need.phrase ?? (() => {
-    const pair = pairFor(need, all);
-    return pair !== null && isDatePhrase(pair.value, need.field) ? pair.value.trim() : null;
-  })();
+  const phrase =
+    need.phrase ??
+    (() => {
+      const pair = pairFor(need, all);
+      if (pair === null) return null;
+      const value = writtenValueOf(pair.value);
+      return isDatePhrase(value, need.field) || labelOfDatePair(value, all) !== null ? value : null;
+    })();
   if (phrase === null) return null;
-  const date = resolveDatePhrase(phrase, env);
+  const date = resolveDatePhrase(phrase, env, 0);
   if (date === null) return null;
   return { need, value: date.iso, source: { kind: 'relative-date', detail: date.detail } };
 }
 
-/** An earlier field's date by label: resolved this case, or stated in the Test data (recursively, bounded). */
+/** An earlier field's date by label (any alias): resolved this case, or stated in the Test data (recursively, bounded). */
 function lookupDate(label: string, pairs: readonly TestDataPair[], known: ReadonlyMap<string, string>, now: Date, depth: number): string | null {
-  const want = normalLabel(label);
-  const hit = known.get(want);
-  if (hit !== undefined) return hit;
+  const names = R.aliasesOf(label);
+  for (const name of names) {
+    const hit = known.get(name);
+    if (hit !== undefined) return hit;
+  }
   if (depth > 3) return null;
   for (const pair of pairs) {
-    if (!keyMatchesLabel(normalLabel(pair.key), want)) continue;
-    const value = pair.value.trim();
+    const key = normalLabel(pair.key);
+    if (!names.some((name) => keyMatchesLabel(key, name))) continue;
+    const value = writtenValueOf(pair.value);
     if (ISO_DATE_VALUE.test(value)) return value;
-    const absolute = absoluteDateOf(value);
+    const absolute = absoluteDateOf(value, ymdOf(now));
     if (absolute !== null) return isoOf(absolute);
-    if (!isDatePhrase(value) || normalLabel(value) === want) continue;
+    if (names.includes(normalLabel(value))) continue;
+    if (!isDatePhrase(value, pair.key) && labelOfDatePair(value, pairs) === null) continue;
     const resolved = resolveDatePhrase(value, { now, lookup: (l) => lookupDate(l, pairs, known, now, depth + 1) }, depth + 1);
     if (resolved !== null) return resolved.iso;
   }
@@ -758,9 +1363,9 @@ function lookupDate(label: string, pairs: readonly TestDataPair[], known: Readon
 
 /** The case says this value must ALREADY be in the system — the lines about the field, the value's own line, the step's intent. */
 function saysAlreadyExists(need: ValueNeed, value: string, caseText: string, intent: string | undefined): boolean {
-  if (intent !== undefined && ALREADY_EXISTS.test(intent)) return true;
+  if (intent !== undefined && R.alreadyExists.test(intent)) return true;
   const lines = caseText.split('\n').filter((line) => line.includes(value));
-  return `${linesAbout(need.field, caseText)}\n${lines.join('\n')}`.split('\n').some((line) => ALREADY_EXISTS.test(line));
+  return `${linesAbout(need.field, caseText)}\n${lines.join('\n')}`.split('\n').some((line) => R.alreadyExists.test(line));
 }
 
 /**
@@ -811,7 +1416,8 @@ export async function fromRepo(need: ValueNeed, ctx: ValueResolutionContext): Pr
   if (passages.length === 0) return null;
   const answer = await ctx.model.fromPassages({ field: need.field, token: need.token, caseText: ctx.caseText.slice(0, 3000), passages });
   if (answer.value === null || answer.value.trim() === '') return null;
-  const value = answer.value.trim();
+  const value = cleanModelValue(answer.value);
+  if (value === '') return null;
   const grounded = passages.some((p) => p.includes(value));
   if (!grounded) {
     ctx.onLog?.(`  value for ${need.field}: the model offered ${JSON.stringify(value)} but no passage contains it — not accepted`);
@@ -841,13 +1447,56 @@ function schemaSummary(schema: DbSchema): string {
     .join('\n');
 }
 
+/**
+ * A model's answer, reduced to the value it meant. Live (ec09 HIR-EC-009,
+ * 2026-09-03): asked to reply `{"value": "<the value>"}` under structured
+ * output, the model put that envelope INSIDE the value field —
+ * `{"value":"{\"value\": \"1999900123459\"}"}` — and the resolver typed the
+ * envelope into the National ID box verbatim. Packaging is unwrapped here,
+ * repeatedly: code fences, a JSON object whose single `value` (or lone) key
+ * is a string, surrounding quotes or backticks, and everything after the
+ * first line. Never changes a value that is already plain.
+ */
+export function cleanModelValue(raw: string): string {
+  let text = raw.trim();
+  for (let i = 0; i < 4; i++) {
+    const before = text;
+    text = text.replace(/^```[a-z]*\s*/i, '').replace(/\s*```$/, '').trim();
+    if (/^\{[\s\S]*\}$/.test(text)) {
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (parsed !== null && typeof parsed === 'object') {
+          const entries = Object.entries(parsed as Record<string, unknown>);
+          const inner = (parsed as { value?: unknown }).value ?? (entries.length === 1 ? entries[0]![1] : undefined);
+          if (typeof inner === 'string' || typeof inner === 'number') text = String(inner).trim();
+          else if (inner !== null && typeof inner === 'object') text = JSON.stringify(inner);
+        }
+      } catch {
+        // not JSON after all — leave it
+      }
+    }
+    if (/^(["'`])[\s\S]*\1$/.test(text) && text.length >= 2) text = text.slice(1, -1).trim();
+    const firstLine = text.split(/\r?\n/).find((l) => l.trim() !== '');
+    if (firstLine !== undefined) text = firstLine.trim();
+    if (text === before) break;
+  }
+  return text;
+}
+
 /** A well-formed candidate from the stated format — deterministic, so a retry can step it. */
 export function candidateFor(format: ValueFormat | null, attempt = 0): string {
   const digits = format?.digits ?? 8;
   const leading = format?.leading ?? '9';
   if (format?.mask) {
+    // `N-NNNN-NNNNN-NN-N` → digits; `EMXXXX` keeps its literal letters.
     let n = 0;
     return format.mask.replace(/[NX]/g, () => String((9 - ((n++ + attempt) % 10) + 10) % 10));
+  }
+  if (format?.length !== undefined) {
+    // A stated length: one over it, one under it, or exactly it — letters, so
+    // a length check is what it exercises and nothing else.
+    const n = format.lengthRelation === 'over' ? format.length + 1 + attempt : format.lengthRelation === 'under' ? Math.max(1, format.length - 1 - attempt) : format.length;
+    return Array.from({ length: n }, (_, i) => 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[i % 26]).join('');
   }
   const body = String(9_999_999_999_999).slice(0, Math.max(1, digits - leading.length));
   const stepped = (BigInt(body) - BigInt(attempt)).toString().padStart(Math.max(1, digits - leading.length), '0');
@@ -915,17 +1564,22 @@ export async function fromDb(need: ValueNeed, ctx: ValueResolutionContext): Prom
 /** The last resort: a well-formed stand-in, flagged. */
 export async function generated(need: ValueNeed, ctx: ValueResolutionContext): Promise<ResolvedValue> {
   const formatNote = need.format
-    ? `the case's stated format (${[need.format.digits ? `${need.format.digits} digits` : '', need.format.leading ? `leading ${need.format.leading}` : '', need.format.mask ?? ''].filter(Boolean).join(', ')})`
+    ? `the case's stated format (${[need.format.digits ? `${need.format.digits} digits` : '', need.format.leading ? `leading ${need.format.leading}` : '', need.format.mask ?? '', need.format.length ? `${need.format.lengthRelation ?? 'exactly'} ${need.format.length} characters` : ''].filter(Boolean).join(', ')})`
     : 'no stated format';
   let value = '';
   if (ctx.model !== null) {
     try {
-      value = (await ctx.model.generate({ field: need.field, token: need.token, caseText: ctx.caseText.slice(0, 3000), format: need.format })).value.trim();
+      value = cleanModelValue((await ctx.model.generate({ field: need.field, token: need.token, caseText: ctx.caseText.slice(0, 3000), format: need.format })).value);
     } catch {
       value = '';
     }
   }
-  if (value === '' || PLACEHOLDER_TOKEN.test(value) || (need.format?.digits !== undefined && !new RegExp(`^\\d{${need.format.digits}}$`).test(value))) {
+  const lengthHolds = (v: string): boolean => {
+    const f = need.format;
+    if (f?.length === undefined) return true;
+    return f.lengthRelation === 'over' ? v.length > f.length : f.lengthRelation === 'under' ? v.length < f.length : v.length === f.length;
+  };
+  if (value === '' || PLACEHOLDER_TOKEN.test(value) || /[{}\[\]"]/.test(value) || (need.format?.digits !== undefined && !new RegExp(`^\\d{${need.format.digits}}$`).test(value)) || !lengthHolds(value)) {
     value = candidateFor(need.format);
   }
   return {
@@ -968,16 +1622,25 @@ export async function resolveValues(
   const now = ctx.now ?? new Date();
   const pairs = ctx.testDataPairs ?? testDataPairsOf(ctx.caseText);
   const earlier = new Map<string, string>();
-  for (const need of findUnresolvedValues(nextSetup, nextSteps, ctx.caseText, { caseId: ctx.caseId })) {
+  for (const need of findUnresolvedValues(nextSetup, nextSteps, ctx.caseText, { caseId: ctx.caseId, pairs })) {
     const list = need.section === 'setup' ? nextSetup : nextSteps;
     const step = list[need.index] as FlowStep & { value?: string; intent?: string | undefined; valueSource?: ValueSource | undefined };
     let answer: ResolvedValue | null = null;
     const tried: string[] = [];
-    if (need.phrase !== undefined || need.uniqueKey !== undefined) {
+    if (need.phrase !== undefined || need.uniqueKey !== undefined || need.blank === true || need.space === true || need.written !== undefined) {
+      // The single-source needs: computed, suffixed, blanked or cleaned from
+      // the case's own words — a model is never asked, and a source that
+      // declines leaves the step as authored.
       answer =
         need.phrase !== undefined
           ? fromRelativeDate(need, ctx.caseText, now, pairs, earlier)
-          : fromUniquePerRun(need, ctx.caseText, ctx.runKey, step.intent);
+          : need.uniqueKey !== undefined
+            ? fromUniquePerRun(need, ctx.caseText, ctx.runKey, step.intent)
+            : need.blank === true
+              ? { need, value: '', source: { kind: 'test-data', detail: `the case says to leave it blank: ${JSON.stringify(step.value ?? '')}` } }
+              : need.space === true
+                ? { need, value: ' ', source: { kind: 'test-data', detail: `the case says the value is a space: ${JSON.stringify(step.value ?? '')}` } }
+                : { need, value: need.written!, source: { kind: 'test-data', detail: `the case writes ${JSON.stringify(step.value ?? '')}; the value is ${JSON.stringify(need.written)}` } };
       if (answer === null) {
         ctx.onLog?.(
           need.phrase !== undefined
@@ -1000,6 +1663,15 @@ export async function resolveValues(
           answer = null;
         }
         if (answer !== null) break;
+      }
+      if (answer === null && need.credential === true) {
+        // A login, account or password is never invented: the run's persona
+        // (a `signIn` by label) supplies it, and a made-up one fails for a
+        // reason no case asked about. Left as authored, so the lint refuses
+        // the token and the author is asked for the persona instead.
+        for (const line of tried) ctx.onLog?.(`  value for ${need.field}: ${line}`);
+        ctx.onLog?.(`  ${need.field}: ${JSON.stringify(need.token ?? step.value ?? '')} is a credential — never generated; the run's persona supplies it`);
+        continue;
       }
       if (answer === null) answer = await generated(need, ctx);
       // A value the Test data states that IS the case id gets the run's suffix
@@ -1093,9 +1765,9 @@ export class LlmValueResolverModel implements ValueResolverModel {
     const { object } = await generateStructuredForModel(this.#source, {
       modelLabel: this.id,
       schema: lenientObject({ value: z.string() }),
-      system: 'You invent ONE well-formed test value for a form field. Match the stated format exactly; make it obviously synthetic; output only the value.',
+      system: 'You invent ONE well-formed test value for a form field. Match the stated format exactly and make it obviously synthetic. The value goes in the "value" field as a plain string — never JSON, quotes or an object inside it.',
       prompt:
-        `FIELD: ${q.field}\nTOKEN: ${q.token ?? '(a described value)'}\nFORMAT: ${q.format ? JSON.stringify(q.format) : 'not stated — infer from the case'}\nCASE:\n${q.caseText}\n\nReply {"value": "<the value>"}.`,
+        `FIELD: ${q.field}\nTOKEN: ${q.token ?? '(a described value)'}\nFORMAT: ${q.format ? JSON.stringify(q.format) : 'not stated — infer from the case'}\nCASE:\n${q.caseText}\n\nReply {"value": "<the value as a plain string>"}.`,
       maxOutputTokens: 60,
     });
     return { value: object.value };

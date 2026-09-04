@@ -18,7 +18,7 @@
 
 import { formatAxNode, INTERACTIVE_ROLES, type AxNode } from '../healer/jit-healer.js';
 import { tokenize } from '../context/relevance.js';
-import { foldValue, valueShownIn } from './goal-evidence.js';
+import { foldValue, goalOutcomes, valueShownIn } from './goal-evidence.js';
 
 /** The shape of a decision the guards read. Kept structural to avoid a cycle. */
 export interface DecisionLike {
@@ -309,6 +309,84 @@ export function repeatedToggleClick(
     `if the control accepts typed input, look for a faster jump (a month/year picker, a search box) instead ` +
     `of stepping to it, act on another control the tree shows, or call fail and say what the page will not reveal`
   );
+}
+
+/**
+ * The actions that activate a named control — the loop's INTERACTION_ACTIONS
+ * minus `signOut`, which names no selector. Mirrored here rather than
+ * imported: this is the leaf, and `workflow-agent` imports it.
+ */
+export const ACTIVATION_ACTIONS: ReadonlySet<string> = new Set([
+  'click',
+  'press',
+  'hover',
+  'check',
+  'uncheck',
+  'fill',
+  'type',
+  'paste',
+  'selectOption',
+]);
+/** Text entry: the value typed is the only thing the action changes on the page. */
+const TEXT_ENTRY_ACTIONS: ReadonlySet<string> = new Set(['fill', 'type', 'paste']);
+
+/** The per-leg key of "this selector was activated on this page". */
+export function activationKey(url: string, selector: string): string {
+  return `${url} :: ${selector.trim()}`;
+}
+
+/**
+ * What an ok activation is, seen against the leg so far:
+ *  - `first` — this selector has not been activated on this URL this leg;
+ *  - `repeat` — it has, by a click-shaped action (click/press/hover/check/
+ *    uncheck/selectOption);
+ *  - `text-again` — it has, and this is another fill/type/paste into it.
+ */
+export type Reactivation = 'first' | 'repeat' | 'text-again';
+
+/**
+ * Whether this activation re-engages a control already activated on this
+ * page this leg, or null when the decision is not an activation at all.
+ *
+ * Live (ec09 HIR-EC-009 job-3 leg [14], 2026-09-03): ~60 turns and 320 s
+ * re-clicking section headers on one wizard page. Every click was ok and
+ * each ok click reset the no-progress judge; `repeatedToggleClick` counts
+ * three per selector, and with a dozen headers on the page that is thirty-
+ * six free turns. Then (job-2, the Position picker, same day): 122 requests
+ * and 18 minutes of ok `fill` into `role=textbox[name="Search options" i]`
+ * — a different search string each time — between failed `selectOption`s
+ * and ok re-clicks of the same button. The judge saw an ok interaction on
+ * every turn and never fired.
+ *
+ * The rule the loop applies through `reactivationAdvanced`: a `first`
+ * activation is progress as before; a `repeat` is progress only if the full
+ * tree changed after it (a header that opened, a tab that switched — and
+ * bounded by AGENT_TREE_CHANGE_CREDITS, so a control that toggles forever
+ * still ends the leg); a `text-again` is never progress, because the value
+ * it typed is echoed into the tree and would pass a change test on its own
+ * evidence. Keyed by the URL the action was taken on: the same selector on
+ * a new page is a new control. Only OK activations belong in
+ * `activatedHere` — a miss activated nothing.
+ */
+export function reactivation(
+  decision: DecisionLike,
+  url: string,
+  activatedHere: ReadonlySet<string>,
+): Reactivation | null {
+  if (!ACTIVATION_ACTIONS.has(decision.action) || decision.selector.trim() === '') return null;
+  if (!activatedHere.has(activationKey(url, decision.selector))) return 'first';
+  return TEXT_ENTRY_ACTIONS.has(decision.action) ? 'text-again' : 'repeat';
+}
+
+/**
+ * Whether an ok activation of that kind counts as the turn advancing.
+ * `treeChanged` is consulted for a `repeat` only — the loop pays the extra
+ * capture just for that case.
+ */
+export function reactivationAdvanced(kind: Reactivation | null, treeChanged: boolean): boolean {
+  if (kind === null || kind === 'first') return true;
+  if (kind === 'text-again') return false;
+  return treeChanged;
 }
 
 /**
@@ -686,4 +764,69 @@ export function formatFormGaps(gaps: readonly FormGap[], cap = 40): string | nul
   const shown = gaps.slice(0, cap).map((g) => g.line);
   const more = gaps.length > cap ? ` · … and ${gaps.length - cap} more` : '';
   return `REQUIRED AND STILL EMPTY (${gaps.length}): ${shown.join(' · ')}${more}`;
+}
+
+/**
+ * What a `selectOption` miss that ENUMERATED the control's options says about
+ * the goal: the pair `control = value` the goal names for that control, when
+ * the value is among none of the options shown.
+ *
+ * Live (ec09 HIR-EC-009, panel job-3 leg [23], 2026-09-03): `selectOption
+ * Employee Group = "F - DVT"` opened the list, which held exactly three
+ * options — "1 — พนักงานประจำ (Active) ✓", "2 — พนักงานชั่วคราว (Temporary)",
+ * "3 — พนักงานนอกเวลา (Part-time)" — and closed it again. The loop recorded a
+ * failed action and asked the model what to do next; the model tried "DVT",
+ * saw the same three, and called `fail` with the same sentence the first
+ * error already contained. Three model turns for a fact the first action
+ * had established. The judge that should have fired did not exist: no rule
+ * read the enumeration as evidence.
+ *
+ * Deliberately narrow, in the direction that costs nothing when it declines:
+ *  - the decision's value must be the goal's OWN value for that control
+ *    (`goalOutcomes`, folded) — a paraphrase the model tried ("DVT"; though
+ *    "F — DVT" for "F - DVT" folds equal) is not the goal's claim, and a
+ *    miss on it proves nothing;
+ *  - the control the selector names must be the control the goal names
+ *    (the selector's name holds the control's words or vice versa);
+ *  - the list must have held at least one option — an empty list is a list
+ *    still loading or a search that hid everything, never an enumeration;
+ *  - the caller passes only a WHOLE enumeration (`ListboxOptionMissingError
+ *    .filtered === false`): a list narrowed by a typed head says nothing
+ *    about what the filter hid.
+ * None of the shown options may show the value (`valueShownIn`, so "F — DVT"
+ * on the page satisfies "F - DVT" in the goal and the rule stays quiet).
+ *
+ * The loop, not this predicate, decides what to do with it — it retries the
+ * pick once after the page settles at $0 (a list still loading is not a list
+ * without the option: in the same run this control offered "F — DVT" three
+ * minutes later) and ends the leg only on a second identical enumeration.
+ */
+export function listboxCannotOffer(
+  decision: DecisionLike,
+  shown: readonly string[],
+  goal: string,
+): { control: string; value: string; shown: string[] } | null {
+  if (decision.action !== 'selectOption' || shown.length === 0 || decision.value.trim() === '') return null;
+  const asked = foldValue(decision.value);
+  const name = selectorName(decision.selector);
+  if (name === null) return null;
+  const nameKey = foldValue(name.replace(/\*+\s*$/u, ''));
+  for (const outcome of goalOutcomes(goal)) {
+    if (foldValue(outcome.value) !== asked) continue;
+    const ctl = foldValue(outcome.control);
+    if (ctl !== nameKey && !nameKey.includes(ctl) && !ctl.includes(nameKey)) continue;
+    if (shown.some((option) => valueShownIn(option, outcome.value))) return null;
+    return { control: outcome.control, value: outcome.value, shown: [...shown] };
+  }
+  return null;
+}
+
+/** Two enumerations of one list are the same list: same options, order aside, a current-pick tick ignored. */
+export function sameOptions(a: readonly string[], b: readonly string[]): boolean {
+  const fold = (list: readonly string[]): string =>
+    [...list]
+      .map((o) => foldValue(o.replace(/\s*[✓✔]\s*$/u, '')))
+      .sort()
+      .join('\n');
+  return a.length === b.length && fold(a) === fold(b);
 }

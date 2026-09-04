@@ -206,6 +206,28 @@ describe('a multi-persona goal is refused before the first turn (OA-15)', () => 
     assert.equal(result.settledBy, undefined);
   });
 
+  it('is recognised as an AUTHORING refusal, so the runner cannot file it against the application', async () => {
+    // The prefix was declared to be "the protocol run-cases reads" and had no
+    // reader anywhere in src/: the refused leg fell through to the ordinary
+    // failed-leg path and became `functional` / `high`, "Workflow goal not
+    // reached" — a fact about how the goal was worded, filed as a broken
+    // feature. `personaRefusal` is the reader; the runner branches on it
+    // beside the provider refusal and files no defect.
+    const { personaRefusal, agentModelUnavailable } = await import('../src/orchestrator/goal-evidence.js');
+    const { model } = scripted([{ action: 'finish', reasoning: 'done' }]);
+    const agent = new WorkflowAgent({ model, maxSteps: 3 });
+    const page = { url: () => 'http://x.test/en/leave' } as unknown as Page;
+    const result = await agent.run(page, 'sign in as <EMPLOYEE_ACCOUNT> and submit it, then as <MANAGER_ACCOUNT> approve it');
+
+    assert.equal(personaRefusal(result.summary), true, 'the summary the guard actually produces is recognised');
+    // The two harness-class branches stay distinct: a refused goal is not a
+    // dead provider, and neither is an ordinary failed leg.
+    assert.equal(agentModelUnavailable(result.summary), false);
+    assert.equal(personaRefusal('agent model failed: the provider refused'), false);
+    assert.equal(personaRefusal('agent stalled: nothing advanced'), false);
+    assert.equal(personaRefusal('the button does not exist on this page'), false);
+  });
+
   it('a read-only look is exempt — it acts as nobody', async () => {
     const { model } = scripted([{ action: 'finish', reasoning: 'looked' }]);
     const agent = new WorkflowAgent({ model, maxSteps: 2 });

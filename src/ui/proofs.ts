@@ -31,6 +31,7 @@ import { join, resolve } from 'node:path';
 
 import type { ProofBundle, RunStatus, TierSummary } from '../engine/proof-bundle.js';
 import { effectiveStatus, isPassing } from '../engine/proof-bundle.js';
+import { harnessOnly, neverRan } from '../cli/exit.js';
 import { provenanceExtras } from '../reporter/step-facts.js';
 
 /** Bundles read for one listing. Beyond this, the oldest are not shown. */
@@ -137,6 +138,17 @@ export interface ProofCard {
    * EN-2 audit: 29 of 31 real QA fails were this class.
    */
   specQuestion: boolean;
+  /**
+   * Why this run delivered NO verdict about the application, when it did
+   * not — the suite loop's own rule (`neverRan` ?? `harnessOnly`,
+   * `cli/exit.ts`), the one that scores the case `blocked` on a catalog
+   * ledger. Null when the run passed, or when some step actually contradicted
+   * a claim. Carried so a row can say in words that nothing was proved and
+   * quote the recorded reason (a session that never held, a database that was
+   * never configured) under the chip — the same function the CLI applies,
+   * never a second rule.
+   */
+  noVerdict: string | null;
   /** Whether opening this run will show any pictures. */
   hasEvidence: boolean;
   error: string | null;
@@ -232,6 +244,7 @@ export function toCard(bundle: ProofBundle, path: string, reportPath: string | n
     hasEvidence:
       bundle.video?.data !== undefined || bundle.steps.some((s) => s.screenshot !== undefined),
     specQuestion: bundle.specQuestion === true,
+    noVerdict: neverRan(bundle) ?? harnessOnly(bundle),
     error: bundle.error ?? null,
     path,
   };

@@ -43,8 +43,14 @@ export { optionSetsIn, type OptionSet };
  * Words that make a listing exhaustive. English needs word boundaries; Thai
  * has no word boundaries, so its markers are matched as substrings, and
  * "เฉพาะ" covers "แสดงเฉพาะ", "มีเฉพาะ", "เฉพาะ … เท่านั้น" alike.
+ *
+ * A hyphen-joined "only" is a compound adjective, not a marker: "Read-only",
+ * "view-only", "admin-only" describe ONE thing's mode, never a set's size
+ * (HIR-EC-001, 2026-09-04: "… เป็น Read-only และ HR ไม่สามารถแก้ไขเองได้" is a
+ * claim that two fields cannot be edited). `\b` sits between "-" and "o", so
+ * the lookbehind is what keeps the compound out.
  */
-const ENGLISH_MARKER = /\b(only|just|exactly|solely|nothing else|no other|none other|and nothing more)\b/i;
+const ENGLISH_MARKER = /(?<![\w-])(only|just|exactly|solely|nothing else|no other|none other|and nothing more)\b/i;
 const THAI_MARKER = /(เท่านั้น|แค่|เฉพาะ|เพียง)/;
 
 /** "3 ค่า", "3 values", "three options" — a stated size of the set. */
@@ -79,7 +85,13 @@ export interface ExclusivityClaim {
  * later heading — Note (from the sheet), Option set, Rounds — ends it.
  */
 function expectedBlockOf(text: string): string | null {
-  return sectionOf(text, 'expected');
+  const block = sectionOf(text, 'expected');
+  // The parser's `[RECORD ONLY]` mark stripped first: its "ONLY" read as the
+  // exclusivity marker and refused a record-only line that enumerated the
+  // fields to be read (ec09 HIR-EC-009, the same false positive
+  // `unboundedExclusivityClaim` fixed for HIR-EC-060). A record-only line
+  // has no oracle, so it cannot carry a claim to prove.
+  return block === null ? null : block.replace(/\[RECORD ONLY\]/g, '');
 }
 
 function enumeratedCount(line: string): number | null {

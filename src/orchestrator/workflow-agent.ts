@@ -30,7 +30,8 @@ import {
   performSignOut,
 } from '../engine/sign-in.js';
 import { revealHidden } from '../engine/reveal.js';
-import { selectFromListbox } from '../engine/listbox.js';
+import { approach, humanClick, humanFill, humanKeys, humanScrollBy, humanScrollTo } from '../engine/humanize.js';
+import { ListboxOptionMissingError, selectFromListbox } from '../engine/listbox.js';
 import { isoDateOf } from '../engine/dates.js';
 import { scopeUrl, type CacheManager } from '../cache/cache-manager.js';
 import type { AxNode } from '../healer/jit-healer.js';
@@ -40,16 +41,22 @@ import {
   formGaps,
   formatFormGaps,
   goalAlreadyShowing,
+  listboxCannotOffer,
   menuNodeScore,
   menuPathOf,
   multiPersonaGoal,
   multiPersonaSummary,
   renderTree,
   repeatedToggleClick,
+  activationKey,
+  reactivation,
+  reactivationAdvanced,
+  sameOptions,
   selectorGrounded,
   selectorName,
   unscopedDestructiveClick,
   type MenuSegment,
+  type Reactivation,
 } from './agent-guards.js';
 import { normaliseAgentSelector } from '../engine/selector.js';
 import {
@@ -63,6 +70,7 @@ import {
   atGoalDestination,
   describeOutcomes,
   destinationReached,
+  differentPage,
   foldValue,
   goalCitedValues,
   goalDestination,
@@ -70,6 +78,7 @@ import {
   outcomesShown,
   urlMoveNote,
   valueAppearsAnywhere,
+  wanderedOffPage,
   wizardStepHint,
 } from './goal-evidence.js';
 import { DETERMINISM_RULES, procedure } from '../providers/prompt-discipline.js';
@@ -167,6 +176,24 @@ export const AGENT_FAIL_FAST_MAX_STEPS = 15;
  * `maxSteps` still wins when one is set.
  */
 export const AGENT_NO_PROGRESS_OFF_TURNS = 25;
+/**
+ * How many turns a leg may spend OFF the page its step began on — on
+ * another origin or path, short of any destination the goal names
+ * (`wanderedOffPage`) — moving the page again or only clicking, before the
+ * loop ends it as a wander. Live (HIR-EC-002, 2026-09-03 13:00): steps 16
+ * and 19 each left /en/admin/hire/draft for /en/requests and kept going,
+ * and every goto or click onto a fresh page was progress by the no-progress
+ * judge's rule, so nothing but DEFAULT_AGENT_MAX_STEPS ended them — 903 s
+ * of a 1,377 s case at ~7 s a turn. A journey to a named destination is
+ * two to four page moves; eight is well past any honest one. A turn off the
+ * page that lands a FIRST-TIME form entry (fill, type, selectOption, check)
+ * does not spend the allowance — "open the form and fill it" legitimately
+ * lives off its start page for fifteen turns — and a return to the start
+ * page resets it. A consent redirect is cleared by the gate rung and never
+ * counted. Lifted to AGENT_NO_PROGRESS_OFF_TURNS when early-stop is off,
+ * like the other two judges.
+ */
+export const AGENT_OFF_PAGE_TURNS = 8;
 
 /**
  * Whether the agent's early-give-up judges (look-only at 3, no-progress at 5)
@@ -223,6 +250,19 @@ export const INTERACTION_ACTIONS: ReadonlySet<string> = new Set([
   // a page-changing act, never a look, and never available to a reveal or
   // read-only run.
   'signOut',
+]);
+/**
+ * The interactions that put a value INTO a control rather than open or
+ * follow one — the work a form page is visited for. A first-time one of
+ * these off the step's page does not spend AGENT_OFF_PAGE_TURNS.
+ */
+export const FORM_ENTRY_ACTIONS: ReadonlySet<string> = new Set([
+  'fill',
+  'type',
+  'paste',
+  'selectOption',
+  'check',
+  'uncheck',
 ]);
 /** Everything a `readOnly` run may do: look, look again, and answer. */
 export const READ_ONLY_ACTIONS: ReadonlySet<string> = new Set([...IDLE_ACTIONS, 'finish', 'fail']);
@@ -463,9 +503,26 @@ export interface AgentMemory {
   forget(key: string): void;
 }
 
-/** `${origin+path} :: workflow :: ${goal}` — the goal's wording, whitespace-folded. */
-export function replayKey(startUrl: string, goal: string): string {
-  return `${scopeUrl(startUrl)} :: workflow :: ${goal.replace(/\s+/g, ' ').trim()}`;
+/**
+ * `${origin+path} :: workflow :: ${goal}` — the goal's wording, whitespace-folded
+ * — and, when the run has one, the persona the leg ran as.
+ *
+ * The persona belongs in the key for the reason `#deadResolutions` is already
+ * keyed by it in the runner: *an employee's 403 page and the manager's real
+ * page share a URL and nothing else*. A case that changes hands mid-way asks
+ * the same question twice from the same address — "open Team > Probation
+ * Reviews and open the case" as the manager, then as the HRBP — and without
+ * the persona here the second leg replays the first one's recorded journey on
+ * the second person's browser, at zero model turns, and reports success.
+ *
+ * Only the LABEL is ever passed. It never reaches a prompt; it exists solely
+ * to keep two people's memories apart. A run with no personas passes nothing
+ * and its keys are byte-identical to before, so no existing cache entry is
+ * orphaned.
+ */
+export function replayKey(startUrl: string, goal: string, persona?: string | undefined): string {
+  const base = `${scopeUrl(startUrl)} :: workflow :: ${goal.replace(/\s+/g, ' ').trim()}`;
+  return persona === undefined || persona === '' ? base : `${base} :: as ${persona}`;
 }
 
 /**
@@ -807,6 +864,13 @@ export interface WorkflowAgentOptions {
   allowedOrigins?: string[] | undefined;
   /** Called after every action, for screenshot capture. */
   onAction?: ((page: Page, action: AgentAction) => Promise<void>) | undefined;
+  /**
+   * Perform like a person — pointer travel, hover, typing pace — for the
+   * film (`engine/humanize.ts`). Same performer as the runner's steps, so an
+   * agent leg looks like the steps around it. Off unless asked; the runner
+   * passes its own setting per run (`RunOptions.humanize`).
+   */
+  humanize?: boolean | undefined;
   /** Remembered solutions; see `AgentMemory`. A run passes the cache-backed one per call. */
   memory?: AgentMemory | undefined;
 }
@@ -873,12 +937,25 @@ export interface RunOptions {
    */
   dbProbe?: AgentDbProbe | undefined;
   /**
+   * The persona LABEL this leg runs as, when the run has personas at all.
+   *
+   * It is used for exactly one thing — scoping the replay memory's key (see
+   * `replayKey`) — and for nothing else. It is never put in a prompt, never
+   * offered to the model, and carries no email and no password: the agent has
+   * no sign-in verb and no credentials by design, and this must not become the
+   * hole in that. Absent on a single-persona run, which keeps its cache keys
+   * exactly as they were.
+   */
+  persona?: string | undefined;
+  /**
    * Where a `save` action puts the value it read (OA-8): the runner wires
    * this to its `VariableStore.set`, so later steps interpolate `{{name}}`.
    * Absent on a run with no store — the action still records what it read
    * (the history line and the observation), it just has nowhere to keep it.
    */
   saveVariable?: ((name: string, value: string) => void) | undefined;
+  /** Perform like a person for this run; overrides the constructor's `humanize`. */
+  humanize?: boolean | undefined;
 }
 
 /** See `RunOptions.dbProbe`. The observed count is evidence; a thrown message is the failure. */
@@ -1024,8 +1101,12 @@ export class WorkflowAgent {
   readonly #noProgressTurns: number;
   /** Look-only soft-handoff turns: 3 with early-stop on, the same ceiling off. */
   readonly #lookOnlyTurns: number;
+  /** Off-page allowance: AGENT_OFF_PAGE_TURNS with early-stop on, the same ceiling off. */
+  readonly #offPageTurns: number;
   readonly #maxAxNodes: number;
   readonly #actionTimeoutMs: number;
+  /** Perform like a person for this run; see `WorkflowAgentOptions.humanize`. */
+  #humanize: boolean;
   readonly #allowedOrigins: string[] | undefined;
   readonly #onAction: ((page: Page, action: AgentAction) => Promise<void>) | undefined;
   readonly #memory: AgentMemory | undefined;
@@ -1036,11 +1117,13 @@ export class WorkflowAgent {
     const earlyStop = options.earlyStop ?? agentEarlyStopDefault();
     this.#noProgressTurns = earlyStop ? AGENT_NO_PROGRESS_TURNS : AGENT_NO_PROGRESS_OFF_TURNS;
     this.#lookOnlyTurns = earlyStop ? AGENT_LOOK_ONLY_TURNS : AGENT_NO_PROGRESS_OFF_TURNS;
+    this.#offPageTurns = earlyStop ? AGENT_OFF_PAGE_TURNS : AGENT_NO_PROGRESS_OFF_TURNS;
     this.#maxAxNodes = options.maxAxNodes ?? DEFAULT_AGENT_MAX_NODES;
     this.#actionTimeoutMs = options.actionTimeoutMs ?? DEFAULT_AGENT_ACTION_TIMEOUT_MS;
     this.#allowedOrigins = options.allowedOrigins;
     this.#onAction = options.onAction;
     this.#memory = options.memory;
+    this.#humanize = options.humanize ?? false;
   }
 
   /**
@@ -1050,6 +1133,7 @@ export class WorkflowAgent {
    */
   async run(page: Page, goal: string, runOptions: RunOptions = {}): Promise<WorkflowResult> {
     const startedMs = Date.now();
+    if (runOptions.humanize !== undefined) this.#humanize = runOptions.humanize;
     // Reset here, not at declaration: the agent is one instance shared across
     // every workflow step of a run, and a flag that stuck from a PRIOR step's
     // goal would mark every step after a looked-only one the same way,
@@ -1145,6 +1229,16 @@ export class WorkflowAgent {
     // tree", buying five fresh turns each time and never converging.
     const visitedUrls = new Set<string>([startUrl]);
     let lastUrlSeen = startUrl;
+    // Selectors already activated (ok) on each URL this leg, and what kind
+    // of activation each recorded action was (`reactivation`): a repeat on
+    // the same page is progress only if the tree changed, and text typed
+    // again into the same field never is — ec09 leg [14]'s section headers,
+    // the job-2 Position picker's search box (2026-09-03).
+    const activatedHere = new Set<string>();
+    const reactivations = new Map<number, Reactivation>();
+    // Turns spent off the step's page short of anything the goal names
+    // (`wanderedOffPage`), reset on returning — the HIR-EC-002 wander.
+    let offPageTurns = 0;
     // Where the agent is going: the step's page until a goto asks for
     // another. A gate cleared mid-run returns here, never to the app's home.
     let intendedUrl = startUrl;
@@ -1176,7 +1270,7 @@ export class WorkflowAgent {
     // the page, a link in the tree that points exactly where the goal ends.
     // Each is handled here deterministically and recorded as an action, so
     // the model is asked only for the part that genuinely needs it.
-    const key = /^https?:/.test(startUrl) ? replayKey(startUrl, goal) : null;
+    const key = /^https?:/.test(startUrl) ? replayKey(startUrl, goal, runOptions.persona) : null;
     const remembered = key !== null && memory ? memory.get(key) : undefined;
     if (remembered && remembered.length > 0) {
       const replayed = await this.#replay(page, remembered, allowed, actions, history, startUrl, goal);
@@ -1300,6 +1394,9 @@ export class WorkflowAgent {
         doneHere.clear();
         lastUrlSeen = page.url();
       }
+      // Where this turn begins, once any gate is cleared: the off-page
+      // judge measures the turn's own move against it.
+      const turnUrl = page.url();
       // Goal-focused: the nodes the goal names survive the budget cut. The
       // FULL tree is rendered too (bytes, never tokens — it is not sent to
       // the model): the judges and the wizard hint read it (OA-3, OA-11).
@@ -1507,6 +1604,8 @@ export class WorkflowAgent {
       ];
       const turnStart = actions.length;
       let arrived = false;
+      // The page's own enumeration ended the leg — see `cannotOffer` below.
+      let stopped = false;
       for (let q = 0; q < queue.length && !arrived; q += 1) {
         const current = queue[q]!;
         if (q > 0) {
@@ -1530,12 +1629,41 @@ export class WorkflowAgent {
         const urlBefore = page.url();
         let ok = true;
         let error: string | undefined;
+        // **An enumerated list that lacks the goal's value is evidence**
+        // (`listboxCannotOffer`, 2026-09-03, ec09 HIR-EC-009 leg [23]). A
+        // `selectOption` that opened the goal's control, read its WHOLE list
+        // and found the goal's own value on none of its options has observed
+        // what the page can offer. The pick is retried once at $0 after the
+        // page settles — a list still loading is not a list without the
+        // option (the same control offered "F — DVT" three minutes later in
+        // the same run) — and a second, identical enumeration ends the leg
+        // without another model turn: the page's state is the verdict, and
+        // the flow's next assertion carries it.
+        let cannotOffer: { control: string; value: string; shown: string[] } | null = null;
 
         try {
           await this.#act(page, current, allowed);
         } catch (caught) {
           ok = false;
           error = describe(caught);
+          const missing =
+            caught instanceof ListboxOptionMissingError && !caught.filtered
+              ? listboxCannotOffer(current, caught.shown, goal)
+              : null;
+          if (missing !== null) {
+            await page.waitForLoadState('networkidle', { timeout: NETWORK_SETTLE_MS }).catch(() => undefined);
+            await page.waitForTimeout(WAIT_SETTLE_MS).catch(() => undefined);
+            try {
+              await this.#act(page, current, allowed);
+              ok = true;
+              error = undefined;
+            } catch (again) {
+              error = describe(again);
+              if (again instanceof ListboxOptionMissingError && !again.filtered && sameOptions(again.shown, missing.shown)) {
+                cannotOffer = missing;
+              }
+            }
+          }
         }
 
         const record = this.#record(
@@ -1572,6 +1700,16 @@ export class WorkflowAgent {
         );
 
         if (ok && page.url() === urlBefore) doneHere.add(decisionKey(current));
+        // What kind of activation this was, judged BEFORE it is recorded
+        // as one: the same selector on the page it was taken on. A miss
+        // activated nothing and records nothing.
+        if (ok) {
+          const kind = reactivation(current, urlBefore, activatedHere);
+          if (kind !== null) {
+            reactivations.set(record.index, kind);
+            activatedHere.add(activationKey(urlBefore, current.selector));
+          }
+        }
         // `press` counts here too (2026-09-02): a targeted press (a selector
         // given, as opposed to a bare key sent to whatever has focus)
         // activates its control exactly as a click does, and a model that
@@ -1643,9 +1781,20 @@ export class WorkflowAgent {
           summary = `reached ${page.url()}, the destination the goal names, after ${turns} turn(s)`;
           arrived = true;
         }
+        if (cannotOffer !== null) {
+          const listed = cannotOffer.shown
+            .slice(0, 8)
+            .map((o) => JSON.stringify(o))
+            .join(', ');
+          summary =
+            `agent stopped: the goal's ${cannotOffer.control} = ${JSON.stringify(cannotOffer.value)} is not among the ` +
+            `${cannotOffer.shown.length} option(s) the control offers (${listed}${cannotOffer.shown.length > 8 ? ', …' : ''}) — ` +
+            `enumerated twice, ${WAIT_SETTLE_MS} ms apart, so the page cannot satisfy this pair`;
+          stopped = true;
+        }
         if (!ok) break;
       }
-      if (arrived) break;
+      if (arrived || stopped) break;
 
       // The no-progress judge. A turn in which an action that can change
       // the page landed resets it; a turn in which nothing did — every action
@@ -1659,14 +1808,65 @@ export class WorkflowAgent {
       // a `goto` that reached a URL this leg had not seen. A `goto` back to a
       // page already visited is a reload — not progress — and no longer buys
       // five fresh turns (PL_07_03: the plans page reloaded turn after turn).
-      let advanced = actions.slice(turnStart).some((a) => {
+      // And an ok activation of a control ALREADY activated on this page
+      // this leg is progress only if the page changed after it; text typed
+      // again into the same field never is (`reactivation`, 2026-09-03:
+      // ec09 leg [14]'s section headers, the job-2 Position picker). The
+      // tree is re-read for that case only, and the credit shares
+      // AGENT_TREE_CHANGE_CREDITS with the looks below, so a control that
+      // toggles forever still ends the leg.
+      const turnActions = actions.slice(turnStart);
+      let repeatedActivation = false;
+      let advanced = turnActions.some((a) => {
         if (!a.ok || IDLE_ACTIONS.has(a.action)) return false;
-        if (a.action !== 'goto') return true;
+        if (a.action !== 'goto') {
+          const kind = reactivations.get(a.index) ?? null;
+          if (reactivationAdvanced(kind, false)) return true;
+          if (kind === 'repeat') repeatedActivation = true;
+          return false;
+        }
         const url = page.url();
         if (visitedUrls.has(url)) return false;
         visitedUrls.add(url);
         return true;
       });
+      if (!advanced && repeatedActivation && treeKey !== null && treeChangeCredits < AGENT_TREE_CHANGE_CREDITS) {
+        await page.waitForLoadState('networkidle', { timeout: NETWORK_SETTLE_MS }).catch(() => undefined);
+        if (treeKeyOf(await captureAxNodes(page, Number.MAX_SAFE_INTEGER)) !== treeKey) {
+          advanced = true;
+          treeChangeCredits += 1;
+        }
+      }
+      if (!advanced && turnActions.some((a) => a.ok && reactivations.has(a.index))) {
+        history.push(
+          '(that control was already activated on this page this leg — activating it again is not progress; ' +
+            'act on something the goal still needs, or call fail)',
+        );
+      }
+      // **A leg off its page, short of anything the goal names, has a small
+      // allowance** (`AGENT_OFF_PAGE_TURNS`; the HIR-EC-002 wander). A turn
+      // counts when it moved the page again or only clicked; a first-time
+      // form entry off the page is the work a page is visited for and is
+      // free. A consent redirect is the gate rung's to clear, never a
+      // wander; returning to the step's page resets the allowance.
+      const turnEndUrl = page.url();
+      if (!CONSENT_GATE_URL_PATTERN.test(turnEndUrl)) {
+        if (!wanderedOffPage(goal, startUrl, turnEndUrl)) {
+          offPageTurns = 0;
+        } else {
+          const formEntry = turnActions.some(
+            (a) => a.ok && reactivations.get(a.index) === 'first' && FORM_ENTRY_ACTIONS.has(a.action),
+          );
+          if (differentPage(turnUrl, turnEndUrl) || !formEntry) offPageTurns += 1;
+          if (offPageTurns >= this.#offPageTurns) {
+            summary =
+              `agent wandered: left the step's page ${startUrl} and spent ${offPageTurns} turn(s) elsewhere ` +
+              `(now at ${turnEndUrl}) without reaching ${destination === null ? 'anything the goal names' : `the goal's destination ${destination}`}` +
+              ' — each move onto a fresh page counted as progress, so this allowance ended the leg';
+            break;
+          }
+        }
+      }
       // **A look that showed more is progress, a bounded number of times**
       // (OA-10). A lazily-rendered table appends rows on every scroll, and a
       // page still hydrating fills in after a wait: the FULL tree's hash
@@ -2189,7 +2389,7 @@ export class WorkflowAgent {
       case 'click':
         if (!decision.selector) throw new Error('click decision carried no selector');
         await this.#target(page, decision.selector);
-        await page.locator(decision.selector).first().click({ timeout: this.#actionTimeoutMs });
+        await humanClick(page, page.locator(decision.selector).first(), this.#actionTimeoutMs, { enabled: this.#humanize });
         break;
 
       case 'fill': {
@@ -2201,7 +2401,7 @@ export class WorkflowAgent {
           break;
         }
         const field = page.locator(decision.selector).first();
-        await field.fill(decision.value, { timeout: this.#actionTimeoutMs });
+        await humanFill(page, field, decision.value, this.#actionTimeoutMs, { enabled: this.#humanize });
         // **A fill the framework reverts is the quietest false negative in
         // the loop.** A controlled React input that has not finished
         // hydrating takes the value, then resets it on its next render — the
@@ -2366,12 +2566,16 @@ export class WorkflowAgent {
         // field that reacts per keystroke (autocomplete, typeahead, masked
         // input) actually wakes. No read-back guard: such a field routinely
         // transforms what it holds, and that is the point of using `type`.
-        await field.click({ timeout: this.#actionTimeoutMs });
+        await humanClick(page, field, this.#actionTimeoutMs, { enabled: this.#humanize });
         await field.fill('', { timeout: this.#actionTimeoutMs }).catch(() => undefined);
-        await field.pressSequentially(decision.value, {
-          delay: 25,
-          timeout: Math.max(this.#actionTimeoutMs, decision.value.length * 25 + 1_000),
-        });
+        await humanKeys(
+          page,
+          field,
+          decision.value,
+          25,
+          Math.max(this.#actionTimeoutMs, decision.value.length * 25 + 1_000),
+          { enabled: this.#humanize },
+        );
         break;
       }
 
@@ -2391,6 +2595,7 @@ export class WorkflowAgent {
       case 'hover':
         if (!decision.selector) throw new Error('hover decision carried no selector');
         await this.#target(page, decision.selector);
+        if (this.#humanize) await approach(page, page.locator(decision.selector).first(), this.#actionTimeoutMs);
         await page
           .locator(decision.selector)
           .first()
@@ -2403,15 +2608,16 @@ export class WorkflowAgent {
           // table has not rendered is "no element matches" in 1.5 s, not a
           // 5 s scrollIntoViewIfNeeded timeout the next turn cannot read.
           await this.#target(page, decision.selector);
+          await humanScrollTo(page.locator(decision.selector).first(), this.#actionTimeoutMs, { enabled: this.#humanize });
           await page
             .locator(decision.selector)
             .first()
             .scrollIntoViewIfNeeded({ timeout: this.#actionTimeoutMs });
         } else {
-          // Anonymous function on purpose: esbuild rewrites a *named* one into
-          // `__name(fn, …)`, which does not exist in the page. See the note in
-          // `engine/evidence.ts`.
-          await page.evaluate('window.scrollBy(0, window.innerHeight)');
+          // A string, not a function, on purpose: esbuild rewrites a *named*
+          // one into `__name(fn, …)`, which does not exist in the page. See
+          // the note in `engine/evidence.ts`. Smooth when humanised.
+          await humanScrollBy(page, { enabled: this.#humanize });
         }
         break;
 
@@ -2772,6 +2978,9 @@ export class WorkflowAgent {
       ok,
       error,
       durationMs,
+      // The instant the action landed: the moment the run's film keeps for
+      // it once the idle around it is dropped (`ProofBundleBuilder.videoMoments`).
+      finishedAt: new Date().toISOString(),
       ...(observed === undefined ? {} : { observed }),
     };
   }

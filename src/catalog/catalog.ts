@@ -45,6 +45,7 @@ import {
   type ModelSource,
 } from '../providers/llm-factory.js';
 import type { ExtractedDocument } from './extract.js';
+import type { PersonaNeed } from './test-case-table.js';
 
 /** Claims asked for in one call. Beyond this a catalog wants splitting up. */
 export const DEFAULT_MAX_CLAIMS = 40;
@@ -242,7 +243,93 @@ export async function extractClaims(
   request: ClaimsRequest,
 ): Promise<CatalogClaims> {
   const result = await model.extractClaims(request);
-  return { ...result, documentNote: request.document.note };
+  return { ...result, claims: groupClaimsByRow(result.claims, request.document.text), documentNote: request.document.note };
+}
+
+const ROW_HEADING = /^## row (\d+)\n/;
+const PRIORITY_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
+
+/**
+ * One row of a table is one case, however many sentences it asserts.
+ *
+ * The extractor is told to split ("a numbered Expected output list is one
+ * claim per number"), which is right for a prose document and wrong for a
+ * test-case sheet read as text: ec09.csv's single row came back as fifteen
+ * claims, and the run authored, opened a browser for and reported fifteen
+ * cases about one scenario — each proving a fragment of a journey that only
+ * makes sense whole. The sheet's own parser (`test-case-table.ts`) has always
+ * made one case per row; this is the same rule for a sheet that reached the
+ * model instead (an unrecognised header, a shifted row the realigner did not
+ * catch).
+ *
+ * Rows are the `## row N` blocks `csvToText` writes. A claim belongs to the
+ * one block that contains its `source` (the case id, or the words the model
+ * quoted); a claim that matches no block, or several, is left alone. The
+ * testable claims of a row become one claim: the row's Test Case ID (or the
+ * first identifier-shaped line) as the source, the sentences joined in the
+ * order the model listed them, the highest priority among them. Context
+ * claims keep their own lines — they are never run, so there is nothing to
+ * merge. A document with no row blocks is returned as it was.
+ */
+export function groupClaimsByRow(claims: CatalogClaim[], documentText: string): CatalogClaim[] {
+  const blocks: { n: number; text: string; id: string }[] = [];
+  for (const chunk of documentText.split(/\n(?=## row \d+\n)/)) {
+    const m = ROW_HEADING.exec(chunk);
+    if (m === null) continue;
+    const text = chunk.slice(m[0].length);
+    const id =
+      /^(?:Test Case ID|Case ID|ID|Case)\s*:\s*(.+)$/im.exec(text)?.[1]?.trim() ??
+      /^[A-Z][A-Z0-9]*(?:[_-][A-Za-z0-9]+)+$/m.exec(text)?.[0] ??
+      '';
+    blocks.push({ n: Number(m[1]), text, id });
+  }
+  if (blocks.length === 0) return claims;
+
+  const rowOf = (claim: CatalogClaim): number | null => {
+    const source = claim.source.trim();
+    if (source === '') return null;
+    const explicit = /^row\s+(\d+)$/i.exec(source);
+    if (explicit !== null) return Number(explicit[1]);
+    const hits = blocks.filter((b) => b.id !== '' && (b.id === source || source.includes(b.id) || b.id.includes(source)));
+    if (hits.length === 1) return hits[0]!.n;
+    const containing = blocks.filter((b) => b.text.includes(source));
+    return containing.length === 1 ? containing[0]!.n : null;
+  };
+
+  const groups = new Map<number, CatalogClaim[]>();
+  const order: Array<{ row: number } | { claim: CatalogClaim }> = [];
+  for (const claim of claims) {
+    const row = claim.testable ? rowOf(claim) : null;
+    if (row === null) {
+      order.push({ claim });
+      continue;
+    }
+    const group = groups.get(row);
+    if (group === undefined) {
+      groups.set(row, [claim]);
+      order.push({ row });
+    } else {
+      group.push(claim);
+    }
+  }
+
+  return order.map((entry) => {
+    if ('claim' in entry) return entry.claim;
+    const group = groups.get(entry.row)!;
+    if (group.length === 1) return group[0]!;
+    const block = blocks.find((b) => b.n === entry.row);
+    const id = block?.id ?? '';
+    const priority = group.reduce(
+      (best, c) => ((PRIORITY_RANK[c.priority] ?? 0) > (PRIORITY_RANK[best] ?? 0) ? c.priority : best),
+      group[0]!.priority,
+    );
+    return {
+      claim: group.map((c) => c.claim.replace(/[.;]\s*$/, '')).join('; '),
+      priority,
+      source: id !== '' ? id : `row ${entry.row}`,
+      testable: true,
+    };
+  });
 }
 
 export class CatalogError extends Error {
@@ -293,6 +380,23 @@ export interface ClaimsFile {
   extractedAt: string;
   claims: ApprovedClaim[];
   sequence?: SequenceGateInfo | undefined;
+  /**
+   * The accounts this document's cases sign in as, and which cases need each
+   * (`tablePersonas`). Labels and case ids only — never an email, never a
+   * password: this file is plain JSON a person opens and mails around.
+   *
+   * It is here because this is the first parsed artefact a surface holds. Two
+   * of the five steps of a hand-off case say `Login ด้วย <SOMEONE_ACCOUNT>`,
+   * and until this field existed nothing downstream could see them: the claim
+   * text is built from the title, the expectation and the note, so a catalog
+   * needing two logins was indistinguishable from one needing none until the
+   * authoring loop refused a row with a browser already open.
+   *
+   * Absent on a claims file written before this existed, and on the document
+   * kinds that have no rows to read it from — a surface must treat "absent"
+   * as "not known", never as "none needed".
+   */
+  personas?: readonly PersonaNeed[] | undefined;
 }
 
 export function toClaimsFile(
@@ -300,6 +404,7 @@ export function toClaimsFile(
   claims: CatalogClaims,
   extractedAt: string,
   sequence?: SequenceGateInfo,
+  personas?: readonly PersonaNeed[],
 ): ClaimsFile {
   return {
     catalog,
@@ -311,6 +416,10 @@ export function toClaimsFile(
     // gate that begins empty is a gate everyone clicks "select all" through.
     claims: claims.claims.map((claim) => ({ ...claim, approved: true })),
     ...(sequence !== undefined ? { sequence } : {}),
+    // Omitted rather than written empty: a document with no rows to read
+    // personas from has not said there are none, and a surface must be able
+    // to tell "this catalog needs nobody" from "nobody looked".
+    ...(personas !== undefined && personas.length > 0 ? { personas } : {}),
   };
 }
 

@@ -61,6 +61,34 @@ describe('agent memory', () => {
     assert.equal(a, 'http://app.test/en/login :: workflow :: go to /en/admin');
   });
 
+  it('keeps two people apart when they ask the same question from the same address', async () => {
+    // The shape this exists for: a case that changes hands mid-way. The
+    // manager opens the review queue and the approver then opens "the same
+    // case" — one URL, one goal wording, two different pages. Unscoped, the
+    // second leg replays the first one's journey on the second person's
+    // browser at zero model turns and reports success. `#deadResolutions` is
+    // keyed by persona for exactly this reason; the agent's memory was not.
+    const url = 'http://app.test/team/probation-reviews';
+    const goal = 'open Team > Probation Reviews and open the case';
+    const manager = replayKey(url, goal, 'MANAGER_ACCOUNT');
+    const approver = replayKey(url, goal, 'HRBP_ACCOUNT');
+    assert.notEqual(manager, approver);
+    assert.equal(manager, `${url} :: workflow :: ${goal} :: as MANAGER_ACCOUNT`);
+
+    // A run with no personas keys exactly as it always did, so no entry
+    // written before this change is orphaned.
+    assert.equal(replayKey(url, goal), `${url} :: workflow :: ${goal}`);
+    assert.equal(replayKey(url, goal, undefined), replayKey(url, goal));
+    assert.equal(replayKey(url, goal, ''), replayKey(url, goal));
+
+    // And the scoping survives the cache the memory is stored in.
+    const dir = await mkdtemp(join(tmpdir(), 'wow-mem-persona-'));
+    const memory = cacheAgentMemory(new CacheManager({ filePath: join(dir, 'c.json') }));
+    memory.set(manager, [{ action: 'click', selector: 'role=link[name="case 41" i]', value: '', url: '' }], 'm');
+    assert.equal(memory.get(manager)?.length, 1);
+    assert.equal(memory.get(approver), undefined, "the approver does not inherit the manager's journey");
+  });
+
   it('round-trips an action list through the healed-selector cache, marked as a replay', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'wow-mem-'));
     const cache = new CacheManager({ filePath: join(dir, 'c.json') });

@@ -5,6 +5,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+import { formatElapsed, phaseHeader, withLogTag } from '../log-format.js';
 
 import { formatCoverage, meaningfulCoverage } from '../coverage/ax-coverage.js';
 import {
@@ -19,7 +20,7 @@ import {
   type GenerationProvenance,
   type ProofBundle,
 } from '../engine/proof-bundle.js';
-import { DEFAULT_CDP_URL, runFlow, type Flow, type RunFlowOptions } from '../engine/runner.js';
+import { DEFAULT_CDP_URL, personasIn, runFlow, type Flow, type RunFlowOptions } from '../engine/runner.js';
 import { AGENT_FAIL_FAST_MAX_STEPS } from '../orchestrator/workflow-agent.js';
 import type { DeadEndRisk } from '../engine/proof-bundle.js';
 import { describeRisk } from '../generator/dead-end-risk.js';
@@ -46,7 +47,7 @@ import {
 import { raiseSessionCapFor } from '../providers/claude-cli-session.js';
 import { describeDiagnosis, diagnoseError } from '../generator/error-diagnosis.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
-import { laneBrowsers, writeFlowFile } from './artifacts.js';
+import { growPool, laneBrowsers, writeFlowFile } from './artifacts.js';
 import { BrowserLease } from '../browser/pool.js';
 import { FlowRepairLoop } from '../repair/flow-repair-loop.js';
 import { LlmFlowRepairModel } from '../repair/flow-repair-model.js';
@@ -936,7 +937,10 @@ export async function runCases(
     queue,
     () => Math.min(poolOverride ?? concurrencyOf(), Math.max(concurrencyOf(), poolOverride ?? 1)),
     (testCase, index) => scheduleOf(testCase, index),
-    async (testCase, index) => {
+    // The lane's tag on the async context: every line written on this
+    // case's behalf without an explicit tag — the repair loop's, the llm
+    // log's on stderr — lands under `[cN]` with the rest of the case.
+    (testCase, index) => withLogTag(tagOf(index), async () => {
     // A streaming list has no roster to print up front, so each case's
     // line of it is printed as the case starts.
     if (streaming && parallel) {
@@ -1003,8 +1007,12 @@ export async function runCases(
       where.onCaseDone?.(testCase, collected[index]!);
       return;
     }
+    // Where this case's RUN begins (its authoring, when pipelined, ended at
+    // `queued …` some lines — or many cases — earlier): one rule a reader
+    // can search for, then the line the panel reads the boundary from.
+    if (!options.json) emitTagged(tag, `\n${phaseHeader(`run ${caseIdOf(testCase.name)}`)}\n`);
     if (parallel) emitTagged(tag, `case "${testCase.name}" started\n`);
-    else log?.(`\nrunning "${testCase.name}"…`);
+    else log?.(`running "${testCase.name}"…`);
     // The case's own clock, started at pickup: the bundle's `durationMs` is
     // one flow attempt, and under --repair the last attempt is the SHORTEST
     // part of what a person actually waited through.
@@ -1026,10 +1034,28 @@ export async function runCases(
         ? (flow: Flow): ReturnType<typeof dataGateFor> =>
             dataGateFor(flow, locks, { fkPairs, onLog: (line) => emitTagged(tag, `  ${line}\n`) })
         : null;
-    const laneCdp = browsers.acquire();
+    // One Chrome per persona: the people this case signs in as, the first on
+    // the lane's browser and each later one on its own. The pool grows on
+    // demand when `--browsers` did not size it (a catalog run cannot know
+    // the count before authoring); a pool that still falls short is shared
+    // and disclosed — contexts isolate the cookie jars on their own.
+    const personaCount = personasIn(testCase.flow).length;
+    if (personaCount > browsers.size) {
+      for (const url of await growPool(options, personaCount)) browsers.add(url);
+    }
+    const leased = browsers.acquireMany(Math.max(1, personaCount));
+    const laneCdp = leased.cdpUrls[0]!;
+    const personaBrowsers = leased.cdpUrls.slice(1);
+    if (personaCount > 1 && !leased.distinct) {
+      emitTagged(
+        tag,
+        `  ${personaCount} personas over ${browsers.size} browser${browsers.size === 1 ? '' : 's'} — some share a Chrome (separate contexts, separate cookies)\n`,
+      );
+    }
     try {
       const ordinaryRunOptions: RunFlowOptions = {
         cdpUrl: laneCdp,
+        personaBrowsers,
         // Concurrent cases must not share a browser context, whatever the
         // video mode says — see `SmartRunnerOptions.isolate`.
         isolate: parallel,
@@ -1038,6 +1064,7 @@ export async function runCases(
         screenshots: options.screenshots,
         highlightTarget: options.highlightTarget,
         video: options.video,
+        humanize: options.humanize,
         // The agent as ERROR BACKSTOP, not journey driver (2026-08-28, asked
         // for with code-grounded authoring): flows are now written to run
         // deterministically — tree- or code-grounded steps instead of agent
@@ -1135,6 +1162,9 @@ export async function runCases(
         emitTagged(
           tag,
           `\n${formatProofSummary(bundle)}\n` +
+            // The summary's own duration is the LAST attempt; this is the span
+            // a stopwatch agrees with — pickup to verdict, repairs included.
+            (bundle.caseDurationMs === undefined ? '' : `  elapsed    ${formatElapsed(bundle.caseDurationMs)} from pickup to verdict\n`) +
             (meaningfulCoverage(bundle) ? `  ${formatCoverage(bundle.coverage!)}\n` : '') +
             (bundle.trend ? `  ${formatTrend(bundle.trend)}\n` : '') +
             `  proof      ${proofPath}\n` +
@@ -1301,7 +1331,7 @@ export async function runCases(
       await noteOutcome(collected[index]!, { flowPath: testCase.flowPath, ...caseFacts(testCase) });
       where.onCaseDone?.(testCase, collected[index]!);
     } finally {
-      browsers.release(laneCdp);
+      browsers.releaseMany(leased.cdpUrls);
       // The case's window joins the registry either way — the interference
       // detector needs finished writers, and a lane must never stay
       // "in flight" after a throw.
@@ -1311,7 +1341,7 @@ export async function runCases(
         inFlightMeta.delete(index);
       }
     }
-    },
+    }),
     () => pauseRequested(pauseFile),
     canRunWith,
     () => governorHold,

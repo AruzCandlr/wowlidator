@@ -23,6 +23,9 @@ import {
   goalSurfaceNames,
   repeatedToggleClick,
   TOGGLE_CLICK_LIMIT,
+  activationKey,
+  reactivation,
+  reactivationAdvanced,
   unscopedDestructiveClick,
   goalIdentifiers,
   DESTRUCTIVE_NAME,
@@ -38,6 +41,7 @@ import {
   AGENT_LOOK_ONLY_TURNS,
   AGENT_NO_PROGRESS_OFF_TURNS,
   AGENT_NO_PROGRESS_TURNS,
+  AGENT_OFF_PAGE_TURNS,
   AGENT_VALUE_HUNT_TURNS,
   DEFAULT_AGENT_MAX_STEPS,
   WorkflowAgent,
@@ -193,6 +197,80 @@ describe('repeatedToggleClick', () => {
     assert.equal(repeatedToggleClick({ ...click, action: 'scroll' }, counts), null);
     assert.equal(repeatedToggleClick({ ...click, selector: 'role=button[name="Other" i]' }, counts), null);
     assert.equal(repeatedToggleClick({ ...click, selector: '' }, counts), null);
+  });
+});
+
+describe('reactivation — the same control on the same page is not progress (2026-09-03)', () => {
+  const PAGE = 'http://localhost:3005/en/admin/hire?step=1';
+
+  it('ec09 HIR-EC-009 leg [14]: a section header re-clicked on the same wizard page is a repeat, credited only if the tree changed', () => {
+    // ~60 turns / 320 s re-opening headers, each click ok, each resetting the judge.
+    const header = { action: 'click', selector: 'role=button[name="Personal Information" i]', value: '', url: '' };
+    const activated = new Set<string>();
+    assert.equal(reactivation(header, PAGE, activated), 'first');
+    activated.add(activationKey(PAGE, header.selector));
+    assert.equal(reactivation(header, PAGE, activated), 'repeat');
+    assert.equal(reactivationAdvanced('repeat', false), false, 'the page did not change — not progress');
+    assert.equal(reactivationAdvanced('repeat', true), true, 'the header actually opened — progress, bounded by the tree-change credits');
+    assert.equal(reactivationAdvanced('first', false), true, 'a first activation is progress as before');
+    assert.equal(reactivationAdvanced(null, false), true, 'a non-activation is left to the judge as before');
+  });
+
+  it('ec09 job-2, the Position picker: text typed again into the same search box is never progress, whatever the tree did', () => {
+    // 122 requests / 18 min: type "40106337", fill "401063", fill "MKB12.12",
+    // fill "", fill "4010", fill "40106337" into one textbox, each ok, between
+    // failed selectOptions and ok re-clicks of the same button.
+    const search = 'role=textbox[name="Search options" i]';
+    const position = 'role=button[name="Position" i]';
+    const activated = new Set<string>();
+    const sequence: Array<{ action: string; selector: string; value: string; ok: boolean }> = [
+      { action: 'selectOption', selector: position, value: '40106337', ok: false },
+      { action: 'click', selector: position, value: '', ok: true },
+      { action: 'type', selector: search, value: '40106337', ok: true },
+      { action: 'fill', selector: search, value: '401063', ok: true },
+      { action: 'fill', selector: search, value: 'MKB12.12', ok: true },
+      { action: 'fill', selector: search, value: '', ok: true },
+      { action: 'fill', selector: search, value: '4010', ok: true },
+      { action: 'fill', selector: search, value: '40106337', ok: true },
+      { action: 'click', selector: position, value: '', ok: true },
+    ];
+    const kinds: Array<ReturnType<typeof reactivation>> = [];
+    for (const step of sequence) {
+      if (!step.ok) continue; // a miss activated nothing and is never recorded
+      const kind = reactivation({ ...step, url: '' }, PAGE, activated);
+      kinds.push(kind);
+      activated.add(activationKey(PAGE, step.selector));
+    }
+    assert.deepEqual(kinds, ['first', 'first', 'text-again', 'text-again', 'text-again', 'text-again', 'text-again', 'repeat']);
+    assert.equal(reactivationAdvanced('text-again', true), false, 'the typed value echoes into the tree, so a change test alone would credit it');
+    // The failed selectOption never entered the set: the button's first OK activation is still 'first'.
+    assert.equal(kinds[1], 'first');
+  });
+
+  it('is scoped to the page the action was taken on, and says nothing about looks or a bare key', () => {
+    const click = { action: 'click', selector: 'role=button[name="Next" i]', value: '', url: '' };
+    const activated = new Set([activationKey(PAGE, click.selector)]);
+    assert.equal(reactivation(click, 'http://localhost:3005/en/admin/hire?step=2', activated), 'first', 'the same selector on another URL is a new control');
+    assert.equal(reactivation(click, PAGE, activated), 'repeat');
+    assert.equal(reactivation({ ...click, action: 'scroll' }, PAGE, activated), null);
+    assert.equal(reactivation({ ...click, action: 'goto', selector: '', url: PAGE }, PAGE, activated), null);
+    assert.equal(reactivation({ ...click, action: 'press', selector: '' }, PAGE, activated), null, 'a bare keypress activates no named control');
+    assert.equal(reactivation({ ...click, action: 'press' }, PAGE, activated), 'repeat', 'a targeted press counts as a click does');
+  });
+
+  it('leaves repeatedToggleClick exactly as it was: the whole-run count, not the per-page set', () => {
+    const click = { action: 'click', selector: 'role=button[name="Type:" i]', value: '', url: '' };
+    assert.equal(repeatedToggleClick(click, new Map([[click.selector, TOGGLE_CLICK_LIMIT - 1]])), null);
+    assert.match(repeatedToggleClick(click, new Map([[click.selector, TOGGLE_CLICK_LIMIT]])) ?? '', /^circling:/);
+  });
+});
+
+describe('the off-page allowance is a judge like the other two', () => {
+  it('is small, exported, and lifted to the off ceiling like the others', () => {
+    assert.equal(AGENT_OFF_PAGE_TURNS, 8);
+    assert.ok(AGENT_OFF_PAGE_TURNS > AGENT_NO_PROGRESS_TURNS, 'a journey of a few moves must never trip it before the stall judge would');
+    assert.ok(AGENT_OFF_PAGE_TURNS < AGENT_NO_PROGRESS_OFF_TURNS);
+    assert.ok(AGENT_OFF_PAGE_TURNS < DEFAULT_AGENT_MAX_STEPS);
   });
 });
 

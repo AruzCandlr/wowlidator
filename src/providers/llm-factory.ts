@@ -550,8 +550,14 @@ function reaskNote(error: unknown, attempt: number): string {
       lines.push(`  - ${(issue.path ?? []).map(String).join('.') || '(root)'}: ${String(issue.message ?? '')}`);
     }
   } else if (typeof e?.text === 'string' && e.text !== '') {
+    // The parser's own complaint (the SDK's JSONParseError carries the
+    // SyntaxError as its cause) names the position; the generic list is what
+    // usually sits there. Both, so the note is exact where it can be.
+    const parser = findInChain(e?.cause, (x) => x?.name === 'SyntaxError') as { message?: unknown } | undefined;
     lines.push(
-      'It was not valid JSON. Common causes: a double quote inside a string that was not ' +
+      'It was not valid JSON' +
+        (typeof parser?.message === 'string' && parser.message !== '' ? ` (parser: ${parser.message})` : '') +
+        '. Common causes: a double quote inside a string that was not ' +
         'escaped as \\", a trailing comma, a comment, text before or after the object, ' +
         'a value that is not a JSON literal.',
     );
@@ -688,12 +694,19 @@ function describeStructuredFailure<T>(request: StructuredRequest<T>, error: unkn
   // misleading: "try a different model id" sends someone changing config
   // when the model was fine and the call was rate-limited. Those failures
   // already rotate keys on their own — see `isKeyExhaustedError`.
+  // A third cause, a third advice: an answer CUT at an output budget is
+  // neither a key nor a model that cannot do JSON — it is a budget, and the
+  // dial is named on line one (2026-09-04: a claude-cli answer cut at the
+  // CLI's own cap used to read "try a different model id").
   const advice = isKeyExhaustedError(error)
     ? 'This looks like the key rather than the model — rate limit, quota, or ' +
       'an expired credential. Retry, or add a second key to rotate into.'
-    : `Not every free-tier model supports JSON-schema output, and this one failed ` +
-      `${RECOVERABLE_ATTEMPTS} times running. Try a different model id for this role, ` +
-      'or point the role at another provider.';
+    : wasCutAtBudget(error)
+      ? 'The answer was cut at an output budget, not refused: raise the budget the ' +
+        'first line names, or ask for a smaller answer.'
+      : `Not every free-tier model supports JSON-schema output, and this one failed ` +
+        `${RECOVERABLE_ATTEMPTS} times running. Try a different model id for this role, ` +
+        'or point the role at another provider.';
   // Two different headlines for two different facts. "Failed to produce a
   // valid structured response" is what the model DID say when it answered
   // and the answer was unusable; a rate limit or quota is the model never

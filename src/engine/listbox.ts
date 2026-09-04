@@ -77,7 +77,26 @@ export interface ListboxSelection {
 export class ListboxOptionMissingError extends Error {
   override readonly name = 'ListboxOptionMissingError';
   readonly shown: string[];
-  constructor(trigger: string, value: string, shown: string[], detail: string) {
+  /**
+   * Was `shown` a list narrowed by a typed search head, or the whole list?
+   * The agent loop's enumerated-listbox judge (`listboxCannotOffer`) reads
+   * only a whole enumeration as evidence that the control cannot offer a
+   * value — a filtered list says nothing about what the filter hid.
+   */
+  readonly filtered: boolean;
+  /**
+   * The search head the list's own empty row answered ("No options found")
+   * — the application's own statement that nothing matches that text — or
+   * null when no search was typed or every head returned options.
+   */
+  readonly searchedEmpty: string | null;
+  constructor(
+    trigger: string,
+    value: string,
+    shown: string[],
+    detail: string,
+    evidence: { filtered?: boolean | undefined; searchedEmpty?: string | null | undefined } = {},
+  ) {
     super(
       `opened ${JSON.stringify(trigger)} but no option named ${JSON.stringify(value)} appeared ` +
         `(looked for role=option, menuitem, menuitemradio; ${
@@ -85,6 +104,8 @@ export class ListboxOptionMissingError extends Error {
         })${detail === '' ? '' : `: ${detail}`}`,
     );
     this.shown = shown;
+    this.filtered = evidence.filtered ?? false;
+    this.searchedEmpty = evidence.searchedEmpty ?? null;
   }
 }
 
@@ -316,6 +337,11 @@ export async function selectFromListbox(
     const candidates = optionCandidates(part);
     // 3. Type-to-filter, the stable head first.
     const box = options.typeToFilter === false ? null : await searchBoxOf(container, list);
+    // What the miss below may say about the list: whether `state` is the
+    // whole list or a typed narrowing of it, and which head the list's own
+    // empty row answered. Read by the agent loop's enumerated-listbox judge.
+    let filtered = false;
+    let searchedEmpty: string | null = null;
     if (box !== null) {
       const heads = [candidates.find((c) => c.by === 'code')?.text ?? candidates[0]!.text];
       const label = candidates.find((c) => c.by === 'label')?.text;
@@ -330,7 +356,9 @@ export async function selectFromListbox(
           found = true;
           break;
         }
+        if (searchedEmpty === null && state.emptyRow !== null && EMPTY_ROW.test(state.emptyRow)) searchedEmpty = head;
       }
+      filtered = found;
       if (!found) {
         await box.fill('', { timeout }).catch(() => undefined);
         await page.waitForTimeout(settleMs);
@@ -353,7 +381,13 @@ export async function selectFromListbox(
     }
     if (hit === null) {
       await page.keyboard.press('Escape').catch(() => undefined);
-      throw new ListboxOptionMissingError(triggerName, part, state.options, state.emptyRow !== null && state.options.length === 0 ? `the list says ${JSON.stringify(state.emptyRow)}` : '');
+      throw new ListboxOptionMissingError(
+        triggerName,
+        part,
+        state.options,
+        state.emptyRow !== null && state.options.length === 0 ? `the list says ${JSON.stringify(state.emptyRow)}` : '',
+        { filtered, searchedEmpty },
+      );
     }
     if (hit.disabled) {
       await page.keyboard.press('Escape').catch(() => undefined);

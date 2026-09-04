@@ -22,7 +22,9 @@ import type { DbCheckRecord } from '../db/db-actions.js';
 import type { CoverageReport } from '../coverage/ax-coverage.js';
 import type { RunTrend } from '../history/run-history.js';
 import type { SnapshotResult } from '../visual/baseline.js';
-import type { VideoRecording } from './video.js';
+import { VIDEO_ACTION_LEAD_MS, leadOf, type ActionMoment, type VideoRecording } from './video.js';
+import { mapToCondensed } from './webm.js';
+import { STEP_ACTION_WIDTH, STEP_DURATION_WIDTH, STEP_INDEX_WIDTH } from '../log-format.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
@@ -229,6 +231,12 @@ export const DB_STEP_ACTIONS: ReadonlySet<string> = new Set([
  * API steps plus one `expectCalls` dispatched without a browser would have no
  * traffic to assert on) but whose subject is HTTP the page made.
  */
+/**
+ * Agent actions that put nothing on screen — a look, a note, or the loop's
+ * own verdict — and so mark no moment in the film (`videoMoments`).
+ */
+export const AGENT_LOOK_ACTIONS: ReadonlySet<string> = new Set(['wait', 'read', 'save', 'finish', 'fail']);
+
 export const BROWSER_FREE_ACTIONS: ReadonlySet<string> = new Set([
   ...API_STEP_ACTIONS,
   ...DB_STEP_ACTIONS,
@@ -373,6 +381,11 @@ export interface AgentAction {
   error?: string | undefined;
   durationMs: number;
   /**
+   * When the action landed, ISO — the moment the film keeps for it (since
+   * 2026-09-04). Absent on records written before the field existed.
+   */
+  finishedAt?: string | undefined;
+  /**
    * What a `read` (or a `save`) actually read off the page — the agent's
    * evidence, not its claim. 179 rows of the QA workbook ask for a value to
    * be RECORDED rather than asserted ("ยังไม่มีคำตอบ ให้บันทึกค่าที่ระบบแสดงจริง"),
@@ -511,6 +524,15 @@ export interface ProofStep {
   action: string;
   /** The author's plain-language description of this step, verbatim from `FlowStep.intent`. */
   intent?: string | undefined;
+  /**
+   * Who the step ran as — the persona label a `signIn` established on the
+   * session the step drove — and on which Chrome (its CDP endpoint), once a
+   * run spans more than one person (multi-browser personas). Stamped by the
+   * builder from `setActor`, so the report can say "manager, browser 9223"
+   * beside the step rather than leaving the reader to reconstruct it.
+   */
+  persona?: string | undefined;
+  browser?: string | undefined;
   /**
    * What a backend check would have proved about this step, when the run's
    * backend toggle was off and the claim deserved one.
@@ -1014,6 +1036,14 @@ export interface DeadEndRisk {
   outputTokens?: number | undefined;
 }
 
+/** A persona's own recording — see `ProofBundle.videos`. */
+export interface PersonaVideo {
+  persona: string;
+  /** The Chrome it was filmed on; null when unknown. */
+  browser: string | null;
+  video: VideoRecording;
+}
+
 export interface ProofBundle {
   /**
    * Marked known-flaky by `--quarantine-flaky`: the result is reported in full
@@ -1070,6 +1100,12 @@ export interface ProofBundle {
    * step addresses its own moment in it.
    */
   video?: VideoRecording | undefined;
+  /**
+   * The other people's films, when the run gave each persona its own Chrome:
+   * one recording per persona session opened by a `signIn`, beside the
+   * primary in `video`. Steps address theirs by `persona` + `videoOffsetMs`.
+   */
+  videos?: PersonaVideo[] | undefined;
   /** UI coverage measured against the AX tree at the end of the run. */
   coverage?: CoverageReport | undefined;
   /** How this run compares to previous runs of the same flow. */
@@ -1159,6 +1195,18 @@ export interface ProofBundleBuilderOptions {
 }
 
 /** Accumulates steps during a run and seals them into a `ProofBundle`. */
+/**
+ * The lead a step's moment is owed on the film: the fixed lead plus how long
+ * the step PERFORMED (`detail.performedMs`, written by a humanised action —
+ * `humanize.ts`), when it says. Bounded by `leadOf` at the window.
+ */
+function stepLeadMs(step: Pick<ProofStep, 'detail'>): number | undefined {
+  const performed = step.detail?.['performedMs'];
+  return typeof performed === 'number' && Number.isFinite(performed) && performed > 0
+    ? VIDEO_ACTION_LEAD_MS + performed
+    : undefined;
+}
+
 export class ProofBundleBuilder {
   readonly runId: string;
   readonly name: string;
@@ -1181,7 +1229,15 @@ export class ProofBundleBuilder {
   #notes: string[] = [];
   #errorIsTally = false;
   #video: VideoRecording | undefined;
-  #videoStartedMs: number | undefined;
+  #videos: PersonaVideo[] = [];
+  /**
+   * When each recording's first frame was, by persona label — `''` for the
+   * primary. A manager's step measured from the employee's first frame
+   * would seek into the wrong film.
+   */
+  readonly #videoStartedMs = new Map<string, number>();
+  /** Who steps are running as right now — see `setActor`. */
+  #actor: { persona: string | undefined; browser: string | undefined } = { persona: undefined, browser: undefined };
   #error: string | undefined;
   #sessionLost = false;
   #network = { calls: 0, failures: 0, dropped: 0 };
@@ -1210,6 +1266,10 @@ export class ProofBundleBuilder {
     const hint = backendHintOf(step.intent);
     const recorded: ProofStep = {
       index: this.#steps.length,
+      // Who and where, from the one place that knows: the runner tells the
+      // builder on every persona switch, so no call site has to.
+      ...(this.#actor.persona === undefined ? {} : { persona: this.#actor.persona }),
+      ...(this.#actor.browser === undefined ? {} : { browser: this.#actor.browser }),
       ...step,
       // Lifted from the intent at the one choke point every action passes
       // through: the alternative is eighteen call sites each remembering to
@@ -1218,7 +1278,15 @@ export class ProofBundleBuilder {
       // Stamped here rather than at each `addStep` call site: every action in
       // the runner already reports `startedAt`, and there are a dozen and a
       // half of them. One derivation cannot disagree with itself.
-      ...this.#videoOffsetFor(step),
+      // Measured on the film of the session the step ran on — the actor's,
+      // when the step did not name one itself. Fixed 2026-09-04: the offset
+      // was derived from the bare argument, which never carries the persona
+      // the builder stamps above, so every persona step was measured from
+      // the PRIMARY film's first frame and seeks on a persona film were off
+      // by however long after it that film began.
+      ...this.#videoOffsetFor(
+        step.persona === undefined && this.#actor.persona !== undefined ? { ...step, persona: this.#actor.persona } : step,
+      ),
     };
     if (recorded.status !== 'passed') {
       // Marked here, at the one choke point, rather than by any caller: a
@@ -1243,24 +1311,105 @@ export class ProofBundleBuilder {
    * steps a screenshot.
    */
   #videoOffsetFor(step: Omit<ProofStep, 'index'>): { videoOffsetMs?: number } {
-    if (this.#videoStartedMs === undefined) return {};
+    // The film of the session the step ran on: a persona's own when it has
+    // one, else the primary's (the first persona binds to the primary).
+    const startedMs =
+      (step.persona === undefined ? undefined : this.#videoStartedMs.get(step.persona)) ??
+      this.#videoStartedMs.get('');
+    if (startedMs === undefined) return {};
     if (BROWSER_FREE_ACTIONS.has(step.action)) return {};
     const began = Date.parse(step.startedAt);
     if (Number.isNaN(began)) return {};
-    return { videoOffsetMs: Math.max(0, began - this.#videoStartedMs) };
+    return { videoOffsetMs: Math.max(0, began - startedMs) };
   }
 
   /**
-   * Mark the moment the recording's first frame corresponds to, so steps can
-   * be addressed against it. Set once, when the recorded page is created.
+   * Mark the moment a recording's first frame corresponds to, so steps can
+   * be addressed against it. Once per recorded page: the primary's when it
+   * is created, and a persona's (by label) when `signIn` opens its Chrome.
    */
-  setVideoStart(startedMs: number): void {
-    this.#videoStartedMs = startedMs;
+  setVideoStart(startedMs: number, persona = ''): void {
+    this.#videoStartedMs.set(persona, startedMs);
+  }
+
+  /**
+   * Who the steps from here on run as. The runner calls it on every persona
+   * switch; `addStep` stamps the current actor onto each step.
+   */
+  setActor(actor: { persona: string | null; browser: string | null }): void {
+    this.#actor = { persona: actor.persona ?? undefined, browser: actor.browser ?? undefined };
+  }
+
+  /** The film a step was filmed on: its persona's own when it has one, else the primary's (`''`). */
+  #filmOf(step: ProofStep): string | undefined {
+    if (step.persona !== undefined && this.#videoStartedMs.has(step.persona)) return step.persona;
+    return this.#videoStartedMs.has('') ? '' : undefined;
+  }
+
+  /**
+   * The action moments on one film, in ms from its first frame: the instant
+   * each filmed step COMPLETED (acted or asserted — its start plus its
+   * duration, superseded attempts included, since they acted too), and the
+   * instant each action the workflow agent took inside a `workflow` step
+   * landed. What the agent only looked at (`wait`, `read`, `save`) and how
+   * it ended (`finish`, `fail`) are no moment: nothing happened on screen.
+   */
+  videoMoments(persona = ''): number[] {
+    return this.videoActionMoments(persona).map((m) => m.at);
+  }
+
+  /**
+   * The same moments with the lead each is owed: a humanised step performs
+   * for `detail.performedMs` (the pointer's approach, the typing — see
+   * `humanize.ts`), and an agent action that landed performed for its
+   * `durationMs`; the film keeps that performance ahead of the moment, on
+   * top of the fixed lead. A failed action gets the fixed lead only — its
+   * duration was the wait for something that was not there.
+   */
+  videoActionMoments(persona = ''): ActionMoment[] {
+    const startedMs = this.#videoStartedMs.get(persona);
+    if (startedMs === undefined) return [];
+    const moments: ActionMoment[] = [];
+    for (const step of this.#steps) {
+      if (this.#filmOf(step) !== persona || step.videoOffsetMs === undefined) continue;
+      moments.push({ at: step.videoOffsetMs + step.durationMs, leadMs: stepLeadMs(step) });
+      for (const action of step.agent?.actions ?? []) {
+        if (action.finishedAt === undefined || AGENT_LOOK_ACTIONS.has(action.action)) continue;
+        const at = Date.parse(action.finishedAt) - startedMs;
+        if (!Number.isFinite(at) || at < 0) continue;
+        moments.push({ at, leadMs: action.ok ? VIDEO_ACTION_LEAD_MS + action.durationMs : undefined });
+      }
+    }
+    return moments.sort((a, b) => a.at - b.at);
+  }
+
+  /**
+   * Put a film's steps on the film's clock. A condensed recording dropped
+   * the idle a step began in, so its offset moves to the start of its kept
+   * moment (`VIDEO_ACTION_LEAD_MS` before it completed) — the frame a "play
+   * from here" should land on.
+   */
+  #remapOffsets(persona: string, video: VideoRecording): void {
+    const condensed = video.condensed;
+    if (!condensed) return;
+    for (const step of this.#steps) {
+      if (this.#filmOf(step) !== persona || step.videoOffsetMs === undefined) continue;
+      const moment = step.videoOffsetMs + step.durationMs;
+      const lead = leadOf({ at: moment, leadMs: stepLeadMs(step) });
+      step.videoOffsetMs = mapToCondensed(condensed.segments, Math.max(0, moment - lead));
+    }
+  }
+
+  /** Attach a persona's own sealed recording — see `ProofBundle.videos`. */
+  addPersonaVideo(persona: string, browser: string | null, video: VideoRecording): void {
+    this.#remapOffsets(persona, video);
+    this.#videos.push({ persona, browser, video });
   }
 
   /** Attach the sealed recording. Called after the recording context closes. */
   setVideo(video: VideoRecording): void {
     this.#video = video;
+    this.#remapOffsets('', video);
     // The recording may end before the run did — it is deliberately cut at
     // the first failure — so any step whose offset lies at or past the end
     // loses it here. A "play from here" that seeks past the last frame is a
@@ -1799,6 +1948,7 @@ export class ProofBundleBuilder {
       steps: this.#steps,
       defects: this.#defects,
       video: this.#video,
+      ...(this.#videos.length > 0 ? { videos: [...this.#videos] } : {}),
       coverage: this.#coverage,
       trend: this.#trend,
       ...(this.#dbBaseline === undefined ? {} : { dbBaseline: this.#dbBaseline }),
@@ -1867,28 +2017,40 @@ export function formatStepLine(step: ProofStep): string {
   // reader can act on. `stepTarget` is the one reading every renderer shares.
   const target = stepTarget(step);
   const tag = step.resolution && step.resolution !== 'fast' ? `${step.resolution}, ` : '';
-  const kind = step.status === 'error' ? ' ERROR' : step.status === 'dead-end' ? ' DEAD END' : '';
-  const lines = [
-    `${mark} [${step.index}] ${step.action}${target ? ` ${target}` : ''}${kind} (${tag}${step.durationMs}ms)`,
-  ];
-  if (step.intent) lines.push(`      ${step.intent}`);
+  const kind = step.status === 'error' ? '  ERROR' : step.status === 'dead-end' ? '  DEAD END' : '';
+  // Columns: mark, index, action, duration, then the target — so a reader
+  // scanning fifty of these compares durations down one column and reads
+  // the selector after the fixed-width part. `joblog.mjs` and the panel's
+  // `STEP_LINE` read the mark and `[index]` from the front; the duration
+  // keeps its `(jit, 42ms)` form so the resolution source rides with it.
+  const head =
+    `${mark} ${`[${step.index}]`.padEnd(STEP_INDEX_WIDTH)} ${step.action.padEnd(STEP_ACTION_WIDTH)} ` +
+    `(${tag}${step.durationMs}ms)`.padStart(STEP_DURATION_WIDTH) +
+    (target ? `  ${target}` : '') +
+    kind;
+  const lines = [head.trimEnd()];
+  const pad = ' '.repeat(STEP_DETAIL_INDENT);
+  if (step.intent) lines.push(`${pad}${step.intent}`);
   const comparison = expectedActual(step);
-  if (comparison) lines.push(`      ${comparison}`);
+  if (comparison) lines.push(`${pad}${comparison}`);
   for (const fact of stepKindFacts(step)) {
-    lines.push(`      ${fact.label}: ${fact.value.split('\n').join('\n        ')}`);
+    lines.push(`${pad}${fact.label}: ${fact.value.split('\n').join(`\n${pad}  `)}`);
   }
   const described = describeTarget(step.target);
-  if (described !== null) lines.push(`      target: ${described}`);
+  if (described !== null) lines.push(`${pad}target: ${described}`);
   for (const seen of observedEvidence(step)) {
-    lines.push(`      observed ${seen.selector === null ? '' : seen.selector + ': '}${JSON.stringify(seen.text)}`);
+    lines.push(`${pad}observed ${seen.selector === null ? '' : seen.selector + ': '}${JSON.stringify(seen.text)}`);
   }
   const valueFrom = describeValueSource(step);
-  if (valueFrom !== null) lines.push(`      value ${valueFrom}`);
-  for (const change of describeDbChanges(step.dbChanges)) lines.push(`      ${change}`);
-  if (step.dbProbeError) lines.push(`      db baseline probe failed: ${step.dbProbeError}`);
-  if (step.status !== 'passed' && step.error) lines.push(`      ${step.error.split('\n')[0]}`);
+  if (valueFrom !== null) lines.push(`${pad}value ${valueFrom}`);
+  for (const change of describeDbChanges(step.dbChanges)) lines.push(`${pad}${change}`);
+  if (step.dbProbeError) lines.push(`${pad}db baseline probe failed: ${step.dbProbeError}`);
+  if (step.status !== 'passed' && step.error) lines.push(`${pad}${step.error.split('\n')[0]}`);
   return lines.join('\n');
 }
+
+/** Where a step's detail lines start: under the action column of the line above. */
+const STEP_DETAIL_INDENT = 2 + STEP_INDEX_WIDTH + 1;
 
 /**
  * The "expected X, actual Y" line, when the step recorded both. Assertions
@@ -1912,11 +2074,17 @@ export function formatAgentAction(action: AgentAction): string {
   // meaning the raw fields do not carry; `describeAgentAction` is the same
   // reading the report uses, so the terminal and the report agree.
   const { target, note } = describeAgentAction(action);
-  const lines = [
-    `  ${mark} agent: ${action.action}${target && target !== '—' ? ` ${target}` : ''} (${action.durationMs}ms)`,
-  ];
-  if (note) lines.push(`        ${note}`);
-  if (action.reasoning) lines.push(`        ${action.reasoning}`);
+  // Indented under the step it serves, with the same columns as a step line
+  // (`agent` standing where the index would): one turn per line, duration
+  // aligned, target last.
+  const head =
+    `  ${mark} agent ${action.action.padEnd(STEP_ACTION_WIDTH)} ` +
+    `(${action.durationMs}ms)`.padStart(STEP_DURATION_WIDTH) +
+    (target && target !== '—' ? `  ${target}` : '');
+  const lines = [head.trimEnd()];
+  const pad = ' '.repeat(STEP_DETAIL_INDENT + 2);
+  if (note) lines.push(`${pad}${note}`);
+  if (action.reasoning) lines.push(`${pad}${action.reasoning}`);
   return lines.join('\n');
 }
 

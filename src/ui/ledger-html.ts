@@ -477,11 +477,12 @@ function renameGroup(group) {
 /* Continue a catalog run from its ledger on disk. Same contract as wowUI's:
    a 409 that names the persona asks for the password once, in a password box,
    and the pair rides the job's env — never argv, never the ledger. */
-function resumeCatalog(ledgerPath, mode, caseId, caseIds, as) {
+function resumeCatalog(ledgerPath, mode, caseId, caseIds, as, personaPasswords) {
   var body = { ledgerPath: ledgerPath, mode: mode || 'continue' };
   if (caseId) body.caseId = caseId;
   if (caseIds && caseIds.length) body.caseIds = caseIds;
   if (as) body.as = as;
+  if (personaPasswords) body.personaPasswords = personaPasswords;
   api('/api/catalog-runs/resume', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body)
@@ -493,6 +494,33 @@ function resumeCatalog(ledgerPath, mode, caseId, caseIds, as) {
     })
     ['catch'](function (error) {
       var b = error.body || {};
+      /* Every OTHER account the run signs in as, asked for one box at a time in
+         this page's own dialog idiom. Sent by label; the server pairs each with
+         the email the ledger recorded, so nothing here can point the run at a
+         different account. Checked before the single-persona branch: that
+         answer carries the persona too, and this list is the specific one. */
+      if (b.needsCredentials && b.personas && b.personas.length && !personaPasswords) {
+        var got = {};
+        var chain = Promise.resolve(true);
+        b.personas.forEach(function (one) {
+          chain = chain.then(function (carryOn) {
+            if (!carryOn) return false;
+            return promptModal({
+              title: 'Password for ' + one.label, label: one.email, type: 'password', button: 'Use it',
+              text: 'This run also signs in as ' + one.label + ' (' + one.email + '). The password is carried to the job as an environment variable — not stored, asked once per panel session.',
+              validate: function (v) { return v === '' ? one.label + ' cannot sign in without it' : null; }
+            }).then(function (pw) {
+              if (pw === null) { toast('not resumed — ' + one.label + ' still needs its password'); return false; }
+              got[one.label] = pw;
+              return true;
+            });
+          });
+        });
+        chain.then(function (carryOn) {
+          if (carryOn) resumeCatalog(ledgerPath, mode, caseId, caseIds, as, got);
+        });
+        return;
+      }
       if (b.needsCredentials && !as) {
         promptModal({
           title: 'Sign-in password', label: b.persona, type: 'password', button: 'Resume with it',
@@ -500,7 +528,7 @@ function resumeCatalog(ledgerPath, mode, caseId, caseIds, as) {
           validate: function (v) { return v === '' ? 'the run cannot resume without it' : null; }
         }).then(function (pw) {
           if (pw === null) { toast('not resumed — the run needs its sign-in password'); return; }
-          resumeCatalog(ledgerPath, mode, caseId, caseIds, b.persona + ':' + pw);
+          resumeCatalog(ledgerPath, mode, caseId, caseIds, b.persona + ':' + pw, personaPasswords);
         });
         return;
       }
@@ -753,6 +781,7 @@ function resumableBanner(run) {
       el('b', { text: head }),
       run.runKey ? el('span', { class: 'fix mono', title: 'run key — the id a resume continues under', text: 'run key: ' + run.runKey }) : null,
       run.persona ? el('span', { class: 'fix mono', text: 'signs in as ' + run.persona + ' — a resume from a restarted panel asks for the password once' }) : null,
+      accountsLine(run),
       el('span', { class: 'fix mono', text: 'cause: ' + (cause || (run.resumable ? 'the run never recorded how it ended' : 'the run completed')) }),
       el('span', { class: 'fix', text: 'Every button continues this catalog run under the same key: cases already tested are pulled in as finished tests unless the button says otherwise, and the resumed cases join the original group.' }),
       el('div', { class: 'acts' }, acts)
@@ -1552,18 +1581,24 @@ function claimsGate(M) {
 
 /* Shown → meant. The chip shows the plain word; this list carries the exact
    term the proof file uses, because that term is what the CLI prints and
-   what grep finds. The data is never rewritten — only explained. */
+   what grep finds. The data is never rewritten — only explained. A status
+   word's meaning is STATUS_MEANING's (wow-ui-html.ts), the same sentence the
+   meaning line under a chip shows, so the glossary and the row cannot drift
+   apart; only the terms that are not statuses carry their own sentence. */
 var VOCAB = [
-  { term: 'passed', shown: 'proved', chip: 'verified', meaning: 'every step passed, first time' },
-  { term: 'pass**', alias: ['passed-with-issues'], shown: 'pass**', chip: 'doubt', meaning: 'proved, but only after the healer replaced a selector — check the heal' },
-  { term: 'proved-?', alias: ['needs-review'], shown: 'proved-? · confirm below', chip: 'blocked', meaning: 'a step could not be sure; confirm proved or failed in the run detail' },
-  { term: 'failed', shown: 'test failed', chip: 'escalated', family: 'test-failed', meaning: "a step's claim was false in the application — the subject missed the case's expectation" },
-  { term: 'dead-end', shown: 'test failed (dead-end)', chip: 'escalated', family: 'test-failed', meaning: 'a control or content the case needed never resolved — the page did not offer what the case expected' },
-  { term: 'error', alias: ['runtime error'], shown: 'system error', chip: 'feedback', family: 'system error', meaning: 'the harness, a model, a key or the environment broke — no verdict about the application was delivered' },
-  { term: 'blocked', shown: 'blocked', chip: 'blocked', meaning: 'needed something not configured (a database, a key) — not run, not failed' },
-  { term: 'quarantined', shown: 'quarantined', chip: 'plain', meaning: 'a known-flaky failure, recorded but not counted against the run' },
-  { term: 'needs a human', alias: ['failStreak ≥ 3'], shown: 'needs a human', chip: 'escalated', meaning: 'failed three or more runs in a row; a person should look' },
-  { term: 'spec?', alias: ['specQuestion'], shown: 'spec?', chip: 'doubt', meaning: 'a needs-review whose disputed expectations quote the sheet’s own wording while the page renders it differently — a triage marker for the BA, never a verdict' },
+  { term: 'passed', shown: 'proved', chip: 'verified', meaning: STATUS_MEANING['passed'] },
+  { term: 'pass**', alias: ['passed-with-issues'], shown: 'pass**', chip: 'doubt', meaning: STATUS_MEANING['passed-with-issues'] },
+  { term: 'proved-?', alias: ['needs-review'], shown: 'proved-? · confirm below', chip: 'blocked', meaning: STATUS_MEANING['needs-review'] },
+  { term: 'human-confirmed', alias: ['review'], shown: 'proved / failed (human-confirmed)', chip: 'verified', meaning: STATUS_MEANING['human-confirmed'] },
+  { term: 'failed', shown: 'test failed', chip: 'escalated', family: 'test-failed', meaning: STATUS_MEANING['failed'] },
+  { term: 'dead-end', shown: 'test failed (dead-end)', chip: 'escalated', family: 'test-failed', meaning: STATUS_MEANING['dead-end'] },
+  { term: 'error', alias: ['runtime error'], shown: 'system error', chip: 'feedback', family: 'system error', meaning: STATUS_MEANING['error'] },
+  { term: 'blocked', shown: 'blocked', chip: 'blocked', meaning: STATUS_MEANING['blocked'] },
+  { term: 'no verdict', alias: ['neverRan', 'harnessOnly'], shown: 'no verdict', chip: 'feedback', meaning: STATUS_MEANING['no verdict'] },
+  { term: 'quarantined', shown: 'quarantined', chip: 'plain', meaning: STATUS_MEANING['quarantined'] },
+  { term: 'needs a human', alias: ['failStreak ≥ 3'], shown: 'needs a human', chip: 'escalated', meaning: STATUS_MEANING['needs a human'] },
+  { term: 'recorded only', alias: ['recordOnly'], shown: 'recorded only', chip: 'record', meaning: STATUS_MEANING['recorded only'] },
+  { term: 'spec?', alias: ['specQuestion'], shown: 'spec?', chip: 'doubt', meaning: STATUS_MEANING['spec?'] },
   { term: 'cycle', shown: 'Run 1, 2, 3…', chip: 'plain', meaning: 'one execution of a flow; the rail shows the last three' },
   { term: 'run key', shown: 'run key', chip: 'plain', meaning: 'the id a paused catalog run resumes under (<catalog>@<stamp>); shown beside Continue' },
   { term: 'ledger', shown: 'progress file', chip: 'plain', meaning: '<claims>.progress.json — what Continue testing reads' },

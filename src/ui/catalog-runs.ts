@@ -122,3 +122,77 @@ export async function listCatalogRuns(reportDir: string): Promise<CatalogRunEntr
     .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))
     .slice(0, MAX_LISTED);
 }
+
+/** One account a resume still needs the password for. Label and email only. */
+export interface MissingPersona {
+  label: string;
+  email: string;
+}
+
+/**
+ * Which of a recorded run's accounts still have no password, and what the
+ * resume may therefore send the job.
+ *
+ * The gate this generalises used to read `launch.persona` alone — the single
+ * `--as` email. A catalog whose rows change hands names more than one account,
+ * `launch.personas` (label → email) has recorded them all along, and nothing
+ * read it: a resume after a panel restart started with the first account's
+ * password and none of the others, and every case needing the second person
+ * died at its `signIn` with `PersonaUnknownError`. Refusing with the list is
+ * the same choice the single-persona gate already made, applied to N.
+ *
+ * The caller supplies passwords BY LABEL and nothing else. Each is paired here
+ * with the email the LEDGER recorded, so a client can hand over the secret half
+ * and cannot redirect the run at a different account — the same "make the
+ * question not arise" shape as addressing a proof by runId.
+ *
+ * `env` is consulted because a machine whose own environment already carries
+ * `WOWLIDATOR_PERSONAS` needs no asking; `inherited` is the prior job's secret
+ * environment, which is why a resume in the SAME panel session never asks.
+ */
+export function missingPersonaPasswords(
+  launch: SuiteLedger['launch'] | null,
+  inherited: Record<string, string> | undefined,
+  env: NodeJS.ProcessEnv,
+  supplied: Readonly<Record<string, string>> = {},
+): { missing: MissingPersona[]; personas: Record<string, { email: string; password: string }> } {
+  const recorded = launch?.personas ?? {};
+  const labels = Object.keys(recorded);
+  if (labels.length === 0) return { missing: [], personas: {} };
+
+  // Whatever is already known, in the order a run would resolve it.
+  const known = new Map<string, { email: string; password: string }>();
+  for (const source of [env['WOWLIDATOR_PERSONAS'], inherited?.['WOWLIDATOR_PERSONAS']]) {
+    if (typeof source !== 'string' || source === '') continue;
+    try {
+      const parsed = JSON.parse(source) as Record<string, { email?: unknown; password?: unknown }>;
+      for (const [label, value] of Object.entries(parsed)) {
+        if (typeof value?.email === 'string' && typeof value.password === 'string') {
+          known.set(label, { email: value.email, password: value.password });
+        }
+      }
+    } catch {
+      // A malformed map is "nothing known", never a crash: the worst case is
+      // asking for a password the caller already had.
+    }
+  }
+
+  const personas: Record<string, { email: string; password: string }> = {};
+  const missing: MissingPersona[] = [];
+  for (const label of labels) {
+    const email = recorded[label] ?? '';
+    const password = supplied[label];
+    if (typeof password === 'string' && password !== '') {
+      // The email is the LEDGER's, never the caller's.
+      personas[label] = { email, password };
+      continue;
+    }
+    const already = known.get(label);
+    if (already !== undefined) {
+      personas[label] = already;
+      continue;
+    }
+    missing.push({ label, email });
+  }
+  return { missing, personas };
+}

@@ -14,3 +14,8 @@ healed-selectors.json
 incident.html
 incident.jsonl
 supervisor.hold
+
+# OS and tool scratch
+.DS_Store
+.lavish/
+scripts-scratch/

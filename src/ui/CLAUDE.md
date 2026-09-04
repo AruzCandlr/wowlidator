@@ -285,3 +285,308 @@ Deliberately absent: the old panel's flow editor (a textarea over
 `/api/file`). wowUI's rule stands — nobody picks or edits a flow file by hand;
 Run again, Repair and Re-author on the row are the actions. No endpoint was
 added or changed for any of this.
+
+## Asking for the accounts a catalog signs in as (2026-09-04)
+
+A catalog row that changes hands — the manager submits, the HRBP approves —
+needs two logins in one case. Everything below the panel could already do it
+(one Chrome per persona, `signIn` by label at $0, the actor on every proof
+step), and the panel could not **ask**: the launcher had one credentials box,
+`personas` was declared on `catalog-run` but excluded from Ledger's Commands
+tab, and nothing anywhere said how many accounts a document needed. The run
+learned it by refusing a row ten minutes in, with a browser already open.
+
+**The hand-off is the claims file, and the panel never re-derives it.**
+`ClaimsFile.personas` (`catalog/catalog.ts`) is `{ label, cases[] }[]`, written
+by the claims phase from `tablePersonas` — the same `personasOf` the authoring
+gate uses, which moved to `catalog/test-case-table.ts` for this and is
+re-exported from `cli/commands/authoring.ts` so no caller moved. It had to be
+written down because `claimTextOf` composes a claim from the title, the
+expectation and the note: the Steps column, where `Login ด้วย <MANAGER_ACCOUNT>`
+actually lives, is not in it. **Labels and case ids only** — the claims file is
+plain JSON a person opens and mails around. Absent (never `[]`) when no row
+names an account, so a surface can tell "nobody needed" from "nobody looked".
+
+**`personaBlock(M)` is in `WOW_SCRIPT` and called from `renderCatalogTab`**,
+which Ledger does not redeclare — one call site, both pages, pinned by a test
+that counts the declarations. One row per label: the label, `N case(s) sign in
+as this account`, an email box and a password box. Every handler calls
+`syncSubmit()`, never `renderLauncher()`. The values live in `M.personaCreds`
+while the launcher is open and are wiped by `closeLauncher`; **never
+`localStorage`** — the view-preference rule is for sorts and open panels, not
+for secrets. **Start is blocked** until every named account is answered, and
+the one-press path (`readClaims(true)`) is gated the same way: a run started
+without one of the accounts its own document names does not fail at the start,
+it authors, opens a browser and refuses rows minutes in.
+
+**The panel predicts no refusal.** Which account may fall back to the run's own
+`--as`, and which row is refused for want of one, is `resolveRowPersonas`'s
+rule in the CLI. Re-implementing it here is exactly the drift `commands.ts`
+exists to prevent — the gate promising two accounts while authoring refuses a
+third. The panel offers a box per label and states the case count; the refusal
+stays the CLI's, printed in the run output.
+
+**`personasValueToMap` takes a record as well as the typed lines**
+(`commands.ts`), evaluated *before* the string guard. Not a convenience: the
+text form splits on `/[\n;]+/` before the first `:`, so a password containing a
+semicolon breaks in one of two measured ways — `A=a@x.test:p;w` throws about a
+fragment (`got "w"`) matching nothing the person typed, and
+`A=a@x.test:p;B=b@x.test:q` **silently** gives A the password `p` and invents an
+account B. The second is the reason: a form collecting several accounts at once
+cannot offer a syntax whose failure mode is a plausible-looking wrong answer.
+An empty record is "not supplied", like an empty box.
+
+**The resume asks for every account, and pairs each with the ledger's email.**
+`missingPersonaPasswords(launch, inherited, env, supplied)` in `catalog-runs.ts`
+is the pure decision; `/api/catalog-runs/resume` answers 409
+`{ needsCredentials, persona?, personas: [{ label, email }] }` — the existing
+`persona` key stays, so an older client still gets the answer it understands.
+The client sends `personaPasswords: { LABEL: '…' }` and **the server pairs each
+password with the email the LEDGER recorded**: the secret half only, so a client
+cannot redirect the run at a different account (the same "make the question not
+arise" shape as addressing a proof by `runId`). Nothing is asked that the prior
+job's `secretEnv` or the machine's own `WOWLIDATOR_PERSONAS` already carries; a
+malformed map is "nothing known", never a crash. Both surfaces' `resumeCatalog`
+grew the sixth argument — wowUI loops its `window.prompt`, Ledger chains
+`promptModal` per label. `launch.personas` (label → email) had been on the wire
+at `/api/catalog-runs` since the ledger learned it, read by nothing; the
+resumable banner now shows it through the shared `accountsLine(run)`.
+
+**`GET /api/jobs/<id>` published `secretEnv`, and that is fixed first.**
+`summariseJob` strips it for the list and says credentials must never leave the
+process; the detail route answered with the raw `Job` and did not. `awaitJob`
+polls it every 700 ms while the launcher reads a catalog, so today's single
+`--as` password was already in the browser — and N passwords on the same overlay
+would have multiplied it. `detailJob(job)` beside `summariseJob` strips the
+secret and keeps `lines` and `cases`, which is what the detail route is for.
+Pinned in `tests/resume-credentials.test.ts` (start a job, assert the body
+carries neither the value nor the field name); verified red without the fix.
+
+**One backtick lesson, again.** `WOW_SCRIPT` is a `String.raw` template, so a
+backtick anywhere inside it — including in a comment — truncates the page and
+takes the launcher with it. The parse assertion in `wow-ui.test.ts` catches it;
+write `personas` in a comment there, never in backticks.
+
+## Stills default to `all` (2026-09-04)
+
+The `screenshots` field defaults to **`all`**, not `auto`, on every command that
+offers it (`go`, `run`, `generate`, `author`, `catalog-run`, `crawl`, `watch`)
+and in the launcher's own state. Under `auto` a filmed run keeps a still only
+where a step FAILED — correct for a machine, wrong for the surface a person
+reads a run on afterwards, where the evidence for a step that passed was a video
+frame they had to scrub to. The cost is report size: the same run captured
+twice, plus 50–150 ms per step.
+
+`auto` is still offered and still means what it says. It is expressed by sending
+**nothing** — `submitLauncher`'s guard is `M.screenshots !== 'auto'` — because
+the run's own fallback (`on-failure` while filming, `all` when not) IS the auto
+decision. That guard reads as "don't send auto" rather than "don't send the
+default", which is now the load-bearing distinction; there is a comment at the
+call site and a test on the pair.
+
+## Every status word says what it means, on the row (2026-09-04)
+
+A run (`c157cf92`) whose session was never established showed the word
+"blocked" on the catalog row and "test failed" on the run row, and the person
+had to ask what either meant. The meaning was on the page — in `familyChip`'s
+hover title and in Help's glossary — and nowhere a reader actually looks.
+
+**One map, `STATUS_MEANING` in `WOW_SCRIPT`** (`wow-ui-html.ts`, beside
+`verdictChip`): status word → one sentence. Keyed by the status the proof file
+or the job line carries (`passed`, `passed-with-issues`, `needs-review`,
+`failed`, `dead-end`, `error`, `blocked`, `quarantined`, `running`, `waiting`)
+plus the labels the page itself derives (`human-confirmed`, `needs a human`,
+`recorded only`, `no verdict`, `spec?`). Ledger's `VOCAB` keeps its shape and
+reads every status entry's `meaning` from the map (`meaning:
+STATUS_MEANING['error']`), so the glossary and the row can never say two
+different things; only the non-status terms (rung, ledger, bundle…) carry
+their own sentence. `meaningLine(key, detail)` builds the visible line —
+`div.meaning`, through `el()`, spanning the whole grid row (`grid-column: 1 /
+-1`, so no column widens; wraps; muted ink) — and returns nothing for
+`passed`, `running` and `waiting`, where the chip says it all. Three call
+sites, one function each, both pages: the run row (`taskRow`, taking the branch
+the chip took, so a three-run streak reads "needs a human"), the catalog case
+row (`caseRow`), and the history row (`appendHistoryRow`).
+
+**A run that delivered no verdict quotes the CLI's recorded reason.**
+`ProofCard.noVerdict` (`proofs.ts`) is `neverRan(bundle) ?? harnessOnly(bundle)`
+from `cli/exit.ts` — the suite loop's own rule that scores the case `blocked`
+on the ledger, imported, not re-derived. `runMeaningLine` uses it: the chip
+keeps the bundle's status (`failed`, with the machine word in its title) and
+the line under it says "nothing about the application was proved — … a catalog
+scores it blocked, not failed — recorded reason: the run is on the sign-in
+page (…) — the session is not established …". No wording is matched to find
+the session case: the reason IS the engine's message, first line only. On a
+live catalog job the same reason comes from the case's own output: `JobCase.
+reason` (`jobs.ts`, `caseReasonOf`) is parsed from the `BLOCKED <case> —
+<reason>` and `! no verdict: <reason>` lines, capped at 300 characters, and
+travels in `summariseCases`. The chip's `title` now carries `status: <word>`
+on the case row too — the line adds, never replaces.
+
+Pinned in `tests/wow-ui.test.ts` ("says in plain words, on the row…": the map,
+the four load-bearing sentences, the three call sites, the CSS, the page still
+parsing; "projects why a run delivered no verdict…": a contradicted claim gives
+null, a stranded session gives the guard's first line, an unattached browser
+gives the attach error; `caseReasonOf` on the two lines and nothing else) and
+`tests/ledger-ui.test.ts` ("explains every status word … from one map": every
+status entry of `VOCAB` reads `STATUS_MEANING[...]`, no status sentence written
+twice, the glossary still renders `v.meaning`).
+
+## The account is remembered; the password never is (2026-09-04)
+
+Asking for an account per persona label (above) closed a real gap and opened a
+smaller one: the addresses do not change between runs, so every launch began
+with the same three strings being retyped by the person who typed them
+yesterday. The choice made explicitly here was **the account only** — the
+password is asked for every run, and nothing that can sign in on its own
+reaches disk. A store holding both halves would be a credential in a file
+beside a server that binds to a port; an address alone opens nothing.
+
+**`ui/persona-accounts.ts` is the store**, `.wowlidator/persona-accounts.json`
+(gitignored already, with the rest of `.wowlidator/`):
+`{ version: 1, accounts: { LABEL: [{ email, lastUsedAt }] } }`, newest first,
+capped at `MAX_ACCOUNTS_PER_LABEL` (8), written temp-file-then-rename like the
+ledger, and a corrupt or foreign-version file read as "nothing remembered" with
+one line to stderr — the cache's rule. Labels are keyed through the CLI's own
+`personaLabelOf`, so a memory filed under `MANAGER_ACCOUNT` is found by a claims
+file that spells it `<manager account>`. **The API boundary is
+`remember({ label, email }[])`**, never a persona map: the shape that cannot
+carry a password is the one that cannot leak one by accident, and every record
+written is rebuilt from those two fields, so a hand-edited `password` key does
+not survive a read either.
+
+**Written by the route, on the 201 path only.** `POST /api/jobs` and
+`/api/catalog-runs/resume` call `ctx.personaAccounts.remember(...)` after
+`jobs.start` succeeds; `personaAccountsOf(spec, values)` in `server.ts` is where
+the password is dropped, re-using `personasValueToMap` — the same parse the env
+overlay just did — and taking only each entry's `email`. In the route rather
+than in the claims phase because it then covers **every** command that declares
+`personas` (`go`, `run`, `generate`, `author`, `catalog-run`, `watch`), and does
+not wait for a run to get far enough to write a ledger. A submission refused
+with 400 or 409 started nothing and teaches the store nothing. Never fatal: a
+store that cannot be written is a stderr line, not a failed launch.
+
+Not to be confused with `SuiteLedger.launch.personas`, which records label →
+email for **one** run and is what the resumable banner and the resume gate read.
+That is a record of a run; this is the panel's memory across runs. Both stay.
+
+**`GET /api/persona-accounts`** answers `{ accounts }` and nothing else — a
+separate route rather than a fold into `/api/documents`, because a documents
+list answering about accounts is two subjects on one wire, and this one takes no
+parameter at all, so there is no client string anywhere near a path. The page
+loads it in `openLauncher` beside `loadDocuments` (`loadPersonaAccounts`), never
+on a poll: it changes only when a run starts.
+
+**The control is `accountPicker(need, got)` in `WOW_SCRIPT`**, called from
+`personaBlock`, so one call site serves `/` and `/wow`. No memory for a label is
+the plain text box, unchanged. With memory it is a `<select>` of the addresses,
+**most recent preselected** (only while the row is untouched, so late-arriving
+data cannot overwrite a choice), plus `Another account…`, which reveals a text
+box **in place** — `typed.style.display`, not `renderLauncher()`, because
+re-rendering the form to show a field rebuilds the control being used and takes
+the caret with it. The sentinel option's value contains a space, which a stored
+address never can, so it cannot collide with a real one. The password box is
+untouched: never remembered, never offered, always typed, and Start stays
+blocked until every account has both halves. The block's copy changed to say so,
+since something is now written to disk.
+
+Tests: `tests/persona-accounts.test.ts` (round-trip, newest-first, re-use moves
+to the front, the cap, label keying agreeing with `personasValueToMap`, a
+corrupt file as empty, an unwritable store that does not throw, and that no
+password-shaped property can be written or read back);
+`tests/resume-credentials.test.ts` grew a real-server block (the address is
+recorded on 201, the answer and the file carry neither the value nor the word
+`password`, a 400 teaches nothing); `tests/wow-ui.test.ts` pins the picker, the
+in-place reveal, the untouched password half — and that **no `_ACCOUNT` literal
+survives comment-stripping of the page**, since `wow-ui-html.ts` is exempt from
+the global `no-hardcode` scan; `tests/ledger-ui.test.ts` adds `accountPicker`,
+`rememberedAccounts`, `personaLabelKey` and `loadPersonaAccounts` to the
+ships-unchanged composition list.
+
+## The console reads the output; it does not rewrite it (2026-09-04)
+
+**Surface:** both pages — the command-output section under a live job row and
+under a finished run's report card, and each case's own pane in a suite. One
+view, `consoleView(lines)` in `WOW_SCRIPT`, so `/` and `/wow` read a job the
+same way; Ledger redeclares nothing here.
+
+**What changed.** A job's output used to be one `div` per line, stderr in red.
+It is now *read* before it is drawn, by `classifyLine()` in
+`src/ui/console-lines.ts` — plain script shipped verbatim ahead of
+`WOW_SCRIPT` and evaluated as-is by `tests/console-lines.test.ts`, so what a
+row looks like is decided by a function the tests can call. The rules, all
+structural (a channel tag, an arrow, a glyph, `refused:`, a leading bullet),
+never a case's wording:
+
+- `[llm HH:MM:SS] → | ← | ✗ …` is a one-line model-call summary with the stamp
+  set aside; the `ask:`/`response:` continuation lines fold under it behind a
+  `▸ ask · response` toggle (`conFold`). ASCII arrows and a stampless tag read
+  the same, because the prefix will move.
+- `✓`/`✗` opens a step row: glyph in `--ok`/`--bad`, then `[index]`, the action
+  in bold, the `(fast, 812ms)` duration muted, then the target — the column
+  order `formatStepLine` writes since 2026-09-04; the older target-then-
+  duration order still parses, since a log on disk is read by the same page.
+  `agent click` stands where the index would (`formatAgentAction`). The
+  detail lines under either (eight or ten spaces: intent, expected/actual,
+  observed, the error's first line) ride with the step through every filter
+  (`conDetail`, on the classifier's `hang` flag).
+- `refused: …` is a refusal row; `  flow: "…"`, the `  (n) …` numbered
+  problems and their six-space continuations become its list (`conBullet`,
+  `conDetail`), and all of it filters with the headline. The older `  · …`
+  bullets read the same.
+- The two-column summary (`  authored   57 step(s) on attempt 2/3 in 4m31s`,
+  `  elapsed    41.2s …`, `  plan       57 step(s)`, `  report     /path`) is a
+  `summary` row with the key in a fixed column — read by shape (a word, two
+  spaces, a value), never by which keys exist.
+- `case "…" started|passed|…`, `— authoring attempt n/m —` and a phase header
+  (`── authoring ID ────…` from `phaseHeader()`, or `## x`, `phase …`, `▶ x`)
+  are markers with a dashed rule; the header's own rule of dashes is dropped
+  on the page, where the row's border is the cue. The attempt pattern is
+  anchored, so a summary that says "on attempt 2/3" is not a marker.
+- **The tag comes first on every line of a row or case** — `[ACME-042] [llm
+  06:41:47] → …` on stderr too (`withLogTag` in `src/log-format.ts`) — so the
+  case tag and the row tag are peeled before the llm channel tag, and a bare
+  `[llm]` is never mistaken for a row.
+- Everything else is plain, **untouched** — a new CLI line shape degrades to
+  text, never to a dropped line. `<script>` in a line is text; the whole view
+  is `el()` and `textContent`, and both page tests still assert no
+  `innerHTML` exists.
+- The `[cN]` tag and a bracketed case id are peeled and become a **sticky
+  label over the run of lines they share** (`.con-case`), so the prefix is
+  not repeated per line; an id doubled as `ID: …` on the message is folded
+  once, by token identity, not by any known id.
+
+**Stderr is a muted `E` in the gutter** (`printed on stderr` on hover), never
+colour alone — colour is reserved for what the line *means*. The class is
+`from-err`, because wowUI already has an `.err` rule that paints red.
+
+**The filter row** — All / Steps / Model calls / Problems, plus find-in-output
+— hides rows in place (`row.hidden`; note the explicit
+`.con-row[hidden] { display: none }`, since the row's own `display: flex`
+would otherwise beat the UA's `[hidden]`). It never re-renders, so the search
+box keeps its focus and the pane its scroll. The mode is a **view preference**
+in `localStorage` (`wow-console-filter`, read and written inside `try`); the
+query is page memory. **Copy raw** copies every line exactly as printed —
+`conRawText` — filters do not apply, because a pasted log must be the log.
+
+**Live output still lands in place, never through `render()`.** `streamJob`
+calls `out.view.append(line)` per SSE line and `out.view.reset(lines)` on a
+`replay`; `append` never re-pushes a line the caller's array already holds
+(the view is built on `S.jobLines[jobId]` itself), which is what a first
+version got wrong and doubled the raw copy. Auto-scroll follows the tail
+while the reader is at it and stops when they scroll up to read something
+(`view.stick`, 24px of slack), resuming when they return to the bottom.
+
+**What this must never become.** The classifier reads text the CLI printed;
+it does not compute a verdict, a duration or a count the CLI did not print
+(rule 1 above, and `verdictFamily` owns verdicts). If a filter needs a fact the
+output does not carry, the fix is a line in the CLI, not a lookup here.
+
+Tests: `tests/console-lines.test.ts` (every kind above, tolerance to the
+prefix moving, plain-and-untouched for anything else, the four filters, raw
+copy verbatim, no `${` in the shipped string); `tests/wow-ui.test.ts` pins the
+one `consoleView`, `outLine` gone, the live path through `append`/`reset`, the
+stderr marker, the glyph colours, the sticky label, the fold and the list, the
+guarded `localStorage` reads and writes, Copy raw, the `[hidden]` rule and
+`conApplyAll` re-reading views in place; `tests/ledger-ui.test.ts` pins the
+same composition on `/` so the guarantee does not leave with `/wow`.

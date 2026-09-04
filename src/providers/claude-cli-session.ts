@@ -36,6 +36,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
+import { answerErrorOf, usageOf, type ClaudeResultEvent } from './claude-envelope.js';
+
 /**
  * How many questions one process answers before it is retired.
  *
@@ -99,11 +101,39 @@ export function sessionTurnBudget(
 }
 /** A session with nothing to do is closed rather than left holding a process. */
 export const SESSION_IDLE_MS = 90_000;
-/** No single answer may hang the run. */
-export const SESSION_ANSWER_TIMEOUT_MS = 5 * 60_000;
+
+function envMs(raw: string | undefined): number | null {
+  const value = Number((raw ?? '').trim());
+  return Number.isFinite(value) && value >= 60_000 ? Math.floor(value) : null;
+}
+
+/**
+ * How long ONE answer may take, on either claude-cli vector.
+ *
+ * One constant for both, because the two used to differ and the difference
+ * was paid for in full (multirole run, 2026-09-04, pid 34607): the warm
+ * session gave up at 5 min on an authoring answer that was still arriving
+ * (that run's answers were 17k–24.5k output tokens at 200–265 s), the
+ * fallback re-sent the whole prompt as a cold one-shot with its own 10 min
+ * budget, and that copy finished in 595.8 s — 24,487 tokens, one ledger row,
+ * ~15 min and two payments for one answer. A timeout never fires on an
+ * answer that arrives, so a longer one cannot slow a good call; a shorter
+ * one than the answer needs is the most expensive outcome there is.
+ * `WOWLIDATOR_CLAUDE_CLI_TIMEOUT_MS` overrides (minimum 60 s).
+ */
+export const CLAUDE_CLI_ANSWER_TIMEOUT_MS =
+  envMs(process.env['WOWLIDATOR_CLAUDE_CLI_TIMEOUT_MS']) ?? 15 * 60_000;
+/** No single answer may hang the run — the shared budget above. */
+export const SESSION_ANSWER_TIMEOUT_MS = CLAUDE_CLI_ANSWER_TIMEOUT_MS;
 
 export interface SessionAnswer {
   text: string;
+  /**
+   * The object the CLI validated against `--json-schema`, when the call had
+   * one — the answer itself; `text` is its rendering. Undefined for a call
+   * without a schema or an answer the model gave as plain text.
+   */
+  structuredOutput: unknown;
   /**
    * This call's OWN cost. The stream-json `result` event reports
    * `total_cost_usd` CUMULATIVELY for the session (measured 2026-08-27:
@@ -120,8 +150,11 @@ export interface SessionAnswer {
   outputTokens: number;
   /**
    * Model turns this answer took (delta of the event's cumulative
-   * `num_turns`). More than 1 means tool use happened — the only signal
-   * that the BM25 `search_context` tool was actually consulted.
+   * `num_turns`). A `--json-schema` answer is a tool call and so takes TWO
+   * turns by itself (measured on CLI 2.1.260, 2026-09-04 — `stop_reason:
+   * "tool_use"`, `num_turns: 2` for a three-item answer with no tools); a
+   * plain-text answer takes one. Anything above that is real tool use — the
+   * only signal that the BM25 `search_context` tool was actually consulted.
    */
   turns: number;
 }
@@ -140,6 +173,14 @@ export interface SessionKey {
   disallowedTools?: string | null;
   /** Inline `--mcp-config` JSON (the BM25 retrieval server), or null for none. */
   mcpConfig?: string | null;
+  /**
+   * The CLI's output cap for this process (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`),
+   * or null to leave the operator's environment alone. An environment
+   * variable is a launch property, so it is part of the identity: a re-ask
+   * at a raised cap must never land on a pooled process still holding the
+   * old one.
+   */
+  maxOutputTokens?: number | null;
 }
 
 /** Stable identity for a session's launch flags — the same flags reuse a process. */
@@ -157,6 +198,7 @@ export function sessionKeyOf(key: SessionKey): string {
         key.allowedTools ?? '',
         key.disallowedTools ?? '',
         key.mcpConfig ?? '',
+        key.maxOutputTokens === undefined || key.maxOutputTokens === null ? '' : String(key.maxOutputTokens),
       ].join(' '),
     )
     .digest('hex');
@@ -216,7 +258,13 @@ class ClaudeSession {
       cwd: key.cwd,
       // Startup network (version check, telemetry) is the enemy this warm
       // process exists to amortise — turn it off outright.
-      env: { ...process.env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+      env: {
+        ...process.env,
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        ...(key.maxOutputTokens === undefined || key.maxOutputTokens === null
+          ? {}
+          : { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(key.maxOutputTokens) }),
+      },
     });
     this.#child.stdout?.on('data', (chunk: Buffer) => this.#onData(chunk.toString()));
     // A dead process must fail the question it was holding, not hang it.
@@ -299,26 +347,34 @@ class ClaudeSession {
       this.#pending = null;
       clearTimeout(held.timer);
       this.#startIdle();
-      if (event['is_error'] === true) {
-        held.reject(new Error(String(event['result'] ?? 'the claude session reported an error')));
-        continue;
-      }
-      const usage = (event['usage'] ?? {}) as Record<string, number>;
       // Cumulative-to-delta for the session-scoped counters; usage is
-      // already per-call. See `SessionAnswer.costUsd`.
+      // already per-call. See `SessionAnswer.costUsd`. Computed BEFORE the
+      // error branch: a failed answer spent real tokens (its thinking is
+      // billed), and that spend belongs in the ledger either way.
       const totalCost = Number(event['total_cost_usd'] ?? 0);
       const costUsd = Math.max(0, totalCost - this.#lastCostUsd);
       this.#lastCostUsd = totalCost;
       const totalTurns = Number(event['num_turns'] ?? 0);
       const turns = Math.max(0, totalTurns - this.#lastNumTurns);
       this.#lastNumTurns = totalTurns;
+      const spent = usageOf(event as ClaudeResultEvent, costUsd, turns);
+      if (event['is_error'] === true) {
+        // The CLI ANSWERED, and the answer is a failure — a cut at its output
+        // cap, an API error it already retried. That is not a dead pipe:
+        // the typed error tells the caller not to re-send the identical
+        // request cold (measured 2026-09-04: the cold copy hits the same cap
+        // and pays the whole prompt again). See `claude-envelope.ts`.
+        held.reject(answerErrorOf(event as ClaudeResultEvent, spent));
+        continue;
+      }
       held.resolve({
         text: String(event['result'] ?? ''),
+        structuredOutput: event['structured_output'],
         costUsd,
-        inputTokens: Number(usage['input_tokens'] ?? 0),
-        cachedInputTokens: Number(usage['cache_read_input_tokens'] ?? 0),
-        cacheWriteTokens: Number(usage['cache_creation_input_tokens'] ?? 0),
-        outputTokens: Number(usage['output_tokens'] ?? 0),
+        inputTokens: spent.inputTokens,
+        cachedInputTokens: spent.cachedInputTokens,
+        cacheWriteTokens: spent.cacheWriteTokens,
+        outputTokens: spent.outputTokens,
         turns,
       });
     }

@@ -22,7 +22,9 @@ import { riskSignals, type RiskRequest } from '../src/generator/dead-end-risk.js
 import { diagnosisSignals } from '../src/generator/error-diagnosis.js';
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 import {
+  AUTHOR_ACTIONS,
   AuthoringError,
+  buildSystemPrompt,
   FlowAuthor,
   LlmFlowAuthorModel,
   MAX_STEP_TIMEOUT_MS,
@@ -30,11 +32,14 @@ import {
   buildUserPrompt,
   countPinnedName,
   dropReasonFor,
+  EMPTY_VALUE_ON_BUTTON_REASON,
   expectedItemsIn,
   fieldErrorAssertedPageWide,
   groundPersonaSignIns,
   handTypedPersonaSignIn,
   hedgedAlternatives,
+  GENERATED_STEP_MARKER,
+  repairAuthoredStep,
   ignoresMenuPath,
   inventedControlInternals,
   multiPersonaWorkflow,
@@ -91,9 +96,9 @@ function wire(step: Partial<Record<'action' | 'selector' | 'value' | 'url' | 'ke
 }
 
 /** Author one raw body through the real narrowing (`LlmFlowAuthorModel` over a JSON mock). */
-async function narrow(steps: ReturnType<typeof wire>[]): Promise<AuthorResult> {
+async function narrow(steps: ReturnType<typeof wire>[], extra: Partial<AuthorRequest> = {}): Promise<AuthorResult> {
   const mock = jsonModel('mock-author', { name: 'x', rationale: '', setup: [], steps, teardown: [], notes: '' }, { inputTokens: 0, outputTokens: 0 });
-  return new LlmFlowAuthorModel({ model: mock, id: 'mock:author' }).author({ prompt: 'p', policy: 'mutations' });
+  return new LlmFlowAuthorModel({ model: mock, id: 'mock:author' }).author({ prompt: 'p', policy: 'mutations', ...extra });
 }
 
 const PERSONAS = {
@@ -172,6 +177,29 @@ describe('CG-05 — personas reach the model by label and email, never by passwo
     assert.match(text, /MANAGER_ACCOUNT: manager@cnext\.test/);
     assert.doesNotMatch(text, /manager2026|admin2026|hrbp2026/);
     assert.doesNotMatch(buildUserPrompt({ prompt: 'PRB-EC-001' }), /PERSONAS/);
+  });
+
+  it('narrows an empty expectValue as the cleared-field claim, except on a button (HIR-EC-001, 2026-09-04)', async () => {
+    // multirole.csv HIR-EC-001, Expected output: "เมื่อเปลี่ยน Province ระบบ
+    // เคลียร์ District / Sub-District / Postal Code เดิม". The Postal Code is a
+    // textbox and "" is what a cleared one holds; District is a dropdown the
+    // tree lists as a button, whose trigger shows its placeholder instead.
+    const result = await narrow([
+      wire({ action: 'expectValue', selector: 'role=textbox[name="Postal Code" i]', value: '', intent: 'Expected: เมื่อเปลี่ยน Province ระบบเคลียร์ Postal Code เดิม' }),
+      wire({ action: 'expectValue', selector: 'role=button[name="District" i]', value: '', intent: 'Expected: เมื่อเปลี่ยน Province ระบบเคลียร์ District เดิม' }),
+      wire({ action: 'expectValue', selector: 'role=textbox[name="Postal Code" i]', value: '10110' }),
+    ]);
+    assert.deepEqual(
+      result.steps.map((s) => [s.action, (s as { value?: string }).value]),
+      [
+        ['expectValue', ''],
+        ['expectValue', '10110'],
+      ],
+    );
+    assert.equal(result.droppedSteps, 1);
+    assert.equal(result.dropped?.[0]?.reason, EMPTY_VALUE_ON_BUTTON_REASON);
+    assert.match(EMPTY_VALUE_ON_BUTTON_REASON, /a button holds no value/);
+    assert.equal(dropReasonFor(wire({ action: 'expectValue', selector: 'role=button[name="District" i]' }) as never, false), EMPTY_VALUE_ON_BUTTON_REASON);
   });
 
   it('narrows signIn by label from "name", strips the sheet\'s <TOKEN> form, and drops a label-less one', async () => {
@@ -254,16 +282,16 @@ describe('CG-05 — personas reach the model by label and email, never by passwo
       model: stubModel({ steps: [{ action: 'workflow', goal }, { action: 'expectVisible', selector: 'text="Approved"', intent: '4.1' }] }),
       attempts: 1,
     });
-    await assert.rejects(author.author('PRB-EC-001'), /one session cannot be both people/);
+    await assert.rejects(author.author('PRB-EC-001'), /the agent drives one person's browser at a time/);
   });
 
   it('the system prompt carries the persona rules', async () => {
     const mock = jsonModel('mock-author', { name: 'x', rationale: '', setup: [], steps: [], teardown: [], notes: '' }, { inputTokens: 0, outputTokens: 0 });
     await new LlmFlowAuthorModel({ model: mock, id: 'mock:author' }).author({ prompt: 'p', policy: 'forms', personas: PERSONAS });
     const sent = JSON.stringify((mock as unknown as { doGenerateCalls: unknown[] }).doGenerateCalls[0]).replace(/\\n/g, ' ').replace(/\s+/g, ' ');
-    assert.match(sent, /A PERSONA IS SIGNED IN BY ITS LABEL, NEVER BY TYPING ITS PASSWORD/);
+    assert.match(sent, /every sign-in is a signIn by label and no step fills an email or password/);
     assert.match(sent, /Login ด้วย <HR_ADMIN_ACCOUNT>/);
-    assert.match(sent, /never one workflow goal that names two people/);
+    assert.match(sent, /never one workflow goal naming two people/);
     assert.match(sent, /HR_ADMIN_ACCOUNT: admin@cnext\.test/);
     assert.doesNotMatch(sent, /admin2026/);
   });
@@ -328,7 +356,13 @@ describe('CG-08 — either/or is one expectAnyVisible', () => {
     const step = result.steps[0] as FlowStep & { selectors: string[]; timeoutMs?: number };
     assert.deepEqual(step.selectors, ['text="Completed"', 'text="Error"']);
     assert.equal(step.timeoutMs, 120000);
-    assert.equal(result.droppedSteps, 1);
+    // One alternative is not dropped any more (2026-09-04): it is the
+    // expectVisible it always meant, marked [generated: …] in its intent.
+    assert.equal(result.droppedSteps, 0);
+    const one = result.steps[1] as FlowStep & { selector: string; intent: string };
+    assert.equal(one.action, 'expectVisible');
+    assert.equal(one.selector, 'text="Completed"');
+    assert.match(one.intent, /\[generated: one alternative is an expectVisible/);
     assert.match(dropReasonFor(wire({ action: 'expectAnyVisible', value: 'text="x"' }) as never, false), /two or more selectors/);
   });
 
@@ -412,6 +446,16 @@ describe('CG-09 — a [RECORD ONLY] line is observed, never asserted', () => {
     const strict = new FlowAuthor({ model: stubModel({ steps: [{ action: 'saveText', selector: 'role=status', as: 'r' }] }), attempts: 1 });
     await assert.rejects(strict.author('HIR-EC-009', undefined, { caseText: mixed }), /contains no assertion/);
   });
+
+  it('a visual snapshot is not authorable: not in the vocabulary, and a record-only state is saveText of the region', () => {
+    // ec09 HIR-EC-009 step 58: `snapshot record_oq_hir_78` wrote a baseline on
+    // the first run and failed "changed" on the second — a record-only
+    // observation turned into a red step by the data the run itself typed.
+    assert.ok(!(AUTHOR_ACTIONS as readonly string[]).includes('snapshot'));
+    const prompt = buildSystemPrompt('mutations', true, undefined);
+    assert.doesNotMatch(prompt, /^- snapshot\s{2,}visual baseline/m);
+    assert.match(prompt, /saveText the region that shows it — never a visual\s+snapshot/);
+  });
 });
 
 // ---------------------------------------------------------------- CG-10 / CG-11
@@ -448,14 +492,14 @@ describe('CG-10 / CG-11 — rounds become labelled cases; the route is the first
     const mock = jsonModel('mock-author', { name: 'x', rationale: '', setup: [], steps: [], teardown: [], notes: '' }, { inputTokens: 0, outputTokens: 0 });
     await new LlmFlowAuthorModel({ model: mock, id: 'mock:author' }).author({ prompt: 'p', policy: 'forms' });
     const sent = JSON.stringify((mock as unknown as { doGenerateCalls: unknown[] }).doGenerateCalls[0]).replace(/\\n/g, ' ').replace(/\s+/g, ' ');
-    assert.match(sent, /THE FIRST LEG IS THE MENU PATH/);
-    assert.match(sent, /TEST DATA ARRIVES ONE PAIR PER LINE/);
-    assert.match(sent, /A DATE PHRASE IS LEFT AS WRITTEN/);
-    assert.match(sent, /AN EXPECTED LINE MARKED \[RECORD ONLY\] IS OBSERVED, NEVER ASSERTED/);
-    assert.match(sent, /AN OPTION SET IS CHECKED WITH THE LIST OPEN ONCE/);
-    assert.match(sent, /A WAIT-UNTIL CLAIM DECLARES ITS WAIT/);
-    assert.match(sent, /AN ERROR UNDER A FIELD IS expectFieldError ON THAT FIELD/);
-    assert.match(sent, /EITHER\/OR IS ONE expectAnyVisible/);
+    assert.match(sent, /Reach the page the way the sheet says\. .{0,3}Menu path:/);
+    assert.match(sent, /Test data arrives one pair per line/);
+    assert.match(sent, /a date phrase \(.*?\) stays as the phrase/);
+    assert.match(sent, /\[RECORD ONLY\] line \(.*?\): saveText/);
+    assert.match(sent, /Open the control once, expectCount on the item role/);
+    assert.match(sent, /Wait-until \(/);
+    assert.match(sent, /expectFieldError with the field's control as selector/);
+    assert.match(sent, /one expectAnyVisible with one selector per named outcome/);
   });
 });
 
@@ -588,5 +632,107 @@ describe('the risk judge and the diagnosis read the new shapes', () => {
     } as unknown as ProofBundle;
     const signals = diagnosisSignals({ caseName: 'PRB-EC-001', caseText: 'x', bundle, declaredRoutes: [] });
     assert.ok(signals.some((s) => /points at environment/.test(s) && /persona/.test(s)));
+  });
+});
+
+// ---------------------------------------------------------------- HIR-EC-001 (multirole, 2026-09-04)
+
+describe('a step the harness cannot run as written is rewritten and marked, never dropped (multirole HIR-EC-001, 2026-09-04)', () => {
+  // multirole.csv HIR-EC-001, Expected output: "เมื่อเปลี่ยน Province ระบบ
+  // เคลียร์ District / Sub-District / Postal Code เดิม". The 07:10 run wrote
+  // two `expectValue ""` on dropdown buttons, both were dropped, the drop was
+  // refused, and the row never ran.
+  const tree = 'main\n  button "Province"\n  button "District"\n  textbox "Postal Code"\n  button "Submit"';
+  const hireRow = row({
+    caseId: 'HIR-EC-001',
+    testData: 'Province = กรุงเทพมหานคร\nHire Date = 01 Sep 2027\nEmployee Sub Group = 10',
+    steps: '1. กรอกข้อมูล\n2. กด Submit',
+    expected: '- Employee Status = Active',
+  });
+
+  it('expectValue "" on a dropdown button becomes expectText of the trigger\'s own tree wording, marked [generated: …] after the intent head', async () => {
+    const result = await narrow(
+      [wire({ action: 'expectValue', selector: 'role=button[name="District" i]', value: '', intent: 'Expected: เมื่อเปลี่ยน Province ระบบเคลียร์ District เดิม' })],
+      { axTree: tree },
+    );
+    assert.equal(result.droppedSteps, 0);
+    const step = result.steps[0] as FlowStep & { value: string; intent: string };
+    assert.equal(step.action, 'expectText');
+    assert.equal(step.value, 'District');
+    assert.match(step.intent, /^Expected: เมื่อเปลี่ยน Province ระบบเคลียร์ District เดิม \[generated: /, 'the head of the intent is untouched');
+    assert.ok(step.intent.includes(GENERATED_STEP_MARKER));
+    assert.equal(result.substituted?.length, 1);
+    assert.equal(result.substituted?.[0]?.action, 'expectValue');
+    assert.match(result.substituted?.[0]?.how ?? '', /a button holds no value/);
+  });
+
+  it('without a tree line for the button there is nothing to rewrite from: dropped, as before', async () => {
+    const result = await narrow([wire({ action: 'expectValue', selector: 'role=button[name="District" i]', value: '' })]);
+    assert.equal(result.droppedSteps, 1);
+    assert.equal(result.dropped?.[0]?.reason, EMPTY_VALUE_ON_BUTTON_REASON);
+    assert.equal(result.substituted, undefined);
+  });
+
+  it('an expect with no value takes the intent\'s own "= value" pair, or narrows to presence and says so', async () => {
+    const result = await narrow([
+      wire({ action: 'expectText', selector: 'role=textbox[name="Employee Status" i]', value: '', intent: 'Expected: Employee Status = Active' }),
+      wire({ action: 'expectCount', selector: 'role=row', value: '', intent: 'rows shown' }),
+      wire({ action: 'expectCount', selector: 'role=row', value: '', intent: 'Expected: rows = 3' }),
+    ]);
+    assert.deepEqual(
+      result.steps.map((s) => [s.action, (s as { value?: string; count?: number }).value ?? (s as { count?: number }).count]),
+      [['expectText', 'Active'], ['expectVisible', undefined], ['expectCount', 3]],
+    );
+    assert.match((result.steps[1] as { intent: string }).intent, /\[generated: narrowed to the control's presence — a thinner claim/);
+  });
+
+  it('a selectOption with no value takes the Test data pair the control is named after, with test-data provenance', async () => {
+    const result = await narrow(
+      [wire({ action: 'selectOption', selector: 'role=button[name="Employee Sub Group" i]', value: '', intent: 'Step 1: เลือก Employee Sub Group' })],
+      { prompt: describeCase(hireRow) },
+    );
+    const chosen = result.steps[0] as FlowStep & { value: string; valueSource?: { kind: string; detail: string } };
+    assert.equal(chosen.action, 'selectOption');
+    assert.equal(chosen.value, '10');
+    assert.equal(chosen.valueSource?.kind, 'test-data');
+    assert.match(chosen.valueSource?.detail ?? '', /Employee Sub Group = 10/);
+    // No pair for the name: dropped, never invented. (A `fill ""` is a
+    // legitimate clear-the-field step and is never dropped or rewritten.)
+    const none = await narrow([wire({ action: 'selectOption', selector: 'role=button[name="Salary" i]', value: '' })], { prompt: describeCase(hireRow) });
+    assert.equal(none.droppedSteps, 1);
+  });
+
+  it('is pure: repairAuthoredStep returns null for shapes with nothing to rewrite from', () => {
+    assert.equal(repairAuthoredStep(wire({ action: 'click', selector: '' }) as never, 'no selector'), null);
+    assert.equal(repairAuthoredStep(wire({ action: 'goto', url: '' }) as never, 'goto needs a url'), null);
+    assert.equal(repairAuthoredStep(wire({ action: 'expectValue', selector: 'role=button[name="X" i]', value: '' }) as never, 'r', { trees: 'button "Y"' }), null);
+    const any = repairAuthoredStep(wire({ action: 'expectAnyVisible', value: 'text="Saved"' }) as never, 'one alternative');
+    assert.equal(any?.step.action, 'expectVisible');
+    assert.equal(any?.step.selector, 'text="Saved"');
+  });
+
+  it('the pipeline discloses the substitution on the flow\'s notes', async () => {
+    const mock = jsonModel(
+      'mock-author',
+      {
+        name: 'HIR-EC-001 New Hire Key-in success',
+        rationale: '',
+        setup: [],
+        steps: [
+          wire({ action: 'fill', selector: 'role=textbox[name="Postal Code" i]', value: '10110', intent: 'Step 1: กรอก Postal Code' }),
+          wire({ action: 'click', selector: 'role=button[name="Submit" i]', intent: 'Step 2: กด Submit' }),
+          wire({ action: 'expectValue', selector: 'role=button[name="District" i]', value: '', intent: 'Expected: เมื่อเปลี่ยน Province ระบบเคลียร์ District เดิม' }),
+          wire({ action: 'expectVisible', selector: 'role=textbox[name="Postal Code" i]', intent: 'Expected: Employee Status = Active' }),
+        ],
+        teardown: [],
+        notes: '',
+      },
+      { inputTokens: 0, outputTokens: 0 },
+    );
+    const author = new FlowAuthor({ model: new LlmFlowAuthorModel({ model: mock, id: 'mock:author' }), journeyTree: tree, valueResolution: { model: null } });
+    const authored = await author.author(describeCase(hireRow), undefined, { caseText: describeCase(hireRow) });
+    assert.match(authored.notes, /1 step\(s\) rewritten by the harness \(marked \[generated: …\] in their intent\): expectValue "Expected: เมื่อเปลี่ยน Province/);
+    assert.equal(authored.droppedSteps, 0);
+    assert.equal(authored.flow.steps.filter((s) => s.action === 'expectText').length, 1);
   });
 });

@@ -46,13 +46,21 @@ export interface ClaudeCliCallRecord {
   /** The process that made the call — lets one run's rows be told apart. */
   pid: number;
   /**
-   * Model turns the call took. Above 1 means tool use — for the retrieval
-   * roles, the only record that `search_context` was consulted. Absent on
-   * rows written before 2026-08-27.
+   * Model turns the call took. A `--json-schema` answer is a tool call and
+   * takes 2 by itself (measured on CLI 2.1.260); above that is tool use —
+   * for the retrieval roles, the only record that `search_context` was
+   * consulted. Absent on rows written before 2026-08-27.
    */
   turns?: number | undefined;
   /** The role that asked (`generator`, `healer`, …). Absent on older rows. */
   role?: string | undefined;
+  /**
+   * Why the call ended when it did not end with an answer: `length` is a cut
+   * at the CLI's output cap, `error` an API error the CLI reported. Absent on
+   * a call that answered. The row exists because the failed answer was still
+   * paid for (2026-09-04).
+   */
+  finish?: 'length' | 'error' | undefined;
 }
 
 export function claudeCliUsageEnabled(env: NodeJS.ProcessEnv = process.env): boolean {

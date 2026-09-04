@@ -67,8 +67,10 @@ import {
   sealVideo,
   videoSize,
   videoTempDir,
+  VIDEO_ACTION_DWELL_MS,
   type VideoCut,
   type VideoMode,
+  type VideoRecording,
 } from './video.js';
 import { CacheManager } from '../cache/cache-manager.js';
 import { measureCoverage } from '../coverage/ax-coverage.js';
@@ -102,6 +104,7 @@ import {
 } from './review-judge.js';
 import {
   agentModelUnavailable,
+  personaRefusal,
   differentPage,
   goalEvidence,
   looksLikeSignIn,
@@ -164,6 +167,7 @@ import {
   nearMiss,
 } from './proof-bundle.js';
 import { captureTarget, TARGET_READ_BUDGET_MS } from './target.js';
+import { approach, humanClick, humanFill, humanKeys, humanScrollTo, humanSettle, remainingTimeout } from './humanize.js';
 import { revealHidden } from './reveal.js';
 import { inferPolarity, type TestPolarity } from './polarity.js';
 import type { DataGate } from '../cli/data-locks.js';
@@ -234,6 +238,19 @@ export interface SmartRunnerOptions {
    */
   video?: VideoMode | undefined;
   /**
+   * How long each action moment is held in a condensed film (`video: 'on'`),
+   * ms. Default `VIDEO_ACTION_DWELL_MS`; see `video.ts`.
+   */
+  videoDwellMs?: number | undefined;
+  /**
+   * Perform like a person — the pointer travels to a control before the
+   * press, a value goes in character by character, a navigation gets a beat
+   * — for the film (`humanize.ts`). Never changes what a step resolves or
+   * asserts. Default: on while filming (`video` not `off`), off otherwise,
+   * so an unfilmed run pays nothing. `WOWLIDATOR_HUMANIZE` / `--humanize`.
+   */
+  humanize?: boolean | undefined;
+  /**
    * Give this run its own browser context even when it is not being filmed.
    *
    * Two runs sharing `browser.contexts()[0]` share its pages, and a suite that
@@ -266,6 +283,13 @@ export interface SmartRunnerOptions {
    * outranks the attached browser's state when present.
    */
   sessionState?: StoredSession | undefined;
+  /**
+   * Banked sessions by account EMAIL (lower-cased), for the people a
+   * `signIn` opens a browser of their own for — the suite's vault, as
+   * `sessionState` is for the primary. A persona context is seeded from
+   * here and never from the pool member's leftover default context.
+   */
+  sessionStates?: Readonly<Record<string, StoredSession>> | undefined;
 
   /**
    * Credentials by persona label — `HR_ADMIN_ACCOUNT`, `MANAGER_ACCOUNT`,
@@ -273,6 +297,17 @@ export interface SmartRunnerOptions {
    * resolves. Never written into a flow file; the label is.
    */
   personas?: Record<string, { email: string; password: string }> | undefined;
+
+  /**
+   * Chromes for the people this case signs in as AFTER the first — one CDP
+   * endpoint each, leased from the `--browsers` pool by the suite loop. The
+   * first persona binds to the browser `connect` attached; every later
+   * distinct `signIn` label takes the next URL here, opens its own context
+   * there and keeps it for the length of the run, so a hand-off never signs
+   * anyone out. Absent or exhausted, `signIn` falls back to signing the
+   * active session out and in — the single-browser behaviour.
+   */
+  personaBrowsers?: readonly string[] | undefined;
 
   /**
    * How the sheets write dates — `th` reads `dd/mm/yyyy` day-first and a
@@ -480,7 +515,7 @@ export interface StepValueSource {
    * deterministic rewrites — "Hire Date = Today" computed at authoring, a
    * key value suffixed so an import never collides with an earlier run.
    */
-  kind: 'test-data' | 'repo' | 'db' | 'generated' | 'relative-date' | 'unique-per-run';
+  kind: 'test-data' | 'rules' | 'repo' | 'db' | 'generated' | 'relative-date' | 'unique-per-run';
   detail: string;
 }
 
@@ -718,7 +753,12 @@ export class RouteNotFoundError extends Error {
  * Errors a step's own callback may raise that describe the HARNESS, not the
  * page — the ladder lets them through untouched (see the fast rung).
  */
-const HARNESS_STEP_ERRORS: ReadonlySet<string> = new Set(['FixtureMissingError', 'PersonaUnknownError', 'UnknownVariableError']);
+const HARNESS_STEP_ERRORS: ReadonlySet<string> = new Set([
+  'FixtureMissingError',
+  'PersonaUnknownError',
+  'PersonaBrowserUnavailableError',
+  'UnknownVariableError',
+]);
 
 /**
  * A `signIn` step named a persona the run was not given (EH-10). Harness-
@@ -728,6 +768,31 @@ const HARNESS_STEP_ERRORS: ReadonlySet<string> = new Set(['FixtureMissingError',
  */
 export class PersonaUnknownError extends Error {
   override readonly name = 'PersonaUnknownError';
+}
+
+/**
+ * A persona's Chrome could not be attached (multi-browser personas): the
+ * pool member `signIn` was handed for a second person answers nothing. The
+ * machine, not the application — a harness error like `PersonaUnknownError`,
+ * so the case is blocked, no app defect is filed, and step repair is never
+ * asked to "rebuild" a browser.
+ */
+export class PersonaBrowserUnavailableError extends Error {
+  override readonly name = 'PersonaBrowserUnavailableError';
+}
+
+/**
+ * The identity a persona label or token reduces to, for matching: angle
+ * brackets, an `_ACCOUNT`/`ACCOUNT` tail, case and separators all folded.
+ * `<HR_ADMIN_ACCOUNT>`, `HR admin` and `hr-admin` are one key.
+ */
+export function foldPersonaKey(text: string): string {
+  return text
+    .trim()
+    .replace(/^[<{[]+|[>}\]]+$/g, '')
+    .replace(/[\s_\-.]+/g, '')
+    .replace(/account$/i, '')
+    .toLowerCase();
 }
 
 /**
@@ -743,13 +808,7 @@ export function resolvePersona(
   as: string,
   personas: Readonly<Record<string, { email: string; password: string }>>,
 ): { label: string; email: string; password: string } | null {
-  const fold = (text: string): string =>
-    text
-      .trim()
-      .replace(/^[<{[]+|[>}\]]+$/g, '')
-      .replace(/[\s_\-.]+/g, '')
-      .replace(/account$/i, '')
-      .toLowerCase();
+  const fold = foldPersonaKey;
   const wanted = fold(as);
   if (wanted === '') return null;
   const asEmail = as.trim().toLowerCase();
@@ -1448,17 +1507,88 @@ export function hasStorableOrigin(url: string): boolean {
   }
 }
 
+/**
+ * One person's browser for the length of a run: the Chrome, the context (the
+ * cookie jar), the page the steps drive, and everything that describes THAT
+ * page rather than the run — the recording, the caption on it, the network
+ * observer attached to it, the session guard's memory of where its last
+ * `goto` went. A runner holds one of these per persona it has signed in as
+ * (multi-browser personas, 2026-09-03) and every step reads the active one,
+ * so a hand-off between people is a pointer move, never a sign-out.
+ *
+ * The first session is the one `connect()` attached; `signIn` opens the
+ * others on the Chromes `SmartRunnerOptions.personaBrowsers` names.
+ */
+type PersonaSession = {
+  /** The persona label this session belongs to; null until a `signIn` claims it. */
+  label: string | null;
+  /** Where the Chrome listens; null for an `attach()`ed embedder's browser. */
+  cdpUrl: string | null;
+  browser: Browser;
+  context: BrowserContext;
+  page: Page;
+  /** Only a context this runner created may be closed by it — see `close()`. */
+  ownsContext: boolean;
+  /** Set only when this runner created a recording context for this session. */
+  video: { dir: string; size: { width: number; height: number } } | null;
+  /** The caption now showing, re-applied whenever a navigation wipes it. */
+  caption: string;
+  /** Pages this session drove and then navigated away from, via popup adoption. */
+  pagesLeftBehind: Page[];
+  network: NetworkObserver | null;
+  /** Where the previous step's network mark sat — see `#takeNetMark`. */
+  previousNetMark: number | undefined;
+  /** Lower bound of the current step's evidence window. */
+  evidenceFloorMs: number | undefined;
+  /** Where the last `expectCalls` window ended — see the accessor's note. */
+  sequenceMark: number;
+  /** Path of the most recent `goto`, and whether that goto asked for a sign-in page. */
+  lastGotoPath: string | null;
+  lastGotoAskedSignIn: boolean;
+  lastAction: string | null;
+  strandedReported: boolean;
+  /** See the `#signInDidNotTake` accessor. */
+  signInDidNotTake: boolean;
+  /** The session bootstrap runs once per session — a second bounce is a real finding. */
+  sessionBootstrapTried: boolean;
+  /** The account the last `signIn` on this session established, for the suite's vault. */
+  signedInAs: string | null;
+  /** How the recording was sealed, once `close()` has run. */
+  sealed: VideoRecording | null;
+};
+
+/** What `SmartRunner.#openContext` hands back. */
+type OpenedContext = {
+  context: BrowserContext;
+  page: Page;
+  video: { dir: string; size: { width: number; height: number } } | null;
+};
+
 export class SmartRunner {
   /**
    * Mutable on purpose: a click on a `target="_blank"` link navigates a page
    * this runner would otherwise never watch, and adopting the popup (see
    * `#adoptPage`) is what keeps the flow on the journey the user is on.
+   *
+   * A view of the ACTIVE persona's page (see `PersonaSession`): a persona
+   * switch re-points it, and the ~50 step implementations that read
+   * `this.page` follow without knowing.
    */
-  page: Page;
+  get page(): Page {
+    return this.#active.page;
+  }
+  set page(page: Page) {
+    this.#active.page = page;
+  }
   readonly bundle: ProofBundleBuilder;
 
-  readonly #browser: Browser;
-  readonly #context: BrowserContext;
+  /** Every session this run opened, in creation order; the first is the primary. */
+  readonly #sessions: PersonaSession[] = [];
+  /** The session the steps are driving now. */
+  #active: PersonaSession;
+  get #context(): BrowserContext {
+    return this.#active.context;
+  }
   readonly #cache: CacheManager;
   readonly #healer: JitHealer | null;
   readonly #agent: WorkflowAgent | null;
@@ -1475,13 +1605,29 @@ export class SmartRunner {
    * only case in which it may close one. An embedder that came in through
    * `attach()` owns its own context and its own video, if any.
    */
-  #video: { dir: string; size: { width: number; height: number } } | null = null;
+  get #video(): { dir: string; size: { width: number; height: number } } | null {
+    return this.#active.video;
+  }
+  set #video(video: { dir: string; size: { width: number; height: number } } | null) {
+    this.#active.video = video;
+  }
   /** How this run is filmed — `'always'` keeps the whole recording on a pass. */
   #videoMode: VideoMode = 'on';
+  /** Dwell per action moment when the film is condensed (`'on'`). */
+  #videoDwellMs: number = VIDEO_ACTION_DWELL_MS;
+  /** Perform actions like a person (`humanize.ts`); follows the recording unless set. */
+  #humanize = false;
+  /** Whether a context this runner opens is filmed — the `video` option, remembered for persona sessions. */
+  #recording = true;
   /** Pause before each step. See `SmartRunnerOptions.stepDelayMs`. */
   #stepDelayMs = 0;
   /** The caption now showing, re-applied whenever a navigation wipes it. */
-  #caption = '';
+  get #caption(): string {
+    return this.#active.caption;
+  }
+  set #caption(caption: string) {
+    this.#active.caption = caption;
+  }
   readonly #agentAssist: boolean;
   /** See `SmartRunnerOptions.agentMaxSteps`. `undefined` leaves the agent's own budget alone. */
   readonly #agentMaxSteps: number | undefined;
@@ -1491,12 +1637,16 @@ export class SmartRunner {
   readonly #declaredRoutes: readonly string[];
   /**
    * Selectors that already exhausted the ladder in this run, keyed by
-   * `url :: selector`, valued with the step index that established it. Never
-   * persisted — a negative result belongs to this run's page state only.
+   * `url :: selector` (and the persona, when one is signed in: an employee's
+   * 403 page and the manager's real page share a URL and nothing else),
+   * valued with the step index that established it. Never persisted — a
+   * negative result belongs to this run's page state only.
    */
   readonly #deadResolutions = new Map<string, { step: number; contentMiss: boolean }>();
-  /** Pages this runner drove and then navigated away from, via popup adoption. */
-  readonly #pagesLeftBehind: Page[] = [];
+  /** Pages this session drove and then navigated away from, via popup adoption. */
+  get #pagesLeftBehind(): Page[] {
+    return this.#active.pagesLeftBehind;
+  }
   /**
    * Repair model for in-run step reconstruction, or null. Public and
    * readonly: `executeSteps` (a module function, not a method) drives the
@@ -1506,9 +1656,19 @@ export class SmartRunner {
   /** The suite's step-level data lock, or null — see `SmartRunnerOptions.dataGate`. */
   readonly dataGate: DataGate | null;
   /** Where the previous step's network mark sat — see `#takeNetMark`. */
-  #previousNetMark: number | undefined;
+  get #previousNetMark(): number | undefined {
+    return this.#active.previousNetMark;
+  }
+  set #previousNetMark(mark: number | undefined) {
+    this.#active.previousNetMark = mark;
+  }
   /** Lower bound of the current step's evidence window. */
-  #evidenceFloorMs: number | undefined;
+  get #evidenceFloorMs(): number | undefined {
+    return this.#active.evidenceFloorMs;
+  }
+  set #evidenceFloorMs(floor: number | undefined) {
+    this.#active.evidenceFloorMs = floor;
+  }
   readonly #coverage: boolean;
   readonly #baselineDir: string;
   readonly #updateBaselines: boolean;
@@ -1522,9 +1682,18 @@ export class SmartRunner {
    */
   readonly #secretValues: ReadonlySet<string>;
   readonly #networkMaxCalls: number | undefined;
-  #network: NetworkObserver | null = null;
+  get #network(): NetworkObserver | null {
+    return this.#active.network;
+  }
+  set #network(observer: NetworkObserver | null) {
+    this.#active.network = observer;
+  }
   readonly #api: ApiActions;
+  /** Whether `#api`'s transport is the active context's — rebuilt on a persona switch. */
+  readonly #transportFollowsContext: boolean;
   readonly #db: DbActions;
+  /** The time `setClock` pinned, re-installed on every persona page opened after it. */
+  #pinnedClock: Date | null = null;
   /**
    * Where the last `expectCalls` window ended — consecutive `expectCalls`
    * steps verify consecutive stretches of the journey. Deliberately not the
@@ -1532,29 +1701,69 @@ export class SmartRunner {
    * step by design, which is right for failure evidence and wrong for a
    * window that must not double-count.
    */
-  #sequenceMark = 0;
+  get #sequenceMark(): number {
+    return this.#active.sequenceMark;
+  }
+  set #sequenceMark(mark: number) {
+    this.#active.sequenceMark = mark;
+  }
   #defectSeq = 0;
   #ownsPage = true;
   /** Path of the most recent `goto`, and whether that goto asked for a sign-in page. */
-  #lastGotoPath: string | null = null;
-  #lastGotoAskedSignIn = false;
-  #lastAction: string | null = null;
-  #strandedReported = false;
+  get #lastGotoPath(): string | null {
+    return this.#active.lastGotoPath;
+  }
+  set #lastGotoPath(path: string | null) {
+    this.#active.lastGotoPath = path;
+  }
+  get #lastGotoAskedSignIn(): boolean {
+    return this.#active.lastGotoAskedSignIn;
+  }
+  set #lastGotoAskedSignIn(asked: boolean) {
+    this.#active.lastGotoAskedSignIn = asked;
+  }
+  get #lastAction(): string | null {
+    return this.#active.lastAction;
+  }
+  set #lastAction(action: string | null) {
+    this.#active.lastAction = action;
+  }
+  get #strandedReported(): boolean {
+    return this.#active.strandedReported;
+  }
+  set #strandedReported(reported: boolean) {
+    this.#active.strandedReported = reported;
+  }
   /**
    * A credential submit fired, the hydration race ate it, and the replay did
-   * not rescue it — so this run holds no session. Positive evidence only: set
-   * from the same signatures `nativeFormResubmitDetected` and
+   * not rescue it — so this session holds no session. Positive evidence only:
+   * set from the same signatures `nativeFormResubmitDetected` and
    * `fillsLostToHydration` produce, never from a page merely looking like a
    * login screen. See `#strandedMessage`.
    */
-  #signInDidNotTake = false;
+  get #signInDidNotTake(): boolean {
+    return this.#active.signInDidNotTake;
+  }
+  set #signInDidNotTake(didNotTake: boolean) {
+    this.#active.signInDidNotTake = didNotTake;
+  }
   /** `--as`, for the session bootstrap; masking holds them separately. */
   #credentials: { email: string; password: string } | undefined;
   #flowSignsInItself = false;
-  /** The bootstrap runs once per run — a second bounce is a real finding. */
-  #sessionBootstrapTried = false;
+  /** The bootstrap runs once per session — a second bounce is a real finding. */
+  get #sessionBootstrapTried(): boolean {
+    return this.#active.sessionBootstrapTried;
+  }
+  set #sessionBootstrapTried(tried: boolean) {
+    this.#active.sessionBootstrapTried = tried;
+  }
   /** Only a context this runner created may be closed by it — see `close()`. */
-  #ownsContext = false;
+  get #ownsContext(): boolean {
+    return this.#active.ownsContext;
+  }
+  set #ownsContext(owns: boolean) {
+    this.#active.ownsContext = owns;
+  }
   /** Credentials by persona label, for `signIn` steps — see `SmartRunnerOptions.personas`. */
   readonly #personas: Record<string, { email: string; password: string }>;
   /** How the sheets write dates — see `SmartRunnerOptions.locale`. */
@@ -1568,9 +1777,21 @@ export class SmartRunner {
    * that asked for one — where a `signIn` step goes when it names no `url`.
    */
   #signInUrl: string | null = null;
-  /** The account the last `signIn` step established, for the suite's vault. */
-  #lastSignedInAs: string | null = null;
-  /** URLs the not-found rung already filed a defect for — one per page, never per step. */
+  /**
+   * Chromes still unclaimed for later personas — see
+   * `SmartRunnerOptions.personaBrowsers`. Shifted as `signIn` hands them out.
+   */
+  readonly #personaBrowsers: string[];
+  /** See `SmartRunnerOptions.sessionStates`. */
+  readonly #sessionStates: Readonly<Record<string, StoredSession>>;
+  /** The account the last `signIn` step established on the active session, for the suite's vault. */
+  get #lastSignedInAs(): string | null {
+    return this.#active.signedInAs;
+  }
+  set #lastSignedInAs(email: string | null) {
+    this.#active.signedInAs = email;
+  }
+  /** URLs (per persona) the not-found rung already filed a defect for — one per page, never per step. */
   readonly #notFoundReported = new Set<string>();
 
   private constructor(
@@ -1578,11 +1799,12 @@ export class SmartRunner {
     context: BrowserContext,
     page: Page,
     options: SmartRunnerOptions,
+    cdpUrl: string | null = options.cdpUrl ?? null,
   ) {
-    this.#browser = browser;
-    this.#context = context;
-    this.page = page;
+    this.#active = SmartRunner.#newSession({ browser, context, page, cdpUrl });
+    this.#sessions.push(this.#active);
     this.bundle = options.bundle;
+    this.bundle.setActor({ persona: null, browser: cdpUrl });
     this.#cache = options.cache;
     this.#healer = options.healer ?? null;
     this.#agent = options.agent ?? null;
@@ -1614,6 +1836,8 @@ export class SmartRunner {
     // (EH-10): a `signIn` step never writes one into a flow file, but the
     // sign-in it performs must not leak one into a record either.
     this.#personas = options.personas ?? {};
+    this.#personaBrowsers = [...(options.personaBrowsers ?? [])];
+    this.#sessionStates = options.sessionStates ?? {};
     this.#secretValues = new Set(
       [
         ...(options.credentials?.password ? [options.credentials.password] : []),
@@ -1627,7 +1851,9 @@ export class SmartRunner {
       options.downloadDir ?? join('.wowlidator', 'downloads', options.bundle.name.replace(/[^\p{L}\p{N}._-]+/gu, '_').slice(0, 80) || 'run');
     this.#flowSignsInItself = options.flowSignsInItself ?? false;
     this.#networkMaxCalls = options.networkMaxCalls;
-    this.#sequenceMark = Date.now();
+    this.#recording = (options.video ?? 'on') !== 'off';
+    this.#humanize = options.humanize ?? this.#recording;
+    this.#transportFollowsContext = options.transport === undefined;
     // One store, both action families: a `request` step saves `{{orderId}}`
     // and an `expectDbRow` keys on it — two stores would make one name mean
     // two different things in one flow.
@@ -1683,29 +1909,16 @@ export class SmartRunner {
    */
   static async connect(options: SmartRunnerOptions): Promise<SmartRunner> {
     const cdpUrl = options.cdpUrl ?? DEFAULT_CDP_URL;
-
-    let browser: Browser;
-    try {
-      browser = await chromium.connectOverCDP(cdpUrl);
-    } catch (error) {
-      throw new Error(
-        `could not attach to a browser at ${cdpUrl}: ${describe(error)}\n` +
-          'Start Chrome with --remote-debugging-port first (npm run chrome).',
-      );
-    }
+    const browser = await SmartRunner.#attachBrowser(cdpUrl);
 
     // Recording is a property of a context, set when the context is created,
     // and there is no way to switch it on for one that already exists. So a
     // recorded run gets its own context — and with it its own cookie jar,
     // which is the cost of filming and the reason `--video off` exists.
     const recording = (options.video ?? 'on') !== 'off';
-    const viewport = configuredViewport();
-    const size = videoSize(viewport);
-    let dir: string | null = null;
-    let context: BrowserContext;
     let inheritance: SessionInheritance | null = null;
-    if (recording) {
-      dir = await videoTempDir();
+    let opened: OpenedContext;
+    if (recording || options.isolate === true) {
       // **A recording context must carry the attached browser's session, or
       // filming silently changes what the test is.** Recording is a property
       // of a context and can only be set when one is created, so a filmed run
@@ -1722,70 +1935,208 @@ export class SmartRunner {
       // the new context makes filming invisible to the application.
       // The suite's own vault outranks the attached browser: a session a
       // sibling case established seconds ago is the fresher truth.
+      //
+      // An isolated, unfilmed run makes the same move for a different
+      // reason: a context of its own, carrying the session so the
+      // application cannot tell the difference.
       inheritance =
         options.inheritSession === false
           ? { state: undefined, available: 0, declined: true }
           : options.sessionState !== undefined
             ? { state: options.sessionState, available: options.sessionState.cookies.length, fromSuite: true }
             : await inheritSession(browser);
-      context = await browser.newContext({
-        recordVideo: { dir, size },
-        ...(viewport ? { viewport } : {}),
-        ...(inheritance.state ? { storageState: inheritance.state } : {}),
-      });
-      await installCursorOverlay(context);
-    } else if (options.isolate === true) {
-      // Same move the recording branch makes, for a different reason: a
-      // context of our own, carrying the browser's session so the application
-      // cannot tell the difference.
-      inheritance =
-        options.inheritSession === false
-          ? { state: undefined, available: 0, declined: true }
-          : options.sessionState !== undefined
-            ? { state: options.sessionState, available: options.sessionState.cookies.length, fromSuite: true }
-            : await inheritSession(browser);
-      context = await browser.newContext({
-        ...(viewport ? { viewport } : {}),
-        ...(inheritance.state ? { storageState: inheritance.state } : {}),
+      opened = await SmartRunner.#openContext(browser, {
+        recording,
+        storageState: inheritance.state,
+        load: () => options.cache.load(),
       });
     } else {
-      context = browser.contexts()[0] ?? (await browser.newContext());
-    }
-
-    // Everything from here to a constructed runner is on the hook for undoing
-    // the context if it fails: nothing else will close it, and an abandoned
-    // recording context is not garbage — it is a live browser context sitting
-    // in a Chrome that outlives this process, one per failed run.
-    let page: Page;
-    try {
-      page = await context.newPage();
+      const context = browser.contexts()[0] ?? (await browser.newContext());
+      const page = await context.newPage();
       await applyViewport(page);
       await options.cache.load();
-    } catch (error) {
-      if (dir) {
-        await context.close().catch(() => undefined);
-        await rm(dir, { recursive: true, force: true }).catch(() => undefined);
-      }
-      throw error;
+      opened = { context, page, video: null };
     }
 
-    const runner = new SmartRunner(browser, context, page, options);
+    const runner = new SmartRunner(browser, opened.context, opened.page, options, cdpUrl);
     if (inheritance) runner.#noteSessionInheritance(inheritance);
     // Whoever created the context closes it. Without this an isolated,
     // unfilmed run leaves a live context behind in a Chrome that outlives the
     // process — one per case, every suite.
     if (options.isolate === true) runner.#ownsContext = true;
-    if (dir) {
-      runner.#video = { dir, size };
+    if (opened.video) {
+      runner.#video = opened.video;
       runner.#videoMode = options.video ?? 'on';
+      runner.#videoDwellMs = options.videoDwellMs ?? VIDEO_ACTION_DWELL_MS;
       // The first frame is written when the page opens, so this is the origin
       // every step's offset is measured from.
       runner.#ownsContext = true;
-      keepCaption(page, () => runner.#caption);
+      keepCaption(opened.page, () => runner.#caption);
       options.bundle.setVideoStart(Date.now());
     }
     await runner.observeNetwork();
     return runner;
+  }
+
+  /** Attach to a Chrome over CDP — connect-only, never a launch. */
+  static async #attachBrowser(cdpUrl: string): Promise<Browser> {
+    try {
+      return await chromium.connectOverCDP(cdpUrl);
+    } catch (error) {
+      throw new Error(
+        `could not attach to a browser at ${cdpUrl}: ${describe(error)}\n` +
+          'Start Chrome with --remote-debugging-port first (npm run chrome).',
+      );
+    }
+  }
+
+  /**
+   * A context of this runner's own — filmed when asked, carrying the session
+   * given as data — and the page on it. Everything from the context to a
+   * usable page is on the hook for undoing the context if it fails: nothing
+   * else will close it, and an abandoned recording context is not garbage —
+   * it is a live browser context sitting in a Chrome that outlives this
+   * process, one per failed run.
+   */
+  static async #openContext(
+    browser: Browser,
+    what: { recording: boolean; storageState: StoredSession | undefined; load?: (() => Promise<void>) | undefined },
+  ): Promise<OpenedContext> {
+    const viewport = configuredViewport();
+    const size = videoSize(viewport);
+    const dir = what.recording ? await videoTempDir() : null;
+    const context = await browser.newContext({
+      ...(dir ? { recordVideo: { dir, size } } : {}),
+      ...(viewport ? { viewport } : {}),
+      ...(what.storageState ? { storageState: what.storageState } : {}),
+    });
+    try {
+      if (dir) await installCursorOverlay(context);
+      const page = await context.newPage();
+      await applyViewport(page);
+      await what.load?.();
+      return { context, page, video: dir ? { dir, size } : null };
+    } catch (error) {
+      await context.close().catch(() => undefined);
+      if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** A fresh `PersonaSession` around a browser, context and page. */
+  static #newSession(where: { browser: Browser; context: BrowserContext; page: Page; cdpUrl: string | null }): PersonaSession {
+    return {
+      label: null,
+      cdpUrl: where.cdpUrl,
+      browser: where.browser,
+      context: where.context,
+      page: where.page,
+      ownsContext: false,
+      video: null,
+      caption: '',
+      pagesLeftBehind: [],
+      network: null,
+      previousNetMark: undefined,
+      evidenceFloorMs: undefined,
+      sequenceMark: Date.now(),
+      lastGotoPath: null,
+      lastGotoAskedSignIn: false,
+      lastAction: null,
+      strandedReported: false,
+      signInDidNotTake: false,
+      sessionBootstrapTried: false,
+      signedInAs: null,
+      sealed: null,
+    };
+  }
+
+  /** The session a persona label owns, if one has been opened for it. */
+  #sessionOf(label: string): PersonaSession | undefined {
+    const wanted = foldPersonaKey(label);
+    return this.#sessions.find((s) => s.label !== null && foldPersonaKey(s.label) === wanted);
+  }
+
+  /**
+   * Make `session` the one the steps drive. A pointer move plus the two
+   * things bound to a context or a page rather than to the run: the API
+   * transport (a context's cookie jar) and a pinned clock (a page's).
+   */
+  async #activate(session: PersonaSession): Promise<void> {
+    if (session === this.#active) return;
+    this.#active = session;
+    this.bundle.setActor({ persona: session.label, browser: session.cdpUrl });
+    if (this.#transportFollowsContext) this.#api.setTransport(new BrowserTransport(session.context));
+    if (this.#pinnedClock !== null) {
+      await session.page.clock.install({ time: this.#pinnedClock }).catch(() => undefined);
+    }
+    await this.observeNetwork();
+  }
+
+  /**
+   * Open a persona's own browser: attach to the Chrome `cdpUrl` names, give
+   * it a context of this runner's own (filmed like the primary, seeded from
+   * the vault's state for that account when the suite has one — never from
+   * whatever the pool member's default context was left holding), and make
+   * it the active session. The Chrome answering nothing is a harness error:
+   * the machine, not the application.
+   */
+  async #openPersonaSession(label: string, cdpUrl: string, storageState: StoredSession | undefined): Promise<PersonaSession> {
+    let browser: Browser;
+    try {
+      browser = await chromium.connectOverCDP(cdpUrl);
+    } catch (error) {
+      throw new PersonaBrowserUnavailableError(
+        `signIn as ${label}: could not attach to the browser at ${cdpUrl} for this persona — ${describe(error)}`,
+      );
+    }
+    let opened: OpenedContext;
+    try {
+      opened = await SmartRunner.#openContext(browser, { recording: this.#recording, storageState });
+    } catch (error) {
+      await browser.close().catch(() => undefined);
+      throw new PersonaBrowserUnavailableError(
+        `signIn as ${label}: the browser at ${cdpUrl} would not open a context for this persona — ${describe(error)}`,
+      );
+    }
+    const session = SmartRunner.#newSession({ browser, context: opened.context, page: opened.page, cdpUrl });
+    session.label = label;
+    session.ownsContext = true;
+    if (opened.video) {
+      session.video = opened.video;
+      keepCaption(opened.page, () => session.caption);
+      this.bundle.setVideoStart(Date.now(), label);
+    }
+    this.#sessions.push(session);
+    await this.#activate(session);
+    return session;
+  }
+
+  /** The persona label the steps are running as, or null before any `signIn`. */
+  get activePersona(): string | null {
+    return this.#active.label;
+  }
+
+  /** Where the active persona's Chrome listens, for the record; null for an attached embedder. */
+  get activeBrowser(): string | null {
+    return this.#active.cdpUrl;
+  }
+
+  /**
+   * The persona scope for an agent leg's REPLAY MEMORY — the label, or nothing.
+   *
+   * Every `#agent.run` that passes `memory` must pass this too. Two people ask
+   * the same question from the same address in a case that changes hands ("open
+   * Team > Probation Reviews and open the case" as the manager, then as the
+   * approver), and an unscoped key replays the first person's journey on the
+   * second person's browser at zero model turns. `#deadResolutions` is keyed
+   * this way already, for the same reason spelled out where it is declared.
+   *
+   * Only the LABEL, and only for the key: it never reaches a prompt. A
+   * single-persona run yields `undefined` and keys exactly as it always did.
+   */
+  #agentPersona(): { persona: string } | Record<string, never> {
+    const label = this.activePersona;
+    return label === null || label === '' ? {} : { persona: label };
   }
 
   /**
@@ -1887,6 +2238,12 @@ export class SmartRunner {
       // and failing on the first answer would blame the app for a redirect
       // it was always going to make.
       await this.#judgeNavigationStatus(url, response);
+      // The pointer put back on the new document's overlay (film only): a
+      // fresh document shows no pointer until the mouse moves. No pause —
+      // the film already holds the landing for its dwell, and a real pause
+      // here moved the ladder's clock (the patience rung's fixtures flipped
+      // from `late` to `fast` at 350 ms).
+      await humanSettle(this.page, { enabled: this.#humanize });
       this.bundle.addStep({
         action: 'goto',
         selector: null,
@@ -1974,11 +2331,18 @@ export class SmartRunner {
             return;
           }
         }
+        // Humanised: the pointer travels to the element the rung resolved
+        // and hovers (`humanize.ts`) BEFORE the popup listener is armed —
+        // the approach never clicks, and a grace window that started
+        // counting during it would have expired before the press.
+        const performStarted = Date.now();
+        const spent = this.#humanize ? await approach(this.page, locator, timeout) : 0;
         const popupPromise = this.page
           .waitForEvent('popup', { timeout: POPUP_GRACE_MS })
           .catch(() => null);
         try {
-          await locator.click({ timeout });
+          await locator.click({ timeout: remainingTimeout(timeout, spent) });
+          if (this.#humanize) detail['performedMs'] = Date.now() - performStarted;
         } catch (error) {
           // A grace window consumed on a failed click would tax every rung
           // of the ladder; the failure is the story, rethrow it now.
@@ -2040,12 +2404,19 @@ export class SmartRunner {
   }
 
   async fill(selector: string, value: string, intent?: string, valueSource?: StepValueSource): Promise<void> {
+    const detail: Record<string, unknown> = this.#withValueSource({ value }, valueSource);
     await this.#step(
       'fill',
       selector,
       intent,
-      (locator, timeout) => locator.fill(value, { timeout }),
-      this.#withValueSource({ value }, valueSource),
+      async (locator, timeout) => {
+        // Humanised, the value goes in character by character (no keydown,
+        // as `fill` promises) and is READ BACK; a field that does not hold
+        // it is filled by this same `fill` — the rung's own action decides.
+        const performed = await humanFill(this.page, locator, value, timeout, { enabled: this.#humanize });
+        if (performed) detail['performedMs'] = performed.performedMs;
+      },
+      detail,
     );
   }
 
@@ -2208,25 +2579,33 @@ export class SmartRunner {
    * `fill`'s single programmatic assignment cannot wake.
    */
   async type(selector: string, value: string, intent?: string, valueSource?: StepValueSource): Promise<void> {
+    const detail: Record<string, unknown> = this.#withValueSource({ value }, valueSource);
     await this.#step(
       'type',
       selector,
       intent,
       async (locator, timeout) => {
+        const started = Date.now();
         // Focus the way a user does, then clear so the typed value is the
         // whole value. A non-input target (a div listening for keydown) has
         // nothing to clear; that is fine.
-        await locator.click({ timeout });
+        await humanClick(this.page, locator, timeout, { enabled: this.#humanize });
         await locator.fill('', { timeout }).catch(() => undefined);
         // The typing budget scales with length: resolving the field is the
         // race the ladder times, typing N characters at a human pace is not,
         // and a fixed 2s window would fail long values on timing alone.
-        await locator.pressSequentially(value, {
-          delay: TYPE_KEY_DELAY_MS,
-          timeout: Math.max(this.#healedTimeoutMs, value.length * TYPE_KEY_DELAY_MS + 1000),
-        });
+        // Real keystrokes either way; humanised only jitters the pace.
+        const performed = await humanKeys(
+          this.page,
+          locator,
+          value,
+          TYPE_KEY_DELAY_MS,
+          Math.max(this.#healedTimeoutMs, value.length * TYPE_KEY_DELAY_MS + 1000),
+          { enabled: this.#humanize },
+        );
+        if (performed) detail['performedMs'] = Date.now() - started;
       },
-      this.#withValueSource({ value }, valueSource),
+      detail,
     );
   }
 
@@ -2277,6 +2656,9 @@ export class SmartRunner {
         );
       }
       await this.page.clock.install({ time: parsed });
+      // A clock is per page: a persona's page opened after this gets the
+      // same pin, or the manager's leg would run on the wall clock.
+      this.#pinnedClock = parsed;
     });
   }
 
@@ -2334,6 +2716,11 @@ export class SmartRunner {
   async signOut(intent?: string): Promise<void> {
     const detail: Record<string, unknown> = { intent, urlBefore: this.page.url() };
     await this.#bareStep('signOut', detail, async () => {
+      // The active session is nobody's after this: a later `signIn` for the
+      // same label logs in again rather than "switching" to a dead session.
+      this.#active.label = null;
+      this.#active.signedInAs = null;
+      this.bundle.setActor({ persona: null, browser: this.#active.cdpUrl });
       const result = await performSignOut(this.page);
       if (result.ok) {
         detail['via'] = result.via;
@@ -2440,6 +2827,9 @@ export class SmartRunner {
    */
   async scrollTo(selector: string, intent?: string): Promise<void> {
     await this.#step('scrollTo', selector, intent, async (locator, timeout) => {
+      // A smooth scroll first, for the film; the instant one is the action
+      // of record and a no-op once the element is already in view.
+      await humanScrollTo(locator, timeout, { enabled: this.#humanize });
       await locator.scrollIntoViewIfNeeded({ timeout });
     });
   }
@@ -3467,6 +3857,63 @@ export class SmartRunner {
       detail['persona'] = persona.label;
       detail['signedInAs'] = persona.email;
 
+      // **One Chrome per person (2026-09-03).** Three shapes, in order:
+      //
+      // 1. This persona already has a session — switch to it. Nobody is
+      //    signed out; the employee returning after the manager's approval
+      //    finds their own page exactly as they left it. Only when the app
+      //    has since expired that session (the page sits on a sign-in URL)
+      //    does the login below run again, on that same browser.
+      // 2. A first `signIn` on a session nobody has claimed binds to it —
+      //    the primary, which `signsInItself` already started with an empty
+      //    jar. No second browser for the first person.
+      // 3. A new persona with a spare Chrome in `personaBrowsers` gets its
+      //    own: a context there, seeded from the suite's vault under that
+      //    account, and the login on it. Absent a spare, the single-browser
+      //    path below: sign the active session out the way a user does,
+      //    then in — today's behaviour, byte for byte.
+      const existing = this.#sessionOf(persona.label);
+      if (existing !== undefined) {
+        await this.#activate(existing);
+        detail['switchedTo'] = existing.cdpUrl;
+        detail['browser'] = existing.cdpUrl;
+        if (!looksLikeSignIn(this.page.url())) {
+          detail['keptSession'] = true;
+          this.#lastAction = 'signIn';
+          detail['urlAfter'] = this.page.url();
+          return;
+        }
+        detail['sessionExpired'] = true;
+      } else if (this.#active.label === null && this.#active.signedInAs === null) {
+        this.#active.label = persona.label;
+        this.bundle.setActor({ persona: persona.label, browser: this.#active.cdpUrl });
+        detail['browser'] = this.#active.cdpUrl;
+      } else if (this.#personaBrowsers.length > 0) {
+        const cdpUrl = this.#personaBrowsers.shift()!;
+        const banked = this.#sessionStates[persona.email.toLowerCase()];
+        const session = await this.#openPersonaSession(persona.label, cdpUrl, banked);
+        detail['browser'] = cdpUrl;
+        detail['openedBrowser'] = cdpUrl;
+        if (banked !== undefined) {
+          // The vault may already land this person signed in: one goto to
+          // the app tells. Off the sign-in page afterwards means no form.
+          const target = this.#signInTarget(url, String(detail['urlBefore'] ?? ''));
+          await session.page.goto(target, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+          if (!looksLikeSignIn(session.page.url()) && hasStorableOrigin(session.page.url())) {
+            detail['inheritedSession'] = true;
+            try {
+              this.#lastGotoPath = new URL(session.page.url()).pathname;
+            } catch {
+              this.#lastGotoPath = null;
+            }
+            this.#lastAction = 'signIn';
+            this.#lastSignedInAs = persona.email;
+            detail['urlAfter'] = session.page.url();
+            return;
+          }
+        }
+      }
+
       // End the live session the way a user does. A sign-in form is hidden
       // from a signed-in user, so this is not optional; the fallback wipe is
       // disclosed, exactly as the `signOut` step discloses it.
@@ -3488,8 +3935,11 @@ export class SmartRunner {
         }
       }
 
-      const target = url ?? this.#signInUrl ?? new URL('/login', this.page.url()).toString();
+      const target = this.#signInTarget(url, String(detail['urlBefore'] ?? ''));
       detail['signInUrl'] = target;
+      // Learned for the personas after this one: a hand-off names no URL
+      // and its fresh page has no origin to resolve `/login` against.
+      this.#signInUrl ??= target;
       if (!looksLikeSignIn(this.page.url()) || url !== undefined) {
         await this.page.goto(target, { waitUntil: 'domcontentloaded' });
       }
@@ -3507,9 +3957,50 @@ export class SmartRunner {
         this.#lastGotoPath = null;
       }
       this.#lastGotoAskedSignIn = false;
+      this.#lastAction = 'signIn';
       this.#lastSignedInAs = persona.email;
+      // The session is this person's now — on the single-browser path the
+      // primary changes hands, and the record follows.
+      this.#active.label = persona.label;
+      this.bundle.setActor({ persona: persona.label, browser: this.#active.cdpUrl });
       detail['urlAfter'] = this.page.url();
     });
+  }
+
+  /**
+   * Where a `signIn` goes: the step's own `url`, else the sign-in page this
+   * run has already learned, else `/login` on the current origin — or, when
+   * the current page has none (a persona's fresh page sits on `about:blank`),
+   * on the origin the run was on before the switch.
+   */
+  #signInTarget(url: string | undefined, urlBefore: string): string {
+    if (url !== undefined) return url;
+    if (this.#signInUrl !== null) return this.#signInUrl;
+    const base = hasStorableOrigin(this.page.url()) ? this.page.url() : urlBefore;
+    try {
+      return new URL('/login', base).toString();
+    } catch {
+      throw new Error('signIn: no sign-in page to open — name one with `url`, or goto the application first');
+    }
+  }
+
+  /**
+   * Every session's state, by the account it ended as — for the suite's
+   * vault, so the manager's session banks under the manager and the
+   * employee's under the employee. Sessions nobody signed in on are skipped.
+   * Read BEFORE `close()`, which takes the contexts away.
+   */
+  async exportSessions(): Promise<{ email: string; url: string; state: StoredSession }[]> {
+    const out: { email: string; url: string; state: StoredSession }[] = [];
+    for (const session of this.#sessions) {
+      if (session.signedInAs === null) continue;
+      try {
+        out.push({ email: session.signedInAs, url: session.page.url(), state: await session.context.storageState() });
+      } catch {
+        // A context already gone banks nothing.
+      }
+    }
+    return out;
   }
 
   /** The account the last `signIn` step established, for the suite's vault; null when none ran. */
@@ -4018,13 +4509,18 @@ export class SmartRunner {
         network: evidence.calls.length > 0 ? evidence.calls : undefined,
         screenshot: touchesPage ? await this.#shoot('failure') : undefined,
       });
-      this.#recordStepFailureDefect(
-        action,
-        selector ?? undefined,
-        describe(error),
-        evidence.failures,
-        'Assertion',
-      );
+      // A harness-class failure (a persona the run lacks, its Chrome gone)
+      // is not a finding about the application — the step fails, the case
+      // blocks, no defect is filed against the app.
+      if (!(error instanceof Error && HARNESS_STEP_ERRORS.has(error.name))) {
+        this.#recordStepFailureDefect(
+          action,
+          selector ?? undefined,
+          describe(error),
+          evidence.failures,
+          'Assertion',
+        );
+      }
       throw error;
     }
   }
@@ -4145,6 +4641,8 @@ export class SmartRunner {
     } = {
       memory: cacheAgentMemory(this.#cache),
       caseContext: this.#caseContext,
+      humanize: this.#humanize,
+      ...this.#agentPersona(),
       ...(script === undefined ? {} : { script }),
       ...(this.#agentDbProbe() ?? {}),
       ...(this.#agentMaxSteps === undefined ? {} : { maxSteps: this.#agentMaxSteps }),
@@ -4224,6 +4722,11 @@ export class SmartRunner {
     // provider fact, not a page fact, and it must never be worded as "the goal
     // is unreachable" or counted against the app.
     const providerFailed = !record.success && evidence === null && agentModelUnavailable(record.summary);
+    // A goal naming two people is refused before the first turn — a fact about
+    // how the leg was AUTHORED, not about the application. Harness-class for
+    // the same reason the provider refusal is: no question was ever put to the
+    // page, so there is no answer to file against it.
+    const authoringRefused = !record.success && evidence === null && personaRefusal(record.summary);
     const failed = !record.success && evidence === null;
     // F4 of docs/consent-gate-recovery-spec.md: a failure reported from a
     // page the flow never asked for names the displacement outright. The
@@ -4238,10 +4741,10 @@ export class SmartRunner {
     // different origin or pathname is displacement; a query or hash change
     // is named neutrally.
     const displaced =
-      failed && !providerFailed && differentPage(urlBefore, urlAfter)
+      failed && !providerFailed && !authoringRefused && differentPage(urlBefore, urlAfter)
         ? ` — note: the agent ended on ${urlAfter}, not the page this step began on (${urlBefore}); ` +
           'the control it reported on may exist on the original page'
-        : failed && !providerFailed && urlAfter !== urlBefore
+        : failed && !providerFailed && !authoringRefused && urlAfter !== urlBefore
           ? ` — on the same page, now at ${queryAndHash(urlAfter) || urlAfter}`
           : '';
 
@@ -4260,7 +4763,7 @@ export class SmartRunner {
       // system-error family — never `failed`, which files the subject.
       // Live (be100 PL_02_08/09, 2026-08-28): an open circuit breaker was
       // scored as two red test failures.
-      status: failed ? (providerFailed ? 'error' : 'failed') : 'passed',
+      status: failed ? (providerFailed || authoringRefused ? 'error' : 'failed') : 'passed',
       startedAt,
       durationMs: Date.now() - started,
       url: urlAfter,
@@ -4347,6 +4850,18 @@ export class SmartRunner {
         throw new Error(
           `workflow agent unavailable: ${record.summary} ` +
             '(this is a SYSTEM failure — the model, not the application; no defect was filed against the app)',
+        );
+      }
+      if (authoringRefused) {
+        // No defect either, and for the stronger reason: the goal was refused
+        // before a turn was spent, so the application was never asked
+        // anything. The summary already names the fix — one `signIn` per
+        // person, one leg each — and the case records blocked rather than
+        // failed, which is what stops a badly-worded goal being counted as a
+        // broken feature.
+        throw new Error(
+          `workflow goal refused: ${record.summary} ` +
+            '(this is an AUTHORING fault — the goal names more than one person; no defect was filed against the app)',
         );
       }
       const exhausted = record.maxSteps !== null && record.turns >= record.maxSteps;
@@ -4800,7 +5315,8 @@ export class SmartRunner {
    * on one URL must not share one memo: a dead end on step 1 is not step 2's.
    */
   async #deadEndKey(selector: string): Promise<string> {
-    const key = CacheManager.key(this.page.url(), selector);
+    const who = this.#active.label === null ? '' : `${this.#active.label} :: `;
+    const key = who + CacheManager.key(this.page.url(), selector);
     try {
       if (/[?&]step=/.test(this.page.url())) return key;
       const current = this.page.locator('nav [aria-current="step"]').first();
@@ -6363,8 +6879,9 @@ export class SmartRunner {
         `not-found: the page is showing "${missing.heading}" at ${missing.url} — ` +
           'the application navigated to a page it does not have; no repair attempted',
       );
-      if (!this.#notFoundReported.has(missing.url)) {
-        this.#notFoundReported.add(missing.url);
+      const notFoundKey = `${this.#active.label ?? ''} :: ${missing.url}`;
+      if (!this.#notFoundReported.has(notFoundKey)) {
+        this.#notFoundReported.add(notFoundKey);
         this.#recordRuntimeDefect(
           'functional',
           'high',
@@ -6837,6 +7354,8 @@ export class SmartRunner {
       record = await this.#agent.run(this.page, goal, {
         memory: cacheAgentMemory(this.#cache),
         caseContext: this.#caseContext,
+        humanize: this.#humanize,
+        ...this.#agentPersona(),
       });
     } catch (error) {
       attempts.push(`agent-enter: ${describe(error)}`);
@@ -7048,6 +7567,8 @@ export class SmartRunner {
       heal = await this.#agent.run(this.page, healGoal, {
         memory: cacheAgentMemory(this.#cache),
         caseContext: this.#caseContext,
+        humanize: this.#humanize,
+        ...this.#agentPersona(),
         ...(asserting ? { allowedActions: REVEAL_ACTIONS } : {}),
       });
     } catch (error) {
@@ -7230,19 +7751,32 @@ export class SmartRunner {
       }
     }
 
-    if (this.#network) {
+    // Every session's observer, summed: the manager's approval leg made
+    // requests on its own Chrome, and a total that counted only the active
+    // session's would understate the run.
+    const totals = { calls: 0, failures: 0, dropped: 0 };
+    let observed = false;
+    for (const session of this.#sessions) {
+      const observer = session.network;
+      if (!observer) continue;
+      observed = true;
       try {
-        const calls = this.#network.all();
-        this.bundle.setNetworkTotals({
-          calls: calls.length + this.#network.dropped,
-          failures: calls.filter(isBlockingFailure).length,
-          dropped: this.#network.dropped,
-        });
+        const calls = observer.all();
+        totals.calls += calls.length + observer.dropped;
+        totals.failures += calls.filter(isBlockingFailure).length;
+        totals.dropped += observer.dropped;
       } catch {
         // Diagnostic, same rule as coverage above.
       }
-      await this.#network.detach().catch(() => undefined);
-      this.#network = null;
+      await observer.detach().catch(() => undefined);
+      session.network = null;
+    }
+    if (observed) {
+      try {
+        this.bundle.setNetworkTotals(totals);
+      } catch {
+        // Diagnostic.
+      }
     }
 
     // The DB connection is the runner's to close (it opened lazily on the
@@ -7259,33 +7793,56 @@ export class SmartRunner {
 
     await this.#cache.flush();
 
-    // Sealing the recording has to happen between closing the context and
-    // closing the browser, and in that order: Playwright finalises a video
+    // Every session, in the order they were opened — the primary first.
+    //
+    // Sealing a recording has to happen between closing its context and
+    // closing its browser, and in that order: Playwright finalises a video
     // when its *context* closes, so asking earlier reads a half-written file
     // that no player will open, and closing the browser first can take the
-    // page — and with it `page.video()` — away before it can be asked.
-    const video = this.#video;
-    if (video) {
-      const page = this.page;
-      await this.#context.close().catch(() => undefined);
-      const sealed = await sealVideo(
-        page,
-        video.dir,
-        video.size,
-        this.#videoMode === 'always' ? 'full' : this.#videoCut(),
-      );
-      if (sealed) this.bundle.setVideo(sealed);
-      this.#video = null;
-    }
-
-    if (this.#ownsPage) {
-      // Pages adoption left behind are this runner's to clean up, under the
-      // same ownership rule as the current page.
-      for (const page of this.#pagesLeftBehind) {
-        if (!this.#ownsContext) await page.close().catch(() => undefined);
+    // page — and with it `page.video()` — away before it can be asked. The
+    // primary's film is cut where the run broke; a persona's is kept whole,
+    // because the cut is judged over the run's steps and a persona's film
+    // covers only its own share of them.
+    const primary = this.#sessions[0];
+    for (const session of this.#sessions) {
+      const video = session.video;
+      if (video) {
+        const page = session.page;
+        await session.context.close().catch(() => undefined);
+        // `'on'` condenses every film — the primary's and each persona's —
+        // to its action moments (`ProofBundleBuilder.videoMoments`, on that
+        // film's own clock); `'always'` keeps the wall-clock film whole.
+        const film = session === primary ? '' : (session.label ?? 'persona');
+        const sealed = await sealVideo(
+          page,
+          video.dir,
+          video.size,
+          session === primary && this.#videoMode !== 'always' ? this.#videoCut() : 'full',
+          this.#videoMode === 'always' ? undefined : this.bundle.videoActionMoments(film),
+          this.#videoDwellMs,
+        );
+        if (sealed) {
+          session.sealed = sealed;
+          if (session === primary) this.bundle.setVideo(sealed);
+          else this.bundle.addPersonaVideo(session.label ?? 'persona', session.cdpUrl, sealed);
+        }
+        session.video = null;
+      } else if (this.#ownsPage && session.ownsContext) {
+        // An isolated, unfilmed context is this runner's to close too — a
+        // CDP disconnect below leaves it alive in a Chrome that outlives
+        // the process, one per case, every suite.
+        await session.context.close().catch(() => undefined);
       }
-      if (!this.#ownsContext) await this.page.close().catch(() => undefined);
-      await this.#browser.close().catch(() => undefined);
+
+      if (this.#ownsPage) {
+        // Pages adoption left behind are this runner's to clean up, under
+        // the same ownership rule as the current page.
+        if (!session.ownsContext) {
+          for (const page of session.pagesLeftBehind) await page.close().catch(() => undefined);
+          await session.page.close().catch(() => undefined);
+        }
+        await session.browser.close().catch(() => undefined);
+      }
     }
     return this.bundle.finish();
   }
@@ -7749,7 +8306,9 @@ function classifyStepFailure(action: string, error: unknown): StepIssue['kind'] 
       // A fixture the flow names that is not on disk, or a persona the run
       // was not given (2026-09-03): the test's problem, never the app's.
       error.name === 'FixtureMissingError' ||
-      error.name === 'PersonaUnknownError')
+      error.name === 'PersonaUnknownError' ||
+      // A persona's own Chrome that answers nothing: the machine's problem.
+      error.name === 'PersonaBrowserUnavailableError')
   ) {
     return 'error';
   }
@@ -7836,7 +8395,9 @@ function reconstructionFutile(error: unknown): boolean {
       error.name === 'RouteNotFoundError' ||
       // Nor put a fixture on disk, nor invent an account.
       error.name === 'FixtureMissingError' ||
-      error.name === 'PersonaUnknownError')
+      error.name === 'PersonaUnknownError' ||
+      // Nor start a Chrome.
+      error.name === 'PersonaBrowserUnavailableError')
   ) {
     return true;
   }
@@ -8127,7 +8688,21 @@ async function executeSteps(
         for (const step of plan) {
           // Before anything else. A run bounced to the sign-in page cannot
           // answer the question it was asked — see `assertSessionHeld`.
-          runner.assertSessionHeld();
+          //
+          // Exempt for a `signIn` and nothing else (HIR-EC-009, 2026-09-04):
+          // a flow whose setup is `goto <app page>` then `signIn` starts with
+          // an empty jar (`signsInItself` declines the inherited session), so
+          // the goto bounces to the login page and all three stranded
+          // conditions hold on the very step that exists to sign in — and
+          // `#bootstrapSession` cannot rescue it either, because it bails
+          // when the flow signs in itself. A sign-in page is exactly where a
+          // `signIn` expects to be. The exemption is this step only: the
+          // steps AFTER it are guarded as before (if the sign-in did not
+          // take, the next step still stops the run), `signOut` is not
+          // exempt, and `#strandedMessage`'s own three conditions — which
+          // the ladder also consults to refuse a heal onto login furniture —
+          // are untouched.
+          if (step.action !== 'signIn') runner.assertSessionHeld();
           await runner.narrate(
             runner.bundle.steps.length,
             step.action,
@@ -8633,6 +9208,10 @@ export interface RunFlowOptions {
   healedTimeoutMs?: number | undefined;
   /** Film the run with a drawn-in pointer. Default `on`; see `video.ts`. */
   video?: VideoMode | undefined;
+  /** Dwell per action moment in a condensed film, ms. Default `VIDEO_ACTION_DWELL_MS`. */
+  videoDwellMs?: number | undefined;
+  /** Perform like a person, for the film. Default: on while filming. See `SmartRunnerOptions.humanize`. */
+  humanize?: boolean | undefined;
   /**
    * Give this run its own browser context even when it is not being filmed.
    *
@@ -8669,6 +9248,8 @@ export interface RunFlowOptions {
 
   /** See `SmartRunnerOptions.personas`. */
   personas?: Record<string, { email: string; password: string }> | undefined;
+  /** See `SmartRunnerOptions.personaBrowsers`. */
+  personaBrowsers?: readonly string[] | undefined;
   /** See `SmartRunnerOptions.locale`. Wins over `Flow.locale`. */
   locale?: DateLocale | undefined;
   /** See `SmartRunnerOptions.downloadDir`. */
@@ -9043,6 +9624,33 @@ export function signsInItself(flow: Flow): boolean {
   return false;
 }
 
+/**
+ * The distinct people a flow signs in as, in order of first appearance — the
+ * `as` of every `signIn` step, folded by `foldPersonaKey` so `<MANAGER_ACCOUNT>`
+ * and `manager` count once. `when` branches are walked; a `use` fragment is
+ * a file this cannot read and is left to the run.
+ *
+ * This is how many browsers a multi-persona case needs: the first persona
+ * binds to the primary Chrome, every later one leases its own, so the extras
+ * a case asks for are `personasIn(flow).length - 1`.
+ */
+export function personasIn(flow: Flow): string[] {
+  const seen = new Map<string, string>();
+  const walk = (steps: readonly FlowStep[]): void => {
+    for (const step of steps) {
+      if (step.action === 'signIn') {
+        const key = foldPersonaKey(step.as);
+        if (key !== '' && !seen.has(key)) seen.set(key, step.as);
+      } else if (step.action === 'when') {
+        walk(step.then);
+        if (step.else) walk(step.else);
+      }
+    }
+  };
+  walk([...(flow.setup ?? []), ...flow.steps, ...(flow.teardown ?? [])]);
+  return [...seen.values()];
+}
+
 export async function runFlow(
   sourceFlow: Flow,
   options: RunFlowOptions = {},
@@ -9138,6 +9746,18 @@ export async function runFlow(
     options.sessionVault !== undefined && vaultOrigin !== null
       ? (options.sessionVault.get(vaultOrigin, options.credentials?.email) ?? undefined)
       : undefined;
+  // And for every person the flow signs in as (one Chrome per persona): the
+  // banked state under THEIR email, so the manager's second appearance in a
+  // suite starts signed in on the manager's own browser.
+  const sessionStates: Record<string, StoredSession> = {};
+  if (options.sessionVault !== undefined && vaultOrigin !== null && options.personas !== undefined) {
+    for (const label of personasIn(flow)) {
+      const persona = resolvePersona(label, options.personas);
+      if (persona === null) continue;
+      const state = options.sessionVault.get(vaultOrigin, persona.email);
+      if (state !== null) sessionStates[persona.email.toLowerCase()] = state;
+    }
+  }
 
   let runner: SmartRunner;
   try {
@@ -9154,12 +9774,16 @@ export async function runFlow(
       fastTimeoutMs: options.fastTimeoutMs,
       healedTimeoutMs: options.healedTimeoutMs,
       video: options.video,
+      videoDwellMs: options.videoDwellMs,
+      humanize: options.humanize,
       isolate: options.isolate,
       // Explicit wins; else the flow's own shape decides. A flow that types a
       // password wants to be the account it types, not the one the browser
       // was left signed in as.
       inheritSession: options.inheritSession ?? !signsInItself(flow),
       personas: options.personas,
+      personaBrowsers: options.personaBrowsers,
+      ...(Object.keys(sessionStates).length === 0 ? {} : { sessionStates }),
       locale: options.locale ?? flow.locale,
       flowDir: options.flowDir,
       downloadDir: options.downloadDir,
@@ -9221,12 +9845,23 @@ export async function runFlow(
   // a convenience lost, not a run changed.
   if (options.sessionVault !== undefined && vaultOrigin !== null) {
     try {
+      // Every person's session under their own account (one Chrome per
+      // persona): each session that ends on the origin, off the sign-in
+      // page, banks as the account it signed in as.
+      const banked = new Set<string>();
+      for (const session of await runner.exportSessions()) {
+        if (session.url.startsWith(vaultOrigin) && !looksLikeSignIn(session.url)) {
+          options.sessionVault.put(vaultOrigin, session.state, session.email);
+          banked.add(session.email.toLowerCase());
+        }
+      }
       const url = runner.page.url();
-      if (url.startsWith(vaultOrigin) && !looksLikeSignIn(url)) {
+      const endedAs = runner.lastSignedInAs ?? options.credentials?.email;
+      if (!banked.has((endedAs ?? '').toLowerCase()) && url.startsWith(vaultOrigin) && !looksLikeSignIn(url)) {
         const state = await runner.exportSession();
         // Under the account the run ENDED as: the last `signIn`'s email,
         // else the `--as` account, else the anonymous slot.
-        options.sessionVault.put(vaultOrigin, state, runner.lastSignedInAs ?? options.credentials?.email);
+        options.sessionVault.put(vaultOrigin, state, endedAs);
       }
     } catch {
       // The context may already be gone (a run-level error) — nothing to bank.

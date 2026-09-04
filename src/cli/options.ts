@@ -44,6 +44,12 @@ export interface CliOptions {
   /** Tables the operator adds to the detected set (`--db-baseline-tables a,b`, WOWLIDATOR_DB_BASELINE_TABLES). */
   dbBaselineTables: string[];
   video: VideoMode;
+  /**
+   * Perform like a person, for the film (`engine/humanize.ts`). Undefined
+   * lets the runner decide: on while filming, off otherwise. `--humanize
+   * on|off` or `WOWLIDATOR_HUMANIZE=1|0` to set it either way.
+   */
+  humanize: boolean | undefined;
   agentAssist: boolean;
   /**
    * Let the agent steady the page before a generation/authoring capture —

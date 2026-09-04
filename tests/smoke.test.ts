@@ -434,8 +434,10 @@ describe('formatStepLine', () => {
       resolution: 'fast',
       status: 'passed',
     });
-    assert.match(line, /^✓ \[2\] click role=button\[name="Edit"\] \(42ms\)$/m);
-    assert.match(line, /^ {6}Open the edit dialog$/m);
+    // Columns: mark, `[index]` (5 wide), action (14 wide), duration
+    // right-aligned in 15, then the target — so durations line up down a log.
+    assert.match(line, /^✓ \[2\]   click {10} {9}\(42ms\)  role=button\[name="Edit"\]$/m);
+    assert.match(line, /^ {8}Open the edit dialog$/m);
   });
 
   it('tags a healed step with its resolution source', () => {

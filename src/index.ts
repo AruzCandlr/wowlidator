@@ -86,6 +86,7 @@ export {
   isStateContradiction,
   executeFlow,
   resolvePersona,
+  personasIn,
   runFlow,
   signsInItself,
   stepPatience,

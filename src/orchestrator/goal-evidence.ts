@@ -188,9 +188,9 @@ export function goalEvidence(goal: string, before: string, after: string): GoalE
   if (destination !== null) {
     return destinationReached(goal, before, after)
       ? {
-          rule: 'destination',
-          reason: `the page reached ${destination}, the destination the goal names, having started at ${before}`,
-        }
+        rule: 'destination',
+        reason: `the page reached ${destination}, the destination the goal names, having started at ${before}`,
+      }
       : null;
   }
 
@@ -297,6 +297,26 @@ export function agentModelUnavailable(summary: string): boolean {
 }
 
 /**
+ * The leg was refused because its goal names more than one person.
+ *
+ * `multiPersonaSummary` returns before the first turn with a `multi-persona
+ * goal:` prefix, and the comment where it is built calls that prefix "the
+ * protocol `run-cases` reads so it can file this as an authoring refusal".
+ * Nothing read it: the refusal fell through to the ordinary failed-leg path
+ * and was filed as `functional` / `high`, "Workflow goal not reached" — a
+ * fact about how the flow was WRITTEN, reported as a defect in the
+ * application under test. The same mistake the provider-refusal branch beside
+ * this one exists to prevent.
+ *
+ * Like `agentModelUnavailable`, this can only be true of a summary produced
+ * by a return that happens before any turn is spent, so it can never change
+ * the outcome of a leg that actually ran.
+ */
+export function personaRefusal(summary: string): boolean {
+  return /^multi-persona goal:/i.test(summary);
+}
+
+/**
  * The checkable END STATE a goal describes, or null when it names none.
  *
  * Audit 2026-08-28 (be100): 20 of 22 agent legs on PASSED cases were settled
@@ -342,7 +362,13 @@ const BARE_CONTROL = String.raw`(\p{L}[^"“'=:,\n]{1,40}?)`;
 // glues the next word on), and before the NEXT `Key =` pair of a data line
 // ("Employee Group = A - Permanent Employee Sub Group = 10", HIR-EC-1xx):
 // one to three words and then "=" is the next pair, not more of this value.
-const VALUE_END = String.raw`(?=\s*(?:$|[,.;)\n]|\s+(?:and|then|on|in|so|while|before|after|but|via|from|at)\b|\s+(?:แล้ว|และ|จากนั้น|โดย|เพื่อ|ก่อน|หลัง|เสมอ|ตาม|พร้อม)|\s+(?:[^\s=\-][^\s=]*\s+){1,3}=))`;
+// The next-pair words carry no comma or semicolon (2026-09-03, ec09
+// HIR-EC-009 leg [38]): in "Partner University = 06 Burapha University,
+// Degree Level = zDVTDegreeLv_3 Vocational Certificate, Course = …" the lazy
+// value took the EARLIEST end, and "University, Degree Level =" read as the
+// next pair — so the value became "06 Burapha", the next "zDVTDegreeLv_3",
+// and a finish that had set every field was refused on truncated values.
+const VALUE_END = String.raw`(?=\s*(?:$|[,.;)\n]|\s+(?:and|then|on|in|so|while|before|after|but|via|from|at)\b|\s+(?:แล้ว|และ|จากนั้น|โดย|เพื่อ|ก่อน|หลัง|เสมอ|ตาม|พร้อม)|\s+(?:[^\s=\-,;][^\s=,;]*\s+){1,3}=))`;
 // A value may carry ONE balanced parenthetical: "A (Active)", "Thailand
 // (TH)", "CPN (10000009)" are single values in the sheets (Employee Status,
 // Country, Business Unit on every EC key-in row), and the old `[^)]` class
@@ -388,6 +414,15 @@ function firstDefined(groups: readonly (string | undefined)[], from: number, cou
 const GOAL_ANNOTATION = /\s*\((?:test\s+step|step|case|row)\b[^)]*\)\s*\.?/gi;
 /** A URL in a goal is a destination (`goalDestination`), never a `key: value`. */
 const GOAL_URL = /\bhttps?:\/\/\S+/gi;
+/**
+ * A bare path in a goal ("On /en/admin/hire fill …") is a destination too,
+ * and its letters are not the tail of a control: without this, "On
+ * /en/admin/hire fill the DVT-Specific Fields: …" yielded the control
+ * `n/admin/hire fill the DVT-Specific Fields` (2026-09-03, ec09 leg [38]).
+ * Only a slash-led token after whitespace or at the start — a date
+ * `31/03/2027` or a code `major006/x` starts with no slash and is left alone.
+ */
+const GOAL_PATH = /(?<=^|\s)\/[\w\-./]+/g;
 
 // A bare control in the `X = "Y"` form runs back to the sentence start and
 // picks up whatever precedes it ("Fill Country", "On the New Hire form with
@@ -412,10 +447,22 @@ function cleanControl(raw: string): string | null {
   return control;
 }
 
+// A DESCRIPTION standing where a value should be names nothing a page could
+// show (2026-09-03, ec09 HIR-EC-009 leg [13]): "set Employee Group to a value
+// other than F - DVT (for example Permanent)" was read as the value `a value
+// other than F - DVT (for example Permanent)`, which no tree can render, so
+// the finish was refused twice and a leg that had set the field was recorded
+// as a claim the page contradicts. An article or quantifier followed by a
+// word (never by a dash — "A - Permanent" is a value), "other than", or a
+// "for example" aside is a description; the pair is dropped and the record
+// says the finish rode the claim, as for any goal naming no checkable pair.
+const DESCRIBED_GOAL_VALUE = /^(?:a|an|any|some|another|other|different|something|anything)\s+(?!-)\p{L}|\bother than\b|\(for example\b|\be\.g\.|\bsuch as\b/iu;
+
 function cleanValue(raw: string): string | null {
   const value = raw.trim();
   // A placeholder the author left in ("<plan name>") names no value.
   if (value === '' || value.length > 60 || /^<[^>]*>$/.test(value)) return null;
+  if (DESCRIBED_GOAL_VALUE.test(value)) return null;
   return value;
 }
 
@@ -436,22 +483,34 @@ function cleanValue(raw: string): string | null {
  * 'agent-claim'` stays visible in the record for those.
  */
 export function goalOutcomes(goal: string): GoalOutcome[] {
-  const text = goal.replace(GOAL_URL, ' ').replace(GOAL_ANNOTATION, ' ');
-  const found: Array<{ at: number; outcome: GoalOutcome }> = [];
+  const text = goal.replace(GOAL_URL, ' ').replace(GOAL_PATH, ' ').replace(GOAL_ANNOTATION, ' ');
+  const found: Array<{ at: number; end: number; valueAt: number; colon: boolean; outcome: GoalOutcome }> = [];
   const collect = (re: RegExp, controlFrom: number, valueFrom: number, separatorAt: number | null): void => {
     for (const m of text.matchAll(re)) {
+      const rawValue = firstDefined(m, valueFrom, 4);
       const control = cleanControl(firstDefined(m, controlFrom, 4));
-      const value = cleanValue(firstDefined(m, valueFrom, 4));
+      const value = cleanValue(rawValue);
       if (control === null || value === null) continue;
       // "10:30", "ratio 3:1" — digits either side of a colon are a time or a
       // ratio, never a control and its value.
       if (separatorAt !== null && m[separatorAt] === ':' && /\d$/.test(control) && /^\d/.test(value)) continue;
-      found.push({ at: m.index ?? 0, outcome: { control, value } });
+      const at = m.index ?? 0;
+      const end = at + m[0].length;
+      found.push({ at, end, valueAt: end - rawValue.length, colon: separatorAt !== null && m[separatorAt] === ':', outcome: { control, value } });
     }
   };
   collect(OUTCOME_SET, 1, 5, null);
   collect(OUTCOME_EQ, 1, 6, 5);
   found.sort((a, b) => a.at - b.at);
+  // A colon that INTRODUCES a list of pairs is not a pair (2026-09-03, ec09
+  // HIR-EC-009 leg [38]): "fill the DVT-Specific Fields: Partner University =
+  // 06 Burapha University, …" read as `DVT-Specific Fields = "Partner"` — the
+  // colon's value is exactly where the first real pair's control begins. A
+  // colon pair whose value span holds the start of another pair is dropped.
+  const introductions = new Set(
+    found.filter((f) => f.colon && found.some((g) => g !== f && g.at >= f.valueAt && g.at <= f.end)),
+  );
+  for (const f of introductions) found.splice(found.indexOf(f), 1);
   // The same pair read twice — once by the verb form, once by the bare `X =
   // Y` form running back into the sentence ("ที่การ์ด ข้อมูลทั่วไป ตั้ง
   // Disability Status" beside "Disability Status") — is one outcome, and the
@@ -685,6 +744,28 @@ export function differentPage(before: string, after: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Is the agent off the page its step began on, somewhere the goal did not
+ * name?
+ *
+ * Live (HIR-EC-002, 2026-09-03 13:00): steps 16 "Reopen the saved New Hire"
+ * and 19 "Leave the New Hire form" spent 903 s of a 1,377 s case. Each leg
+ * left the step's page (/en/admin/hire/draft → /en/requests → on through the
+ * admin area), and every goto or click onto a fresh page was progress by the
+ * no-progress judge's own rule, so only DEFAULT_AGENT_MAX_STEPS ended them —
+ * 60 turns at ~7 s each. True when the URL is on a different origin or path
+ * from `startUrl` (a `?step=` change is the same page, see `differentPage`)
+ * AND is not at the destination the goal names — a goal naming no
+ * destination has nowhere off its page that counts. Pure: what the loop
+ * does with it (the AGENT_OFF_PAGE_TURNS allowance, the consent exemption,
+ * the reset on return) lives beside the other judges in `workflow-agent`.
+ */
+export function wanderedOffPage(goal: string, startUrl: string, url: string): boolean {
+  if (!differentPage(startUrl, url)) return false;
+  const destination = goalDestination(goal);
+  return destination === null || !atGoalDestination(url, destination);
 }
 
 /** `?step=2#top` — the part of a URL that is not the page. Empty when unparsable. */

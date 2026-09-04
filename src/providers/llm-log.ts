@@ -11,6 +11,8 @@
  * `provider:modelId`, the pacer id ends in the key's last four characters.
  */
 
+import { currentLogTag } from '../log-format.js';
+
 export type LlmLogMode = 'off' | 'on' | 'full';
 
 function llmLogMode(env: NodeJS.ProcessEnv = process.env): LlmLogMode {
@@ -39,11 +41,24 @@ export function resetLlmTally(): void {
   tally.outputTokens = 0;
 }
 
-let sink: (line: string) => void = (line) => process.stderr.write(`${line}\n`);
+/**
+ * The default sink prefixes the async context's log tag (`[c3]`,
+ * `[HIR-EC-001]`) on every line of an entry, so a model call made on behalf
+ * of a case lands under that case in the interleaved log rather than floating
+ * between two cases' lines. Outside any tagged context — `doctor`, a single
+ * `run` — nothing is added.
+ */
+function writeStderr(line: string): void {
+  const tag = currentLogTag();
+  const text = tag === undefined ? line : line.split('\n').map((l) => `${tag} ${l}`).join('\n');
+  process.stderr.write(`${text}\n`);
+}
+
+let sink: (line: string) => void = writeStderr;
 
 /** Test seam: capture lines instead of writing them. */
 export function setLlmLogSink(next: ((line: string) => void) | null): void {
-  sink = next ?? ((line) => process.stderr.write(`${line}\n`));
+  sink = next ?? writeStderr;
 }
 
 /** A free-form line on the same channel (pacing notices), honouring `off`. */

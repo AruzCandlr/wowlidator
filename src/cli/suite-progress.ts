@@ -52,6 +52,12 @@ export interface LedgerOutcome {
    */
   proofPath?: string | null | undefined;
   /**
+   * The Chromes this case ran on (CDP endpoints), primary first — more than
+   * one when the case gave each persona a browser of its own. Absent for a
+   * case that never ran and for ledgers written before 2026-09-03.
+   */
+  browsers?: string[] | undefined;
+  /**
    * How many times authoring REFUSED to write this case (the flow lints:
    * ungrounded text, no assertion, …). Recorded so the row reads "authoring
    * refused: …" on the report instead of "never ran", and so a resume knows
@@ -233,8 +239,15 @@ export function recordOutcome(
     knownResult?: 'passed' | 'failed' | 'blocked' | undefined;
   } = {},
 ): void {
+  // Which Chromes the steps ran on, in order of first use — read off the
+  // proof, the one place that knows (the runner stamps each step).
+  const browsers: string[] = [];
+  for (const step of outcome.bundle?.steps ?? []) {
+    if (step.browser !== undefined && !browsers.includes(step.browser)) browsers.push(step.browser);
+  }
   ledger.outcomes[caseIdOf(outcome.name)] = {
     ...(extra.authoringRefused === undefined ? {} : { authoringRefused: extra.authoringRefused }),
+    ...(browsers.length === 0 ? {} : { browsers }),
     ...(extra.dependsOn === undefined || extra.dependsOn.length === 0 ? {} : { dependsOn: [...extra.dependsOn] }),
     ...(extra.knownResult === undefined ? {} : { knownResult: extra.knownResult }),
     verdict: outcome.verdict,

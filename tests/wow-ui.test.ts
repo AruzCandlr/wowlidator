@@ -17,11 +17,11 @@ import { after, before, describe, it } from 'node:test';
 
 import { BACKEND_TIER_ACTIONS, type ProofBundle } from '../src/engine/proof-bundle.js';
 import { SUPPORTED_EXTENSIONS } from '../src/catalog/extract.js';
-import { UiCommandError, buildArgv, commandById, buildEnvOverlay } from '../src/ui/commands.js';
+import { COMMANDS, UiCommandError, buildArgv, commandById, buildEnvOverlay } from '../src/ui/commands.js';
 import { UploadError, deleteDocument, safeName, saveDocument } from '../src/ui/uploads.js';
 import { clearProofCache, groupAccuracy, groupRuns, groupScenarios, inferredCaseTitle, inferredScenario, readProof, readProofIndex, tallyVerdicts, toCard } from '../src/ui/proofs.js';
 import { renderWowUi } from '../src/ui/wow-ui-html.js';
-import { applyProgressLine, formatProgressReadout, type JobProgress } from '../src/ui/jobs.js';
+import { applyProgressLine, caseReasonOf, formatProgressReadout, type JobProgress } from '../src/ui/jobs.js';
 import { ModelSelection, ModelSelectionError } from '../src/ui/models.js';
 
 function bundle(overrides: Partial<ProofBundle> = {}): ProofBundle {
@@ -106,6 +106,39 @@ describe('the wowUI page', () => {
     // panel.
     assert.doesNotMatch(html, /<script src=|rel="stylesheet"|fonts\.googleapis|@import/);
     assert.doesNotMatch(html, /https?:\/\/(?!localhost|www\.w3\.org)/);
+  });
+
+  it('says in plain words, on the row, what every status word means', () => {
+    // The page parses whole: a stray backtick in WOW_SCRIPT truncates the
+    // document and takes the launcher with it.
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]!);
+    for (const script of scripts) assert.doesNotThrow(() => new Function(script));
+    // One map, the source of every meaning on both surfaces.
+    assert.match(html, /var STATUS_MEANING = \{/);
+    const meanings = {
+      error: 'the harness, a model, a key or the environment broke — no verdict about the application was delivered',
+      'dead-end': 'a control or content the case needed never resolved — the page did not offer what the case expected',
+      blocked: 'not run and not failed: the case needed something that was not in place (a session that held, a database, a key, a flow authoring accepted), so nothing about the application was proved',
+      'no verdict': 'nothing about the application was proved — the harness ended this run before any claim was tested, so a catalog scores it blocked, not failed',
+    };
+    for (const [key, text] of Object.entries(meanings)) assert.ok(html.includes(text), `the meaning of ${key}`);
+    for (const key of ['passed-with-issues', 'needs-review', 'human-confirmed', 'failed', 'quarantined', 'needs a human', 'recorded only', 'running']) {
+      assert.match(html, new RegExp(`\n  '?${key.replace(/[-?]/g, (c) => '\\' + c)}'?: '`), `STATUS_MEANING has ${key}`);
+    }
+    // The helper, built through el() and never an HTML string, on all three rows.
+    assert.match(html, /function meaningLine\(key, detail\)/);
+    assert.match(html, /function runMeaningLine\(card, key\)/);
+    assert.match(html, /isRunning \? null : runMeaningLine\(latest, why\)/, 'the run card');
+    assert.match(html, /meaningLine\(entry\.status, entry\.reason\)/, 'the catalog case row');
+    assert.match(html, /runMeaningLine\(card, cardMeaningKey\(card\)\)/, 'the history row');
+    // A run with no verdict quotes the CLI's recorded reason after the words, verbatim.
+    assert.match(html, /if \(card\.noVerdict && !isPassing\(card\.status\)\) return meaningLine\('no verdict', card\.noVerdict\)/);
+    assert.match(html, /text: 'recorded reason: '/);
+    // The machine status stays in the chip's title — the meaning line adds, never replaces.
+    assert.match(html, /'status: ' \+ entry\.status/);
+    assert.match(html, /chip\.title = status === 'error'/);
+    // Full width of the grid row, so no column widens; theme ink only.
+    assert.match(html, /\.meaning \{\n  grid-column: 1 \/ -1;/);
   });
 
   it('carries both palettes of the shared theme rather than a third dialect', () => {
@@ -236,6 +269,112 @@ describe('the wowUI page', () => {
     assert.doesNotMatch(html, /commandId: 'run'/);
   });
 
+  it('keeps a still for every step by default, on every command that offers the choice', () => {
+    // A filmed run under `auto` keeps a still only where a step FAILED, so the
+    // evidence for everything that passed is a video frame someone has to
+    // scrub to. The panel is where a run is read afterwards, and a
+    // full-resolution still per step is what a reader opens.
+    for (const spec of COMMANDS) {
+      const stills = spec.fields.find((f) => f.name === 'screenshots');
+      if (stills === undefined) continue;
+      assert.equal(stills.default, 'all', `${spec.id} offers Stills and must default to all`);
+      assert.ok(stills.choices?.includes('auto'), `${spec.id} still offers auto`);
+    }
+    // The form renders from the spec, so the default is what a submission
+    // carries — and it reaches the run as an ordinary flag.
+    assert.deepEqual(buildArgv(commandById('run')!, { flow: 'x.flow.json', screenshots: 'all' }), [
+      'run', 'x.flow.json', '--screenshots', 'all',
+    ]);
+    // The launcher starts there too, on both pages (one shared script).
+    assert.match(html, /screenshots: 'all'/);
+    // …and `auto` is still expressible: it is sent as NOTHING, because the
+    // run's own fallback is exactly what auto means.
+    assert.match(html, /if \(M\.screenshots !== 'auto'\) extras\.screenshots = M\.screenshots;/);
+  });
+
+  it('asks for every account the catalog signs in as, and will not start until it has them', () => {
+    // The gap this closes: the launcher had ONE credentials box, so a catalog
+    // whose rows change hands — the manager submits, the HRBP approves — had
+    // nowhere to give the second account. The run learned about it by refusing
+    // rows minutes in, with a browser already open.
+    assert.match(html, /function personaBlock\(M\)/);
+    assert.match(html, /function personasUnanswered\(M\)/);
+    assert.match(html, /function personaValues\(M\)/);
+
+    // Rendered from what the CLI wrote into the claims file. The panel does
+    // not re-read the sheet, and does not predict which rows will be refused.
+    assert.match(html, /M\.claims && M\.claims\.personas/);
+    assert.match(html, /case\(s\) sign in as this account/);
+
+    // A password box, and handlers that update in place — a re-render on a
+    // keystroke takes the caret out of the field being typed in.
+    assert.match(html, /type: 'password', value: got\.password/);
+    assert.match(html, /got\.password = e\.target\.value; syncSubmit\(\);/);
+    assert.match(html, /got\.email = e\.target\.value; syncSubmit\(\);/);
+
+    // Blocking, both ways in: the Start button and the one-press path.
+    assert.match(html, /account\(s\) still need an email and a password/);
+    assert.match(html, /countApproved\(M\) > 0 && personasUnanswered\(M\) === 0\) submitLauncher\(\);/);
+
+    // Sent on the run as the field the command already declares — a secret, so
+    // it rides the env overlay and never becomes argv.
+    assert.match(html, /values\.personas = accounts;/);
+    assert.ok(COMMANDS.find((c) => c.id === 'catalog-run')?.fields.some((f) => f.name === 'personas' && f.type === 'secret'));
+
+    // In memory for as long as the launcher is open, and nowhere else. A
+    // secret is not a view preference.
+    assert.match(html, /personaCreds: \{\}/);
+    assert.doesNotMatch(html, /localStorage[^\n]*personaCreds|personaCreds[^\n]*localStorage/);
+  });
+
+  it('offers an address it has run before, and asks for the password anyway', () => {
+    // The half that is friction is the address: it does not change between
+    // runs, and the person retyping it is the one who typed it yesterday. The
+    // half that must never be remembered is the password — a store holding
+    // both would be a credential on disk that can sign in on its own.
+    assert.match(html, /function loadPersonaAccounts\(\)/);
+    assert.match(html, /api\('\/api\/persona-accounts'\)/);
+    // Loaded where the launcher loads its data, beside the documents fetch —
+    // never on a poll: it changes only when a run starts.
+    assert.match(html, /\n  loadDocuments\(\);\n  loadPersonaAccounts\(\);/);
+    assert.match(html, /personaAccounts: \{\}/);
+
+    // Nothing remembered for an account is exactly the box it had before.
+    assert.match(html, /function accountPicker\(need, got\)/);
+    assert.match(html, /if \(known\.length === 0\) return typed;/);
+
+    // Something remembered is a list of them, most recent preselected.
+    assert.match(html, /var known = rememberedAccounts\(need\.label\);/);
+    assert.match(html, /if \(!got\.custom && \(got\.email \|\| ''\) === ''\) got\.email = known\[0\]\.email;/);
+    assert.match(html, /text: 'Another account…'/);
+
+    // Revealed in place. Re-rendering the form to show a field would rebuild
+    // the control being used and take the caret with it.
+    assert.match(html, /typed\.style\.display = got\.custom \? 'block' : 'none';/);
+    const picker = /function accountPicker\(need, got\) \{[\s\S]*?\n\}/.exec(html)?.[0] ?? '';
+    assert.ok(picker !== '', 'the picker is in the page');
+    assert.doesNotMatch(picker, /renderLauncher\(/, 'a handler here syncs, it does not re-render');
+    assert.ok(picker.includes('syncSubmit();'));
+
+    // The password half is untouched: no memory, no offer, always typed, and
+    // Start still blocked until it is there.
+    assert.doesNotMatch(picker, /password/);
+    assert.match(html, /type: 'password', value: got\.password/);
+    assert.match(html, /account\(s\) still need an email and a password/);
+    // …and the copy says so, because something IS written to disk now.
+    assert.match(html, /is written nowhere, and never reaches the command line/);
+  });
+
+  it('names no account in code: labels come from the claims file, addresses from the store', () => {
+    // The universal rule (`tests/no-hardcode.test.ts`) exempts this module
+    // from its scan because it is an inline HTML/JS bundle, so the page string
+    // is checked here instead: a persona label may be discussed in a comment
+    // — that is history — and may never be a literal the page steers on or
+    // shows. Comments stripped, nothing may be left.
+    const code = html.replace(/\/\*[\s\S]*?\*\//g, ' ');
+    assert.doesNotMatch(code, /_ACCOUNT/);
+  });
+
   it('remembers repositories under Machinery, and any run can select one', () => {
     // Saving is memory, not an upload: the Machinery view scans through the
     // whitelisted `context add` (never a shell string), and the launch modal
@@ -357,6 +496,44 @@ describe('the wowUI page', () => {
     assert.ok(html.includes('Command output ('), 'the collapsible section header is missing');
     assert.ok(html.includes('jobForRun'), 'runs must be matched to the job that produced them');
     assert.match(html, /outOpen/);
+  });
+
+  it('reads command output rather than dumping it: classified rows, case groups, filters, copy raw', () => {
+    // The lines are the CLI's, untouched in substance (src/ui/console-lines.ts);
+    // the page only decides how each is laid out and which filter keeps it.
+    // Both surfaces render output through this one view, so what is pinned
+    // here holds on Ledger too (tests/ledger-ui.test.ts pins it there).
+    assert.equal((html.match(/function consoleView\(/g) ?? []).length, 1, 'one console view');
+    assert.equal((html.match(/function classifyLine\(/g) ?? []).length, 1, 'the classifier ships once');
+    assert.doesNotMatch(html, /function outLine\(/, 'the old one-div-per-line renderer is gone');
+    // Live lines and the replay both go through the view, in place, never via render().
+    assert.match(html, /out\.view\.append\(line\);\s*out\.view\.follow\(\);/);
+    assert.match(html, /out\.view\.reset\(S\.jobLines\[jobId\] \|\| \[\]\)/);
+    // Stderr is a muted gutter marker, never colour alone; steps carry their glyph.
+    assert.match(html, /'printed on stderr'/);
+    assert.match(html, /\.con-row\.step-pass \.con-g \{ color: var\(--ok\)/);
+    assert.match(html, /\.con-row\.step-fail \.con-g \{ color: var\(--bad\)/);
+    // A case's lines sit under one sticky label instead of a repeated prefix.
+    assert.match(html, /\.con-case \{[^}]*position: sticky/);
+    // ask:/response: fold behind a toggle; a refusal's bullets are a list.
+    assert.match(html, /function conFold\(row, c\)/);
+    assert.match(html, /function conBullet\(row, c\)/);
+    assert.match(html, /el\('ul', \{ class: 'con-bullets' \}\)/);
+    // An indented line rides with the row above it: a refusal item's wrapped
+    // rest, a step's detail, an agent turn's note (2026-09-04 shapes).
+    assert.match(html, /function conDetail\(row, c\)/);
+    assert.match(html, /if \(c\.hang && last && \(last\.list \|\| last\.c\.kind === 'step-pass'/);
+    assert.match(html, /class: 'con-key', text: c\.label/, 'the two-column summary keeps its key');
+    // The filter row, its persistence guarded, and the raw copy that ignores it.
+    for (const label of ["'All'", "'Steps'", "'Model calls'", "'Problems'"]) assert.ok(html.includes(label), label);
+    assert.match(html, /try \{\s*var v = localStorage\.getItem\('wow-console-filter'\)/);
+    assert.match(html, /try \{ localStorage\.setItem\('wow-console-filter', v\); \} catch/);
+    assert.match(html, /text: 'Copy raw'/);
+    assert.match(html, /placeholder: 'find in output'/);
+    // The filter hides rows; an author display must not beat the UA's [hidden].
+    assert.match(html, /\.con-row\[hidden\], \.con-group\[hidden\], \.con-fold\[hidden\] \{ display: none; \}/);
+    // A filter change re-reads mounted views in place — never render().
+    assert.match(html, /function conApplyAll\(\) \{ conViews\(\)\.forEach\(function \(v\) \{ v\.apply\(\); \}\); \}/);
   });
 
   it('puts a runtime on every step, and a total under them', () => {
@@ -670,6 +847,37 @@ describe('the card projection', () => {
     assert.equal(card.frontend.steps + card.backend.steps, card.totalSteps);
   });
 
+  it('projects why a run delivered no verdict, by the CLI\'s own rule, never a second one', () => {
+    // A pass carries no such reason.
+    assert.equal(toCard(bundle(), '/tmp/run-1.json').noVerdict, null);
+    // A failed run where a claim was actually contradicted: a verdict exists.
+    const contradicted = bundle();
+    contradicted.status = 'failed';
+    contradicted.steps[1] = { ...contradicted.steps[1]!, action: 'expectVisible', status: 'failed', error: 'expected the banner, the page holds nothing' };
+    assert.equal(toCard(contradicted, '/tmp/run-2.json').noVerdict, null);
+    // The session guard fired: every broken step is `error`, and the reason
+    // it recorded — the sign-in page, the session never established — is what
+    // the row quotes under the chip. Same words as `harnessOnly`, same function.
+    const stranded = bundle();
+    stranded.status = 'failed';
+    stranded.steps[1] = {
+      ...stranded.steps[1]!,
+      status: 'error',
+      error: 'the run is on the sign-in page (http://localhost:3000/en/login) after asking for /en — the session is not established, so nothing after this point can say anything about the feature under test.\n  Every later step would be asserted against the login screen.',
+    };
+    const card = toCard(stranded, '/tmp/run-3.json');
+    assert.ok(card.noVerdict !== null);
+    assert.match(card.noVerdict!, /^runtime error — the harness ended this case, not the application: the run is on the sign-in page/);
+    assert.match(card.noVerdict!, /the session is not established/);
+    assert.doesNotMatch(card.noVerdict!, /\n/, 'first line only — it goes on one row');
+    // A run that never got going at all.
+    const dead = bundle();
+    dead.status = 'failed';
+    dead.steps = [];
+    dead.error = 'could not attach to Chrome at http://localhost:9222\nstart it with: npm run chrome';
+    assert.equal(toCard(dead, '/tmp/run-4.json').noVerdict, 'could not attach to Chrome at http://localhost:9222');
+  });
+
   it('says when a model wrote the flow, and which one', () => {
     const card = toCard(
       bundle({
@@ -688,9 +896,20 @@ describe('the card projection', () => {
   });
 });
 
+describe('a case\'s recorded reason, read out of the command\'s own output', () => {
+  it('keeps the reason from the BLOCKED and no-verdict lines and nothing else', () => {
+    assert.equal(caseReasonOf('BLOCKED PL_02_03 — authoring refused (attempt 2): the flow proves nothing about its claim'), 'authoring refused (attempt 2): the flow proves nothing about its claim');
+    assert.equal(caseReasonOf('  ! no verdict: runtime error — the harness ended this case, not the application: the session is not established'), 'runtime error — the harness ended this case, not the application: the session is not established');
+    assert.equal(caseReasonOf('case "PL_02_03" blocked'), null);
+    assert.equal(caseReasonOf('  ✓ 3/7 the sign-in button works'), null);
+    assert.equal(caseReasonOf('BLOCKED x — '), null);
+    assert.equal(caseReasonOf('BLOCKED x — ' + 'y'.repeat(400))!.length, 300, 'one row, capped');
+  });
+});
+
 describe('live progress, read out of the command\'s own output', () => {
   const fresh = (): JobProgress =>
-    ({ done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0 });
+    ({ done: 0, total: null, etaMs: null, percent: null, phase: null, rateMsPerStep: null, lastStepMs: 0, startedMs: null });
 
   it('takes the denominator from the plan line the run announces', () => {
     const progress = fresh();

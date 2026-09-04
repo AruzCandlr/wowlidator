@@ -81,11 +81,13 @@ const flowStepSchema = z.discriminatedUnion('action', [
     as: z.string().min(1).describe('Variable name the saved file path is stored under, for {{as}} later.'),
     intent,
   }),
-  // Persona switch (2026-09-03): sign out through the app, sign in as a named
-  // persona from the run's persona map — never credentials in the flow.
+  // Persona switch (2026-09-03): sign in as a named persona from the run's
+  // persona map — never credentials in the flow. Each persona gets a browser
+  // of their own and keeps it; a persona already signed in is switched to,
+  // not re-authenticated.
   z.object({
     action: z.literal('signIn'),
-    as: z.string().min(1).describe('A persona label (HR_ADMIN_ACCOUNT, <MANAGER_ACCOUNT>, "manager") or the email of one.'),
+    as: z.string().min(1).describe('A persona label (HR_ADMIN_ACCOUNT, <MANAGER_ACCOUNT>, "manager") or the email of one. A persona already signed in earlier in the flow is switched back to, session kept.'),
     url: z.string().optional().describe('The sign-in page. Omit to use the one the flow already named, else /login.'),
     intent,
   }),

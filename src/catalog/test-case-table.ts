@@ -37,6 +37,9 @@
 
 import { parseDelimited, sniffDelimiter } from './extract.js';
 import type { CatalogClaim } from './catalog.js';
+// The words the gates read a Note with are data — a leaf module that imports
+// nothing of the parser, so the dependency still runs one way (2026-09-04).
+import { AUTHORING } from '../generator/value-rules.js';
 
 /**
  * The header, exactly as the format has it — including the leading space in
@@ -259,6 +262,60 @@ export function parseWorkbookCases(sheets: readonly { name: string; rows: readon
   return all.length === 0 ? null : finishTable(all);
 }
 
+const POLARITY_CELL = /^(positive|negative)$/i;
+
+/**
+ * A data row whose cells slipped one or two columns against the header.
+ *
+ * Live (ec09.csv, 2026-09-03): the writer left Scenario ID empty and typed the
+ * scenario title one cell to the right, so every later cell sat under the
+ * wrong heading — "Positive" under Priority, the steps under Expected Output,
+ * the ticket numbers under Note. The header still matched, the row still had
+ * nineteen cells, and `caseId` read a paragraph, so the row was refused and
+ * the whole sheet fell through to the model extractor: 142 s and fifteen
+ * claims for one case, against a few milliseconds for the columns read
+ * directly.
+ *
+ * The anchor is the Positive/Negative column: a cell that is exactly
+ * `Positive` or `Negative` and sits within two columns of where the header
+ * says it should be tells us the offset. A rightward slip is undone by
+ * dropping that many EMPTY cells to the left of the anchor (the blank the
+ * writer skipped over) — or, when there is no blank, the cells just before
+ * it; a leftward slip is undone by inserting blanks before the anchor. A row
+ * whose polarity cell is where it belongs, or that has no such cell anywhere
+ * near, is returned untouched: this fixes the one shape it recognises and
+ * never guesses at another. Returns the offset it undid, for the log.
+ */
+export function realignRow(cells: readonly string[], polarityColumn: number): { cells: string[]; shift: number } {
+  const out = [...cells];
+  if (polarityColumn < 0) return { cells: out, shift: 0 };
+  const at = (i: number): string => (out[i] ?? '').trim();
+  if (POLARITY_CELL.test(at(polarityColumn))) return { cells: out, shift: 0 };
+  const near: number[] = [];
+  for (let d = -2; d <= 2; d += 1) {
+    if (d === 0) continue;
+    const j = polarityColumn + d;
+    if (j >= 0 && POLARITY_CELL.test(at(j))) near.push(j);
+  }
+  if (near.length !== 1) return { cells: out, shift: 0 };
+  const shift = near[0]! - polarityColumn;
+  if (shift > 0) {
+    // Slipped right: remove `shift` cells left of the anchor, blanks first.
+    let remaining = shift;
+    for (let i = near[0]! - 1; i >= 0 && remaining > 0; i -= 1) {
+      if (at(i) === '') {
+        out.splice(i, 1);
+        remaining -= 1;
+      }
+    }
+    if (remaining > 0) out.splice(polarityColumn, remaining);
+  } else {
+    // Slipped left: the writer dropped a cell; put blanks back before the anchor.
+    out.splice(near[0]!, 0, ...new Array<string>(-shift).fill(''));
+  }
+  return { cells: out, shift };
+}
+
 /**
  * Read a grid of cells as a test-case table. `sheet` names the worksheet on
  * every row when there is one. Rows come back as the sheet has them —
@@ -312,7 +369,9 @@ export function parseTestCaseRows(
   let menu = '';
   let menuScenario = '';
 
-  for (const cells of rows.slice(headerAt + 1)) {
+  const polarityColumn = mapping.indexOf('polarity');
+  for (const raw of rows.slice(headerAt + 1)) {
+    const { cells } = realignRow(raw, polarityColumn);
     const row: TestCaseRow = { ...EMPTY_ROW };
     const notes: string[] = [];
     mapping.forEach((field, column) => {
@@ -622,6 +681,55 @@ export function testDataPairs(text: string): TestDataPair[] {
 }
 
 /**
+ * A Test data VALUE that is not a value: the sheet's own "nobody knows yet"
+ * marks. Live (ec09 HIR-EC-009, 2026-09-03): `DVT Project Name = ? รอตาราง
+ * โครงการ DVT` (waiting for the DVT project table), `Type = ? ยังไม่ยืนยัน
+ * ตารางที่ใช้` (the table is not confirmed), `Course of Time = ? ยังไม่ยืนยัน
+ * หน่วย/รูปแบบ` (unit/format not confirmed), and `University Type = ต้องระบุ
+ * เป็น DVT Partnered University หรือ Other University ก่อน Execute` — an
+ * INSTRUCTION to decide before executing, not a value. Rendered to the author
+ * as ordinary pairs, the first three were dropped silently and the fourth was
+ * resolved by the model's own choice into a workflow goal; the app then
+ * refused Submit for the required field nobody could fill. The shapes: a
+ * leading `?`; the sheet's open-question ids (`OQ-HIR-78`, `CF-SIT-19`);
+ * English TBD / TBC / "to be confirmed" / "not yet confirmed" / "pending
+ * confirmation"; Thai ยังไม่ยืนยัน / ยังไม่ได้กำหนด / ยังไม่ทราบ / ยังไม่มีคำตอบ
+ * (not yet confirmed / defined / known / answered), รอ + ยืนยัน / ตาราง /
+ * ข้อมูล / คำตอบ / BA / SA (waiting for confirmation / the table / data / an
+ * answer / BA / SA), and an instruction that starts ต้องระบุ / ต้องกำหนด /
+ * ต้องเลือก (must specify / define / choose) or ends ก่อน Execute.
+ *
+ * Deliberately NOT matched, because each is a real value somewhere in the
+ * sheets: `No`, `Pending` / `รออนุมัติ` (a status), `N/A` (handled by the
+ * block reader), a bare `รอ` (waiting — a status word too).
+ *
+ * An open-question id counts only where it IS the value — at the start, or
+ * after the sheet's own `?` (2026-09-04, multirole HIR-EC-001): `Policy
+ * Profile = CDS ใช้แทน CDS ที่เคยระบุ ดู CF-SIT-19` names the value and then
+ * the question that settled it, and `writtenValueOf` reads it as `CDS`; the
+ * same rule `fixtureFacts` applies to a case id after "same as".
+ */
+export const UNCONFIRMED_VALUE =
+  /^\?|\b(?:TBD|TBC|TBA)\b|\b(?:TBD|TBC|TBA)\b|\bto be (?:confirmed|decided|determined|defined|announced)\b|\bnot yet (?:confirmed|decided|defined|determined|known|available)\b|\bpending (?:confirmation|confirm|decision|BA|SA)\b|\bawaiting (?:confirmation|decision|BA|SA)\b|ยังไม่(?:ได้)?(?:ยืนยัน|กำหนด|ระบุ|ทราบ|สรุป|มีคำตอบ)|รอ(?:การ)?(?:ยืนยัน|สรุป|คอนเฟิร์ม)|รอ(?:ตาราง|ข้อมูล|คำตอบ)|รอ\s*(?:BA|SA)\b|^ต้อง(?:ระบุ|กำหนด|เลือก|ยืนยัน)|ก่อน\s*Execute\b/iu;
+
+/** Is this Test data value one nobody has confirmed yet? See `UNCONFIRMED_VALUE`. */
+export function unconfirmedValue(value: string): boolean {
+  // The open-question prefixes are data (`generator/value-rules.ts`,
+  // `authoring.openQuestionPrefixes`); the position — at the START of the
+  // value — is the structure (2026-09-04, HIR-EC-001).
+  return UNCONFIRMED_VALUE.test(value.trim()) || AUTHORING.openQuestionAtStart.test(value);
+}
+
+/**
+ * The pairs of a Test data block whose value is unconfirmed — the fields a
+ * case cannot key, assert or hand to an agent, listed for the author, the
+ * case card and the run log so the gap is visible instead of hunted.
+ */
+export function unconfirmedTestData(text: string): TestDataPair[] {
+  return testDataPairs(text).filter((pair) => unconfirmedValue(pair.value));
+}
+
+/**
  * The Test Data block as the author should read it: one pair per line with
  * its phase in brackets, corrections applied, prose lines kept verbatim —
  * so the value resolver's line scan finds `Job Code = MKB12.12` on a line of
@@ -631,9 +739,9 @@ function renderTestData(text: string): string[] {
   const out: string[] = [];
   const corrected = new Map<string, TestDataPair[]>();
   for (const pair of testDataPairs(text)) {
-    const list = corrected.get(`${pair.phase ?? ''} ${pair.key}`) ?? [];
+    const list = corrected.get(`${pair.phase ?? ''}\u0000${pair.key}`) ?? [];
     list.push(pair);
-    corrected.set(`${pair.phase ?? ''} ${pair.key}`, list);
+    corrected.set(`${pair.phase ?? ''}\u0000${pair.key}`, list);
   }
   let phase: string | null = null;
   for (const raw of text.split('\n')) {
@@ -665,7 +773,7 @@ function renderTestData(text: string): string[] {
       continue;
     }
     for (const pair of pairs) {
-      const fixed = corrected.get(`${phase ?? ''} ${pair.key}`)?.shift();
+      const fixed = corrected.get(`${phase ?? ''}\u0000${pair.key}`)?.shift();
       const value = fixed?.value ?? pair.value;
       out.push(`${phase === null ? '' : `[${phase}] `}${pair.key} = ${value}`);
     }
@@ -945,21 +1053,40 @@ export function referencedCases(row: TestCaseRow): CaseReference[] {
  * it needs. A data-shaped reference to an id the table lacks (`Plan =
  * PL_08`) is data, not a dependency, and is dropped. A row never depends on
  * itself.
+ *
+ * **A reference is resolved against SCENARIO ids too** (2026-09-04, multirole
+ * PRB-EC-001). The workbook names a hire by its scenario (`ต่อจากเคส E2E-01`:
+ * the E2E scenario whose rows are HIR-EC-001, HIR-EC-002 …), never by one of
+ * those rows' Test Case IDs, so a scenario id is a name this table may hold.
+ * The row's OWN scenario id is itself — the probation rows of scenario
+ * E2E-01 "continue from E2E-01" — and is never a dependency, external or
+ * otherwise. Another scenario the table holds resolves to its first row
+ * (the one that creates what the scenario's later rows use), same sheet
+ * first. Only a scenario the table does NOT hold is external. Structural: the
+ * ids come from the table's own columns, never from a list of prefixes.
  */
 export function linkDependencies(rows: TestCaseRow[]): void {
   const bySheet = new Map<string, TestCaseRow>();
   const byId = new Map<string, TestCaseRow[]>();
+  const byScenario = new Map<string, TestCaseRow[]>();
   for (const row of rows) {
+    if (row.scenarioId !== '') byScenario.set(row.scenarioId, [...(byScenario.get(row.scenarioId) ?? []), row]);
     const own = row.sheetCaseId ?? row.caseId;
     if (own === '') continue;
-    bySheet.set(`${row.sheet ?? ''} ${own}`, bySheet.get(`${row.sheet ?? ''} ${own}`) ?? row);
+    bySheet.set(`${row.sheet ?? ''}\u0000${own}`, bySheet.get(`${row.sheet ?? ''}\u0000${own}`) ?? row);
     byId.set(own, [...(byId.get(own) ?? []), row]);
   }
   const resolve = (row: TestCaseRow, id: string): TestCaseRow | null => {
-    const same = bySheet.get(`${row.sheet ?? ''} ${id}`);
+    const same = bySheet.get(`${row.sheet ?? ''}\u0000${id}`);
     if (same !== undefined) return same;
     const any = byId.get(id);
-    return any !== undefined && any.length === 1 ? any[0]! : (any?.[0] ?? null);
+    if (any !== undefined && any.length > 0) return any[0]!;
+    // The row's own scenario is the row itself (skipped by the caller); another
+    // scenario the table holds is its first row, this sheet's before another's.
+    if (id === row.scenarioId) return row;
+    const scenario = byScenario.get(id);
+    if (scenario === undefined) return null;
+    return scenario.find((other) => (other.sheet ?? '') === (row.sheet ?? '')) ?? scenario[0] ?? null;
   };
   for (const row of rows) {
     const dependsOn: string[] = [];
@@ -1342,17 +1469,16 @@ export function sheetGateReason(row: TestCaseRow, options: { includeBlocked?: bo
   const lower = actual.toLowerCase();
   const note = row.note.trim();
   if (/^cancel+ed$|^ยกเลิก/u.test(lower)) return 'the sheet records this case as Cancelled — the requirement dropped it';
+  // The Note's words are data (`generator/value-rules.ts`, `authoring.sheetNote`),
+  // both languages; the column read — the Note, never the Steps — is the structure.
   if (options.includeBlocked !== true && (BLOCKED_STATUS_RE.test(actual) || PENDING_STATUS_RE.test(actual))) {
     const ticket = oneLine(row.bugTicket);
     return `the sheet records this case as ${actual}${ticket === '' ? '' : ` — bug ticket ${ticket}`}`;
   }
-  if (/\b(cancel+ed|dropped|removed from (?:the )?req|out of scope)\b/i.test(note) && !/re-?test/i.test(lower)) {
+  if (AUTHORING.sheetNote.cancelled.test(note) && !AUTHORING.sheetNote.retest.test(lower)) {
     return `the sheet's Note says the case was cancelled: "${note.slice(0, 80)}"`;
   }
-  const notYet =
-    /ยังรันไม่ได้|ยังทดสอบไม่ได้|ยังไม่สามารถทดสอบ|บันทึกผลเป็นยังทดสอบไม่ได้|cannot (?:be )?(?:run|tested) yet|not (?:yet )?testable|blocked until (?:dev|the team|delivery)/iu.exec(
-      note,
-    );
+  const notYet = AUTHORING.sheetNote.notYet.exec(note);
   if (notYet !== null) {
     const line = note.split('\n').find((l) => l.includes(notYet[0])) ?? notYet[0];
     return `the sheet's Note says the case cannot be run yet: "${line.trim().slice(0, 140)}"`;
@@ -1448,6 +1574,17 @@ export function describeCase(row: TestCaseRow): string {
   if (row.testData !== '' && !/^(?:n\/?a|-)$/i.test(row.testData.trim())) {
     const heading = row.testDataFrom === undefined ? 'Test data:' : `Test data (inherited from ${row.testDataFrom}):`;
     parts.push(`${heading}\n${renderTestData(row.testData).map((line) => `  ${line}`).join('\n')}`);
+    // The pairs nobody has confirmed, named as such (`UNCONFIRMED_VALUE`):
+    // the author skips their steps and says so, never types the marker,
+    // never names them in a workflow goal, never asserts them.
+    const unconfirmed = unconfirmedTestData(row.testData);
+    if (unconfirmed.length > 0) {
+      parts.push(
+        'Unconfirmed test data (no value yet — never type it, never assert it, never name it in a workflow goal; ' +
+          'write the scripted step for such a field as "skipped step N: unconfirmed test data — <Field>"):\n' +
+          unconfirmed.map((pair) => `  ${pair.key} = ${pair.value}`).join('\n'),
+      );
+    }
   }
   for (const set of optionSetsIn(row.expected)) {
     const size = set.count === null ? String(set.members.length) : String(set.count);
@@ -1617,4 +1754,78 @@ export function prefixFor(subject: string): string {
     .filter((word) => word.length > 2);
   const initials = words.slice(0, 2).map((word) => word[0]?.toUpperCase() ?? '').join('');
   return initials.length >= 2 ? initials : 'TC';
+}
+
+/**
+ * The persona labels a row names, in order of first appearance (CG-05): the
+ * workbook's `<HR_ADMIN_ACCOUNT>` tokens (424 mentions), and the role words
+ * the PY and TM sheets use instead of a token — `Login ด้วย SPD Admin` (every
+ * PY row), `หัวหน้าอนุมัติ` / `Manager approve` (the hand-off rows), `HRBP`,
+ * `Login web humi` / `พนักงานเข้าสู่ระบบ` (an employee's own session). A bare
+ * "Manager" is NOT a persona — `Approval route = Manager` is a field value —
+ * so the role word must be doing something (approving, signing in).
+ */
+export function personasOf(row: TestCaseRow): string[] {
+  const text = [row.persona, row.preconditions, row.testData, row.steps, row.testCase].join('\n');
+  const found: { label: string; at: number }[] = [];
+  for (const match of text.matchAll(/<([A-Z][A-Z0-9_]*_ACCOUNT)>/g)) {
+    found.push({ label: match[1]!, at: match.index ?? 0 });
+  }
+  const ROLE_WORDS: readonly [RegExp, string][] = [
+    [/SPD\s*Admin/iu, 'SPD_ADMIN'],
+    [/\bHR\s*Admin\b/iu, 'HR_ADMIN_ACCOUNT'],
+    [/\bHRBP\b/u, 'HRBP_ACCOUNT'],
+    [/\b(?:line\s+)?manager\b[^\n.]{0,24}?(?:approv|reject|log ?in|sign ?in|อนุมัติ|ปฏิเสธ|เข้าสู่ระบบ)|หัวหน้า(?:งาน)?\s*(?:อนุมัติ|ปฏิเสธ|เข้าสู่ระบบ|กด|login)/iu, 'MANAGER_ACCOUNT'],
+    [/login\s+web\s+humi|พนักงานเข้าสู่ระบบ|\bemployee\b[^\n.]{0,16}?(?:log ?in|sign ?in|เข้าสู่ระบบ)/iu, 'EMPLOYEE_ACCOUNT'],
+  ];
+  for (const [re, label] of ROLE_WORDS) {
+    const match = re.exec(text);
+    if (match !== null) found.push({ label, at: match.index });
+  }
+  found.sort((a, b) => a.at - b.at);
+  const out: string[] = [];
+  for (const { label } of found) if (!out.includes(label)) out.push(label);
+  return out;
+}
+
+/**
+ * Every persona the WHOLE document needs, and which cases need each — the
+ * hand-off that lets a surface ask for credentials before anything is spent.
+ *
+ * It exists because the claims file was the first parsed artefact the panel
+ * ever held and it said nothing about accounts: `claimTextOf` composes a claim
+ * from the title, the expectation and the note, and the Steps column — where
+ * `Login ด้วย <MANAGER_ACCOUNT>` actually lives — is not among them. So a
+ * catalog needing two logins looked exactly like one needing none until the
+ * authoring loop refused a row, by which time a browser was open and tokens
+ * were spent.
+ *
+ * Labels and case ids ONLY. No email, no password: the claims file is plain
+ * JSON a person opens, edits and mails around, and a credential has no
+ * business in it. Which account fills a label is decided later, by the run,
+ * from its environment.
+ *
+ * Order is first appearance across the document, and `cases` keeps sheet
+ * order, so a surface can render "3 cases sign in as this account" without
+ * sorting anything itself.
+ */
+export interface PersonaNeed {
+  /** The label as the sheet spells it, e.g. `MANAGER_ACCOUNT`. */
+  label: string;
+  /** The ids of the cases that need it, in sheet order. */
+  cases: string[];
+}
+
+export function tablePersonas(rows: readonly TestCaseRow[]): PersonaNeed[] {
+  const found = new Map<string, string[]>();
+  for (const row of rows) {
+    const id = row.caseId || row.scenarioId;
+    if (id === '') continue;
+    for (const label of personasOf(row)) {
+      const cases = found.get(label);
+      if (cases === undefined) found.set(label, [id]);
+      else if (!cases.includes(id)) cases.push(id);
+    }
+  }
+  return [...found].map(([label, cases]) => ({ label, cases }));
 }

@@ -51,16 +51,23 @@ export function poolMember(
  * time) always lands on the primary and behaves exactly as before.
  */
 export class BrowserLease {
+  readonly #cdpUrls: string[];
   readonly #inFlight: number[];
 
-  constructor(readonly cdpUrls: readonly string[]) {
+  constructor(cdpUrls: readonly string[]) {
     if (cdpUrls.length === 0) throw new Error('a browser lease needs at least one browser');
+    this.#cdpUrls = [...cdpUrls];
     this.#inFlight = cdpUrls.map(() => 0);
+  }
+
+  /** The browsers in the pool, primary first — including any added later. */
+  get cdpUrls(): readonly string[] {
+    return this.#cdpUrls;
   }
 
   /** How many browsers are in the pool. */
   get size(): number {
-    return this.cdpUrls.length;
+    return this.#cdpUrls.length;
   }
 
   /** Cases currently leased to each browser, by index. */
@@ -68,18 +75,65 @@ export class BrowserLease {
     return [...this.#inFlight];
   }
 
+  /**
+   * A browser that joined after the pool was built (`growPool`, for a case
+   * that needs one Chrome per persona). Idempotent: a URL already in the
+   * pool is left where it is.
+   */
+  add(cdpUrl: string): void {
+    if (this.#cdpUrls.includes(cdpUrl)) return;
+    this.#cdpUrls.push(cdpUrl);
+    this.#inFlight.push(0);
+  }
+
   acquire(): string {
-    let pick = 0;
-    for (let i = 1; i < this.#inFlight.length; i += 1) {
-      if (this.#inFlight[i]! < this.#inFlight[pick]!) pick = i;
+    return this.acquireMany(1).cdpUrls[0]!;
+  }
+
+  /**
+   * `k` browsers for one case — one per persona. Distinct members when the
+   * pool has them, least-loaded first, ties to the lowest index so a serial
+   * single-persona run still lands on the primary. When the pool is smaller
+   * than `k` the least-loaded member is leased again and `distinct` says so:
+   * the case still runs (contexts isolate cookies on their own), the report
+   * discloses which people shared a Chrome.
+   */
+  acquireMany(k: number): { cdpUrls: string[]; distinct: boolean } {
+    const wanted = Math.max(1, Math.floor(k));
+    const picked: string[] = [];
+    const taken = new Set<number>();
+    let distinct = true;
+    for (let n = 0; n < wanted; n += 1) {
+      let pick = -1;
+      for (let i = 0; i < this.#inFlight.length; i += 1) {
+        if (taken.has(i)) continue;
+        if (pick < 0 || this.#inFlight[i]! < this.#inFlight[pick]!) pick = i;
+      }
+      if (pick < 0) {
+        // Every member is already in this case's hands: double up on the
+        // least-loaded one.
+        distinct = false;
+        pick = 0;
+        for (let i = 1; i < this.#inFlight.length; i += 1) {
+          if (this.#inFlight[i]! < this.#inFlight[pick]!) pick = i;
+        }
+      } else {
+        taken.add(pick);
+      }
+      this.#inFlight[pick] = (this.#inFlight[pick] ?? 0) + 1;
+      picked.push(this.#cdpUrls[pick]!);
     }
-    this.#inFlight[pick] = (this.#inFlight[pick] ?? 0) + 1;
-    return this.cdpUrls[pick]!;
+    return { cdpUrls: picked, distinct };
   }
 
   release(cdpUrl: string): void {
-    const i = this.cdpUrls.indexOf(cdpUrl);
+    const i = this.#cdpUrls.indexOf(cdpUrl);
     if (i < 0) return;
     this.#inFlight[i] = Math.max(0, this.#inFlight[i]! - 1);
+  }
+
+  /** The counterpart of `acquireMany`: a URL leased twice is released twice. */
+  releaseMany(cdpUrls: readonly string[]): void {
+    for (const url of cdpUrls) this.release(url);
   }
 }

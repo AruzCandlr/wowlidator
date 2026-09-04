@@ -106,12 +106,47 @@ describe('step-facts — what a step WAS, from the record', () => {
     assert.equal(stepTarget({ action: 'upload', selector: null, detail: { files: ['/x/cert.pdf'] } }), 'cert.pdf');
   });
 
+  it('a step on a persona browser says which Chrome, by port, and a switch says the session was kept', () => {
+    // The runner stamps `persona`/`browser` on every step of a multi-browser
+    // run; the fact reads as the port so "9223 (MANAGER_ACCOUNT)" sits
+    // beside the step. A single-browser run carries no stamp and no noise.
+    assert.deepEqual(stepKindFacts({ action: 'click', selector: 'role=button', persona: 'MANAGER_ACCOUNT', browser: 'http://localhost:9223' }), [
+      { label: 'browser', value: '9223 (MANAGER_ACCOUNT)' },
+    ]);
+    assert.deepEqual(stepKindFacts({ action: 'click', selector: 'role=button' }), []);
+    const back = stepKindFacts({
+      action: 'signIn',
+      detail: { as: 'EMPLOYEE_ACCOUNT', keptSession: true, switchedTo: 'http://localhost:9222' },
+    });
+    assert.deepEqual(back, [
+      { label: 'persona', value: 'EMPLOYEE_ACCOUNT' },
+      { label: 'session', value: "kept — switched to this persona's own browser, no login" },
+      { label: 'browser', value: '9222' },
+    ]);
+    assert.ok(!JSON.stringify(back).includes('@'));
+  });
+
   it('a signIn shows the persona LABEL and withholds an email spelled as the label', () => {
     assert.deepEqual(stepKindFacts({ action: 'signIn', detail: { as: 'HR_ADMIN_ACCOUNT' } }), [{ label: 'persona', value: 'HR_ADMIN_ACCOUNT' }]);
     assert.equal(stepTarget({ action: 'signIn', detail: { as: 'HR_ADMIN_ACCOUNT' } }), 'persona HR_ADMIN_ACCOUNT');
     const literal = stepKindFacts({ action: 'signIn', detail: { as: 'admin@cnext.test' } });
     assert.equal(literal.length, 1);
     assert.doesNotMatch(literal[0]!.value, /@/);
+  });
+
+  it('withholds anything carrying a password, not only a well-formed address', () => {
+    // The persona wire format is `LABEL=email:password`, so a colon in the
+    // value means the half after it is a secret. Testing for a well-formed
+    // address let two real shapes through: a domain with no dot, and a label
+    // with the password still attached.
+    for (const as of ['mgr@intranet:hunter2', 'HRBP_ACCOUNT:hunter2', 'admin@x.test hunter2', 'admin@x.test']) {
+      const facts = stepKindFacts({ action: 'signIn', detail: { as } });
+      assert.equal(facts.length, 1, as);
+      assert.doesNotMatch(facts[0]!.value, /hunter2|@|:/, as);
+      assert.doesNotMatch(String(stepTarget({ action: 'signIn', detail: { as } })), /hunter2/, as);
+    }
+    // A label with a space in it is still a label, and is still shown.
+    assert.deepEqual(stepKindFacts({ action: 'signIn', detail: { as: 'HR admin' } }), [{ label: 'persona', value: 'HR admin' }]);
   });
 
   it('a field-error assertion names its field; the author\'s timeout is a fact on any kind', () => {
@@ -568,5 +603,83 @@ describe('wowUI on the new kinds, the counts and the chip', () => {
     assert.match(WOW_SCRIPT, /var recorded = redactedDetail\(step\);/);
     assert.match(WOW_SCRIPT, /JSON\.stringify\(recorded, null, 2\)/);
     assert.doesNotMatch(WOW_SCRIPT, /JSON\.stringify\(step\.detail, null, 2\)/);
+    // The persona shown beside a signIn is a LABEL and only a label, by the
+    // same structural test the reporter uses — the panel and the report must
+    // not disagree about what is safe to print.
+    assert.match(WOW_SCRIPT, /var LABEL_ONLY_RE = \/\^\[\^@:\]\+\$\//);
+    assert.match(WOW_SCRIPT, /LABEL_ONLY_RE\.test\(raw\) \? raw : 'an account named by its credentials/);
+    assert.doesNotMatch(WOW_SCRIPT, /EMAIL_RE\.test\(raw\)/, 'the well-formed-address test let a password through');
+  });
+});
+
+/* --------------------------------------- a rescued step shows once, as it ended */
+
+describe('the HTML report folds a superseded attempt under the step that replaced it', () => {
+  const click = { action: 'click', selector: 'role=button[name="Add Rate" i]', resolvedSelector: null, resolution: null, ...base };
+
+  function rescued(): ProofBundle {
+    return bundleOf((b) => {
+      b.addStep({ action: 'goto', intent: 'open the page', ...bare, screenshot: 'AAAA' });
+      // The attempt as written: failed, then rescued by a reconstruction.
+      b.addStep({ ...click, intent: 'Step 2: กดปุ่ม "Add"', status: 'failed', error: 'could not resolve\nfull trace', screenshot: 'BBBB' });
+      // Preparation the reconstruction inserted, then the rebuilt step that held.
+      b.addStep({ action: 'click', intent: 'Switch to the SSO Branch Rate tab', ...bare, selector: 'role=button[name="SSO Branch Rate" i]', resolution: 'fast', screenshot: 'CCCC' });
+      b.addStep({ ...click, intent: 'Step 2: กดปุ่ม "Add"', status: 'passed', resolution: 'fast', screenshot: 'DDDD' });
+      b.supersedeSteps([1]);
+      b.noteReconstruction({ attempt: 2, from: '{"action":"click"}', to: '{"action":"click"}', inserted: 1, reasoning: 'the button lives on the other tab', model: 'stub' });
+      // An absence check after the rescue: the run is unbroken, so it is not "in doubt".
+      b.addStep({ action: 'expectHidden', intent: 'no error shown', ...bare, selector: 'role=alert', resolution: 'fast' });
+    });
+  }
+
+  it('lists the run as it ended: the attempt is not a top-level row, the rebuilt step carries it behind a disclosure', () => {
+    const page = renderReport(rescued());
+    const list = page.slice(page.indexOf('<ol class="steps">'), page.indexOf('<details class="diagnostics"'));
+    const rows = [...list.matchAll(/<li class="step ([^"]*)" id="step-(\d+)"/g)].map((m) => `${m[2]}:${m[1]}`);
+    assert.deepEqual(rows, ['0:passed', '2:passed', '3:passed', '1:failed attempt', '4:passed'], 'the attempt renders inside step 3, after its body, never as its own row');
+    assert.match(list, /<summary>Replaced 1 failed attempt at this step — as written, before the in-run reconstruction \(step 1\)<\/summary>/);
+    assert.match(list, /<ol class="steps attempts">\s*<li class="step failed attempt" id="step-1"/);
+    // The attempt is still a full row — its error and screenshot survive — because what was tried is evidence.
+    assert.match(list, /id="step-1"[\s\S]*could not resolve[\s\S]*data:image\/jpeg;base64,BBBB/);
+    assert.match(list, /id="step-1"[\s\S]*<span class="badge res-cache"><abbr[^>]*>superseded<\/abbr>/);
+    assert.match(GLOSSARY['superseded'] ?? '', /folded under the step that replaced it/);
+  });
+
+  it('a superseded failure is not a break: later absence checks are not "in doubt", and the filmstrip counts live steps only', () => {
+    const page = renderReport(rescued());
+    assert.doesNotMatch(page, /passed, in doubt/);
+    assert.match(page, /Evidence — 3 of 4 steps/, 'three live steps carry a screenshot; the folded attempt is not a frame');
+    // The page script neither auto-opens a folded attempt nor films it.
+    assert.match(page, /\.step\.failed:not\(\.attempt\) \.step-head/);
+    assert.match(page, /querySelectorAll\('\.step:not\(\.attempt\)'\)/);
+    assert.match(page, /':scope > \.step-body > \.shot-wrap img'/);
+  });
+
+  it('a live failure still renders in place, and an attempt with no rescue after it is never dropped', () => {
+    const page = renderReport(
+      bundleOf((b) => {
+        b.addStep({ ...click, status: 'failed', error: 'nope' });
+        b.addStep({ ...click, status: 'failed', error: 'nope again' });
+        b.supersedeSteps([0]);
+        // No reconstruction record ever landed — the orphan attempt stays visible.
+      }),
+    );
+    const rows = [...page.matchAll(/<li class="step ([^"]*)" id="step-(\d+)"/g)].map((m) => `${m[2]}:${m[1]}`);
+    assert.deepEqual(rows, ['1:failed', '0:failed']);
+  });
+
+  it('the agent callout on a PASSED step says the step passed, even when the agent itself reported no success', () => {
+    const agent: AgentRecord = {
+      goal: 'open the Company Code picker', model: 'stub', success: false, summary: 'stalled on turn 2',
+      turns: 2, maxSteps: null, latencyMs: 5,
+      actions: [{ index: 0, action: 'click', selector: 'button "Company Code"', value: null, url: 'u', reasoning: 'open it', ok: true, durationMs: 1 }],
+    };
+    const passed = renderReport(bundleOf((b) => b.addStep({ action: 'selectOption', ...bare, selector: 'role=combobox[name="Company Code" i]', resolution: 'agent', agent })));
+    assert.match(passed, /<div class="callout agent ">\s*<div class="callout-title">Workflow agent prepared the page — the step then passed on the flow's own selector<\/div>/);
+    assert.doesNotMatch(passed, /goal not reached/);
+    assert.doesNotMatch(passed, /<details open>/);
+    const failed = renderReport(bundleOf((b) => b.addStep({ action: 'selectOption', ...bare, status: 'failed', error: 'x', selector: 'role=combobox[name="Company Code" i]', agent })));
+    assert.match(failed, /<div class="callout agent failed">\s*<div class="callout-title">Workflow agent took over — goal not reached<\/div>/);
+    assert.match(failed, /<details open>/);
   });
 });

@@ -24,6 +24,8 @@ import { VIDEO_MODES, parseVideoMode } from './engine/video.js';
 import { DEFAULT_MUTATION_POLICY, MUTATION_POLICIES, type MutationPolicy } from './generator/test-generator.js';
 import { LaunchPresets, formatPresetLine } from './history/launch-presets.js';
 import { main as mcpMain } from './mcp/server.js';
+import { closeClaudeSessions } from './providers/claude-cli-session.js';
+import { closeClaudeRetrievalServer } from './providers/claude-retrieval.js';
 import { LlmFactory } from './providers/llm-factory.js';
 import { DEFAULT_MAX_REPAIR_ATTEMPTS } from './repair/flow-repair-loop.js';
 import { EXIT, classifyError } from './cli/exit.js';
@@ -111,6 +113,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'no-report': { type: 'boolean', default: false },
       screenshots: { type: 'string' },
       video: { type: 'string' },
+      humanize: { type: 'string' },
       // parseArgs has no --no-x negation, so this is opt-in as written.
       'agent-assist': { type: 'boolean', default: false },
       // parseArgs has no `--no-x` negation, so these are declared as written.
@@ -328,6 +331,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 2;
   }
 
+  // `--humanize on|off` beats WOWLIDATOR_HUMANIZE; unset lets the runner
+  // follow the recording (on while filming). Refused rather than guessed.
+  const humanizeRaw = values.humanize;
+  const humanize =
+    humanizeRaw === undefined || humanizeRaw === 'auto'
+      ? config.humanize
+      : /^(on|1|true|yes)$/i.test(humanizeRaw)
+        ? true
+        : /^(off|0|false|no)$/i.test(humanizeRaw)
+          ? false
+          : null;
+  if (humanize === null) {
+    process.stderr.write('wowlidator: --humanize must be on, off or auto\n');
+    return 2;
+  }
+
   // Same rule as --screenshots: the flag overrides WOWLIDATOR_CAPTURE_DELAY_MS,
   // and an unparseable value is an error rather than a silent fallback — a
   // typo'd delay would otherwise be discovered as a filmstrip of blank frames.
@@ -355,6 +374,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     reportEnabled: values['no-report'] !== true && config.reportEnabled,
     screenshots,
     video,
+    humanize,
     agentAssist: values['agent-assist'] === true || config.agentAssist,
     agentCapture: values['no-agent-capture'] !== true,
     highlightTarget: values['no-target-highlight'] !== true,
@@ -540,15 +560,26 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     );
     process.exitCode = EXIT.environment;
   });
+  // Warm `claude` processes are spawned with piped stdio, and those pipes hold
+  // the event loop open after main() has settled: a run whose last model call
+  // landed at T exited at T + SESSION_IDLE_MS (90 s), every artefact written
+  // within three seconds of the last step (job-5, 2026-09-04). The idle timer
+  // is unref'd — the child is not — so the sessions are closed here explicitly.
+  const releaseControlPlane = (): void => {
+    closeClaudeSessions();
+    closeClaudeRetrievalServer();
+  };
   main().then(
     (code) => {
       mainSettled = true;
       process.exitCode = code;
+      releaseControlPlane();
     },
     (error: unknown) => {
       mainSettled = true;
       process.stderr.write(`wowlidator: ${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = classifyError(error);
+      releaseControlPlane();
     },
   );
 }

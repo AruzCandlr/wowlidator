@@ -5,7 +5,8 @@
 
 import type { ExtractedDocument } from '../catalog/extract.js';
 import { connectDb, defaultDbConfig, type DbClient } from '../db/client.js';
-import type { FlowAuthorOptions } from '../generator/flow-author.js';
+import { LlmFlowAuthorModel, type FlowAuthorModel, type FlowAuthorOptions } from '../generator/flow-author.js';
+import { createModelForRole } from '../providers/llm-factory.js';
 import { LlmValueResolverModel } from '../generator/value-resolution.js';
 import { FlowReviewer, LlmFlowReviewModel } from '../generator/flow-review.js';
 import { LlmRiskModel, riskEnabled, type RiskModel } from '../generator/dead-end-risk.js';
@@ -16,6 +17,7 @@ import { LlmDataModel } from '../data/data-model.js';
 import { formatAgentAction, formatStepLine, type ProofStep } from '../engine/proof-bundle.js';
 import type { RunPlan } from '../engine/runner.js';
 import { CAPTURE_PILOT_MAX_STEPS } from '../context/capture-pilot.js';
+import { currentLogTag } from '../log-format.js';
 import { LlmFlowRepairModel, type FlowRepairModel } from '../repair/flow-repair-model.js';
 import { LlmReviewJudge, type ReviewJudge } from '../engine/review-judge.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
@@ -26,13 +28,13 @@ import type { CliOptions } from './options.js';
 export function buildHealer(options: CliOptions, hints?: HealHintsProvider | undefined) {
   return options.heal
     ? (cache: CacheManager) =>
-        new JitHealer({
-          model: new LlmHealerModel({
-            factory: options.factory,
-            ...(hints === undefined ? {} : { hints }),
-          }),
-          cache,
-        })
+      new JitHealer({
+        model: new LlmHealerModel({
+          factory: options.factory,
+          ...(hints === undefined ? {} : { hints }),
+        }),
+        cache,
+      })
     : undefined;
 }
 
@@ -52,12 +54,16 @@ export function buildHealer(options: CliOptions, hints?: HealHintsProvider | und
  */
 export function emitTagged(tag: string | undefined, text: string, stream: 'out' | 'err' = 'out'): void {
   const target = stream === 'out' ? process.stdout : process.stderr;
-  if (tag === undefined) {
+  // An explicit tag wins; otherwise the async context's own (`withLogTag`),
+  // which is how a shared collaborator's narration — the author's lints, the
+  // reviewer, the value resolver — lands under the row or case it serves.
+  const effective = tag ?? currentLogTag();
+  if (effective === undefined) {
     target.write(text);
     return;
   }
   const body = text.endsWith('\n') ? text.slice(0, -1) : text;
-  target.write(body.split('\n').map((line) => `${tag} ${line}`).join('\n') + '\n');
+  target.write(body.split('\n').map((line) => `${effective} ${line}`).join('\n') + '\n');
 }
 
 /** Live per-step console output; suppressed under --json, whose stdout must stay one document. */
@@ -107,8 +113,8 @@ export function buildAgent(options: CliOptions, tag?: string | undefined): Workf
     onAction: options.json
       ? undefined
       : async (_page, action) => {
-          emitTagged(tag, formatAgentAction(action) + '\n');
-        },
+        emitTagged(tag, formatAgentAction(action) + '\n');
+      },
   });
 }
 
@@ -124,8 +130,8 @@ export function buildInvestigationAgent(options: CliOptions): WorkflowAgent {
     onAction: options.json
       ? undefined
       : async (_page, action) => {
-          console.log(formatAgentAction(action));
-        },
+        emitTagged(undefined, formatAgentAction(action) + '\n');
+      },
   });
 }
 
@@ -191,8 +197,8 @@ export function buildCapturePilot(options: CliOptions): WorkflowAgent | null {
     onAction: options.json
       ? undefined
       : async (_page, action) => {
-          console.log(formatAgentAction(action));
-        },
+        emitTagged(undefined, formatAgentAction(action) + '\n');
+      },
   });
 }
 
@@ -212,6 +218,34 @@ export function buildFlowReviewer(options: CliOptions): FlowReviewer | null {
     model: new LlmFlowReviewModel({ factory: options.factory }),
     onLog: lineLogger(options),
   });
+}
+
+/**
+ * The author's retry model (`FlowAuthorOptions.retryModel`): the generator
+ * role's provider with `WOWLIDATOR_GENERATOR_RETRY_MODEL` as the model id, so a
+ * run can put the expensive model on the first ask and a faster one on the
+ * re-asks. Unset means one model throughout. Fails the way the generator
+ * role fails — a missing key surfaces at the first retry, not at startup.
+ */
+export function buildAuthorRetryModel(options: CliOptions): FlowAuthorModel | null {
+  const modelId = (process.env['WOWLIDATOR_GENERATOR_RETRY_MODEL'] ?? '').trim();
+  if (modelId === '') return null;
+  const config = options.factory.config;
+  const generator = config.roles.generator;
+  if (modelId === generator.modelId) return null;
+  const patched = {
+    ...config,
+    roles: { ...config.roles, generator: { ...generator, modelId } },
+  };
+  let resolved: ReturnType<typeof createModelForRole> | null = null;
+  const lazy: FlowAuthorModel = {
+    id: `${generator.provider}:${modelId}`,
+    author: (request) => {
+      resolved ??= createModelForRole('generator', patched, options.factory.activeKeyIndex(generator.provider));
+      return new LlmFlowAuthorModel({ model: resolved.model, id: resolved.id }).author(request);
+    },
+  };
+  return lazy;
 }
 
 /**

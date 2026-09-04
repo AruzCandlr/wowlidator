@@ -55,8 +55,14 @@ import {
   unindexedRequestMethod,
   assertsOpenQuestion,
   skipsAuthoredScript,
+  describeScriptDemand,
+  unperformedScriptSteps,
   unboundedExclusivityClaim,
   wordingClaimAssertsDataValue,
+  settleViolations,
+  settleExclusivity,
+  settleSelectorRole,
+  GENERATED_STEP_MARKER,
   type AuthorRequest,
   type AuthorResult,
   type FlowAuthorModel,
@@ -67,9 +73,13 @@ import {
   switchesPersona,
   groundPersonaSwitches,
 } from '../src/generator/flow-author.js';
+import { compileAuthoringRules, openQuestionIdsIn, withOverride, DEFAULT_VALUE_RULES } from '../src/generator/value-rules.js';
+import { exclusivityClaimIn, unprovedExclusivity } from '../src/generator/exclusivity.js';
 import {
+  controlNamedIn,
   fillRouteIds,
   journeyCaptureNote,
+  journeyTreeSection,
   literalDestinations,
   shouldSignInForCapture,
 } from '../src/cli/commands/authoring.js';
@@ -307,7 +317,53 @@ describe('FlowAuthor', () => {
       () => new FlowAuthor({ model }).author('sign in somehow'),
       (error: unknown) => error instanceof AuthoringError && /credential field/.test((error as Error).message),
     );
-    assert.equal(calls, AUTHOR_ATTEMPTS, 'the budget is spent, then the refusal is loud');
+    // Since 2026-09-04 a fatal refusal repeated identically is not re-asked:
+    // the second answer proved the feedback changes nothing.
+    assert.equal(calls, 2, 'the same refusal twice ends the budget early, and the refusal is loud');
+  });
+
+  it('stops after two identical fatal refusals and says so, without counting the repeat as suite memory (HIR-EC-001, 2026-09-04)', async () => {
+    // multirole.csv HIR-EC-001: three opus calls (~$0.95, 264 s each) were
+    // spent on two lints no flow could satisfy. A model answering the same
+    // flow every time, through the real narrowing.
+    const payload = {
+      name: 'HIR-EC-001 New Hire Key-in success',
+      rationale: '',
+      setup: [{ action: 'goto', case: null, selector: '', value: '', url: '/en/home', key: '', name: '', timeoutMs: '', intent: '' }],
+      steps: [
+        { action: 'fill', case: null, selector: 'role=textbox >> nth=1', value: 'pw', url: '', key: '', name: '', timeoutMs: '', intent: 'the password field' },
+        { action: 'expectVisible', case: null, selector: 'text=x', value: '', url: '', key: '', name: '', timeoutMs: '', intent: 'x' },
+      ],
+      teardown: [],
+      notes: '',
+    };
+    const mock = jsonModel('mock-author', payload, { inputTokens: 10, outputTokens: 10 });
+    const inner = new LlmFlowAuthorModel({ model: mock, id: 'mock:author' });
+    const seen: AuthorRequest[] = [];
+    const model: FlowAuthorModel = {
+      id: inner.id,
+      author: (request) => {
+        seen.push(request);
+        return inner.author(request);
+      },
+    };
+    const log: string[] = [];
+    const author = new FlowAuthor({ model, onLog: (line) => log.push(line) });
+    await assert.rejects(
+      () => author.author('sign in somehow'),
+      (error: unknown) =>
+        error instanceof AuthoringError &&
+        error.severity === 'fatal' &&
+        /^refused identically on 2 attempts — a rule the model cannot satisfy or a lint that misreads the case; review the lint/.test(error.message) &&
+        /credential field/.test(error.message),
+    );
+    assert.equal(mock.doGenerateCalls.length, 2, 'the third call is never made');
+    assert.match(seen[1]?.feedback?.[0] ?? '', /credential field/, 'the second ask did carry the feedback');
+    assert.ok(log.some((line) => /refused identically on 2 attempts/.test(line)));
+    // The repeat is not a second sighting: the shape travels to other rows
+    // only once a DIFFERENT answer broke the same rule.
+    await assert.rejects(() => author.author('another row of the same suite'));
+    assert.equal(seen[2]?.commonRefusals, undefined, 'seen once, not twice — the next row starts clean');
   });
 });
 
@@ -1347,11 +1403,11 @@ describe('the system prompt teaches the uncaptured-page rules', () => {
     )
       .replace(/\\n/g, ' ')
       .replace(/\s+/g, ' ');
-    assert.match(sent, /evidence INDEPENDENT of the agent/);
-    assert.match(sent, /never use workflow where the tree shows them/i);
-    assert.match(sent, /NEVER follow a disclosure with an assertion/);
-    assert.match(sent, /a request is a real HTTP call/i);
-    assert.match(sent, /The tree describes ONE page state/);
+    assert.match(sent, /evidence independent of the agent/);
+    assert.match(sent, /Use it only for a leg whose controls appear in no tree/);
+    assert.match(sent, /Never follow such a disclosure with an assertion/);
+    assert.match(sent, /request .{0,3}name.{0,3} is .{0,3}METHOD \/path/);
+    assert.match(sent, /The tree describes one page state/);
   });
 });
 
@@ -1563,6 +1619,16 @@ describe('assertsOpenQuestion', () => {
       null,
     );
     assert.equal(assertsOpenQuestion([{ action: 'expectVisible', selector: 'text=Employee Group' }]), null);
+  });
+
+  it('reads the id through a role name and past an nth chain (HIR-EC-001, 2026-09-04)', () => {
+    // multirole.csv HIR-EC-001: "Policy Profile = CDS ใช้แทน CDS ที่เคยระบุ ดู CF-SIT-19".
+    assert.equal(
+      assertsOpenQuestion([{ action: 'expectVisible', selector: 'role=cell[name="CF-SIT-19" i]' }])?.marker,
+      'CF-SIT-19',
+    );
+    assert.equal(assertsOpenQuestion([{ action: 'expectVisible', selector: 'text=CF-SIT-19 >> nth=0' }])?.marker, 'CF-SIT-19');
+    assert.equal(assertsOpenQuestion([{ action: 'expectVisible', selector: 'role=textbox[name="Policy Profile" i]' }]), null);
   });
 });
 
@@ -2056,7 +2122,7 @@ describe('supplied credentials reach the model as their own labelled block', () 
     assert.match(wire, /use these characters exactly/i);
     assert.match(
       full().replace(/\\n/g, ' ').replace(/\s+/g, ' '),
-      /never substitute one source's address for the other's/i,
+      /never a variation and never an invention/i,
       'and the system prompt forbids improving on them',
     );
   });
@@ -2253,7 +2319,8 @@ describe('best-attempt-wins across the authoring budget', () => {
       new FlowAuthor({ model }).author('click the button'),
       (error: unknown) => error instanceof AuthoringError && /no assertion/.test((error as Error).message),
     );
-    assert.equal(model.calls, AUTHOR_ATTEMPTS);
+    // The same fatal refusal twice ends the budget early (2026-09-04).
+    assert.equal(model.calls, 2);
   });
 
   it('stops asking the moment an answer passes every lint', async () => {
@@ -2296,7 +2363,9 @@ describe('best-attempt-wins across the authoring budget', () => {
       new FlowAuthor({ model }).author('PL_04_05 the Type filter lists Record and Reimbursement'),
       (error: unknown) => error instanceof AuthoringError && /proves nothing about its claim/.test((error as Error).message),
     );
-    assert.equal(model.calls, AUTHOR_ATTEMPTS, 'every attempt was asked, with the reason');
+    // Asked again once with the reason; the identical second refusal ends the
+    // budget early (2026-09-04) — the case is blocked either way.
+    assert.equal(model.calls, 2, 'asked again with the reason, then not a third time');
   });
 });
 
@@ -2320,8 +2389,8 @@ describe('the system prompt teaches that a captured second page is not absent', 
     )
       .replace(/\\n/g, ' ')
       .replace(/\s+/g, ' ');
-    assert.match(sent, /ANOTHER PAGE IN THIS JOURNEY is present, that page is NOT absent/);
-    assert.match(sent, /Write explicit grounded steps against its controls/);
+    assert.match(sent, /ANOTHER PAGE IN THIS JOURNEY is present, that page is captured/);
+    assert.match(sent, /write grounded steps against it/);
   });
 });
 
@@ -2921,15 +2990,15 @@ describe('the test scope reaches the model', () => {
   it('tells the model an e2e test must leave the page it starts on', async () => {
     const { model, full } = recordingModel();
     await model.author({ ...request, scope: 'e2e' });
-    assert.match(full(), /SCOPE: END-TO-END/);
+    assert.match(full(), /<scope>END-TO-END/);
     assert.match(full(), /must leave the page it starts on/);
   });
 
   it('tells the model a unit test stays on one page', async () => {
     const { model, full } = recordingModel();
     await model.author({ ...request, scope: 'unit' });
-    assert.match(full(), /SCOPE: UNIT/);
-    assert.match(full(), /Prove ONE thing on ONE page/);
+    assert.match(full(), /<scope>UNIT/);
+    assert.match(full(), /prove one thing on one page/);
   });
 
   it('changes nothing at all when no scope was given', async () => {
@@ -3355,6 +3424,55 @@ describe('fixtureFacts / ungroundedFixtureAssertion (S3 — test data is not an 
     assert.equal(ungroundedFixtureAssertion(created, facts), null, 'the flow made it true before asserting it');
     assert.equal(ungroundedFixtureAssertion(assertFirst, []), null, 'no facts, nothing to judge');
   });
+
+  // multirole.csv HIR-EC-001 (2026-09-04), Test data verbatim: the Branch is a
+  // value the sheet says the SYSTEM derives from the Department ("ระบบดึงข้อมูล
+  // จาก Department ได้แก่ … Store/Branch Location"), and the Policy Profile
+  // pair carries a remark citing a confirmation question.
+  const hiring =
+    'HIR-EC-001: ตรวจสอบการจ้างพนักงานใหม่แบบ Key-in สำเร็จ\nTest data:\n' +
+    '  [TD-01] Department = 30042174\n  [TD-01] Branch = T153_1733\n  [TD-01] SSO Location = T153\n' +
+    '  [TD-01] Work Schedule = D05H0830\n  Policy Profile = CDS ใช้แทน CDS ที่เคยระบุ ดู CF-SIT-19\n' +
+    'Expected output:\n  - ระบบดึงข้อมูลจาก Department ได้แก่ Cost Center / SSO Location / Work Location / Store/Branch Location / Policy Profile / Holiday Calendar / Division\n' +
+    '  - Probationary Period End Date = ? CF-HIR-08 OQ-HIR-50';
+
+  it('does not list an open-question id as a fixture — it is the name of a question', () => {
+    const facts = fixtureFacts(hiring);
+    assert.ok(facts.includes('T153_1733'));
+    for (const q of ['CF-SIT-19', 'CF-HIR-08', 'OQ-HIR-50']) assert.ok(!facts.includes(q), `${q} is not a fixture`);
+  });
+
+  it('reads the claim, never the intent — a skip note citing a question asserts nothing', () => {
+    const facts = fixtureFacts(hiring);
+    const skipNote = [
+      {
+        action: 'expectVisible',
+        selector: 'role=textbox[name="Policy Profile" i]',
+        intent: 'skipped step 4: unconfirmed test data — Policy Profile = CDS ใช้แทน CDS ที่เคยระบุ ดู CF-SIT-19; Work Schedule D05H0830 left to the derivation',
+      },
+    ] as never[];
+    assert.equal(ungroundedFixtureAssertion(skipNote, facts), null);
+  });
+
+  it('accepts a derived field read after data entry, and still refuses a lookup before any entry', () => {
+    const facts = fixtureFacts(hiring);
+    const derived = [
+      { action: 'selectOption', selector: 'role=button[name="Department" i]', value: '30042174', intent: 'Step 4: เลือก Department' },
+      { action: 'expectText', selector: 'role=textbox[name="Branch" i]', value: 'T153_1733', intent: 'Step 4: ตรวจสอบค่าที่ระบบดึงจาก Department' },
+      { action: 'expectValue', selector: 'role=textbox[name="Work Schedule" i]', value: 'D05H0830', intent: 'Step 4: ค่าที่ระบบดึงจาก Position' },
+    ] as never[];
+    assert.equal(ungroundedFixtureAssertion(derived, facts), null, 'the application populated the field in answer to the selection');
+    const lookup = [
+      { action: 'goto', url: '/en/admin/employees' },
+      { action: 'expectText', selector: 'role=textbox[name="Branch" i]', value: 'T153_1733' },
+    ] as never[];
+    assert.equal(ungroundedFixtureAssertion(lookup, facts)?.fact, 'T153_1733', 'nothing was entered, so the value is presumed to pre-exist');
+    const listRow = [
+      { action: 'selectOption', selector: 'role=button[name="Department" i]', value: '30042174' },
+      { action: 'expectVisible', selector: 'text=T153_1733' },
+    ] as never[];
+    assert.equal(ungroundedFixtureAssertion(listRow, facts)?.fact, 'T153_1733', 'a presence in a list is still a lookup');
+  });
 });
 
 /**
@@ -3410,18 +3528,22 @@ describe('the suite\'s refusal memory', () => {
     assert.equal(seen[0]?.commonRefusals, undefined, 'nothing has been refused yet');
   });
 
-  it('carries a repeated rule into a LATER row\'s first attempt', async () => {
+  it('carries a rule broken by TWO rows into a later row\'s first attempt', async () => {
     const seen: AuthorRequest[] = [];
     const author = new FlowAuthor({ model: stubbornModel(seen) });
-    // Row one exhausts its attempts, so the same shape is recorded more than
-    // once — which is the evidence that it is a pattern, not an accident.
+    // Since 2026-09-04 a row's identical second refusal is not re-asked and
+    // not counted — one row's accident is not the suite's pattern — so the
+    // second sighting must come from another row.
     await author.author('row one').catch(() => undefined);
-    const before = seen.length;
+    const afterOne = seen.length;
     await author.author('row two').catch(() => undefined);
-    const rowTwoFirstAsk = seen[before]!;
-    assert.ok(rowTwoFirstAsk.commonRefusals !== undefined, 'row two starts already knowing');
-    assert.ok(rowTwoFirstAsk.commonRefusals!.length > 0);
-    assert.equal(rowTwoFirstAsk.feedback, undefined, 'and it is NOT dressed up as this row\'s own refusal');
+    assert.equal(seen[afterOne]?.commonRefusals, undefined, 'seen on one row only is not yet a pattern');
+    const afterTwo = seen.length;
+    await author.author('row three').catch(() => undefined);
+    const rowThreeFirstAsk = seen[afterTwo]!;
+    assert.ok(rowThreeFirstAsk.commonRefusals !== undefined, 'row three starts already knowing');
+    assert.ok(rowThreeFirstAsk.commonRefusals!.length > 0);
+    assert.equal(rowThreeFirstAsk.feedback, undefined, 'and it is NOT dressed up as this row\'s own refusal');
   });
 
   it('a rule seen once never travels — one row\'s accident is not the suite\'s pattern', async () => {
@@ -3594,6 +3716,359 @@ describe('unboundedExclusivityClaim', () => {
   it('reads "only" and "เฉพาะ" without a number too', () => {
     const r = unboundedExclusivityClaim(presences, 'Expected: the filter offers only Active and Inactive');
     assert.ok(r !== null);
-    assert.equal(r.wanted, null);
+    // One detector since 2026-09-04: the shared one counts the listing too.
+    assert.equal(r.wanted, 2);
+  });
+
+  it('never reads "only" inside a hyphen compound — "Read-only" is a mode, not a set (HIR-EC-001, 2026-09-04)', () => {
+    // multirole.csv HIR-EC-001, Expected output verbatim. The legacy regex had
+    // no word boundary and demanded `expectCount role=option` for a set the
+    // page does not have; every attempt was refused for it.
+    const readOnly =
+      'HIR-EC-001: ตรวจสอบการจ้างพนักงานใหม่แบบ Key-in สำเร็จ\nExpected output:\n' +
+      '  - ระบบ Auto-Derive Time Management Status = 01 - Clocking และ O.T. Flag = Yes ตาม Rule Table\n' +
+      '  - Time Management Status และ O.T. Flag เป็น Read-only และ HR ไม่สามารถแก้ไขเองได้\n' +
+      '  - ระบบดึงข้อมูลจาก Department ได้แก่ Cost Center / SSO Location / Work Location / Store/Branch Location / Policy Profile / Holiday Calendar / Division';
+    assert.equal(unboundedExclusivityClaim(presences, readOnly), null);
+    assert.equal(unprovedExclusivity(presences, readOnly), null, 'the shared detector agrees');
+    // And a line that enumerates after a hyphen compound still does not read the compound as the marker.
+    assert.equal(
+      exclusivityClaimIn('Expected output:\n  - Time Management Status is read-only for HR / Manager / Employee'),
+      null,
+    );
+  });
+});
+
+describe('journey capture reads the tab the row selects, before the opening click (2026-09-04)', () => {
+  // The landing state of a page with a tab strip rendered as buttons: the
+  // DEFAULT tab's panel is what the tree shows, and its own Add control is
+  // the only "Add…" on the page. The row's script selects the THIRD tab
+  // first, then presses "Add" / "+".
+  const LANDING = [
+    { role: 'button', name: 'Account menu' },
+    { role: 'button', name: 'Branch Rate' },
+    { role: 'button', name: 'Branch Registration' },
+    { role: 'button', name: 'Base Amount' },
+    { role: 'heading', name: 'Branch Rate' },
+    { role: 'button', name: 'Add Rate' },
+    { role: 'table', name: 'Rates' },
+  ];
+
+  it('controlNamedIn picks the exact name over a prefix sibling, and ignores non-clickable roles', () => {
+    assert.equal(controlNamedIn(LANDING, 'Branch Registration')?.name, 'Branch Registration');
+    assert.equal(controlNamedIn(LANDING, 'branch  registration')?.selector, 'role=button[name="Branch Registration" i]', 'whitespace-folded, case-insensitive');
+    assert.equal(controlNamedIn(LANDING, 'Rates'), null, 'a table is not something the sheet clicks');
+    assert.equal(controlNamedIn([{ role: 'button', name: 'Add Rate' }, { role: 'button', name: 'Add' }], 'Add')?.name, 'Add', 'whole name beats an earlier prefix match');
+    assert.equal(controlNamedIn(LANDING, ''), null);
+    assert.equal(controlNamedIn(LANDING, 'Nothing here'), null);
+  });
+
+  it('the prefix fallback is what matched "Add" to the default panel\'s "Add Rate" — so the tab is selected before it runs', () => {
+    // Exactly the substitution the live capture made on the wrong panel. It
+    // stays a legal match (an "Add" that IS rendered "Add Rate" on the right
+    // panel is the common case); what changed is that the capture selects the
+    // row's tab first and skips this click when it cannot.
+    assert.equal(controlNamedIn(LANDING, 'Add')?.name, 'Add Rate');
+  });
+
+  it('journeyTreeSection says the tab was selected and that the flow must click it first', () => {
+    const section = journeyTreeSection({
+      landed: 'https://app.test/admin/config',
+      tree: 'button "Branch Registration"\nbutton "Add Registration"',
+      tabWanted: 'Branch Registration',
+      tabSelected: { name: 'Branch Registration', selector: 'role=button[name="Branch Registration" i]' },
+      opened: { name: 'Add Registration', selector: 'role=button[name="Add Registration" i]', url: 'https://app.test/admin/config', tree: 'dialog "Add Registration"' },
+    });
+    assert.match(section, /read WITH the tab "Branch Registration" selected \(role=button\[name="Branch Registration" i\]\)/);
+    assert.match(section, /write that click first/);
+    assert.match(section, /AFTER CLICKING "Add Registration" ON https:\/\/app\.test\/admin\/config \(with the tab "Branch Registration" selected\)/);
+    assert.ok(section.indexOf('button "Add Registration"') < section.indexOf('dialog "Add Registration"'), 'landing tree, then the opened tree');
+  });
+
+  it('a tab the capture could not select is announced, and an absent control is "not captured", never absent', () => {
+    const section = journeyTreeSection({
+      landed: 'https://app.test/admin/config',
+      tree: 'button "Branch Rate"\nbutton "Add Rate"',
+      tabWanted: 'Branch Registration',
+      tabSelected: null,
+      opened: null,
+    });
+    assert.match(section, /could NOT select it/);
+    assert.match(section, /NOT CAPTURED rather than absent/);
+    assert.match(section, /never a control of another panel that merely resembles the name/);
+    assert.doesNotMatch(section, /AFTER CLICKING/, 'no opening click is read from the wrong panel');
+    // No tab named at all: the section reads as it always did.
+    const plain = journeyTreeSection({ landed: 'https://app.test/x', tree: 'button "Go"', tabWanted: null, tabSelected: null, opened: null });
+    assert.doesNotMatch(plain, /tab/);
+  });
+});
+
+// ------------------------------------------------------------- 2026-09-04
+// The two lint defects of multirole PRB-EC-001 / ML_01_04, and the vocabulary
+// they read through moving into data (`value-rules.ts`).
+
+describe('skipsAuthoredScript — a choice is made by clicking (PRB-EC-001, 2026-09-04)', () => {
+  const probation = [
+    'PRB-EC-001: ผ่านทดลองงานปกติ',
+    'Steps:',
+    '  1. Login ด้วย <HR_ADMIN_ACCOUNT>',
+    '  2. ไปที่ EC > Probation',
+    '  3. เลือก Pass probation (normal)',
+    '  4. กด Submit',
+    '  5. Login ด้วย <HRBP_ACCOUNT>',
+    '  5.1 กด Approve',
+    'Expected output:',
+    '  1. สถานะเปลี่ยนเป็น Approved',
+  ].join('\n');
+
+  it('accepts the PRB body: a click on a radio, Submit, a hand-off, Approve, a workflow leg', () => {
+    const body = [
+      { action: 'click', selector: 'role=radio[name="Pass probation (normal)" i]', intent: 'Step 3: เลือก Pass probation (normal)' },
+      { action: 'click', selector: 'role=button[name="Submit" i]', intent: 'Step 4: กด Submit' },
+      { action: 'signIn', name: 'HRBP_ACCOUNT', intent: 'Step 5: Login HRBP' },
+      { action: 'click', selector: 'role=button[name="Approve" i]', intent: '5.1 กด Approve' },
+      { action: 'workflow', goal: 'approve the probation request' },
+    ] as never[];
+    assert.equal(skipsAuthoredScript(probation, body), null);
+  });
+
+  it('a click on a choice role chooses even as the last step; a click on a button does so only when a step follows it', () => {
+    assert.equal(skipsAuthoredScript(probation, [{ action: 'click', selector: 'role=option[name="Pass" i]' }] as never[]), null);
+    assert.equal(skipsAuthoredScript(probation, [{ action: 'click', selector: 'role=checkbox[name="Pass" i]' }] as never[]), null);
+    const lastClick = skipsAuthoredScript(probation, [{ action: 'click', selector: 'role=button[name="Submit" i]' }] as never[]);
+    assert.equal(lastClick?.tier, 'choosing');
+    assert.equal(
+      skipsAuthoredScript(probation, [
+        { action: 'click', selector: 'role=button[name="Pass probation (normal)" i]' },
+        { action: 'expectVisible', selector: 'text=Approved' },
+      ] as never[]),
+      null,
+      'a click that a later step follows is a choice made by clicking',
+    );
+  });
+
+  it('still refuses a body of pure assertions, naming the tier and exactly what the code accepts', () => {
+    const refused = skipsAuthoredScript(probation, [
+      { action: 'expectVisible', selector: 'text=Approved' },
+      { action: 'expectText', selector: 'role=status', value: 'Approved' },
+    ] as never[]);
+    assert.ok(refused !== null);
+    assert.equal(refused.tier, 'choosing');
+    assert.equal(refused.demanded, 'เลือก');
+    assert.match(describeScriptDemand('choosing'), /radio, option, checkbox/);
+    assert.match(describeScriptDemand('choosing'), /a click that another body step follows/);
+    assert.match(describeScriptDemand('typing'), /fill, fillRetry, type, setValue, upload, selectOption, check or uncheck/);
+    assert.match(describeScriptDemand('acting'), /workflow leg/);
+  });
+
+  it('typing is still typing: a script that says กรอก is not performed by clicks alone (HIR-EC-001 kept)', () => {
+    const keyIn = 'HIR-EC-001: x\nSteps:\n  1. กรอกข้อมูล Identity\n  2. กด Submit\nExpected output:\n  1. ok';
+    const clicksOnly = skipsAuthoredScript(keyIn, [
+      { action: 'click', selector: 'role=button[name="Next" i]' },
+      { action: 'click', selector: 'role=button[name="Submit" i]' },
+    ] as never[]);
+    assert.equal(clicksOnly?.tier, 'typing');
+    assert.equal(skipsAuthoredScript(keyIn, [{ action: 'fill', selector: 'role=textbox[name="First Name" i]', value: 'A' }] as never[]), null);
+  });
+});
+
+describe('unperformedScriptSteps — a citation in a goal or in the sheet\'s sub-numbering (PRB-EC-001, 2026-09-04)', () => {
+  const script = ['X: y', 'Steps:', '  1. a', '  2. b', '  3. c', '  4. d', '  5. e', 'Expected output:', '  1.1 z'].join('\n');
+  const through4 = { action: 'click', selector: 'x', intent: 'Step 4: d' } as never;
+
+  it('a workflow goal citing "Step 5:" performs step 5', () => {
+    assert.equal(unperformedScriptSteps(script, [through4, { action: 'workflow', goal: 'Step 5: do e' } as never]), null);
+  });
+
+  it('an intent headed by the sheet\'s own sub-number "5.4 …" cites step 5', () => {
+    assert.equal(unperformedScriptSteps(script, [through4, { action: 'click', selector: 'y', intent: '5.4 กด Approve' } as never]), null);
+  });
+
+  it('an Expected id at the head of an intent is not a script citation', () => {
+    // "1.1 z" is the Expected line; citing it says nothing about script step 1.
+    const flow = [{ action: 'expectVisible', selector: 'x', intent: '1.1 z is shown' } as never];
+    assert.equal(unperformedScriptSteps(script, flow), null, 'no script step cited at all — nothing to reason from');
+    const refused = unperformedScriptSteps(script, [{ action: 'click', selector: 'x', intent: 'Step 4: d' } as never, ...flow]);
+    assert.deepEqual(refused?.missing.map((m) => m.n), [5]);
+  });
+
+  it('a flow citing 1–4 and nothing about 5 is still refused; a skip marker still clears it', () => {
+    const refused = unperformedScriptSteps(script, [{ action: 'click', selector: 'x', intent: 'Step 1: a' } as never, through4]);
+    assert.equal(refused?.performedThrough, 4);
+    assert.deepEqual(refused?.missing.map((m) => m.n), [5]);
+    assert.equal(unperformedScriptSteps(script, [through4, { action: 'expectVisible', selector: 'x', intent: 'skipped step 5: no account' } as never]), null);
+    assert.equal(unperformedScriptSteps(script, [{ action: 'click', selector: 'x', intent: 'ขั้นตอนที่ 5: e' } as never]), null, 'the Thai step word cites too');
+  });
+});
+
+describe('expectedItemsIn — an id is at the head of its line (ML_01_04, 2026-09-04)', () => {
+  it('does not read "0.52" out of "Requested hours : 0.52 hrs"', () => {
+    const text = ['ML_01_04: x', 'Expected output:', '  1. Requested hours : 0.52 hrs', '  - Balance : 7.5 days', '  2.1 the row shows', '  - 2.2 bulleted id', 'Steps:', '  1. x'].join('\n');
+    assert.deepEqual(expectedItemsIn(text), ['1', '2.1', '2.2']);
+    assert.deepEqual(unassertedExpectedItems([{ action: 'expectText', selector: 'x', value: '0.52', intent: '1. 2.1 2.2' }], text), []);
+  });
+});
+
+describe('the authoring vocabulary is data (value-rules.ts, 2026-09-04)', () => {
+  it('an override replaces a list wholesale and the compiled rules follow it', () => {
+    const rules = withOverride({ authoring: { script: { choosing: ['pick'] }, openQuestionPrefixes: ['QQ-'] } });
+    assert.deepEqual(rules.authoring.script.choosing, ['pick']);
+    assert.deepEqual(rules.authoring.script.typing, DEFAULT_VALUE_RULES.authoring.script.typing, 'an absent list keeps the built-in');
+    const compiled = compileAuthoringRules(rules.authoring);
+    assert.ok(compiled.script.choosing.test('pick a plan'));
+    assert.ok(!compiled.script.choosing.test('เลือก Province'), 'the built-in word is gone — a replacement, not a union');
+    assert.ok(compiled.openQuestion.test('see QQ-HIR-12'));
+    assert.ok(!compiled.openQuestion.test('see OQ-HIR-12'));
+    assert.ok(compiled.sheetNote.notYet.test('ยังทดสอบไม่ได้') && compiled.sheetNote.notYet.test('cannot be tested yet'), 'both languages, untouched');
+  });
+
+  it('an open question is any id the case writes after its "?" — no prefix needed', () => {
+    assert.deepEqual([...openQuestionIdsIn('Probationary End = ? CF-HIR-08 OQ-HIR-50\nNotice = ? QX-ABC-12')], ['CF-HIR-08', 'OQ-HIR-50', 'QX-ABC-12']);
+    assert.equal(assertsOpenQuestion([{ action: 'expectVisible', selector: 'text=QX-ABC-12' }], 'Expected output:\n  - Notice = ? QX-ABC-12')?.marker, 'QX-ABC-12');
+    assert.equal(assertsOpenQuestion([{ action: 'expectVisible', selector: 'text=QX-ABC-12' }]), null, 'without the case, an unknown prefix is just an id');
+    assert.ok(!fixtureFacts('ZZ-QA-029: t\nTest data: Ref = ? QX-ABC-12, Plan = TH_MED_005').includes('QX-ABC-12'));
+  });
+
+  it('a sibling case id is recognised by the skeleton of the case\'s own id, whatever the catalog\'s prefixes', () => {
+    const facts = fixtureFacts('ZZ-QA-029: title\nTest data: Plan = TH_MED_005, same as ZZ-QA-001, เคส E2E-29\nExpected: ok ZZ-QA-030');
+    assert.deepEqual(facts, ['TH_MED_005']);
+  });
+});
+
+// ---------------------------------------------------------------- multirole HIR-EC-001 (2026-09-04)
+
+describe('the last word is a rewrite, not a refusal (multirole HIR-EC-001, 2026-09-04)', () => {
+  // The sheet row as `describeCase` renders it, cut to the columns the lints
+  // read: eight scripted steps, and the Expected lines the 07:10 run was
+  // refused over. The authored flow performs steps 1–7 and never reaches 8.
+  const caseText = [
+    'HIR-EC-001: ตรวจสอบการจ้างพนักงานใหม่แบบ Key-in สำเร็จ กรณีวันเริ่มงานต้นเดือน',
+    'Test data:',
+    '  Province = กรุงเทพมหานคร',
+    'Steps:',
+    '  1. Login ด้วย <HR_ADMIN_ACCOUNT>',
+    '  2. กรอกข้อมูล Identity ตาม Test Data',
+    '  3. กรอกและตรวจสอบ Home Address',
+    '  4. กรอกข้อมูล Position & Organization',
+    '  5. ตรวจสอบ Time Management Status และ O.T. Flag',
+    '  6. กรอก Compensation Information และ Payment Information ให้ครบถ้วน',
+    '  7. กด Submit เพื่อสร้างพนักงานใหม่',
+    '  8. ตรวจสอบ Employee Profile ใน EC',
+    'Expected output:',
+    '  EC',
+    '  - Employee Status = Active',
+    '  - เมื่อเปลี่ยน Province ระบบเคลียร์ District / Sub-District / Postal Code เดิม',
+    '  - Time Management Status และ O.T. Flag เป็น Read-only และ HR ไม่สามารถแก้ไขเองได้',
+  ].join('\n');
+  const throughSeven: FlowStep[] = [
+    { action: 'click', selector: 'role=link[name="New Hire" i]', intent: 'Step 1: ไปที่ EC > New Hire' },
+    { action: 'fill', selector: 'role=textbox[name="First Name" i]', value: 'สมชาย', intent: 'Step 2: กรอกข้อมูล Identity' },
+    { action: 'selectOption', selector: 'role=button[name="Province" i]', value: 'กรุงเทพมหานคร', intent: 'Step 3: เลือก Province' },
+    { action: 'expectValue', selector: 'role=textbox[name="Postal Code" i]', value: '', intent: 'Step 3: เมื่อเปลี่ยน Province ระบบเคลียร์ Postal Code เดิม' },
+    { action: 'fill', selector: 'role=textbox[name="Position" i]', value: '1', intent: 'Step 4: กรอก Position' },
+    { action: 'expectDisabled', selector: 'role=textbox[name="Time Management Status" i]', intent: 'Step 5: Read-only' },
+    { action: 'fill', selector: 'role=textbox[name="Salary" i]', value: '1', intent: 'Step 6: กรอก Compensation' },
+    { action: 'click', selector: 'role=button[name="Submit" i]', intent: 'Step 7: กด Submit' },
+    { action: 'expectVisible', selector: 'text="Employee Status"', intent: 'Expected: Employee Status = Active' },
+  ];
+
+  it('settleViolations: weak notes ride along, a fatal complaint with a grounded rewrite is settled, one without keeps the refusal', () => {
+    const r = settleViolations([
+      { message: 'thin', severity: 'weak', note: 'thin note' },
+      { message: 'fatal but settleable', severity: 'fatal', note: 'n', settle: () => 'settled note' },
+      { message: 'fatal, no evidence', severity: 'fatal', note: 'n', settle: () => null },
+      { message: 'fatal, no fallback', severity: 'fatal', note: 'n' },
+    ]);
+    assert.deepEqual(r.notes, ['thin note', 'settled note']);
+    assert.deepEqual(r.unsettled.map((v) => v.message), ['fatal, no evidence', 'fatal, no fallback']);
+  });
+
+  it('on the last attempt the flow that stops at step 7 of 8 is handed over with "not covered: script step(s) 8" instead of blocked', async () => {
+    const log: string[] = [];
+    const author = new FlowAuthor({ model: stubModel({ name: 'HIR-EC-001 New Hire Key-in success', steps: [...throughSeven] }), attempts: 1, onLog: (l) => log.push(l) });
+    const authored = await author.author(caseText, undefined, { caseText });
+    assert.match(authored.notes, /not covered: script step\(s\) 8 \(ตรวจสอบ Employee Profile ใน EC\) — no authored step performs them; the flow performs the script through step 7 of 8/);
+    assert.equal(authored.flow.steps.length, throughSeven.length, 'the covered steps go out as written');
+    assert.ok(log.some((l) => /settled 1 refusal\(s\) by rewriting instead of refusing/.test(l)));
+  });
+
+  it('the same fatal refusal answered twice is settled on the second attempt, not re-asked a third time', async () => {
+    let calls = 0;
+    const model: FlowAuthorModel = {
+      id: 'stub:author',
+      async author() {
+        calls += 1;
+        return { name: 'HIR-EC-001', rationale: '', setup: [], steps: [...throughSeven], teardown: [], notes: '', droppedSteps: 0 };
+      },
+    };
+    const author = new FlowAuthor({ model });
+    const authored = await author.author(caseText, undefined, { caseText });
+    assert.equal(calls, 2, 'one informed re-ask, then the rewrite');
+    assert.match(authored.notes, /not covered: script step\(s\) 8/);
+  });
+
+  it('a fatal complaint with no grounded rewrite still refuses — a false claim is never handed over', async () => {
+    const author = new FlowAuthor({
+      model: stubModel({
+        steps: [
+          ...throughSeven.slice(0, 8),
+          { action: 'fill', selector: 'role=textbox[name="Employee ID" i]', value: '<NON_EXISTING_EMPLOYEE_ID>', intent: 'Step 8: ค้นหา' },
+          { action: 'expectVisible', selector: 'text="Employee Status"', intent: 'Step 8: Expected: Employee Status = Active' },
+        ],
+      }),
+      attempts: 1,
+    });
+    await assert.rejects(() => author.author(caseText, undefined, { caseText }), (e: unknown) => e instanceof AuthoringError && e.severity === 'fatal' && /<NON_EXISTING_EMPLOYEE_ID>|token/.test(e.message));
+  });
+
+  it('an ungrounded text assertion is handed over marked [generated: …] on the last attempt, with the nearest rendering named', async () => {
+    const tree = 'main\n  heading "Benefit Plan Catalog"\n  button "Submit"';
+    const author = new FlowAuthor({
+      model: stubModel({ steps: [{ action: 'click', selector: 'role=button[name="Submit" i]', intent: 'go' }, { action: 'expectVisible', selector: 'text="Benefit Plans"', intent: 'Expected: the heading' }] }),
+      journeyTree: tree,
+      attempts: 1,
+    });
+    const authored = await author.author('the catalog heading is shown');
+    const step = authored.flow.steps[1] as FlowStep & { intent: string };
+    assert.ok(step.intent.startsWith('Expected: the heading ' + GENERATED_STEP_MARKER), step.intent);
+    assert.match(step.intent, /the page renders "Benefit Plan Catalog"/);
+    assert.match(authored.notes, /handed over marked \[generated: …\] for the run to prove or dead-end/);
+  });
+
+  it('settleSelectorRole repoints a role to the tree\'s own line for the same name, and refuses to guess otherwise', () => {
+    const step: FlowStep = { action: 'selectOption', selector: 'role=combobox[name="Event Reason" i]', value: 'New Hire', intent: 'Step 2: เลือก Event Reason' };
+    const note = settleSelectorRole(step, { role: 'combobox', name: 'Event Reason', nearest: ['button "Event Reason" haspopup'], disabled: false });
+    assert.match(note ?? '', /repointed to role=button/);
+    assert.equal((step as { selector: string }).selector, 'role=button[name="Event Reason" i]');
+    assert.match((step as { intent: string }).intent, /^Step 2: เลือก Event Reason \[generated: role "combobox" repointed to "button"/);
+    const other: FlowStep = { action: 'click', selector: 'role=combobox[name="Event Reason" i]' };
+    assert.equal(settleSelectorRole(other, { role: 'combobox', name: 'Event Reason', nearest: ['button "Event Reason Type"'], disabled: false }), null, 'a different name is no evidence');
+    assert.equal(settleSelectorRole(other, { role: 'combobox', name: 'Event Reason', nearest: ['textbox "Event Reason"'], disabled: true }), null, 'disabled is a different complaint');
+  });
+
+  it('settleExclusivity inserts the count from the tree before the first member presence, and declines when a member is in no tree (HIR-EC-029 shape)', () => {
+    const text = 'HIR-EC-029: Event Reason\nExpected output:\n  - dropdown แสดง 3 ค่า : Event Reason บนหน้า Key-in แสดงเฉพาะ New Hire / Replacement / Migration';
+    const claim = exclusivityClaimIn(text);
+    assert.ok(claim !== null);
+    const flow = {
+      steps: [
+        { action: 'click', selector: 'role=button[name="Event Reason" i]' },
+        { action: 'expectVisible', selector: 'text="New Hire"' },
+        { action: 'expectVisible', selector: 'text="Replacement"' },
+      ] as FlowStep[],
+      cases: undefined as undefined,
+    };
+    const opened = 'listbox\n  option "New Hire"\n  option "Replacement"\n  option "Migration"\n  option "HIREDM"';
+    const note = settleExclusivity(flow, claim, text, opened);
+    assert.match(note ?? '', /expectCount role=option = 3 inserted/);
+    const inserted = flow.steps[1] as FlowStep & { count: number; intent: string; selector: string };
+    assert.equal(inserted.action, 'expectCount');
+    assert.equal(inserted.count, 3);
+    assert.match(inserted.selector, /role=option/);
+    assert.ok(inserted.intent.includes(GENERATED_STEP_MARKER));
+    assert.equal(unboundedExclusivityClaim(flow.steps, text), null, 'the inserted count settles the lint');
+    // No tree lists "Migration": no role is evidence for a count.
+    const bare = { steps: [{ action: 'expectVisible', selector: 'text="New Hire"' }] as FlowStep[], cases: undefined as undefined };
+    assert.equal(settleExclusivity(bare, claim, text, 'option "New Hire"\noption "Replacement"'), null);
   });
 });

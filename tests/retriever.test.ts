@@ -214,7 +214,7 @@ describe('sheetGate (S7 — the Note/Actual columns are a gate)', () => {
     assert.equal(sheetGate(row('Re-Test Passed', 'was cancelled, then reinstated')), null);
   });
   it('the card carries a requirement-change note as its own line, ahead of the persona', () => {
-    const card = caseCard({ ...row('Passed', '4-Aug New req. update pop-up to page'), caseId: 'PL_06_01', testCase: 'Create plan', expected: '2.1 dialog opens' } as never) ?? '';
+    const card = caseCard({ ...(row('Passed', '4-Aug New req. update pop-up to page') as object), caseId: 'PL_06_01', testCase: 'Create plan', expected: '2.1 dialog opens' } as never) ?? '';
     assert.match(card, /Requirement note .*pop-up to page/);
   });
 

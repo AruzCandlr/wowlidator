@@ -51,6 +51,7 @@
  */
 
 import { GRIM_BASE, GRIM_TOKENS } from '../reporter/theme.js';
+import { CONSOLE_LINES_SCRIPT } from './console-lines.js';
 
 /**
  * GRIM's QA Command Center, on wowlidator's tokens.
@@ -362,11 +363,68 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .case-name { font-size: var(--fs-sm); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .case-sub { font-size: var(--fs-xs); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .case .prog { padding: 0 var(--s4) var(--s2); }
-.case-out {
-  max-height: 260px; overflow: auto; padding: 8px 12px;
-  white-space: pre-wrap; font-size: var(--fs-xs);
-  border-top: 1px solid var(--line); background: var(--panel-2);
+.case-out { border-top: 1px solid var(--line); background: var(--panel-2); font-size: var(--fs-xs); }
+.case-out .con { max-height: 260px; }
+
+/* ---- command output: one job's lines, read (src/ui/console-lines.ts) ----
+   Colour never carries a meaning alone: stderr wears a muted "E" in the
+   gutter, a step its ✓/✗ glyph, a model call its arrow. */
+.con-wrap { display: flex; flex-direction: column; min-width: 0; }
+.con-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 6px 12px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
 }
+.con-bar .btn { height: 22px; padding: 0 8px; font-size: 11px; }
+.con-bar .btn.on { border-color: var(--accent); color: var(--accent-ink); background: var(--accent-soft); font-weight: 600; }
+.con-bar .con-q {
+  font: inherit; font-size: 11px; height: 22px; padding: 0 8px; min-width: 140px; flex: 1 1 140px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--panel); color: var(--ink);
+}
+.con-bar .con-count { font-size: 10.5px; color: var(--faint); white-space: nowrap; }
+.con-bar .con-copy { margin-left: auto; }
+.con { max-height: 300px; overflow: auto; padding: 4px 12px 8px; font-size: var(--fs-xs); line-height: 1.5; color: var(--ink); position: relative; }
+.con-case {
+  position: sticky; top: 0; z-index: 1; margin: 6px 0 2px; padding: 2px 6px;
+  font-size: 10px; font-weight: 700; letter-spacing: .04em; color: var(--muted);
+  background: var(--panel-2); border-bottom: 1px solid var(--line);
+}
+.con-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; min-width: 0; }
+/* An author display beats the UA's [hidden]; the filter relies on hidden. */
+.con-row[hidden], .con-group[hidden], .con-fold[hidden] { display: none; }
+.con-src { flex: 0 0 10px; font-size: 9.5px; color: var(--faint); text-align: center; user-select: none; }
+.con-g { flex: 0 0 12px; text-align: center; color: var(--faint); user-select: none; }
+.con-t { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.con-row.step-pass .con-g { color: var(--ok); font-weight: 700; }
+.con-row.step-fail .con-g { color: var(--bad); font-weight: 700; }
+.con-row.step-fail .con-t { color: var(--bad); }
+.con-row .con-idx { color: var(--faint); margin-right: 4px; }
+.con-row .con-act { font-weight: 600; }
+.con-row .con-took { color: var(--faint); margin-left: 6px; }
+.con-row.llm-req .con-t, .con-row.llm-res .con-t, .con-row.llm-note .con-t { color: var(--muted); }
+.con-row.llm-fail .con-g, .con-row.llm-fail .con-t { color: var(--bad); }
+.con-row .con-time { color: var(--faint); font-size: 10px; margin-right: 6px; }
+.con-row .con-more {
+  font: inherit; font-size: 10px; margin-left: 6px; padding: 0 5px; height: 16px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: var(--r-xs); background: var(--panel); color: var(--muted);
+}
+.con-fold { flex: 0 0 calc(100% - 28px); box-sizing: border-box; margin: 2px 0 6px 28px; padding: 6px 8px; background: var(--code-bg); border-radius: var(--r-xs); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.con-fold b { color: var(--ink); font-weight: 600; margin-right: 4px; }
+.con-row.refusal .con-g, .con-row.refusal .con-t { color: var(--bad); }
+.con-row.refusal .con-t { font-weight: 600; }
+.con-bullets { flex: 0 0 calc(100% - 42px); box-sizing: border-box; margin: 2px 0 6px 28px; padding-left: 14px; color: var(--muted); }
+.con-bullets { list-style: none; padding-left: 0; }
+.con-bullets li { white-space: pre-wrap; overflow-wrap: anywhere; padding-left: 28px; text-indent: -28px; }
+.con-bullets .con-mark { color: var(--faint); font-weight: 600; }
+.con-bullets .con-flow { color: var(--faint); }
+.con-detail { flex: 0 0 calc(100% - 28px); box-sizing: border-box; margin-left: 28px; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.con-row.step-fail .con-detail { color: var(--bad); opacity: .85; }
+.con-row.summary .con-t { color: var(--muted); }
+.con-row .con-key { display: inline-block; min-width: 76px; color: var(--faint); }
+.con-row.bullet { padding-left: 16px; color: var(--muted); }
+.con-row.marker { margin-top: 6px; padding-top: 4px; border-top: 1px dashed var(--line); }
+.con-row.marker .con-t { font-weight: 600; }
+.con-row.marker.problem .con-t { color: var(--bad); }
+.con-empty { color: var(--faint); padding: 8px 12px; }
 @media (max-width: 720px) {
   .case-head { grid-template-columns: 16px 30px minmax(0, 1fr); row-gap: 4px; }
 }
@@ -437,6 +495,16 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .counts b { color: var(--ink); font-weight: 600; }
 .counts.none { color: var(--faint); }
 .when { font-size: var(--fs-xs); color: var(--faint); white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; min-width: 92px; }
+/* The meaning line: what the chip's word means, in plain words, visibly under
+   the row — not only in the chip's title or the Help glossary. It spans the
+   whole grid row so no column widens for it, wraps, and reads in the muted
+   ink; indented past the rail so it sits under the name and the chip. */
+.meaning {
+  grid-column: 1 / -1; font-size: var(--fs-xs); color: var(--muted); line-height: 1.5;
+  white-space: normal; overflow-wrap: anywhere; padding-left: 66px; margin-top: -4px;
+}
+.meaning b { font-weight: 600; color: var(--ink); }
+.case-head .meaning { padding-left: 56px; margin-top: -2px; }
 
 /* Pointing a role at a provider and a model, in the Machinery tab. The model is
    an input rather than a select because OpenRouter alone serves several hundred
@@ -613,6 +681,20 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
 .launcher input:disabled, .launcher select:disabled, .launcher textarea:disabled {
   background: var(--panel-2); color: var(--faint); cursor: not-allowed;
 }
+/* The accounts a catalog signs in as. One row per account the document names;
+   the grid collapses to one column on a narrow screen like every other table
+   on this page. */
+.launcher .personas { border: 1px solid var(--line); border-radius: var(--r-sm); padding: var(--s3) var(--s4); background: var(--panel-2); }
+.launcher .personas .phead { display: flex; align-items: flex-start; gap: var(--s3); justify-content: space-between; }
+.launcher .personas .phead .sub { margin-bottom: 0; }
+.launcher .personas .prow {
+  display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--s3); align-items: end; padding: var(--s3) 0; border-bottom: 1px solid var(--line);
+}
+.launcher .personas .prow:last-of-type { border-bottom: 0; }
+.launcher .personas .prow .sub { margin-bottom: 0; }
+.launcher .personas .prow label { margin-top: 0; }
+@media (max-width: 900px) { .launcher .personas .prow { grid-template-columns: minmax(0, 1fr); } }
 .modal .optional, .launcher .optional { font-weight: 400; color: var(--faint); }
 .modal .acts, .launcher .acts { display: flex; gap: var(--s2); margin-top: var(--s6); justify-content: flex-end; }
 .modal .inline, .launcher .inline { display: flex; align-items: center; gap: 6px; font-weight: 400; color: var(--ink); cursor: pointer; margin: 0; }
@@ -696,6 +778,7 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
      cost lines become ordinary wrapped text, full width, left-aligned. */
   .counts { max-width: none; text-align: left; }
   .when { text-align: left; min-width: 0; }
+  .meaning, .case-head .meaning { padding-left: 0; margin-top: 0; }
   .meta.cost { white-space: normal; }
   .scenario-head b { white-space: normal; }
 }
@@ -704,12 +787,14 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
   .stat { border-left: 0; border-top: 1px solid var(--line); }
   .stat:first-child { border-top: 0; }
 }
+details > summary { cursor: pointer; font-weight: 600; margin: 12px 0 4px; }
+details > summary .meta { font-weight: 400; margin-left: 8px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
 `;
 
-export const WOW_SCRIPT = String.raw`
+export const WOW_SCRIPT = CONSOLE_LINES_SCRIPT + String.raw`
 'use strict';
 
 /* ------------------------------------------------------------------ state */
@@ -917,6 +1002,9 @@ var S = {
   models: { providers: [], roles: [], checks: [], checking: [] },  /* the model catalogue, each role's pick, and its last readiness check */
   claude: null,      /* the claude-* run scripts and the signed-in session's live quota */
   contextDocs: [],   /* stored background documents — see the launcher */
+  personaAccounts: {},  /* LABEL -> [{ email, lastUsedAt }] the panel has run as before, newest
+                           first. ADDRESSES ONLY: the password half is never stored anywhere and
+                           is typed again every run. Loaded when the launcher opens, not polled. */
   repos: [],         /* saved repositories (context add) — see Machinery › Repositories */
   bundles: {},       /* runId -> the full bundle, fetched when a run is opened */
   verdicts: {},      /* runId -> the server-computed verdict (same pure function the report leads with) */
@@ -933,6 +1021,9 @@ var S = {
   jobArts: {},       /* jobId -> artifacts streamed so far, for the live section */
   streams: {},       /* jobId -> EventSource, live while that job runs */
   outLive: [],       /* mounted live output panes, written in place — see streamJob */
+  conViews: [],      /* every console view on screen — a filter change re-reads them all in place */
+  conFilter: conFilterLoad(),  /* how the output is read (see CON_FILTERS); a view preference, kept in localStorage */
+  conQuery: '',      /* the find-in-output text; per session, never stored */
   launcher: null,    /* the inline start-verification section's state, null = collapsed */
   drawer: null
 };
@@ -1495,6 +1586,73 @@ function verdictChip(kind, label) {
   return el('span', { class: 'chip ' + kind, text: label });
 }
 
+/* What each status word MEANS, in one sentence a person can act on. The one
+   source for both surfaces: the meaning line under a chip (meaningLine) and
+   Ledger's Help glossary (VOCAB reads its meanings from here), so the two can
+   never disagree. The data is never rewritten — the chip keeps its word, its
+   title keeps the machine status, and this only says what the word means.
+   Keyed by the status the proof file or the job line carries, plus the four
+   labels the page itself derives (needs a human, recorded only, human-
+   confirmed, no verdict). */
+var STATUS_MEANING = {
+  passed: 'every step passed, first time',
+  'passed-with-issues': 'proved: every claim held, but a step that only acted (a click, a navigation, an agent leg) broke on the way and a later step made it redundant — the path was not clean, the verdict is unchanged',
+  'needs-review': 'a step could not be sure whether the page satisfies the claim; confirm proved or failed in the run detail',
+  'human-confirmed': 'a person (or the review judge) ruled on the doubtful step, and that ruling is the verdict',
+  failed: "a step's claim was false in the application — the subject missed the case's expectation",
+  'dead-end': 'a control or content the case needed never resolved — the page did not offer what the case expected',
+  error: 'the harness, a model, a key or the environment broke — no verdict about the application was delivered',
+  blocked: 'not run and not failed: the case needed something that was not in place (a session that held, a database, a key, a flow authoring accepted), so nothing about the application was proved',
+  'no verdict': 'nothing about the application was proved — the harness ended this run before any claim was tested, so a catalog scores it blocked, not failed',
+  quarantined: 'passed, but the flow is marked known-flaky: the result is recorded in full and not counted against the run',
+  'needs a human': 'failed three or more runs in a row; a person should look before it is run again',
+  'recorded only': 'the sheet asked only to record what the system shows, so the run asserted nothing; a person judges the captures',
+  'spec?': 'a needs-review whose disputed expectations quote the sheet\u2019s own wording while the page renders it differently — a triage marker for the BA, never a verdict',
+  running: 'in progress; its verdict lands here when it finishes',
+  waiting: 'queued behind the cases before it; not started'
+};
+
+function meaningFor(key) {
+  return Object.prototype.hasOwnProperty.call(STATUS_MEANING, key) ? STATUS_MEANING[key] : null;
+}
+
+/* The visible line under a chip. Nothing for a first-time pass or a run in
+   progress (the chip says it all); every other status gets its sentence, and
+   a recorded reason — a run's noVerdict, a case's BLOCKED line — is quoted
+   after it verbatim, never composed. */
+function meaningLine(key, detail) {
+  if (key === 'passed' || key === 'running' || key === 'waiting') return null;
+  var text = meaningFor(key);
+  if (!text && !detail) return null;
+  var line = el('div', { class: 'meaning' });
+  if (text) line.appendChild(document.createTextNode(text));
+  if (detail) {
+    if (text) line.appendChild(document.createTextNode(' \u2014 '));
+    line.appendChild(el('b', { text: 'recorded reason: ' }));
+    line.appendChild(document.createTextNode(String(detail).split('\n')[0]));
+  }
+  return line;
+}
+
+/* Which meaning a proof card carries — the same branches the chip takes. */
+function cardMeaningKey(card) {
+  if (card.status === 'needs-review') return card.review ? 'human-confirmed' : 'needs-review';
+  if (card.generatedBy && card.generatedBy.recordOnly) return 'recorded only';
+  if (card.status === 'passed-with-issues') return 'passed-with-issues';
+  if (!isPassing(card.status)) return card.status;
+  return card.quarantined ? 'quarantined' : 'passed';
+}
+
+/* The meaning line for a proof card. A run that delivered no verdict says so
+   in words and quotes the reason the suite loop recorded (card.noVerdict —
+   the CLI's own neverRan/harnessOnly, never re-derived here): "the session is
+   not established", "database unavailable"; the chip keeps the bundle's
+   status and its title the machine word. */
+function runMeaningLine(card, key) {
+  if (card.noVerdict && !isPassing(card.status)) return meaningLine('no verdict', card.noVerdict);
+  return meaningLine(key, null);
+}
+
 function loopRail(slots, size) {
   var rail = el('span', {
     class: 'rail' + (size === 'lg' ? ' lg' : ''), role: 'img',
@@ -1693,6 +1851,7 @@ function renderRuns(main) {
           el('b', { text: head }),
           run.runKey ? el('span', { class: 'fix mono', text: 'run key: ' + run.runKey }) : null,
           run.persona ? el('span', { class: 'fix mono', text: 'signs in as ' + run.persona + ' — a resume from a restarted panel asks for the password once' }) : null,
+          accountsLine(run),
           el('span', { class: 'fix mono', text: 'cause: ' + (cause || (run.resumable ? 'the run never recorded how it ended' : 'the run completed')) }),
           el('span', { class: 'fix', text: 'Every button continues this catalog run under the same key: cases already tested are pulled in as finished tests unless the button says otherwise, and the resumed cases join the original group.' }),
           el('div', { class: 'acts' }, acts)
@@ -1946,6 +2105,9 @@ function taskRow(task) {
 
   var chip;
   var latestEff = effStatus(latest);
+  /* The meaning line under the row takes the branch the chip took: a
+     three-run streak reads "needs a human", a running row nothing. */
+  var why = isRunning ? 'running' : escalated && latest.status !== 'needs-review' ? 'needs a human' : cardMeaningKey(latest);
   if (isRunning) chip = verdictChip('running', 'running');
   else if (latest.status === 'needs-review' && !latest.review) chip = verdictChip('doubt', 'proved-? · confirm below');
   else if (latest.status === 'needs-review' && latest.review) chip = verdictChip(latestEff === 'passed' ? 'verified' : 'feedback', latestEff === 'passed' ? 'proved (human-confirmed)' : 'failed (human-confirmed)');
@@ -2110,7 +2272,8 @@ function taskRow(task) {
         text: 'Report',
         onclick: function () { window.open('/view?path=' + encodeURIComponent(latest.reportPath), '_blank'); }
       })
-    ])
+    ]),
+    isRunning ? null : runMeaningLine(latest, why)
   ]);
 }
 
@@ -2279,8 +2442,227 @@ function toggleOut(key, job) {
   render();
 }
 
-function outLine(line) {
-  return el('div', { style: line.stream === 'err' ? 'color:var(--bad)' : null, text: line.text || ' ' });
+/* ------------------------------------------------ the console view */
+
+/* The filter mode outlives a reload (a view preference — per browser, moves
+   nothing on disk); a value no longer in CON_FILTERS falls back to 'all'. */
+function conFilterLoad() {
+  try {
+    var v = localStorage.getItem('wow-console-filter');
+    return CON_FILTERS.some(function (f) { return f[0] === v; }) ? v : 'all';
+  } catch (e) { return 'all'; }
+}
+function conFilterSave(v) {
+  try { localStorage.setItem('wow-console-filter', v); } catch (e) { /* storage may be unavailable; the choice still holds for this page */ }
+}
+
+/** Every console view still on screen; the filter bar drives them all together. */
+function conViews() {
+  S.conViews = S.conViews.filter(function (v) { return v.node.isConnected; });
+  return S.conViews;
+}
+function conApplyAll() { conViews().forEach(function (v) { v.apply(); }); }
+
+/**
+ * One job's (or one case's) output, read.
+ *
+ * Every line the command printed is here, in order, untouched in substance:
+ * the view only decides how a line is laid out — a step with its glyph, a
+ * model call as one line with its ask/response folded behind a toggle, a
+ * refusal with its bullets as a list, the lines of one case under a sticky
+ * label instead of a repeated prefix — and which of the four filters it
+ * answers to. Rows are appended in place as a live job streams (never
+ * through render()), and a filter is applied by hiding rows, never by
+ * rebuilding them, so a search box keeps its focus and a pane its scroll.
+ * Everything is built with el(): a line is untrusted text.
+ */
+function consoleView(lines) {
+  var view = { lines: lines || [], rows: [], groups: [], last: null, group: null, label: undefined, stick: true, shown: 0 };
+  var pane = el('div', { class: 'con mono', role: 'log', 'aria-live': 'off' });
+  var count = el('span', { class: 'con-count' });
+  var query = el('input', { type: 'search', class: 'con-q', placeholder: 'find in output', 'aria-label': 'find in output',
+    oninput: function () { S.conQuery = query.value; conApplyAll(); } });
+  query.value = S.conQuery || '';
+  var bar = el('div', { class: 'con-bar' });
+  CON_FILTERS.forEach(function (f) {
+    bar.appendChild(el('button', { type: 'button', class: 'btn', 'data-f': f[0], text: f[1], title: f[2],
+      onclick: function () { S.conFilter = f[0]; conFilterSave(f[0]); conApplyAll(); } }));
+  });
+  bar.appendChild(query);
+  bar.appendChild(count);
+  bar.appendChild(el('button', { type: 'button', class: 'btn con-copy', text: 'Copy raw',
+    title: 'copy every line exactly as the command printed it — filters do not apply',
+    onclick: function () { copy(conRawText(view.lines), 'raw log (' + view.lines.length + ' lines)'); } }));
+  view.node = el('div', { class: 'con-wrap' }, [bar, pane]);
+  view.pane = pane;
+
+  // Follow the tail while the reader is at it; stop the moment they scroll
+  // up to read something, and resume when they come back to the bottom.
+  pane.addEventListener('scroll', function () {
+    view.stick = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 24;
+  });
+  view.follow = function () { if (view.stick) pane.scrollTop = pane.scrollHeight; };
+
+  function rowVisible(row) {
+    var on = conMatchesMode(row.c, S.conFilter) && conMatchesQuery(row.text, S.conQuery);
+    row.node.hidden = !on;
+    return on;
+  }
+  function groupVisible(group) {
+    var any = false;
+    for (var i = 0; i < group.rows.length; i++) if (!group.rows[i].node.hidden) { any = true; break; }
+    group.node.hidden = !any;
+  }
+  view.apply = function () {
+    view.shown = 0;
+    view.rows.forEach(function (row) { if (rowVisible(row)) view.shown++; });
+    view.groups.forEach(groupVisible);
+    var buttons = bar.querySelectorAll('[data-f]');
+    for (var i = 0; i < buttons.length; i++) {
+      var on = buttons[i].getAttribute('data-f') === S.conFilter;
+      buttons[i].className = 'btn' + (on ? ' on' : '');
+      buttons[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+    if (document.activeElement !== query && query.value !== (S.conQuery || '')) query.value = S.conQuery || '';
+    setCount();
+    view.follow();
+  };
+
+  function setCount() {
+    count.textContent = view.shown === view.rows.length ? view.rows.length + ' line(s)' : view.shown + ' of ' + view.rows.length + ' line(s)';
+  }
+
+  /* A line arriving on the stream: the caller's array (S.jobLines) already
+     holds it when the view was built on that array; a view built on its own
+     copy keeps it here so "Copy raw" has the whole log either way. */
+  view.append = function (line) {
+    if (view.lines[view.lines.length - 1] !== line) view.lines.push(line);
+    place(line);
+    setCount();
+  };
+
+  function place(line) {
+    var c = classifyLine(line.text);
+    var last = view.last;
+    // A model call's ask/response continuation folds under the call itself.
+    if (c.kind === 'llm-cont' && last && last.c.kind.slice(0, 4) === 'llm-' && last.c.kind !== 'llm-cont') {
+      conFold(last, c);
+      last.text += '\n' + line.text;
+      rowVisible(last);
+      return;
+    }
+    // A refusal's numbered problems (and its "flow:" line) become its list.
+    if (c.kind === 'bullet' && last && last.c.kind === 'refusal') {
+      conBullet(last, c);
+      last.text += '\n' + line.text;
+      rowVisible(last);
+      return;
+    }
+    // A line indented under the one above belongs to it: the wrapped rest of
+    // a refusal item, a step's intent/expected/observed detail, an agent
+    // turn's note. It rides with its row through every filter.
+    if (c.hang && last && (last.list || last.c.kind === 'step-pass' || last.c.kind === 'step-fail' || last.c.kind === 'summary')) {
+      conDetail(last, c);
+      last.text += '\n' + line.text;
+      rowVisible(last);
+      return;
+    }
+    var label = conGroupLabel(c);
+    if (!view.group || label !== view.label) {
+      var groupNode = el('div', { class: 'con-group' });
+      if (label !== null) groupNode.appendChild(el('div', { class: 'con-case', text: label, title: 'the lines that follow belong to this case' }));
+      view.group = { node: groupNode, rows: [] };
+      view.groups.push(view.group);
+      view.label = label;
+      pane.appendChild(groupNode);
+    }
+    var row = conRow(c, line);
+    view.group.node.appendChild(row.node);
+    view.group.rows.push(row);
+    view.rows.push(row);
+    view.last = row;
+    if (rowVisible(row)) view.shown++;
+    groupVisible(view.group);
+  }
+
+  view.reset = function (next) {
+    clear(pane);
+    view.lines = next || [];
+    view.rows = []; view.groups = []; view.last = null; view.group = null; view.label = undefined; view.shown = 0;
+    view.lines.forEach(place);
+    view.stick = true;
+    view.apply();
+  };
+
+  S.conViews.push(view);
+  view.reset(view.lines);
+  return view;
+}
+
+/** One classified line as a row: stderr marker, glyph, then the text laid out for its kind. */
+function conRow(c, line) {
+  var err = line.stream === 'err';
+  var text = el('span', { class: 'con-t' });
+  if (c.kind === 'step-pass' || c.kind === 'step-fail') {
+    if (c.index !== null) text.appendChild(el('span', { class: 'con-idx', text: '[' + c.index + ']' }));
+    text.appendChild(el('span', { class: 'con-act', text: c.action || '' }));
+    if (c.rest) text.appendChild(document.createTextNode(' ' + c.rest));
+    if (c.took) text.appendChild(el('span', { class: 'con-took', text: c.took }));
+  } else if (c.kind.slice(0, 4) === 'llm-') {
+    if (c.time) text.appendChild(el('span', { class: 'con-time', text: c.time }));
+    text.appendChild(document.createTextNode(c.body));
+  } else if (c.kind === 'summary') {
+    text.appendChild(el('span', { class: 'con-key', text: c.label }));
+    text.appendChild(document.createTextNode(c.body));
+  } else {
+    text.appendChild(document.createTextNode(c.body === '' ? ' ' : c.body));
+  }
+  var node = el('div', { class: 'con-row ' + c.kind + (c.problem ? ' problem' : '') + (err ? ' from-err' : ''), 'data-k': c.kind }, [
+    el('span', { class: 'con-src', text: err ? 'E' : '', title: err ? 'printed on stderr' : 'printed on stdout' }),
+    el('span', { class: 'con-g', text: c.glyph, 'aria-hidden': 'true' }),
+    text
+  ]);
+  return { c: c, node: node, text: line.text || '', fold: null, more: null, list: null };
+}
+
+/** Fold an ask:/response: continuation under its model-call row, behind a toggle. */
+function conFold(row, c) {
+  if (!row.fold) {
+    row.fold = el('div', { class: 'con-fold' });
+    row.fold.hidden = true;
+    row.more = el('button', { type: 'button', class: 'con-more', text: '▸ details', 'aria-expanded': 'false',
+      onclick: function () {
+        row.fold.hidden = !row.fold.hidden;
+        row.more.textContent = (row.fold.hidden ? '▸ ' : '▾ ') + row.more.getAttribute('data-what');
+        row.more.setAttribute('aria-expanded', row.fold.hidden ? 'false' : 'true');
+      } });
+    row.node.querySelector('.con-t').appendChild(row.more);
+    row.node.appendChild(row.fold);
+  }
+  var what = (row.more.getAttribute('data-what') ? row.more.getAttribute('data-what') + ' · ' : '') + c.label;
+  row.more.setAttribute('data-what', what);
+  row.more.textContent = (row.fold.hidden ? '▸ ' : '▾ ') + what;
+  row.fold.appendChild(el('div', {}, [el('b', { text: c.label + ':' }), c.body]));
+}
+
+/** A refusal's item — "(1) …", "· …", "flow: …" — as an entry of the list under the refusal row. */
+function conBullet(row, c) {
+  if (!row.list) {
+    row.list = el('ul', { class: 'con-bullets' });
+    row.node.appendChild(row.list);
+  }
+  row.list.appendChild(el('li', { class: c.label === 'flow' ? 'con-flow' : null }, [
+    el('span', { class: 'con-mark', text: c.glyph }), ' ' + c.body
+  ]));
+}
+
+/** An indented continuation: onto the last list item when the row has one, else a detail line under the row. */
+function conDetail(row, c) {
+  if (row.list && row.list.lastChild) {
+    row.list.lastChild.appendChild(document.createTextNode(' ' + c.body));
+    return;
+  }
+  row.node.appendChild(el('div', { class: 'con-detail', text: c.body }));
 }
 
 function artifactButton(artifact) {
@@ -2369,7 +2751,11 @@ function caseRow(job, entry) {
       el('div', { class: 'case-sub', text: (entry.exclusive ? 'runs alone (changes data)' : 'runs beside others') + ' · ' + (entry.lineCount || (entry.lines || []).length) + ' line(s)' })
     ]),
     el('span', { class: 'chip ' + (CASE_CHIP[entry.status] || 'plain'), text: caseLabel(entry.status),
-      title: entry.status === 'passed-with-issues' ? 'pass: every claim held. ** = a step that only acted (a click, a navigation, an agent leg) broke on the way; it does not affect the verdict' : null })
+      title: entry.status === 'passed-with-issues' ? 'status: passed-with-issues — every claim held. ** = a step that only acted (a click, a navigation, an agent leg) broke on the way; it does not affect the verdict' : 'status: ' + entry.status }),
+    /* In words, on the row: what the status means, and the reason the CLI
+       printed when it scored the case blocked (entry.reason, parsed out of
+       the case's own output — the console line, not a second judgement). */
+    meaningLine(entry.status, entry.reason)
   ]);
   row.appendChild(head);
 
@@ -2383,9 +2769,9 @@ function caseRow(job, entry) {
     var pane = el('div', { class: 'case-out mono' });
     var lines = caseLines(job, entry);
     if (lines.length === 0) {
-      pane.appendChild(el('div', { style: 'color:var(--faint)', text: 'nothing yet' }));
+      pane.appendChild(el('div', { class: 'con-empty', text: 'nothing yet' }));
     } else {
-      lines.forEach(function (line) { pane.appendChild(outLine(line)); });
+      pane.appendChild(consoleView(lines).node);
     }
     row.appendChild(pane);
   }
@@ -2434,22 +2820,21 @@ function outputSection(key, job) {
   });
   section.appendChild(toggle);
   if (open) {
-    var pane = el('div', { class: 'mono', style: 'max-height:300px;overflow:auto;padding:8px 12px;white-space:pre-wrap;font-size:var(--fs-xs)' });
     if (!lines && !running) {
-      pane.appendChild(el('div', { style: 'color:var(--faint)', text: 'reading the output…' }));
-    } else {
-      (lines || []).forEach(function (line) { pane.appendChild(outLine(line)); });
+      section.appendChild(el('div', { class: 'con-empty mono', text: 'reading the output…' }));
+      return section;
     }
-    section.appendChild(pane);
+    var view = consoleView(lines || []);
+    section.appendChild(view.node);
     if (running) {
-      // Live: subscribe once, and let the stream write onto this pane in
+      // Live: subscribe once, and let the stream write onto this view in
       // place. The artifacts the run announces land as buttons as they arrive.
       var arts = el('div', { class: 'acts', style: 'padding:8px 12px' });
       artifactsFor(job).forEach(function (artifact) { arts.appendChild(artifactButton(artifact)); });
       section.appendChild(arts);
-      S.outLive.push({ jobId: job.id, pane: pane, toggle: toggle, arts: arts });
+      S.outLive.push({ jobId: job.id, view: view, toggle: toggle, arts: arts });
       streamJob(job.id);
-      setTimeout(function () { pane.scrollTop = pane.scrollHeight; }, 0);
+      setTimeout(function () { view.follow(); }, 0);
     }
   }
   return section;
@@ -2461,16 +2846,14 @@ function artifactsFor(job) {
 
 /** The live panes currently on screen for one job; stale ones fall away here. */
 function mountedOut(jobId) {
-  S.outLive = S.outLive.filter(function (out) { return out.pane.isConnected; });
+  S.outLive = S.outLive.filter(function (out) { return out.view.node.isConnected; });
   return S.outLive.filter(function (out) { return out.jobId === jobId; });
 }
 
 /** Rebuild every mounted pane for a job from the buffered lines (after a replay). */
 function repaintOut(jobId) {
   mountedOut(jobId).forEach(function (out) {
-    clear(out.pane);
-    (S.jobLines[jobId] || []).forEach(function (line) { out.pane.appendChild(outLine(line)); });
-    out.pane.scrollTop = out.pane.scrollHeight;
+    out.view.reset(S.jobLines[jobId] || []);
     out.toggle.textContent = '▾ Command output (' + (S.jobLines[jobId] || []).length + ' lines)';
     clear(out.arts);
     (S.jobArts[jobId] || []).forEach(function (artifact) { out.arts.appendChild(artifactButton(artifact)); });
@@ -2499,8 +2882,8 @@ function streamJob(jobId) {
     var line = JSON.parse(event.data);
     (S.jobLines[jobId] = S.jobLines[jobId] || []).push(line);
     mountedOut(jobId).forEach(function (out) {
-      out.pane.appendChild(outLine(line));
-      out.pane.scrollTop = out.pane.scrollHeight;
+      out.view.append(line);
+      out.view.follow();
       out.toggle.textContent = '▾ Command output (' + S.jobLines[jobId].length + ' lines)';
     });
   });
@@ -3100,7 +3483,11 @@ function describeTarget(t) {
    and the report cannot disagree about what a step WAS. Two rules travel
    with them: never a credential (a persona is its LABEL; an address is
    withheld), never file contents (names only). */
-var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+/* A persona LABEL and nothing else. An '@' is an address — a credential's
+   other half — and a ':' is the persona wire format's own separator
+   (LABEL=email:password), so anything after it is a password. Mirrors
+   LABEL_ONLY in reporter/step-facts.ts; the two must not drift. */
+var LABEL_ONLY_RE = /^[^@:]+$/;
 var CONTAINS_EMAIL_RE = /[^\s@"']+@[^\s@"']+\.[^\s@"']+/;
 var CREDENTIAL_KEY_RE = /password|passwd|pwd|secret|token|credential|signedIn|personas|^email$|^as$/i;
 function namesOf(value) {
@@ -3137,7 +3524,7 @@ function signInPersonaOf(step) {
   var d = step.detail || {};
   var raw = d.as || d.persona || d.personaLabel;
   if (typeof raw !== 'string' || raw === '') return null;
-  return EMAIL_RE.test(raw) ? 'an account named by its email (withheld from the panel)' : raw;
+  return LABEL_ONLY_RE.test(raw) ? raw : 'an account named by its credentials (withheld from the panel)';
 }
 /* What the step was aimed at: the resolved selector, the authored one, or
    the record's own account for a kind with none. Null for a goto. */
@@ -3665,7 +4052,8 @@ function appendHistoryRow(rows, card) {
           type: 'button', class: 'btn', text: 'Raw proof',
           onclick: function () { window.open('/view?path=' + encodeURIComponent(card.path), '_blank'); }
         })
-      ])
+      ]),
+      runMeaningLine(card, cardMeaningKey(card))
     ]));
     if (open) {
       var bundle = S.bundles[card.runId];
@@ -4819,6 +5207,10 @@ function openLauncher() {
     claims: null,        /* the parsed claims file, once the gate has run */
     progress: null,      /* { percent, phase } while the catalog job runs */
     cut: {},             /* claim index -> struck out */
+    personaCreds: {},    /* LABEL -> { email, password } for the accounts this catalog signs in as.
+                            In memory for as long as the launcher is open, wiped by closeLauncher,
+                            and NEVER localStorage: the view-preference rule is for sorts and open
+                            panels, not for secrets. Sent as the personas value on the run. */
     attach: {},          /* context document path -> attached to this run */
     reading: false,
     // Describe
@@ -4834,13 +5226,14 @@ function openLauncher() {
     dbUrl: '',         /* WOWLIDATOR_DB_URL — env-carried like the sign-in pair, never argv */
     advanced: false,
     video: 'on',
-    screenshots: 'auto',
+    screenshots: 'all',   /* a still per step, not only per failure — see the Stills field in commands.ts */
     policy: 'mutations',
     waitFor: '',
     error: '',
     busy: false
   };
   loadDocuments();
+  loadPersonaAccounts();
   // The section lives on the runs view; a start button pressed anywhere else
   // (the empty repos page, say) goes there, where the form actually is.
   if (S.view !== 'runs') { show('runs'); return; }
@@ -4856,6 +5249,19 @@ function closeLauncher() {
 function loadDocuments() {
   return api('/api/documents?kind=context').then(function (body) {
     S.contextDocs = body.documents;
+    renderLauncher();
+  })['catch'](function () {});
+}
+
+/* The addresses this panel has started runs as, per account label.
+   Loaded once when the launcher opens — like the documents beside it — and
+   never on a poll: it changes only when a run starts. The server stores and
+   answers with the ADDRESS half only; the password is asked for every run and
+   is written nowhere. A failure here is silent on purpose: no memory means the
+   plain text box, which is what the launcher did before this existed. */
+function loadPersonaAccounts() {
+  return api('/api/persona-accounts').then(function (body) {
+    S.personaAccounts = body.accounts || {};
     renderLauncher();
   })['catch'](function () {});
 }
@@ -4979,6 +5385,171 @@ function contextList(M, attachable) {
   return wrap;
 }
 
+/* The accounts beyond the first that a recorded run signs in as.
+   launch.personas is label -> EMAIL (never a password: the ledger has never
+   held one) and has been on the wire at /api/catalog-runs since the ledger
+   learned it, unread by any page. A person looking at a resumable two-login
+   run could not see that it needed two, which is the same blindness the
+   launcher had before it could ask. */
+function extraAccountsOf(run) {
+  var map = (run.launch && run.launch.personas) || {};
+  var out = [];
+  for (var label in map) if (Object.prototype.hasOwnProperty.call(map, label)) out.push(label + ' = ' + map[label]);
+  return out;
+}
+
+function accountsLine(run) {
+  var extra = extraAccountsOf(run);
+  if (extra.length === 0) return null;
+  return el('span', { class: 'fix mono', text: 'accounts: ' + extra.join(', ') + ' — a resume asks for each missing password once' });
+}
+
+/* The accounts a catalog signs in as.
+   Rendered from claims.personas, which the claims phase wrote by reading the
+   sheet's own Steps column — the panel never re-derives it. A catalog that
+   changes hands ("Login with <MANAGER_ACCOUNT>" then "<HRBP_ACCOUNT>")
+   needs two logins, and until this existed there was nowhere to give the second
+   one: the launcher had a single credentials box, and the run learned about the
+   other account by refusing a row ten minutes in.
+
+   Three rules it must keep:
+     - nothing here is remembered anywhere. The values live in M.personaCreds
+       while the launcher is open and go with it.
+     - every handler calls syncSubmit(), never renderLauncher() — a re-render on
+       a keystroke takes the caret out of the box being typed in.
+     - it predicts nothing. Which account may fall back to the run's own
+       sign-in, and which row is refused for want of one, is the CLI's rule
+       (resolveRowPersonas); re-implementing it here is exactly the drift the
+       single command declaration exists to prevent. The panel offers a box per
+       account and says how many cases want it. */
+function personaNeeds(M) {
+  return (M.claims && M.claims.personas) || [];
+}
+
+function personasUnanswered(M) {
+  var needs = personaNeeds(M);
+  var missing = 0;
+  for (var i = 0; i < needs.length; i++) {
+    var got = M.personaCreds[needs[i].label] || {};
+    if (!(got.email || '').trim() || !(got.password || '')) missing++;
+  }
+  return missing;
+}
+
+/** Only the accounts that are complete — a half-filled row is not sent at all. */
+function personaValues(M) {
+  var out = {};
+  var needs = personaNeeds(M);
+  for (var i = 0; i < needs.length; i++) {
+    var label = needs[i].label;
+    var got = M.personaCreds[label] || {};
+    if ((got.email || '').trim() && (got.password || '')) out[label] = { email: got.email.trim(), password: got.password };
+  }
+  return out;
+}
+
+/* The label the panel's memory is keyed by: the CLI's own personaLabelOf rule,
+   mirrored here for a LOOKUP only. The claims file may name an account in one
+   spelling where an earlier run was stored under the trimmed, upper-cased
+   form, and the two have to meet. A mismatch costs the dropdown and nothing
+   else — the row falls back to the plain box it had before this existed. */
+function personaLabelKey(label) {
+  return String(label === null || label === undefined ? '' : label)
+    .trim().replace(/^<|>$/g, '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+}
+
+/* Addresses this panel has started a run as for that account, newest first.
+   Loaded by loadPersonaAccounts; empty until it lands, and empty forever on a
+   machine that has never run this account — both are the text box. */
+function rememberedAccounts(label) {
+  var all = S.personaAccounts || {};
+  var list = all[label] || all[personaLabelKey(label)] || [];
+  return list.filter(function (one) { return one && typeof one.email === 'string' && one.email !== ''; });
+}
+
+/* The value of the "type a different one" option. A stored address can never
+   contain a space (the store refuses one), so this cannot collide with a real
+   choice. */
+var PICK_ANOTHER = 'another account';
+
+/* The address half of one account row.
+   Nothing remembered — the plain box, unchanged. Something remembered — a list
+   of them, most recent preselected, plus a way to type a new one. The new-address
+   box is built either way and SHOWN in place: re-rendering the form to reveal a
+   field would rebuild the control being used and take the caret with it.
+   The password half is not here on purpose: it is never remembered, never
+   offered, and always typed. */
+function accountPicker(need, got) {
+  var known = rememberedAccounts(need.label);
+  var typed = el('input', {
+    type: 'text', value: got.custom ? got.email : '', placeholder: 'name@company.test',
+    'aria-label': 'a different address for this account',
+    style: known.length === 0 ? '' : 'margin-top:6px; display:' + (got.custom ? 'block' : 'none'),
+    oninput: function (e) { got.email = e.target.value; syncSubmit(); }
+  });
+  if (known.length === 0) return typed;
+
+  // Preselect the most recent: not having to choose is the whole point.
+  // Only while the row is untouched, so late-arriving memory cannot overwrite
+  // an address someone has already picked or typed.
+  if (!got.custom && (got.email || '') === '') got.email = known[0].email;
+
+  var pick = el('select', { 'aria-label': 'account to sign in as' });
+  known.forEach(function (one) {
+    pick.appendChild(el('option', {
+      value: one.email, text: one.email, selected: !got.custom && one.email === got.email
+    }));
+  });
+  pick.appendChild(el('option', { value: PICK_ANOTHER, text: 'Another account…', selected: !!got.custom }));
+  pick.onchange = function () {
+    got.custom = pick.value === PICK_ANOTHER;
+    got.email = got.custom ? typed.value : pick.value;
+    typed.style.display = got.custom ? 'block' : 'none';
+    if (got.custom) typed.focus();
+    syncSubmit();
+  };
+  return el('div', {}, [pick, typed]);
+}
+
+function personaBlock(M) {
+  var needs = personaNeeds(M);
+  if (needs.length === 0) return null;
+  var missing = personasUnanswered(M);
+
+  var rows = needs.map(function (need) {
+    var got = M.personaCreds[need.label] || (M.personaCreds[need.label] = { email: '', password: '', custom: false });
+    var email = accountPicker(need, got);
+    var password = el('input', {
+      type: 'password', value: got.password,
+      oninput: function (e) { got.password = e.target.value; syncSubmit(); }
+    });
+    return el('div', { class: 'prow' }, [
+      el('div', {}, [
+        el('div', { class: 'mono', style: 'font-weight:600', text: need.label }),
+        el('div', { class: 'sub', text: need.cases.length + ' case(s) sign in as this account' })
+      ]),
+      el('div', {}, [el('label', { text: 'Email' }), email]),
+      el('div', {}, [el('label', { text: 'Password' }), password])
+    ]);
+  });
+
+  return el('div', { class: 'personas', style: 'margin-top:12px' }, [
+    el('div', { class: 'phead' }, [
+      el('div', {}, [
+        el('strong', { text: 'Accounts this catalog signs in as' }),
+        el('div', { class: 'sub', text:
+          'Read from the document. An address you have run before is offered again; the password is held for ' +
+          'this run only, is written nowhere, and never reaches the command line.' })
+      ]),
+      el('span', { class: 'chip ' + (missing === 0 ? 'verified' : 'feedback'),
+        text: (needs.length - missing) + ' of ' + needs.length + ' given' })
+    ])
+  ].concat(rows).concat([
+    el('div', { class: 'sub', style: 'margin-top:8px', text:
+      'Each account gets its own browser, its own cookies and its own recording.' })
+  ]));
+}
+
 /* ------------------------------------------------------------ Add Catalog */
 
 function renderCatalogTab(box, M) {
@@ -5033,6 +5604,9 @@ function renderCatalogTab(box, M) {
   if (M.reading) box.appendChild(readingProgress(M));
 
   if (M.claims) box.appendChild(claimsGate(M));
+  // Between the gate and the context list, so the order on screen is the order
+  // of the decisions: which claims, then who proves them, then what to read.
+  if (M.claims) { var accounts = personaBlock(M); if (accounts) box.appendChild(accounts); }
 
   box.appendChild(contextList(M, true));
 }
@@ -5178,7 +5752,7 @@ function countApproved(M) {
 }
 
 /** Phase one: ask the CLI what the document claims, then read the file it wrote. */
-function readClaims() {
+function readClaims(thenRun) {
   var M = S.launcher;
   M.error = '';
 
@@ -5221,6 +5795,16 @@ function readClaims() {
       M.reading = false;
       M.progress = null;
       renderLauncher();
+      // One press, not two (2026-09-03): a table sheet reads in milliseconds
+      // and every row is a claim, so the gate between "read" and "prove" was
+      // a second click that only ever said "yes". Only after the Start
+      // verification press, though — the "read the claims" button is a
+      // preview, and firing a run from it launched against a URL nobody had
+      // typed yet. A sheet with nothing testable still stops at the gate.
+      // …and never while an account the document names has no credentials:
+      // one press is a convenience, not a licence to start a run that will
+      // refuse half its rows (2026-09-04).
+      if (thenRun && countApproved(M) > 0 && personasUnanswered(M) === 0) submitLauncher();
     })
     ['catch'](function (error) {
       M.reading = false;
@@ -5422,7 +6006,7 @@ function launcherBox(M) {
         shots.appendChild(el('option', { value: mode, selected: mode === M.screenshots, text: mode }));
       });
       adv.appendChild(formField('Stills', false, shots,
-        'auto follows the recording: failures only while filming, every step when not. all gives both — the same run twice, at several times the size.'));
+        'all (the default) keeps a full-resolution still for every step alongside the film, at the cost of report size. auto follows the recording instead: failures only while filming, every step when not.'));
 
       var policy = el('select', { onchange: function (e) { M.policy = e.target.value; } });
       ['read-only', 'forms', 'mutations'].forEach(function (mode) {
@@ -5492,6 +6076,12 @@ function submitBlocked() {
   if (M.mode === 'catalog') {
     if (!M.catalog && M.catText.trim() === '') return 'choose a file or paste the catalog text';
     if (M.claims && countApproved(M) === 0) return 'at least one claim has to survive';
+    // Blocking on purpose. A run started without one of the accounts its own
+    // document names does not fail at the start — it authors, opens a browser,
+    // and refuses the rows that need the missing person, minutes in.
+    if (M.claims && personasUnanswered(M) > 0) {
+      return personasUnanswered(M) + ' account(s) still need an email and a password';
+    }
     return null;
   }
   return M.describe.trim() ? null : 'say what should be proved';
@@ -5515,6 +6105,10 @@ function submitLauncher() {
 
   var extras = {};
   if (M.video !== 'on') extras.video = M.video;
+  /* Everything except auto is sent. auto MEANS "let the run decide", and the
+     run's own fallback is that decision — failures only while filming, every
+     step when not — so sending nothing is how auto is expressed. The launcher
+     now starts on all, so this fires by default. */
   if (M.screenshots !== 'auto') extras.screenshots = M.screenshots;
   if (M.waitFor.trim()) extras['wait-for'] = M.waitFor.trim();
   if (M.repo) extras.repo = M.repo;
@@ -5542,7 +6136,7 @@ function submitLauncher() {
   // Catalog. The first press reads the claims; the second proves the ones that
   // survived the gate. One button, because "show me" and "go" are one decision
   // taken twice, not two features.
-  if (!M.claims) { readClaims(); return; }
+  if (!M.claims) { readClaims(true); return; }
 
   M.busy = true; renderLauncher();
   var approved = { catalog: M.claims.catalog, summary: M.claims.summary,
@@ -5566,6 +6160,11 @@ function submitLauncher() {
     };
     if (M.url.trim()) values.url = M.url.trim();
     if (M.policy !== 'mutations') values.policy = M.policy;
+    // The personas field is already declared on this command, so nothing new
+    // is offered here — only a value shape the server already accepts. It is a
+    // secret field, so it travels by env overlay and never becomes argv.
+    var accounts = personaValues(M);
+    if (Object.keys(accounts).length > 0) values.personas = accounts;
     fire('catalog-run', Object.assign(values, extras), null);
   })['catch'](function (error) { M.busy = false; M.error = error.message; renderLauncher(); });
 }
@@ -5738,11 +6337,12 @@ function suiteRunButtons(items) {
    restart too, because the ledger (not the in-memory job) is the record.
    The resumed run keeps the catalog's unique run key, so cases already
    tested under it are pulled into the resumed roll-up as finished tests. */
-function resumeCatalog(ledgerPath, mode, caseId, caseIds, as) {
+function resumeCatalog(ledgerPath, mode, caseId, caseIds, as, personaPasswords) {
   var body = { ledgerPath: ledgerPath, mode: mode || 'continue' };
   if (caseId) body.caseId = caseId;
   if (caseIds && caseIds.length) body.caseIds = caseIds;
   if (as) body.as = as;
+  if (personaPasswords) body.personaPasswords = personaPasswords;
   api('/api/catalog-runs/resume', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body)
@@ -5755,10 +6355,27 @@ function resumeCatalog(ledgerPath, mode, caseId, caseIds, as) {
          Never resume without it: a credential-less resume authors login-only
          flows and fails every case at "Sign in" (ec10, 2026-09-02). */
       var b = error.body || {};
+      /* A catalog whose rows change hands names more than one account, and the
+         ledger has recorded every one of them (label -> email, never a
+         password). Asked for by label; the server pairs each with the email IT
+         recorded, so this sends the secret half and cannot point the run at a
+         different account. Checked first: this answer carries the single
+         persona too, and the list is the more specific one. */
+      if (b.needsCredentials && b.personas && b.personas.length && !personaPasswords) {
+        var got = {};
+        for (var i = 0; i < b.personas.length; i++) {
+          var one = b.personas[i];
+          var each = window.prompt('This run also signs in as ' + one.label + ' (' + one.email + '). Password? (not stored — asked once per panel session)', '');
+          if (each === null || each === '') { toast('not resumed — ' + one.label + ' still needs its password'); return; }
+          got[one.label] = each;
+        }
+        resumeCatalog(ledgerPath, mode, caseId, caseIds, as, got);
+        return;
+      }
       if (b.needsCredentials && !as) {
         var pw = window.prompt('This run signs in as ' + b.persona + '. Password? (not stored — asked once per panel session)', '');
         if (pw === null || pw === '') { toast('not resumed — the run needs its sign-in password'); return; }
-        resumeCatalog(ledgerPath, mode, caseId, caseIds, b.persona + ':' + pw);
+        resumeCatalog(ledgerPath, mode, caseId, caseIds, b.persona + ':' + pw, personaPasswords);
         return;
       }
       toast(error.message);

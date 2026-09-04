@@ -300,6 +300,24 @@ describe('Cross-case references (CG-12)', () => {
     assert.match(described, /\nTest data \(inherited from PL_03_07\):\n {2}Benefit Plan ID = PL_03_07\n/);
     assert.match(sectionOf(described, 'test data') ?? '', /Status = Active/);
   });
+
+  it('resolves a reference against the Scenario ID column: the row\'s own scenario is itself, another scenario in the table is its first row (multirole PRB-EC-001, 2026-09-04)', () => {
+    // multirole.csv: PRB-EC-001 "ต่อจากเคส E2E-01" was refused as "depends on
+    // E2E-01, which is not in this catalog" while HIR-EC-001 — the row whose
+    // Scenario ID IS E2E-01 — sat two rows above it.
+    const rows: TestCaseRow[] = [
+      row({ caseId: 'HIR-EC-001', scenarioId: 'E2E-01', sheet: 'EC', testData: 'Province = กรุงเทพมหานคร', steps: '1. hire' }),
+      row({ caseId: 'HIR-EC-002', scenarioId: 'E2E-01', sheet: 'EC', testData: 'ต่อจากเคส E2E-01 ใช้พนักงานคนเดิม', steps: '1. x' }),
+      row({ caseId: 'PRB-EC-001', scenarioId: 'E2E-152', sheet: 'EC', testData: 'ต่อจากเคส E2E-01 ชุดข้อมูล TD-01', steps: '1. x' }),
+      row({ caseId: 'PRB-EC-002', scenarioId: 'E2E-153', sheet: 'EC', testData: 'ต่อจากเคส E2E-99', steps: '1. x' }),
+    ];
+    linkDependencies(rows);
+    assert.equal(rows[1]!.dependsOn, undefined, 'a row never depends on its own scenario');
+    assert.equal(rows[1]!.externalRefs, undefined);
+    assert.deepEqual(rows[2]!.dependsOn, ['HIR-EC-001'], 'the scenario resolves to the row that creates what it uses');
+    assert.equal(rows[2]!.externalRefs, undefined);
+    assert.deepEqual(rows[3]!.externalRefs, ['E2E-99'], 'a scenario the table does not hold is still external');
+  });
 });
 
 describe('Duplicate ids (CG-04)', () => {

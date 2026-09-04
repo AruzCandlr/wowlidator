@@ -172,7 +172,7 @@ describe('the proof column', () => {
       index: 2, action: 'expectText', selector: 'role=heading', resolvedSelector: 'role=heading[name="Plans"]',
       resolution: 'jit', detail: { expected: 'Plans', actual: 'Plans' },
       heal: { from: 'role=heading', to: 'role=heading[name="Plans"]', strategy: 'ax-tree', confidence: 0.9 },
-    } as Partial<ProofStep>);
+    } as unknown as Partial<ProofStep>);
     const proof = stepProof(s);
     assert.ok(proof.includes('expected "Plans" · actual "Plans"'));
     assert.ok(proof.includes('resolved via jit'));

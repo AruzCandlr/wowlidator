@@ -76,6 +76,17 @@ describe('chrome — decisions', () => {
     assert.equal(ready, false);
     assert.ok(Date.now() - started < 6_000, 'the timeout must be a budget, not a suggestion');
   });
+
+  it('counts the wait down on the console, one line per second, and stops at the deadline', async () => {
+    const lines: string[] = [];
+    const ready = await waitForApp('http://127.0.0.1:9/nothing', 2_500, (l) => lines.push(l));
+    assert.equal(ready, false);
+    assert.deepEqual(lines, [
+      'waiting for http://127.0.0.1:9/nothing … 3s left',
+      'waiting for http://127.0.0.1:9/nothing … 2s left',
+      'waiting for http://127.0.0.1:9/nothing … 1s left',
+    ]);
+  });
 });
 
 /**

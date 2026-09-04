@@ -5,6 +5,7 @@
 
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { phaseHeader, withLogTag } from '../../log-format.js';
 
 import type { Page } from 'playwright';
 
@@ -45,9 +46,12 @@ import {
   roundsOf,
   sheetGateReason,
   sheetVerdict,
+  personasOf,
   splitPairs,
+  tablePersonas,
   tableToClaims,
   testDataPairs,
+  unconfirmedTestData,
   uniqueKeys,
   type CaseDestination,
   type SheetVerdict,
@@ -96,7 +100,7 @@ import {
 } from '../../generator/flow-author.js';
 import { LlmGeneratorModel, TestGenerator } from '../../generator/test-generator.js';
 import type { GeneratedSuite } from '../../generator/test-generator.js';
-import { captureAxNodes, captureAxTree } from '../../healer/jit-healer.js';
+import { captureAxNodes, captureAxTree, type AxNode } from '../../healer/jit-healer.js';
 import { performSignIn, acceptConsentGate } from '../../engine/sign-in.js';
 import { probeInteractions } from '../../context/page-probe.js';
 import { formatTrend } from '../../history/run-history.js';
@@ -142,6 +146,7 @@ import {
   buildCapturePilot,
   buildDataModel,
   buildFlowReviewer,
+  buildAuthorRetryModel,
   buildValueResolution,
   buildHealer,
   buildStepRepair,
@@ -184,10 +189,10 @@ export async function cmdGenerate(url: string | undefined, options: CliOptions):
     repoContextGraph ??
     (options.context || options.api
       ? await new ContextEngine({
-          rootDir: options.root,
-          cacheFile: options.contextOut,
-          openApiSpec: options.openapi,
-        }).build()
+        rootDir: options.root,
+        cacheFile: options.contextOut,
+        openApiSpec: options.openapi,
+      }).build()
       : undefined);
   // What a claude-cli generator/healer session may search on demand — the
   // same graph the prompt slice is cut from. See `providers/claude-retrieval.ts`.
@@ -246,9 +251,9 @@ export async function cmdGenerate(url: string | undefined, options: CliOptions):
 
   process.stdout.write(
     `generated ${suite.cases.length} case(s) and ${suite.defects.length} defect(s) from ${suite.sourceUrl}\n` +
-      `  model      ${suite.model} (${suite.latencyMs}ms, ${suite.inputTokens ?? 0} in / ${suite.outputTokens ?? 0} out tokens)\n` +
-      `  folder     ${dir}\n` +
-      `  suite      ${suitePath}\n`,
+    `  model      ${suite.model} (${suite.latencyMs}ms, ${suite.inputTokens ?? 0} in / ${suite.outputTokens ?? 0} out tokens)\n` +
+    `  folder     ${dir}\n` +
+    `  suite      ${suitePath}\n`,
   );
   for (const testCase of suite.cases) {
     process.stdout.write(`  · [${testCase.kind}] ${testCase.name} (${testCase.flow.steps.length} steps)\n`);
@@ -370,8 +375,8 @@ export async function cmdDraft(subject: string | undefined, options: CliOptions)
   if ((subject === undefined || subject.trim() === '') && !hasContext) {
     process.stderr.write(
       'wowlidator draft: say what to cover, or give it something to read.\n\n' +
-        '  wowlidator draft "the probation inbox"\n' +
-        '  wowlidator draft --context-doc spec.md\n',
+      '  wowlidator draft "the probation inbox"\n' +
+      '  wowlidator draft --context-doc spec.md\n',
     );
     return EXIT.usage;
   }
@@ -437,7 +442,7 @@ export async function cmdDraft(subject: string | undefined, options: CliOptions)
   if (drafted.rows.length === 0) {
     process.stderr.write(
       'wowlidator draft: no cases came back. Say more about what to cover, or ' +
-        'add the spec with --context-doc.\n',
+      'add the spec with --context-doc.\n',
     );
     return EXIT.failed;
   }
@@ -454,18 +459,18 @@ export async function cmdDraft(subject: string | undefined, options: CliOptions)
 
   process.stdout.write(
     `drafted ${drafted.rows.length} case(s) across ${scenarios.size} scenario(s) — ${drafted.subject}\n` +
-      `  model      ${drafted.model} (${drafted.latencyMs}ms, ${drafted.inputTokens ?? 0} in / ${drafted.outputTokens ?? 0} out tokens)\n` +
-      `  grounded   ${axTree === undefined ? 'NO — no page was read, so menu paths are guesses' : `yes — against ${options.url}`}\n` +
-      `  negative   ${negative} of ${drafted.rows.length}\n` +
-      `  catalog    ${target}\n`,
+    `  model      ${drafted.model} (${drafted.latencyMs}ms, ${drafted.inputTokens ?? 0} in / ${drafted.outputTokens ?? 0} out tokens)\n` +
+    `  grounded   ${axTree === undefined ? 'NO — no page was read, so menu paths are guesses' : `yes — against ${options.url}`}\n` +
+    `  negative   ${negative} of ${drafted.rows.length}\n` +
+    `  catalog    ${target}\n`,
   );
   for (const row of drafted.rows) {
     process.stdout.write(`    ${row.caseId} [${row.priority}] ${row.testCase}\n`);
   }
   process.stdout.write(
     '\nNothing has been run. This is a catalog, not a test — read it, strike out ' +
-      'what you do not want, then:\n' +
-      `  wowlidator catalog ${target} --url <page> --run\n`,
+    'what you do not want, then:\n' +
+    `  wowlidator catalog ${target} --url <page> --run\n`,
   );
 
   return EXIT.ok;
@@ -499,14 +504,14 @@ function printAuthored(
 
   process.stdout.write(
     `authored "${authored.flow.name}" — ${totalSteps} step(s) in ${cases.length} case(s) for ${claims} claim(s)\n` +
-      `  model      ${authored.model} (${authored.latencyMs}ms, ${authored.inputTokens ?? 0} in / ${authored.outputTokens ?? 0} out tokens)\n` +
-      `  grounded   ${authored.grounded ? `yes — selectors checked against ${authored.sourceUrl}` : 'NO — selectors are guesses; verify every one before trusting this'}\n` +
-      (group === undefined ? '' : `  folder     ${dir}\n`),
+    `  model      ${authored.model} (${authored.latencyMs}ms, ${authored.inputTokens ?? 0} in / ${authored.outputTokens ?? 0} out tokens)\n` +
+    `  grounded   ${authored.grounded ? `yes — selectors checked against ${authored.sourceUrl}` : 'NO — selectors are guesses; verify every one before trusting this'}\n` +
+    (group === undefined ? '' : `  folder     ${dir}\n`),
   );
   for (const [index, testCase] of cases.entries()) {
     process.stdout.write(
       `  · ${testCase.name} (${testCase.flow.steps.length} steps)\n` +
-        `    flow     ${flowPaths[index]}\n`,
+      `    flow     ${flowPaths[index]}\n`,
     );
   }
   if (authored.droppedSteps > 0) {
@@ -518,8 +523,8 @@ function printAuthored(
     const r = authored.review;
     process.stdout.write(
       `  review     ${r.flagged} ungrounded step(s): ${r.replaced} repointed, ${r.inserted} inserted, ` +
-        `${r.kept} confirmed, ${r.unsure} still unsure, ${r.rejected.length} proposal(s) rejected ` +
-        `(${r.model}, ${r.latencyMs}ms, ${r.inputTokens} in / ${r.outputTokens} out tokens)\n`,
+      `${r.kept} confirmed, ${r.unsure} still unsure, ${r.rejected.length} proposal(s) rejected ` +
+      `(${r.model}, ${r.latencyMs}ms, ${r.inputTokens} in / ${r.outputTokens} out tokens)\n`,
     );
     for (const line of r.notes) process.stdout.write(`    · ${line}\n`);
     for (const line of r.rejected) process.stdout.write(`    ! ${line}\n`);
@@ -609,37 +614,12 @@ export function sheetGate(
   return null;
 }
 
-/**
- * The persona labels a row names, in order of first appearance (CG-05): the
- * workbook's `<HR_ADMIN_ACCOUNT>` tokens (424 mentions), and the role words
- * the PY and TM sheets use instead of a token — `Login ด้วย SPD Admin` (every
- * PY row), `หัวหน้าอนุมัติ` / `Manager approve` (the hand-off rows), `HRBP`,
- * `Login web humi` / `พนักงานเข้าสู่ระบบ` (an employee's own session). A bare
- * "Manager" is NOT a persona — `Approval route = Manager` is a field value —
- * so the role word must be doing something (approving, signing in).
- */
-export function personasOf(row: TestCaseRow): string[] {
-  const text = [row.persona, row.preconditions, row.testData, row.steps, row.testCase].join('\n');
-  const found: { label: string; at: number }[] = [];
-  for (const match of text.matchAll(/<([A-Z][A-Z0-9_]*_ACCOUNT)>/g)) {
-    found.push({ label: match[1]!, at: match.index ?? 0 });
-  }
-  const ROLE_WORDS: readonly [RegExp, string][] = [
-    [/SPD\s*Admin/iu, 'SPD_ADMIN'],
-    [/\bHR\s*Admin\b/iu, 'HR_ADMIN_ACCOUNT'],
-    [/\bHRBP\b/u, 'HRBP_ACCOUNT'],
-    [/\b(?:line\s+)?manager\b[^\n.]{0,24}?(?:approv|reject|log ?in|sign ?in|อนุมัติ|ปฏิเสธ|เข้าสู่ระบบ)|หัวหน้า(?:งาน)?\s*(?:อนุมัติ|ปฏิเสธ|เข้าสู่ระบบ|กด|login)/iu, 'MANAGER_ACCOUNT'],
-    [/login\s+web\s+humi|พนักงานเข้าสู่ระบบ|\bemployee\b[^\n.]{0,16}?(?:log ?in|sign ?in|เข้าสู่ระบบ)/iu, 'EMPLOYEE_ACCOUNT'],
-  ];
-  for (const [re, label] of ROLE_WORDS) {
-    const match = re.exec(text);
-    if (match !== null) found.push({ label, at: match.index });
-  }
-  found.sort((a, b) => a.at - b.at);
-  const out: string[] = [];
-  for (const { label } of found) if (!out.includes(label)) out.push(label);
-  return out;
-}
+// `personasOf` moved to `catalog/test-case-table.ts` (2026-09-04): the claims
+// phase needs it too, and a second implementation there would be a second
+// answer to "how many logins does this catalog need" — the panel's gate
+// promising two accounts while authoring refuses a third. Re-exported here
+// because this is the import path every caller and test already uses.
+export { personasOf };
 
 /**
  * The row's labels resolved through the persona map (CG-05). A single
@@ -757,9 +737,9 @@ export function expandRounds(rows: readonly TestCaseRow[]): TestCaseRow[] {
         round.dataOverrides !== '' || !/\s=\s/.test(round.label)
           ? round.dataOverrides
           : splitPairs(round.label.slice(round.label.search(/[A-Z][A-Za-z0-9 /()'-]{0,40}\s=\s/)))
-              .filter((pair) => pair.key.split(/\s+/).length <= 5)
-              .map((pair) => `${pair.key} = ${pair.value}`)
-              .join('; '),
+            .filter((pair) => pair.key.split(/\s+/).length <= 5)
+            .map((pair) => `${pair.key} = ${pair.value}`)
+            .join('; '),
     }));
     if (rounds.length < 2) {
       out.push(row);
@@ -894,6 +874,18 @@ export function caseCard(row: TestCaseRow): string | undefined {
     // Test data IS the values the flow must type; it is the one column that
     // must never be the thing cut.
     cut('Test data', row.testData, 420),
+    // The fields the sheet has no value for yet (`UNCONFIRMED_VALUE`; ec09
+    // HIR-EC-009's `= ? รอตารางโครงการ DVT`), named so every runtime role —
+    // the agent, the judge, the diagnosis — reads "this field was never
+    // keyed, by design" instead of hunting a value or blaming the app.
+    (() => {
+      const unconfirmed = unconfirmedTestData(row.testData);
+      return unconfirmed.length === 0
+        ? null
+        : `Unconfirmed test data (no value yet — never typed, never asserted; their steps are skipped by design): ${unconfirmed
+            .map((pair) => `${pair.key} = ${pair.value.replace(/\s+/g, ' ').slice(0, 60)}`)
+            .join('; ')}`;
+    })(),
     // A dated requirement change in the Note ("pop-up → page 4 Aug", "TBC
     // wording") is prepended as its own line, so the author reads "this is
     // now a page, not a dialog" BEFORE it writes role=dialog (S7). Four
@@ -1000,17 +992,28 @@ async function authorEachRow(
   if (workers === 1 && options.authorConcurrency === undefined && rows.length > 1) {
     context.log?.(
       `authoring rows one at a time: the generator role is on ${options.config.roles.generator.provider}, ` +
-        'which answers one call at a time (pass --author-concurrency to override)',
+      'which answers one call at a time (pass --author-concurrency to override)',
     );
   }
   // Rows authored beside each other interleave their narration; the case id
-  // in front is what keeps a line readable. A sequential run's output is
-  // exactly what it was.
-  const rowLog = (row: TestCaseRow): ((line: string) => void) | undefined =>
-    workers > 1 && context.log ? (line) => context.log?.(`[${row.caseId}] ${line}`) : context.log;
+  // in front is what keeps a line readable. The tag rides the async context
+  // (`withLogTag`, applied where the pool dispatches the row) so it reaches
+  // the author's lints, the reviewer, the value resolver and the `[llm]`
+  // lines too — not only the lines this file writes. A line that already
+  // names its row (`  HIR-EC-001: persona …`) is not made to say it twice.
+  // A sequential run's output is exactly what it was.
+  const rowTag = (row: TestCaseRow): string | undefined => (workers > 1 && context.log ? `[${row.caseId}]` : undefined);
+  const rowLog = (row: TestCaseRow): ((line: string) => void) | undefined => {
+    const log = context.log;
+    if (rowTag(row) === undefined || log === undefined) return log;
+    const own = new RegExp(`^(\\s*)${row.caseId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: `);
+    return (line) => log(line.replace(own, '$1'));
+  };
 
   const authorRow = async (sheetRow: TestCaseRow, index: number, page?: Page): Promise<void> => {
     const log = rowLog(sheetRow);
+    // Where this row's authoring begins — the one line to search for.
+    log?.(phaseHeader(`authoring ${sheetRow.caseId}`));
     const scenarioKey = sheetRow.scenarioId || 'ungrouped';
     // **The Note and Actual columns are a gate, not a footnote** (S7 of the
     // 2026-08-28 audit). A row the sheet records as Cancelled is a feature
@@ -1050,8 +1053,8 @@ async function authorEachRow(
     if (personaLabels.length > 0) {
       log?.(
         `  ${sheetRow.caseId}: persona${personaLabels.length > 1 ? 's' : ''} ` +
-          personaLabels.map((label) => `${personaLabelOf(label)} → ${resolved.personas[personaLabelOf(label)]?.email ?? '?'}`).join(', ') +
-          (resolved.fellBack === null ? '' : ` (${resolved.fellBack} is the --as account; pass --persona ${resolved.fellBack}=… to name it)`),
+        personaLabels.map((label) => `${personaLabelOf(label)} → ${resolved.personas[personaLabelOf(label)]?.email ?? '?'}`).join(', ') +
+        (resolved.fellBack === null ? '' : ` (${resolved.fellBack} is the --as account; pass --persona ${resolved.fellBack}=… to name it)`),
       );
     }
     // **The sheet's key values are made unique to this run before anything
@@ -1064,7 +1067,7 @@ async function authorEachRow(
     if (keyed.substitutions.length > 0) {
       log?.(
         `  ${row.caseId}: unique per run — ` +
-          keyed.substitutions.map((sub) => `${sub.key}: ${sub.from} → ${sub.to}`).join(', '),
+        keyed.substitutions.map((sub) => `${sub.key}: ${sub.from} → ${sub.to}`).join(', '),
       );
     }
     const refusedBefore = context.refusedBefore?.get(row.caseId) ?? 0;
@@ -1100,6 +1103,16 @@ async function authorEachRow(
     // row's step vocabulary, and the prompt below can demand the value be
     // quoted from it rather than invented.
     const cited = referencedSources(`${row.testCase}\n${described}`);
+    // The sheet's own "no value yet" marks, said once per row in the log so
+    // the reader knows before the run which steps will be skipped by design.
+    const unconfirmed = unconfirmedTestData(row.testData);
+    if (unconfirmed.length > 0) {
+      log?.(
+        `  ${row.caseId}: ${unconfirmed.length} unconfirmed test-data value(s) — ` +
+          unconfirmed.map((pair) => `${pair.key} = ${pair.value.replace(/\s+/g, ' ').slice(0, 50)}`).join('; ') +
+          ' — never typed, never asserted, never handed to the agent; their steps are skipped with the reason',
+      );
+    }
     // **Is the Expected output contextual enough to assert?** An expected
     // result with no concrete anchor — no value, no "field = value" pair, no
     // quoted label, no number in it or in the Note — leaves the author
@@ -1155,31 +1168,31 @@ async function authorEachRow(
       page === undefined
         ? undefined
         : await captureJourneyTree(page, options, context.graph ?? null, described, log, {
-            // The Menu column is the sheet saying where the row goes, in the
-            // application's own labels — as breadcrumbs first (CG-11), then
-            // the cell, the title and the steps.
-            where: [menuPathOf(row).join(' > '), row.menu, row.testCase, row.steps].filter((t) => t !== '').join('\n'),
-            // A literal destination the row states outranks every ranking:
-            // the PY rows put their URL in Steps, not in Menu, and 233 rows
-            // pick a tab on arrival.
-            destination: destinationOf(row),
-            // The capture signs in as the row's own first persona (CG-05):
-            // an HRBP row read through the admin's session sees the admin's
-            // page, and the author grounds every selector in the wrong one.
-            credentials: resolved.first,
-            // The row's first opening click (CG-18, reduced): the fields of
-            // ~400 rows live behind "Create Plan" / "Add" / "ถัดไป", and a
-            // tree read before that click shows none of them.
-            opening: openingControlOf(row.steps),
-            // **Not behind a flag on this path.** A sheet row names a
-            // destination that is almost never the start url, and authoring it
-            // from the sign-in tree alone is the failure this capture exists
-            // for: measured on PL_07, 10 of 10 rows had every Benefit Plan
-            // Catalog selector refused as "appears in no captured tree", 5 of
-            // them fatally. `--capture-journey` stays the opt-in for the
-            // single-page paths, where the start url usually IS the subject.
-            force: true,
-          });
+          // The Menu column is the sheet saying where the row goes, in the
+          // application's own labels — as breadcrumbs first (CG-11), then
+          // the cell, the title and the steps.
+          where: [menuPathOf(row).join(' > '), row.menu, row.testCase, row.steps].filter((t) => t !== '').join('\n'),
+          // A literal destination the row states outranks every ranking:
+          // the PY rows put their URL in Steps, not in Menu, and 233 rows
+          // pick a tab on arrival.
+          destination: destinationOf(row),
+          // The capture signs in as the row's own first persona (CG-05):
+          // an HRBP row read through the admin's session sees the admin's
+          // page, and the author grounds every selector in the wrong one.
+          credentials: resolved.first,
+          // The row's first opening click (CG-18, reduced): the fields of
+          // ~400 rows live behind "Create Plan" / "Add" / "ถัดไป", and a
+          // tree read before that click shows none of them.
+          opening: openingControlOf(row.steps),
+          // **Not behind a flag on this path.** A sheet row names a
+          // destination that is almost never the start url, and authoring it
+          // from the sign-in tree alone is the failure this capture exists
+          // for: measured on PL_07, 10 of 10 rows had every Benefit Plan
+          // Catalog selector refused as "appears in no captured tree", 5 of
+          // them fatally. `--capture-journey` stays the opt-in for the
+          // single-page paths, where the start url usually IS the subject.
+          force: true,
+        });
     // The repository slice ranked against THIS row's words — the shared
     // author-wide section describes the whole project; the routes that decide
     // this row's expectUrl and workflow destination are the row's own. The
@@ -1298,10 +1311,12 @@ async function authorEachRow(
                 priorFeedback: risk.reasons.map((r) => `the pre-run risk judge found: ${r}`),
               });
               const riskAgain = await assessDeadEndRisk(
-                { caseName: testCase.name, caseText: `${row.testCase}\n${described}`, flow: again.flow,
+                {
+                  caseName: testCase.name, caseText: `${row.testCase}\n${described}`, flow: again.flow,
                   documents: selected.documents.map((d) => ({ name: d.name, text: d.text })), repository: rowProjectContext,
                   declaredRoutes: declaredPageRoutes(context.graph ?? null), backend: options.backend,
-                  ...(humanVerdict === undefined ? {} : { knownResult: humanVerdict }) },
+                  ...(humanVerdict === undefined ? {} : { knownResult: humanVerdict })
+                },
                 { model: context.risk, log: (line) => process.stderr.write(`${line}\n`) },
               );
               // Only a genuinely better flow replaces the first — feedback must never make the
@@ -1326,9 +1341,9 @@ async function authorEachRow(
               } else if (riskAgain && riskAgain.likelihood < risk.likelihood) {
                 log?.(
                   `  ${row.caseId}: the re-authored flow scored lower risk (${riskAgain.likelihood}% vs ` +
-                    `${risk.likelihood}%) but proves less of the claim (${againProof} vs ${firstProof} ` +
-                    'substantive assertion(s)) — keeping the first; a flow that asserts nothing cannot ' +
-                    'dead-end, which is not the same as succeeding',
+                  `${risk.likelihood}%) but proves less of the claim (${againProof} vs ${firstProof} ` +
+                  'substantive assertion(s)) — keeping the first; a flow that asserts nothing cannot ' +
+                  'dead-end, which is not the same as succeeding',
                 );
               } else {
                 log?.(`  ${row.caseId}: the re-authored flow was no better; keeping the first`);
@@ -1380,10 +1395,15 @@ async function authorEachRow(
         await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
       }
       if (tabs > 1) context.log?.(`authoring ${rows.length} row(s), up to ${tabs} at a time`);
-      await mapPool(rows, tabs, (row, index, slot) => authorRow(row, index, pages[slot]!), () => pauseRequested());
+      await mapPool(
+        rows,
+        tabs,
+        (row, index, slot) => withLogTag(rowTag(row), () => authorRow(row, index, pages[slot]!)),
+        () => pauseRequested(),
+      );
     });
   } else {
-    await mapPool(rows, tabs, (row, index) => authorRow(row, index), () => pauseRequested());
+    await mapPool(rows, tabs, (row, index) => withLogTag(rowTag(row), () => authorRow(row, index)), () => pauseRequested());
   }
   const cases = slots.filter((c): c is TableCase => c !== undefined);
 
@@ -1487,10 +1507,10 @@ async function tableInventory(
       if (Math.max(0, ...apiScores) <= 0) {
         log?.(
           `schema: ${all.length} table(s) indexed, but none of the ${apiRoutes.length} API route(s) ` +
-            'this repository declares matches what is being tested — DB checks are not offered' +
-            (namedKnown.length > 0 ? ' beyond the tables the sheet itself names. ' : '. ') +
-            'A database claim needs evidence the feature reaches a backend; a screen that keeps ' +
-            'its state in the browser would fail one on every run.',
+          'this repository declares matches what is being tested — DB checks are not offered' +
+          (namedKnown.length > 0 ? ' beyond the tables the sheet itself names. ' : '. ') +
+          'A database claim needs evidence the feature reaches a backend; a screen that keeps ' +
+          'its state in the browser would fail one on every run.',
         );
         return namedKnown;
       }
@@ -1522,7 +1542,7 @@ async function tableInventory(
       .map((entry) => entry.table);
     log?.(
       `schema: ${kept.length} of ${all.length} table(s) match this test — the rest are not ` +
-        'offered, so a DB check can only be written against these',
+      'offered, so a DB check can only be written against these',
     );
     return withNamed(kept);
   } catch {
@@ -1585,7 +1605,7 @@ async function loadRepoGraph(
     if (!stale) throw error;
     log?.(
       `repository ${entry.slug} could not be re-scanned (${(error as Error).message}) — ` +
-        `using the graph saved ${entry.indexedAt} (${stale.nodes.length} node(s)); it may lag the code`,
+      `using the graph saved ${entry.indexedAt} (${stale.nodes.length} node(s)); it may lag the code`,
     );
     return stale;
   }
@@ -1615,9 +1635,9 @@ function repoPromptSection(
   const section =
     url !== undefined || query !== ''
       ? toPromptContext(graph, {
-          ...(url === undefined ? {} : { url }),
-          ...(query === '' ? {} : { query }),
-        })
+        ...(url === undefined ? {} : { url }),
+        ...(query === '' ? {} : { query }),
+      })
       : '';
   // `toPromptContext` reports a no-match as a sentence, not an empty string —
   // splicing that sentence in as "what the repository declares" would hand
@@ -2018,13 +2038,20 @@ async function captureJourneyTree(
       options.scope === 'e2e'
         ? 'journey capture: on because --scope e2e — an end-to-end test needs the page it ends on'
         : "journey capture: on because this row's destination is not the start page — a catalog row " +
-          'authored from the sign-in tree alone hands every leg past it to a workflow step',
+        'authored from the sign-in tree alone hands every leg past it to a workflow step',
     );
   }
-  if (graph === null || options.url === undefined) {
-    log?.('journey capture: needs both --repo (for the routes) and a start url — skipped');
+  if (options.url === undefined) {
+    log?.('journey capture: needs a start url — skipped');
     return undefined;
   }
+  // No graph is no RANKING, not no capture (2026-09-03, PY-1 TC_SSO_001_001):
+  // a row that names its destination in so many words ("Navigate ไปที่
+  // https://…/admin/config/sso") needs no route index to be read, and
+  // refusing it here left the author with the sign-in tree alone — an
+  // invented role=tab, the whole script handed to a workflow leg, and five
+  // refusals with no attempt budget left. The graph is consulted only where
+  // a ranking is actually needed, below.
 
   // **A URL the request names outright outranks any ranking.** A test-case
   // row frequently says where it goes in so many words ("Go to
@@ -2033,7 +2060,7 @@ async function captureJourneyTree(
   // only say "Team → Probation Reviews". Measured before this: PB_01_01's row
   // named its page in step 2 and the ranker chose `…/:id/change-type` from
   // the same words, which needed an id and was skipped.
-  const startRoute = findRouteForUrl(graph, options.url);
+  const startRoute = graph === null ? undefined : findRouteForUrl(graph, options.url);
   const stated = hints.destination?.url ?? null;
   const literal = [
     ...(stated === null ? [] : literalDestinations(stated, options.url)),
@@ -2074,13 +2101,17 @@ async function captureJourneyTree(
       resolved = { ok: true, url: origin + hit.path };
       log?.(
         `journey capture: the application's menu names "${hit.label}" → ${hit.path}` +
-          (hit.via ? ` (behind "${hit.via}")` : '') +
-          ' — reading it',
+        (hit.via ? ` (behind "${hit.via}")` : '') +
+        ' — reading it',
       );
     }
   }
+  if (resolved === undefined && graph === null) {
+    log?.('journey capture: the row names no URL on the start origin and there is no --repo to rank routes from — skipped');
+    return undefined;
+  }
   if (resolved === undefined) {
-    const candidates = routesForDescription(graph, description, JOURNEY_ROUTE_CANDIDATES).filter(
+    const candidates = routesForDescription(graph as NonNullable<typeof graph>, description, JOURNEY_ROUTE_CANDIDATES).filter(
       (route) => route.id !== startRoute?.id && route.meta?.['type'] !== 'api',
     );
     if (candidates.length === 0) {
@@ -2183,12 +2214,26 @@ async function captureJourneyTree(
       }
     }
 
+    // **The tab the row selects on arrival is selected HERE, before the tree
+    // is read** (2026-09-04, PY-1 TC_SSO_001_001). A page with a tab strip
+    // renders one panel at a time, so the landing tree is the DEFAULT tab's
+    // panel and nothing of the tab the row is about. The prompt used to say
+    // "the row selects the tab X — click it before reading" and hand over the
+    // landing tree anyway: the author clicked the tab, then grounded every
+    // control on the other panel's tree (its "Add Rate" for the script's
+    // "Add", its rate form for the registration form), and the run died at the
+    // first of them. `destinationOf` already reads the tab's name from the
+    // row; matched by accessible name, whatever role the strip renders it as.
+    const tabWanted = hints.destination?.tab ?? null;
+    const tabSelected = await selectNamedTab(extra, tabWanted, log);
+    if (tabSelected !== null) landed = extra.url();
+
     const tree = await captureAxTree(extra, DEFAULT_AUTHOR_MAX_NODES);
     if (tree.trim() === '') {
       log?.(`journey capture: ${landed} yielded an empty tree — skipped`);
       return undefined;
     }
-    log?.(`journey capture: read ${landed}`);
+    log?.(`journey capture: read ${landed}${tabSelected === null ? '' : ` with the tab "${tabSelected.name}" selected`}`);
     // **The row's first opening click, once, on the capture tab** (CG-18,
     // reduced). ~400 rows' fields live behind "Create Plan" / "Add" / "ถัดไป",
     // and a tree read before that click shows none of them — every grounding
@@ -2197,37 +2242,42 @@ async function captureJourneyTree(
     // has already refused saves, submits and deletes); the tab is a context of
     // its own, so what opens here reaches no run. Never fatal: a click that
     // does not land leaves the capture as it was.
-    const opened = await captureAfterOpening(extra, hints.opening ?? null, log);
-    const tab = hints.destination?.tab ?? null;
+    //
+    // **Only from the state the script clicks it in.** The opening control
+    // is scripted AFTER the tab; when the row names a tab this capture could
+    // not select, the control that name matches on the landing panel belongs
+    // to another tab ("Add" → the rate tab's "Add Rate"), and a tree read
+    // behind it is evidence for a form the row never opens. No tree is
+    // better than that tree: the author then declines the fields or hands the
+    // leg to a workflow goal, both of which the run can settle honestly.
+    let opened: Awaited<ReturnType<typeof captureAfterOpening>> = null;
+    if (tabWanted !== null && tabSelected === null) {
+      if (hints.opening) {
+        log?.(
+          `journey capture: the row's first click "${hints.opening}" is scripted after selecting the tab ` +
+          `"${tabWanted}", which this page does not name — not clicked, so no control of another tab is read as the row's`,
+        );
+      }
+    } else {
+      opened = await captureAfterOpening(extra, hints.opening ?? null, log);
+    }
     const landing =
       landingAfterSignIn === undefined ||
-      LOGIN_URL_PATTERN.test(landingAfterSignIn) ||
-      CONSENT_URL_PATTERN.test(landingAfterSignIn)
+        LOGIN_URL_PATTERN.test(landingAfterSignIn) ||
+        CONSENT_URL_PATTERN.test(landingAfterSignIn)
         ? ''
         : `SIGN-IN LANDING (observed): after signing in as ${(credentials as { email: string }).email}` +
-          ` — and passing the consent gate, when one appeared — the application landed on ${landingAfterSignIn}. ` +
-          'This is the ONLY landing path you may expectUrl, and only for that same account; any ' +
-          'other persona\'s landing is unknown, so its proof of sign-in is expectHidden of the ' +
-          'submit control (see SIGNING IN), never a path inferred from a route or role name.\n\n';
-    return (
-      landing +
-      `ANOTHER PAGE IN THIS JOURNEY — the accessibility tree of ${landed}, which the request ` +
-      'describes. It is NOT the page this run starts on: a selector taken from here resolves ' +
-      'only after the flow has navigated to that page, so write the goto or the click that ' +
-      `reaches it first.${tab === null ? '' : ` The row selects the tab "${tab}" on arrival — click it before reading.`}\n\n${tree}` +
-      (opened === null
-        ? ''
-        : `\n\nAFTER CLICKING "${opened.name}" ON ${landed} — the accessibility tree once that control ` +
-          `(${opened.selector}) was clicked, now at ${opened.url}: the dialog, form or wizard step the row's ` +
-          'fields live in. Write that click FIRST; every selector below resolves only after it, and none of ' +
-          `them is on the page above.\n\n${opened.tree}`)
-    );
+        ` — and passing the consent gate, when one appeared — the application landed on ${landingAfterSignIn}. ` +
+        'This is the ONLY landing path you may expectUrl, and only for that same account; any ' +
+        'other persona\'s landing is unknown, so its proof of sign-in is expectHidden of the ' +
+        'submit control (see SIGNING IN), never a path inferred from a route or role name.\n\n';
+    return landing + journeyTreeSection({ landed, tree, tabWanted, tabSelected, opened });
   } catch (error) {
     // Diagnostic, and swallowed: authoring without this section is exactly
     // what authoring did before it existed.
     log?.(
       `journey capture: ${error instanceof Error ? error.message : String(error)} — authoring ` +
-        'proceeds with the start page alone',
+      'proceeds with the start page alone',
     );
     return undefined;
   } finally {
@@ -2237,13 +2287,111 @@ async function captureJourneyTree(
   }
 }
 
+/** The roles a row's named tab or opening control may be rendered as. A tab strip is as often buttons or links as `tab`s. */
+const CLICKABLE_ROLES = new Set(['button', 'link', 'menuitem', 'tab']);
+
+/**
+ * The one control a row's quoted name picks out of a captured tree — the
+ * matcher behind both the tab the row selects on arrival and its opening
+ * click, so "which control did the sheet mean" cannot mean two things.
+ * Deterministic and $0: whole accessible name first (whitespace-folded,
+ * case-insensitive), else the first whose name starts with it, else — for a
+ * name of three characters or more — the first containing it; clickable roles
+ * only. Returns the node and its `role=` selector, or null.
+ */
+export function controlNamedIn(
+  nodes: readonly Pick<AxNode, 'role' | 'name'>[],
+  wanted: string,
+): { role: string; name: string; selector: string } | null {
+  const fold = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
+  const needle = fold(wanted);
+  if (needle === '') return null;
+  const clickable = nodes.filter((node) => CLICKABLE_ROLES.has(node.role) && node.name.trim() !== '');
+  const hit =
+    clickable.find((node) => fold(node.name) === needle) ??
+    clickable.find((node) => fold(node.name).startsWith(needle)) ??
+    clickable.find((node) => needle.length >= 3 && fold(node.name).includes(needle));
+  if (hit === undefined) return null;
+  const name = hit.name.replace(/\s+/g, ' ').trim();
+  return { role: hit.role, name, selector: `role=${hit.role}[name="${name.replace(/"/g, '\\"')}" i]` };
+}
+
+/**
+ * The journey-tree section as the author reads it. Pure, so a test can hold
+ * it to its wording: a tree read with the row's tab selected says so and
+ * says the flow must click that tab first; a tab the capture could not select
+ * is announced as such, so a control the script names that is absent below
+ * is read as "not captured", never "not on the page".
+ */
+export function journeyTreeSection(parts: {
+  landed: string;
+  tree: string;
+  tabWanted: string | null;
+  tabSelected: { name: string; selector: string } | null;
+  opened: { name: string; selector: string; url: string; tree: string } | null;
+}): string {
+  const { landed, tree, tabWanted, tabSelected, opened } = parts;
+  const tabNote =
+    tabSelected !== null
+      ? ` This tree was read WITH the tab "${tabSelected.name}" selected (${tabSelected.selector}), as the row's script ` +
+        'selects it on arrival: write that click first; the controls below belong to that tab\'s panel and are not on the ' +
+        'page before it.'
+      : tabWanted !== null
+        ? ` The row selects the tab "${tabWanted}" on arrival, and this capture could NOT select it (no control of that name), ` +
+          'so the controls below are the page\'s DEFAULT panel: click the tab first, and treat a control the script names that ' +
+          'is not listed below as NOT CAPTURED rather than absent — a workflow goal in the script\'s own words is the honest ' +
+          'shape for that leg, never a control of another panel that merely resembles the name.'
+        : '';
+  return (
+    `ANOTHER PAGE IN THIS JOURNEY — the accessibility tree of ${landed}, which the request ` +
+    'describes. It is NOT the page this run starts on: a selector taken from here resolves ' +
+    'only after the flow has navigated to that page, so write the goto or the click that ' +
+    `reaches it first.${tabNote}\n\n${tree}` +
+    (opened === null
+      ? ''
+      : `\n\nAFTER CLICKING "${opened.name}" ON ${landed}${tabSelected === null ? '' : ` (with the tab "${tabSelected.name}" selected)`} — the accessibility tree once that control ` +
+      `(${opened.selector}) was clicked, now at ${opened.url}: the dialog, form or wizard step the row's ` +
+      'fields live in. Write that click FIRST; every selector below resolves only after it, and none of ' +
+      `them is on the page above.\n\n${opened.tree}`)
+  );
+}
+
+/**
+ * Select the tab the row names, on the capture tab, before the tree is read.
+ * Matched by accessible name (`controlNamedIn`) in whatever role the strip
+ * renders it as. Null — with the reason logged — when the row names no tab,
+ * no control carries the name, or the click does not land; the landing tree
+ * then stands, and `captureJourneyTree` says so in the section's label.
+ */
+async function selectNamedTab(
+  tab: Page,
+  name: string | null,
+  log?: ((line: string) => void) | undefined,
+): Promise<{ name: string; selector: string } | null> {
+  if (name === null) return null;
+  try {
+    const hit = controlNamedIn(await captureAxNodes(tab, 600), name);
+    if (hit === null) {
+      log?.(`journey capture: the row selects the tab "${name}", which no button, link or tab on this page is named — the default panel is read`);
+      return null;
+    }
+    await tab.locator(hit.selector).first().click({ timeout: 3_000 });
+    await tab.waitForTimeout(800);
+    await tab.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
+    log?.(`journey capture: selected the tab "${hit.name}" (${hit.selector}) before reading`);
+    return { name: hit.name, selector: hit.selector };
+  } catch (error) {
+    log?.(`journey capture: selecting the tab "${name}" did not land (${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}) — the default panel is read`);
+    return null;
+  }
+}
+
 /**
  * Click the named opening control on the capture tab and read the page after
- * it. Deterministic and $0: the control is matched by accessible name in the
- * tree already captured (whole name, whitespace-folded, case-insensitive;
- * else the first whose name starts with it), roles button / link / menuitem /
- * tab only. Null — with the reason logged — when nothing matches or the click
- * does not land; the capture then stands as it was.
+ * it. Deterministic and $0: the control is matched by accessible name
+ * (`controlNamedIn`) in the tree as it stands — after the row's tab, when it
+ * names one. Null — with the reason logged — when nothing matches or the
+ * click does not land; the capture then stands as it was.
  */
 async function captureAfterOpening(
   tab: Page,
@@ -2251,21 +2399,13 @@ async function captureAfterOpening(
   log?: ((line: string) => void) | undefined,
 ): Promise<{ name: string; selector: string; url: string; tree: string } | null> {
   if (opening === null) return null;
-  const fold = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
-  const wanted = fold(opening);
   try {
-    const nodes = (await captureAxNodes(tab, 600)).filter(
-      (node) => ['button', 'link', 'menuitem', 'tab'].includes(node.role) && node.name.trim() !== '',
-    );
-    const hit =
-      nodes.find((node) => fold(node.name) === wanted) ??
-      nodes.find((node) => fold(node.name).startsWith(wanted)) ??
-      nodes.find((node) => wanted.length >= 3 && fold(node.name).includes(wanted));
-    if (hit === undefined) {
+    const hit = controlNamedIn(await captureAxNodes(tab, 600), opening);
+    if (hit === null) {
       log?.(`journey capture: the row's first click "${opening}" names no button or link on this page — the fields behind it are not captured`);
       return null;
     }
-    const selector = `role=${hit.role}[name="${hit.name.replace(/\s+/g, ' ').trim().replace(/"/g, '\\"')}" i]`;
+    const { selector } = hit;
     const before = tab.url();
     await tab.locator(selector).first().click({ timeout: 3_000 });
     await tab.waitForTimeout(800);
@@ -2416,7 +2556,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
 
   log?.(
     `read ${document.name} (${document.format}, ${document.originalChars.toLocaleString('en-US')} chars)` +
-      (contextDocs.length > 0 ? ` + ${contextDocs.length} context document(s)` : ''),
+    (contextDocs.length > 0 ? ` + ${contextDocs.length} context document(s)` : ''),
   );
   // Never a log line only: an approximation the reader does not see is an
   // approximation that reaches the model unchallenged.
@@ -2450,7 +2590,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     const sheets = [...new Set(table.map((row) => row.sheet).filter((s): s is string => s !== undefined))];
     log?.(
       `${document.name} is a test-case table — ${table.length} case(s), read from its columns` +
-        (sheets.length > 0 ? ` across ${sheets.length} sheet(s): ${sheets.join(', ')}` : ''),
+      (sheets.length > 0 ? ` across ${sheets.length} sheet(s): ${sheets.join(', ')}` : ''),
     );
     // **A workbook is sliced before it becomes claims** (CG-11): `--sheet EC
     // --category Hiring` makes the claims file, the ledger and the report
@@ -2462,7 +2602,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         const categories = [...new Set(table.map((row) => `${row.sheet ?? '-'}/${row.category ?? '-'}`))];
         process.stderr.write(
           `wowlidator catalog: --sheet ${options.sheets.join(', ') || '(any)'} --category ${options.categories.join(', ') || '(any)'} selects no row. ` +
-            `Sheets: ${sheets.join(', ') || '(none)'}. Categories: ${categories.slice(0, 20).join(', ')}${categories.length > 20 ? ', …' : ''}\n`,
+          `Sheets: ${sheets.join(', ') || '(none)'}. Categories: ${categories.slice(0, 20).join(', ')}${categories.length > 20 ? ', …' : ''}\n`,
         );
         return 2;
       }
@@ -2534,11 +2674,20 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         documentNote: document.note,
       },
       new Date().toISOString(),
+      undefined,
+      // The same reading the authoring gate makes, made once and written down
+      // — so a surface can ask for the accounts BEFORE a browser opens, rather
+      // than learning about them from a refusal line ten minutes in.
+      tablePersonas(table),
     );
+    const needs = claimsFile.personas ?? [];
     process.stdout.write(
       `read ${claimsFile.claims.length} claim(s) from ${document.name}\n` +
-        `  format     test-case table — columns read directly, no model call\n` +
-        `  summary    ${claimsFile.summary}\n`,
+      `  format     test-case table — columns read directly, no model call\n` +
+      `  summary    ${claimsFile.summary}\n` +
+      (needs.length === 0
+        ? ''
+        : `  accounts   ${needs.map((p) => `${p.label} (${p.cases.length} case(s))`).join(', ')}\n`),
     );
   } else if (sequence !== null) {
     // Free and exact, the table path one notch up in structure: one claim per
@@ -2568,11 +2717,11 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     );
     process.stdout.write(
       `read ${claimsFile.claims.length} claim(s) from ${document.name}\n` +
-        `  format     sequence diagram (${sequence.notation}) — ` +
-        (transcriptionNote === ''
-          ? 'messages read directly, no model call\n'
-          : 'messages read from the model-transcribed .mmd; review it against the image\n') +
-        `  summary    ${claimsFile.summary}\n`,
+      `  format     sequence diagram (${sequence.notation}) — ` +
+      (transcriptionNote === ''
+        ? 'messages read directly, no model call\n'
+        : 'messages read from the model-transcribed .mmd; review it against the image\n') +
+      `  summary    ${claimsFile.summary}\n`,
     );
     // The participant table is the gate's new column. A guessed plane decides
     // which claims are checkable, so it is shown here and stored in the
@@ -2580,7 +2729,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     for (const participant of sequence.participants) {
       process.stdout.write(
         `  lane       ${participant.id} (${participant.label}) — ${participant.plane}` +
-          `${participant.guessed ? '   (guessed — confirm in the claims file)' : ''}\n`,
+        `${participant.guessed ? '   (guessed — confirm in the claims file)' : ''}\n`,
       );
     }
   } else {
@@ -2611,8 +2760,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     claimsFile = toClaimsFile(document.name, claims, new Date().toISOString());
     process.stdout.write(
       `read ${claimsFile.claims.length} claim(s) from ${document.name}\n` +
-        `  model      ${claims.model} (${claims.latencyMs}ms, ${claims.inputTokens ?? 0} in / ${claims.outputTokens ?? 0} out tokens)\n` +
-        `  summary    ${claims.summary}\n`,
+      `  model      ${claims.model} (${claims.latencyMs}ms, ${claims.inputTokens ?? 0} in / ${claims.outputTokens ?? 0} out tokens)\n` +
+      `  summary    ${claims.summary}\n`,
     );
   }
 
@@ -2635,8 +2784,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   if (options.claimsOnly) {
     process.stdout.write(
       '\nNothing has been run. Strike out anything you do not want by setting ' +
-        '"approved": false, then:\n' +
-        `  wowlidator catalog ${file} --claims ${claimsPath} --url <page> --run\n`,
+      '"approved": false, then:\n' +
+      `  wowlidator catalog ${file} --claims ${claimsPath} --url <page> --run\n`,
     );
     return 0;
   }
@@ -2695,9 +2844,9 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     // checkable UI half); it must never happen silently.
     process.stdout.write(
       '  ! these claims assert database state, but no schema is indexed — DB checks cannot ' +
-        'be authored and the cases degrade to what the UI alone shows. Index one with: ' +
-        'wowlidator context add <app repo> --db-schema <schema.sql> (or set WOWLIDATOR_DB_URL ' +
-        'for live introspection) and pass --repo.\n',
+      'be authored and the cases degrade to what the UI alone shows. Index one with: ' +
+      'wowlidator context add <app repo> --db-schema <schema.sql> (or set WOWLIDATOR_DB_URL ' +
+      'for live introspection) and pass --repo.\n',
     );
   }
   // What this catalog is about, in the document's own words — the same text
@@ -2714,8 +2863,10 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   );
   const reviewer = buildFlowReviewer(options);
   const valueResolution = buildValueResolution(options, contextDocs);
+  const retryModel = buildAuthorRetryModel(options);
   const author = new FlowAuthor({
     model: new LlmFlowAuthorModel({ factory: options.factory }),
+    ...(retryModel === null ? {} : { retryModel }),
     policy: options.policy,
     probe: options.probe,
     ...(options.authorAttempts === undefined ? {} : { attempts: options.authorAttempts }),
@@ -2790,29 +2941,29 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     options.claims === undefined && allRows.length === 0
       ? undefined
       : {
-          path: ledgerPathFor(ledgerClaimsPath),
-          planned: allRows.map((r) => r.caseId),
-          resume: options.resume,
-          stamp: () => passStamp.value,
-          runKey: () => runKeyOf(),
-          // Enough to rebuild a resume after this process — and the panel
-          // that may have spawned it — are gone. The password (`--as`) rides
-          // env on purpose and is deliberately NOT recorded.
-          launch: {
-            catalog: resolve(file),
-            claims: ledgerClaimsPath,
-            ...(options.url === undefined ? {} : { url: options.url }),
-            ...(options.repo === undefined ? {} : { repo: options.repo }),
-            agent: options.agent,
-            // The email only — see `SuiteLedger.launch.persona`.
-            ...(options.credentials === undefined ? {} : { persona: options.credentials.email }),
-            // Labels → emails, never a password (CG-05); the slice (CG-11).
-            ...(Object.keys(options.personas).length === 0 ? {} : { personas: personaEmails(options.personas) }),
-            ...(options.sheets.length === 0 ? {} : { sheets: [...options.sheets] }),
-            ...(options.categories.length === 0 ? {} : { categories: [...options.categories] }),
-            ...(options.includeBlocked ? { includeBlocked: true } : {}),
-          },
-        };
+        path: ledgerPathFor(ledgerClaimsPath),
+        planned: allRows.map((r) => r.caseId),
+        resume: options.resume,
+        stamp: () => passStamp.value,
+        runKey: () => runKeyOf(),
+        // Enough to rebuild a resume after this process — and the panel
+        // that may have spawned it — are gone. The password (`--as`) rides
+        // env on purpose and is deliberately NOT recorded.
+        launch: {
+          catalog: resolve(file),
+          claims: ledgerClaimsPath,
+          ...(options.url === undefined ? {} : { url: options.url }),
+          ...(options.repo === undefined ? {} : { repo: options.repo }),
+          agent: options.agent,
+          // The email only — see `SuiteLedger.launch.persona`.
+          ...(options.credentials === undefined ? {} : { persona: options.credentials.email }),
+          // Labels → emails, never a password (CG-05); the slice (CG-11).
+          ...(Object.keys(options.personas).length === 0 ? {} : { personas: personaEmails(options.personas) }),
+          ...(options.sheets.length === 0 ? {} : { sheets: [...options.sheets] }),
+          ...(options.categories.length === 0 ? {} : { categories: [...options.categories] }),
+          ...(options.includeBlocked ? { includeBlocked: true } : {}),
+        },
+      };
   let rows = allRows;
   // Rows authoring refused on an earlier pass, with their refusal counts —
   // a resume authors those leniently once, then stops re-authoring them.
@@ -2829,8 +2980,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     if (prior?.launch?.agent === true && !options.agent) {
       process.stderr.write(
         'wowlidator catalog: this run was authored WITH the multi-page agent, and this resume has it off — ' +
-          'its workflow legs would error one by one. Configure the agent role (or drop --no-agent), or pass ' +
-          '--no-agent explicitly together with --rerun-errors to accept the downgrade and re-author.\n',
+        'its workflow legs would error one by one. Configure the agent role (or drop --no-agent), or pass ' +
+        '--no-agent explicitly together with --rerun-errors to accept the downgrade and re-author.\n',
       );
       return EXIT.environment;
     }
@@ -2879,7 +3030,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       await writeLedger(ledgerSpec.path, prior);
       log?.(
         `--resume-from: rerunning from ${prior.planned[start]} — ${marked.length} recorded case(s) rerun, ` +
-          `${start} before it keep their verdicts; the rerun uses the current config`,
+        `${start} before it keep their verdicts; the rerun uses the current config`,
       );
     }
     // The single-case re-author (the panel's "Re-author & run" and its work
@@ -2926,8 +3077,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       const s = summariseLedger(prior);
       log?.(
         `--resume: ${s.planned} planned — ${s.passed} passed, ${s.failed} failed${s.review > 0 ? `, ${s.review} proved-?` : ''} already have verdicts and are skipped; ` +
-          `${rows.length} to run (${s.blocked} never ran, ${s.notReached} never reached)` +
-          (prior.ended?.cause ? ` — the last run stopped: ${prior.ended.cause}` : ''),
+        `${rows.length} to run (${s.blocked} never ran, ${s.notReached} never reached)` +
+        (prior.ended?.cause ? ` — the last run stopped: ${prior.ended.cause}` : ''),
       );
       if (rows.length === 0) {
         process.stdout.write('nothing left to run — every planned case has a verdict\n');
@@ -2967,8 +3118,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       `scenario order, fastest estimate first: ${ordered.order
         .map((o) => `${o.scenario} (~${Math.round(o.estimateMs / 1000)}s, ${o.rows} row(s))`)
         .join(' → ')}` +
-        (priorMs.size > 0 ? ` — ${priorMs.size} row(s) priced from this catalog's own history` : '') +
-        ' (--sheet-order keeps the sheet’s order)',
+      (priorMs.size > 0 ? ` — ${priorMs.size} row(s) priced from this catalog's own history` : '') +
+      ' (--sheet-order keeps the sheet’s order)',
     );
   }
 
@@ -3061,9 +3212,9 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         queue === null || options.authorLookahead === 'all' || gateOff
           ? null
           : new ScenarioGate(
-              rows.map((row) => row.scenarioId || 'ungrouped'),
-              { lookahead: typeof options.authorLookahead === 'number' ? options.authorLookahead : 0 },
-            );
+            rows.map((row) => row.scenarioId || 'ungrouped'),
+            { lookahead: typeof options.authorLookahead === 'number' ? options.authorLookahead : 0 },
+          );
       if (gate !== null) {
         log?.('authoring keeps pace with the runs: a scenario is authored only once every scenario before it has finished running (--author-lookahead widens this; the Machinery card can turn the gate off)');
       } else if (gateOff && queue !== null) {
@@ -3162,61 +3313,61 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
             queue === null
               ? undefined
               : async (testCase, first) => {
-                  // The report folder is known from the first authored flow,
-                  // and the consumer starts then: nothing is queued before
-                  // there is somewhere for its report to go.
-                  placed.value ??= placeFor(first);
-                  const { group, dir } = placed.value;
-                  drain.value ??= runCases(queue, options, {
-                    dir,
+                // The report folder is known from the first authored flow,
+                // and the consumer starts then: nothing is queued before
+                // there is somewhere for its report to go.
+                placed.value ??= placeFor(first);
+                const { group, dir } = placed.value;
+                drain.value ??= runCases(queue, options, {
+                  dir,
+                  group,
+                  indexTitle: `wowlidator catalog — ${document.name}`,
+                  declaredRoutes: declaredPageRoutes(repoContextGraph),
+                  graphFacts: graphFactsOf(repoContextGraph),
+                  ledger: ledgerSpec,
+                  healHints: suiteHealHints,
+                  // The sheet's words for every planned row: what the
+                  // database baseline detects its tables from, so it can
+                  // snapshot before the first case instead of waiting for
+                  // the whole pass to author (which would disable the
+                  // pipelining this path exists for).
+                  planRows: rows.map(planRowText),
+                  onCaseDone: (finished) => {
+                    if (finished.scenarioId !== undefined) gate?.ran(finished.scenarioId);
+                  },
+                });
+                // Refusals that arrived before the runner existed join its queue now.
+                for (const refusedCase of pendingRefused.splice(0)) enqueueRefused(refusedCase);
+                // Same stamp and same file the non-pipelined path writes
+                // below — built here because the run needs both now.
+                testCase.flow.authoredBy = stampProvenance(provenanceOf(first), testCase);
+                const flowPath = await writeFlowFile(
+                  catalogFlowPath(options, {
+                    dir: join(dir, slugify(testCase.scenarioId)),
                     group,
-                    indexTitle: `wowlidator catalog — ${document.name}`,
-                    declaredRoutes: declaredPageRoutes(repoContextGraph),
-                    graphFacts: graphFactsOf(repoContextGraph),
-                    ledger: ledgerSpec,
-                    healHints: suiteHealHints,
-                    // The sheet's words for every planned row: what the
-                    // database baseline detects its tables from, so it can
-                    // snapshot before the first case instead of waiting for
-                    // the whole pass to author (which would disable the
-                    // pipelining this path exists for).
-                    planRows: rows.map(planRowText),
-                    onCaseDone: (finished) => {
-                      if (finished.scenarioId !== undefined) gate?.ran(finished.scenarioId);
-                    },
+                    name: testCase.flow.name,
+                    index: rows.length === 1 ? undefined : queuedPaths.length + 1,
+                  }),
+                  testCase.flow,
+                );
+                queuedPaths.push(flowPath);
+                const caseId = caseIdOfName(testCase.name);
+                await offer(caseId, testCase.dependsOn, async () => {
+                  log?.(`  queued ${testCase.name} → ${flowPath}`);
+                  queue.push({
+                    name: testCase.name,
+                    flow: testCase.flow,
+                    flowPath,
+                    kind: 'catalog',
+                    scenarioId: testCase.scenarioId,
+                    ...(group === undefined ? {} : { group: `${group}/${slugify(testCase.scenarioId)}` }),
+                    generatedBy: testCase.flow.authoredBy,
+                    ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
+                    ...suiteFactsOf(testCase),
                   });
-                  // Refusals that arrived before the runner existed join its queue now.
-                  for (const refusedCase of pendingRefused.splice(0)) enqueueRefused(refusedCase);
-                  // Same stamp and same file the non-pipelined path writes
-                  // below — built here because the run needs both now.
-                  testCase.flow.authoredBy = stampProvenance(provenanceOf(first), testCase);
-                  const flowPath = await writeFlowFile(
-                    catalogFlowPath(options, {
-                      dir: join(dir, slugify(testCase.scenarioId)),
-                      group,
-                      name: testCase.flow.name,
-                      index: rows.length === 1 ? undefined : queuedPaths.length + 1,
-                    }),
-                    testCase.flow,
-                  );
-                  queuedPaths.push(flowPath);
-                  const caseId = caseIdOfName(testCase.name);
-                  await offer(caseId, testCase.dependsOn, async () => {
-                    log?.(`  queued ${testCase.name} → ${flowPath}`);
-                    queue.push({
-                      name: testCase.name,
-                      flow: testCase.flow,
-                      flowPath,
-                      kind: 'catalog',
-                      scenarioId: testCase.scenarioId,
-                      ...(group === undefined ? {} : { group: `${group}/${slugify(testCase.scenarioId)}` }),
-                      generatedBy: testCase.flow.authoredBy,
-                      ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
-                      ...suiteFactsOf(testCase),
-                    });
-                    gate?.queued(testCase.scenarioId);
-                  });
-                },
+                  gate?.queued(testCase.scenarioId);
+                });
+              },
         });
         authored = authoredRows.first;
         tableCases = authoredRows.cases;
@@ -3260,13 +3411,13 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       log?.(`writing a flow for ${approved.length} claim(s)…`);
       authored = options.url
         ? await withPage(options.cdp, async (page) => {
-            log?.(`opening ${options.url}…`);
-            await page.goto(options.url as string, { waitUntil: 'domcontentloaded' });
-            await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
-            const pilot = buildCapturePilot(options);
-            if (pilot) await pilotCapture(page, pilot, log);
-            return author.author(prompt, page);
-          })
+          log?.(`opening ${options.url}…`);
+          await page.goto(options.url as string, { waitUntil: 'domcontentloaded' });
+          await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+          const pilot = buildCapturePilot(options);
+          if (pilot) await pilotCapture(page, pilot, log);
+          return author.author(prompt, page);
+        })
         : await author.author(prompt);
     }
   } catch (error) {
@@ -3403,8 +3554,10 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
   // out here.
   const reviewer = buildFlowReviewer(options);
   const valueResolution = buildValueResolution(options);
+  const retryModel = buildAuthorRetryModel(options);
   const authorOptions = {
     model: new LlmFlowAuthorModel({ factory: options.factory }),
+    ...(retryModel === null ? {} : { retryModel }),
     policy: options.policy,
     probe: options.probe,
     ...(options.authorAttempts === undefined ? {} : { attempts: options.authorAttempts }),
@@ -3437,27 +3590,27 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
   try {
     authored = options.url
       ? await withPage(options.cdp, async (page) => {
-          log?.(`opening ${options.url}…`);
-          await page.goto(options.url as string, { waitUntil: 'domcontentloaded' });
-          // Client-rendered pages need a beat before the AX tree is meaningful.
-          await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
-          const pilot = buildCapturePilot(options);
-          if (pilot) await pilotCapture(page, pilot, log);
-          // Read in a second tab, so `page` is still the start page when the
-          // author captures the tree its selectors are checked against.
-          const journeyTree = await captureJourneyTree(
-            page,
-            options,
-            repoContextGraph,
-            prompt,
-            log ?? undefined,
-          );
-          const author = new FlowAuthor({
-            ...authorOptions,
-            ...(journeyTree ? { journeyTree } : {}),
-          });
-          return author.author(prompt, page);
-        })
+        log?.(`opening ${options.url}…`);
+        await page.goto(options.url as string, { waitUntil: 'domcontentloaded' });
+        // Client-rendered pages need a beat before the AX tree is meaningful.
+        await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+        const pilot = buildCapturePilot(options);
+        if (pilot) await pilotCapture(page, pilot, log);
+        // Read in a second tab, so `page` is still the start page when the
+        // author captures the tree its selectors are checked against.
+        const journeyTree = await captureJourneyTree(
+          page,
+          options,
+          repoContextGraph,
+          prompt,
+          log ?? undefined,
+        );
+        const author = new FlowAuthor({
+          ...authorOptions,
+          ...(journeyTree ? { journeyTree } : {}),
+        });
+        return author.author(prompt, page);
+      })
       : await new FlowAuthor(authorOptions).author(prompt);
   } catch (error) {
     if (error instanceof AuthoringError) {
@@ -3489,11 +3642,11 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
 
   process.stdout.write(
     `authored "${authored.flow.name}" — ${totalSteps} step(s)\n` +
-      `  model      ${authored.model} (${authored.latencyMs}ms, ${authored.inputTokens ?? 0} in / ${authored.outputTokens ?? 0} out tokens)\n` +
-      `  grounded   ${authored.grounded ? `yes — selectors checked against ${authored.sourceUrl}` : 'NO — selectors are guesses; verify every one before trusting this'}\n` +
-      `  rationale  ${authored.rationale}\n` +
-      (group === undefined ? '' : `  folder     ${dir}\n`) +
-      `  flow       ${flowPath}\n`,
+    `  model      ${authored.model} (${authored.latencyMs}ms, ${authored.inputTokens ?? 0} in / ${authored.outputTokens ?? 0} out tokens)\n` +
+    `  grounded   ${authored.grounded ? `yes — selectors checked against ${authored.sourceUrl}` : 'NO — selectors are guesses; verify every one before trusting this'}\n` +
+    `  rationale  ${authored.rationale}\n` +
+    (group === undefined ? '' : `  folder     ${dir}\n`) +
+    `  flow       ${flowPath}\n`,
   );
   // Surfaced, not silently dropped — a rising count means the prompt is slipping.
   if (authored.droppedSteps > 0) {
@@ -3514,12 +3667,13 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
     screenshots: options.screenshots,
     highlightTarget: options.highlightTarget,
     video: options.video,
+    humanize: options.humanize,
     agentAssist: options.agentAssist,
-      backend: options.backend,
+    backend: options.backend,
     captureDelayMs: options.captureDelayMs,
-      stepDelayMs: options.stepDelayMs,
+    stepDelayMs: options.stepDelayMs,
     makeHealer: buildHealer(options),
-      stepRepair: buildStepRepair(options),
+    stepRepair: buildStepRepair(options),
     healer: options.heal ? undefined : null,
     agent: buildAgent(options),
     dataModel: buildDataModel(options),
@@ -3549,10 +3703,10 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
 
   process.stdout.write(
     `\n${formatProofSummary(bundle)}\n` +
-      (meaningfulCoverage(bundle) ? `  ${formatCoverage(bundle.coverage!)}\n` : '') +
-      (bundle.trend ? `  ${formatTrend(bundle.trend)}\n` : '') +
-      `  proof      ${proofPath}\n` +
-      (reportPath === null ? '' : `  report     ${reportPath}\n`),
+    (meaningfulCoverage(bundle) ? `  ${formatCoverage(bundle.coverage!)}\n` : '') +
+    (bundle.trend ? `  ${formatTrend(bundle.trend)}\n` : '') +
+    `  proof      ${proofPath}\n` +
+    (reportPath === null ? '' : `  report     ${reportPath}\n`),
   );
   if (bundle.error) process.stderr.write(`\n${bundle.error}\n`);
 

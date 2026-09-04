@@ -236,6 +236,24 @@ const CREDENTIALS_FIELD: Field = {
   help: 'The account the run may use — email and password joined by the first colon (a password may contain colons). With it, a flow that lands on the sign-in page establishes the session itself; the authored steps also fill these exact characters instead of guessing. The value travels to the CLI as an environment variable, never in the command line, and the password is masked in every record.',
 };
 
+/**
+ * Credentials by persona label (CG-05), for cases that sign in as several
+ * people. `LABEL=email:password` entries, one per line or `;`-separated;
+ * they become the `WOWLIDATOR_PERSONAS` JSON map the CLI reads. A secret,
+ * like `--as`: never argv, never a record.
+ */
+const PERSONAS_FIELD: Field = {
+  name: 'personas',
+  label: 'Personas',
+  type: 'secret',
+  envVar: 'WOWLIDATOR_PERSONAS',
+  placeholder: 'EMPLOYEE_ACCOUNT=emp@x.test:pw; MANAGER_ACCOUNT=mgr@x.test:pw',
+  help: 'Credentials by persona label for cases that hand off between people — an employee submits, a manager approves. One LABEL=email:password per line (or separated by ";"); the labels match the sheet’s <LABEL> tokens. Each persona gets a Chrome of its own for the length of the case and keeps its session, so a later signIn as the first persona switches back without a login. Never in the command line; passwords are masked in every record.',
+};
+
+/** The sign-in group: the one account, and the persona map beside it. */
+const SIGN_IN_FIELDS: readonly Field[] = [CREDENTIALS_FIELD, PERSONAS_FIELD];
+
 /** Options every browser-touching command shares. Kept in the advanced drawer. */
 const COMMON_BROWSER_FIELDS: readonly Field[] = [
   {
@@ -252,8 +270,14 @@ const COMMON_BROWSER_FIELDS: readonly Field[] = [
     label: 'Stills',
     type: 'enum',
     choices: ['auto', 'all', 'on-event', 'on-failure', 'off'],
-    default: 'auto',
-    help: 'auto follows the recording: failures only while filming, since the video already covers every other step, and every step when filming is off. all adds a filmstrip alongside the video — the same run twice, at several times the report size, worth it only when you need full-resolution frames. Each capture costs 50–150ms, plus the settle below.',
+    // `all` rather than `auto` (2026-09-04): a filmed run under `auto` keeps a
+    // still only where a step FAILED, so the evidence for everything that
+    // passed is a video frame someone has to scrub to. The panel is where a
+    // person reads a run afterwards, and a full-resolution still per step is
+    // what they open. The cost is report size, which is a cost worth naming
+    // rather than one worth defaulting away from.
+    default: 'all',
+    help: 'all keeps a full-resolution still for every step, alongside the film — what a reader opens when they want to see exactly what a step saw, and the panel default for that reason. It costs report size: the same run captured twice. auto follows the recording instead — failures only while filming, since the video already covers the rest, and every step when filming is off. Each capture costs 50–150ms, plus the settle below.',
     advanced: true,
   },
   {
@@ -342,7 +366,7 @@ const COMMON_BROWSER_FIELDS: readonly Field[] = [
     type: 'number',
     min: 1,
     placeholder: '1',
-    help: 'How many browsers a parallel run spreads its cases over: the one on the CDP port plus this many minus one on the ports after it, each on its own profile, started headless. One Chrome’s main thread queues every lane’s renderer, encoder and CDP session, so a run at 8 cases waits on Chrome rather than on the application — 4 browsers is a good start. Only worth more than 1 with more than one case at a time.',
+    help: 'How many browsers a parallel run spreads its cases over: the one on the CDP port plus this many minus one on the ports after it, each on its own profile, started headless. One Chrome’s main thread queues every lane’s renderer, encoder and CDP session, so a run at 8 cases waits on Chrome rather than on the application — 4 browsers is a good start. A case that signs in as several people gets one Chrome per person with every session kept; the pool grows on demand when this is blank, and with Headless off you watch employee and manager side by side.',
     advanced: true,
   },
   {
@@ -468,7 +492,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       SCOPE_FIELD,
       POLICY_FIELD,
       AUTOHEAL_FIELD,
-      CREDENTIALS_FIELD,
+      ...SIGN_IN_FIELDS,
       BACKEND_FIELD,
       DB_URL_FIELD,
       ...COMMON_BROWSER_FIELDS,
@@ -522,7 +546,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         type: 'boolean',
         help: 'Lets a fix rewrite the failed step and everything after it in the same section, for when the failure shows the rest of the flow was written against a page that does not exist. Steps before the failure are never touched. Implies repair.',
       },
-      CREDENTIALS_FIELD,
+      ...SIGN_IN_FIELDS,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -615,7 +639,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       },
       CONCURRENCY_FIELD,
       AUTOHEAL_FIELD,
-      CREDENTIALS_FIELD,
+      ...SIGN_IN_FIELDS,
       BACKEND_FIELD,
       DB_URL_FIELD,
       ...COMMON_BROWSER_FIELDS,
@@ -690,7 +714,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Where the authored flow is written.',
         advanced: true,
       },
-      CREDENTIALS_FIELD,
+      ...SIGN_IN_FIELDS,
       BACKEND_FIELD,
       DB_URL_FIELD,
       ...COMMON_BROWSER_FIELDS,
@@ -928,7 +952,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         help: 'Where the authored flow is written.',
         advanced: true,
       },
-      CREDENTIALS_FIELD,
+      ...SIGN_IN_FIELDS,
       BACKEND_FIELD,
         DB_BASELINE_FIELD,
       DB_URL_FIELD,
@@ -1024,7 +1048,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         type: 'boolean',
         help: 'Otherwise it runs until you stop it.',
       },
-      CREDENTIALS_FIELD,
+      ...SIGN_IN_FIELDS,
       ...COMMON_BROWSER_FIELDS,
     ],
   },
@@ -1248,6 +1272,94 @@ export function commandById(id: string): CommandSpec | undefined {
 export class UiCommandError extends Error {}
 
 /**
+ * The panel's persona text as the map the CLI reads from `WOWLIDATOR_PERSONAS`:
+ * `LABEL=email:password` entries separated by newlines or `;`, the label
+ * trimmed of `<…>` and upper-cased as `parsePersonas` would. Refused, never
+ * dropped, when an entry is malformed — the CLI's rule for the same reason.
+ */
+export function personasFieldToMap(raw: string, label = 'Personas'): Record<string, { email: string; password: string }> {
+  const map: Record<string, { email: string; password: string }> = {};
+  for (const line of raw.split(/[\n;]+/)) {
+    const item = line.trim();
+    if (item === '') continue;
+    const eq = item.indexOf('=');
+    if (eq <= 0) throw new UiCommandError(`"${label}": each entry must be LABEL=email:password (got "${item.split(':')[0] ?? item}")`);
+    const key = item.slice(0, eq).trim().replace(/^<|>$/g, '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+    const pair = item.slice(eq + 1);
+    const at = pair.indexOf(':');
+    if (key === '' || at <= 0 || pair.slice(at + 1) === '') {
+      throw new UiCommandError(`"${label}": ${key || '?'} must be LABEL=email:password, both halves present`);
+    }
+    map[key] = { email: pair.slice(0, at).trim(), password: pair.slice(at + 1) };
+  }
+  if (Object.keys(map).length === 0) throw new UiCommandError(`"${label}": no LABEL=email:password entries found`);
+  return map;
+}
+
+/** One persona as a structured form sends it: the secret half separate from the label. */
+export interface PersonaEntry {
+  email: string;
+  password: string;
+}
+
+/**
+ * The `personas` value, in either shape the panel can send it.
+ *
+ * The typed lines (`LABEL=email:password`, `;`- or newline-separated) are what
+ * a person writes into the textarea, and `personasFieldToMap` still owns them.
+ * A structured record is what the launcher's per-account form sends, and it is
+ * not a convenience. The text form splits on `/[\n;]+/` before it splits on the
+ * first `:`, so a password containing a semicolon or a newline breaks in one of
+ * two ways, measured:
+ *
+ *   `A=a@x.test:p;w`               → throws about a fragment ("got \"w\"") that
+ *                                    matches nothing the person typed;
+ *   `A=a@x.test:p;B=b@x.test:q`    → **silently** gives A the password `p` and
+ *                                    invents an account B — a run that then
+ *                                    starts with one wrong credential and one
+ *                                    account nobody asked for.
+ *
+ * The second is the reason this exists. A form collecting several accounts at
+ * once cannot offer a syntax whose failure mode is a plausible-looking wrong
+ * answer.
+ *
+ * Both shapes normalise the label exactly as `personaLabelOf` does — the
+ * sheet's `<MANAGER_ACCOUNT>`, a bare `MANAGER_ACCOUNT` and `manager account`
+ * are one key — so the two paths cannot disagree about who is who. An entry
+ * missing either half is refused, never dropped: a persona silently absent is
+ * a run that dies at its second sign-in, which is the failure this exists to
+ * end.
+ */
+export function personasValueToMap(
+  raw: unknown,
+  label = 'Personas',
+): Record<string, PersonaEntry> {
+  if (typeof raw === 'string') return personasFieldToMap(raw, label);
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new UiCommandError(`"${label}" must be text or one entry per account`);
+  }
+  const map: Record<string, PersonaEntry> = {};
+  for (const [rawKey, value] of Object.entries(raw as Record<string, unknown>)) {
+    const key = rawKey.trim().replace(/^<|>$/g, '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+    if (key === '') throw new UiCommandError(`"${label}": an account has no label`);
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new UiCommandError(`"${label}": ${key} must have an email and a password`);
+    }
+    const { email, password } = value as { email?: unknown; password?: unknown };
+    if (typeof email !== 'string' || typeof password !== 'string') {
+      throw new UiCommandError(`"${label}": ${key} must have an email and a password`);
+    }
+    if (email.trim() === '' || password === '') {
+      throw new UiCommandError(`"${label}": ${key} is missing its ${email.trim() === '' ? 'email' : 'password'}`);
+    }
+    if (`${email}${password}`.includes('\0')) throw new UiCommandError(`"${label}": ${key} contains a NUL byte`);
+    map[key] = { email: email.trim(), password };
+  }
+  if (Object.keys(map).length === 0) throw new UiCommandError(`"${label}": no accounts were given`);
+  return map;
+}
+
+/**
  * The environment a submission's secret fields become.
  *
  * The mirror of `buildArgv`, for the values that must not be argv: each
@@ -1273,6 +1385,19 @@ export function buildEnvOverlay(
           `"${field.label}" is required when "${field.requiredWhen.field}" is on`,
         );
       }
+      continue;
+    }
+    if (field.name === 'personas') {
+      // Before the text guard, because the launcher's per-account form sends a
+      // record rather than a line — and a password with a `;` or a newline in
+      // it survives only on that path. Either shape becomes the same JSON map
+      // `parsePersonas` reads.
+      //
+      // An empty record is "not supplied", the same as an empty box: the form
+      // sends only the accounts it actually has, and a catalog whose personas
+      // are all set in the machine's own environment sends none.
+      if (typeof raw === 'object' && !Array.isArray(raw) && Object.keys(raw as object).length === 0) continue;
+      env[field.envVar] = JSON.stringify(personasValueToMap(raw, field.label));
       continue;
     }
     if (typeof raw !== 'string') throw new UiCommandError(`"${field.label}" must be text`);

@@ -468,17 +468,19 @@ export async function waitForApp(
   onLog?: (line: string) => void,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  let announced = false;
   while (Date.now() < deadline) {
+    const attemptAt = Date.now();
     try {
-      await fetch(url, { signal: AbortSignal.timeout(3_000), redirect: 'follow' });
+      await fetch(url, { signal: AbortSignal.timeout(Math.min(3_000, Math.max(250, deadline - attemptAt))), redirect: 'follow' });
       return true;
     } catch {
-      if (!announced) {
-        onLog?.(`waiting for ${url} …`);
-        announced = true;
-      }
-      await sleep(1_000);
+      // A countdown, one line per second, so a person watching the console
+      // sees the wait is bounded and how much of it is left — a single
+      // "waiting …" line read as a hang.
+      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      if (left === 0) break;
+      onLog?.(`waiting for ${url} … ${left}s left`);
+      await sleep(Math.min(1_000, deadline - Date.now()));
     }
   }
   return false;

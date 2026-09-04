@@ -377,6 +377,139 @@ describe('the signIn step: personas, sign-out first, the vault keyed by account 
     assert.equal(vault.get(origin, 'admin@b.test'), null, 'the admin session was signed out of, never banked');
   });
 
+  it('with a browser per persona, a hand-off keeps both sessions and a return is a switch, not a login', async () => {
+    // One Chrome per persona (2026-09-03). The test points the second
+    // persona's "browser" at the same Chrome — a context of its own there is
+    // the same isolation a second process gives, and what the assertions are
+    // about: the admin's jar survives the manager's leg, the manager's leg
+    // signs nobody out, and the admin's return needs no form.
+    const { SessionVault } = await import('../src/engine/session-vault.js');
+    const vault = new SessionVault();
+    const flow: Flow = {
+      name: 'employee submits, manager approves, employee checks',
+      steps: [
+        { action: 'signIn', as: '<HR_ADMIN_ACCOUNT>', url: `${origin}/login` },
+        { action: 'goto', url: `${origin}/app` },
+        { action: 'expectText', selector: '#who', value: 'Signed in as admin@b.test' },
+        { action: 'signIn', as: 'manager' },
+        { action: 'goto', url: `${origin}/app` },
+        { action: 'expectText', selector: '#who', value: 'Signed in as manager@b.test' },
+        { action: 'signIn', as: 'HR_ADMIN_ACCOUNT' },
+        { action: 'expectText', selector: '#who', value: 'Signed in as admin@b.test' },
+      ],
+    };
+    const bundle = await runFlow(flow, {
+      cdpUrl: CDP_URL,
+      video: 'off',
+      isolate: true,
+      screenshots: 'off',
+      healer: null,
+      personas,
+      personaBrowsers: [CDP_URL],
+      sessionVault: vault,
+    });
+
+    assert.equal(bundle.status, 'passed', bundle.error ?? '');
+    const [first, , , second, , , back, last] = bundle.steps;
+    assert.equal(first?.detail?.['persona'], 'HR_ADMIN_ACCOUNT');
+    assert.equal(first?.persona, 'HR_ADMIN_ACCOUNT', 'the first signIn binds the primary session');
+    assert.equal(second?.detail?.['openedBrowser'], CDP_URL, 'the manager got a browser of their own');
+    assert.equal(second?.detail?.['signedOutVia'], undefined, 'nobody was signed out');
+    assert.equal(second?.persona, 'MANAGER_ACCOUNT');
+    assert.equal(back?.detail?.['keptSession'], true, 'the admin returns to a live session');
+    assert.equal(back?.detail?.['signInUrl'], undefined, 'no login form on the way back');
+    assert.equal(last?.persona, 'HR_ADMIN_ACCOUNT');
+    assert.ok(!JSON.stringify(bundle).includes('pw2026'), 'no persona password reaches the record');
+    // Both accounts banked, each under its own email.
+    assert.ok(vault.get(origin, 'manager@b.test'), 'banked under the manager');
+    assert.ok(vault.get(origin, 'admin@b.test'), 'banked under the admin — the session was never ended');
+  });
+
+  it('a persona browser that answers nothing blocks the case as a harness error, not an app defect', async () => {
+    const bundle = await runFlow(
+      {
+        name: 'dead persona browser',
+        steps: [
+          { action: 'signIn', as: 'HR_ADMIN_ACCOUNT', url: `${origin}/login` },
+          { action: 'signIn', as: 'MANAGER_ACCOUNT' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        video: 'off',
+        isolate: true,
+        screenshots: 'off',
+        healer: null,
+        personas,
+        personaBrowsers: ['http://127.0.0.1:9'],
+      },
+    );
+    assert.equal(bundle.status, 'error');
+    assert.match(bundle.steps[1]?.error ?? '', /could not attach to the browser at http:\/\/127\.0\.0\.1:9/);
+    assert.equal(bundle.defects.length, 0, 'the machine, not the application');
+  });
+
+  // --- HIR-EC-009 (2026-09-04): a `signIn` is allowed to stand on the
+  // sign-in page ------------------------------------------------------------
+
+  it('a goto bounced to login followed by a signIn signs in rather than dying session-lost', async () => {
+    // ec09's exact setup shape: `goto <app page>` then `signIn`. The flow
+    // signs in itself, so it starts with an empty jar and the goto bounces
+    // to /login — and the guard that runs before every step used to kill the
+    // run on the ONE step for which standing on a sign-in page is right.
+    const bundle = await runFlow(
+      {
+        name: 'goto first, sign in second',
+        setup: [
+          { action: 'goto', url: `${origin}/app` },
+          { action: 'signIn', as: '<HR_ADMIN_ACCOUNT>', url: `${origin}/login` },
+        ],
+        steps: [
+          { action: 'goto', url: `${origin}/app` },
+          { action: 'expectText', selector: '#who', value: 'Signed in as admin@b.test' },
+        ],
+      },
+      { cdpUrl: CDP_URL, video: 'off', isolate: true, screenshots: 'off', healer: null, personas },
+    );
+
+    assert.equal(bundle.status, 'passed', bundle.error ?? '');
+    const signIn = bundle.steps.find((s) => s.action === 'signIn');
+    assert.equal(signIn?.status, 'passed', 'the signIn ran instead of being pre-empted');
+    assert.equal(signIn?.detail?.['signedInAs'], 'admin@b.test');
+    assert.match(String(signIn?.detail?.['urlBefore'] ?? ''), /\/login/, 'it began ON the sign-in page');
+    assert.equal(
+      bundle.defects.filter((d) => /lost its session|never took effect/.test(d.title)).length,
+      0,
+      'no session defect is filed about a flow that was about to sign in',
+    );
+  });
+
+  it('the exemption is the signIn step only: an ordinary step after the same bounce still stops', async () => {
+    // The negative half. Identical setup minus the signIn: the guard must
+    // fire exactly as it does today, and the run must not proceed to assert
+    // against login furniture.
+    const bundle = await runFlow(
+      {
+        name: 'goto first, no sign-in',
+        setup: [{ action: 'goto', url: `${origin}/app` }],
+        steps: [{ action: 'expectVisible', selector: 'role=heading[name="Benefit Plans" i]' }],
+      },
+      { cdpUrl: CDP_URL, video: 'off', isolate: true, screenshots: 'off', healer: null, personas },
+    );
+
+    assert.notEqual(bundle.status, 'passed');
+    assert.match(bundle.error ?? '', /the run is on the sign-in page/);
+    assert.equal(
+      bundle.steps.find((s) => s.action === 'expectVisible'),
+      undefined,
+      'the assertion never ran against the login screen',
+    );
+    assert.ok(
+      bundle.defects.some((d) => /lost its session/.test(d.title)),
+      'the session-lost finding is filed exactly as before',
+    );
+  });
+
   it('an unknown persona is a harness error naming the labels available', async () => {
     const bundle = await runFlow(
       { name: 'unknown persona', steps: [{ action: 'signIn', as: 'HRBP_ACCOUNT', url: `${origin}/login` }] },

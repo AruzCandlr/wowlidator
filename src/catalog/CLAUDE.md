@@ -86,3 +86,41 @@ There is a real `.xlsx` (written by openpyxl) and a real `.pdf` in `tests/fixtur
 ## Fastest scenario first (2026-08-28)
 
 A multi-scenario catalog no longer runs in typing order: `orderScenariosFastestFirst` (`src/cli/case-plan.ts`, pure) reorders the scenario BLOCKS by ascending estimated cost before the queue and the ScenarioGate are built, so the cheapest verdicts land first and cheap scenarios fail fast ahead of expensive ones. Cost per row is the catalog's OWN history where it exists — the prior progress ledger's proof bundles, `caseDurationMs` — and a static estimate otherwise (Steps lines + half-weighted Expected lines + a writer penalty, since a case that writes runs alone and serializes the pool). Only the ordering matters, never the number; rows keep sheet order inside their scenario; ties break to sheet order; the chosen order is logged with its estimates. `--sheet-order` keeps the sheet's order (the same flag that keeps writers in place), and the roll-up still prints in planned (sheet) order either way — execution order and reading order are different concerns.
+
+## One row is one case, and a slipped row is still a row (2026-09-03, ec09.csv)
+
+Two rails, one live sheet. ec09.csv had the project's own header and one
+data row whose writer left Scenario ID blank and typed the title one cell to
+the right, so every later cell sat under the wrong heading. `caseId` read a
+paragraph, the row was refused, and the sheet fell through to the model
+extractor: 142 s on the generator role and fifteen claims — fifteen authored
+cases, fifteen browsers — for one scenario. `realignRow` (applied to every
+data row in `parseTestCaseRows`) uses the Positive/Negative cell as the
+anchor: exactly `Positive`/`Negative` within two columns of its header says
+the offset, a rightward slip drops the blanks the writer skipped (or the cells
+just before the anchor when there are none), a leftward slip inserts blanks.
+Anything else is left alone — it fixes the one shape it recognises. The same
+sheet now reads as a table in milliseconds, no model call.
+
+For a sheet that still reaches the model (an unrecognised header),
+`groupClaimsByRow` in `catalog.ts` folds the testable claims of one `## row N`
+block into one claim — source the row's Test Case ID, sentences joined in the
+model's order, the highest priority — matching the table parser's one case
+per row. A claim is placed by its `source` (the id, or the words the model
+quoted) and only when exactly one block holds it; context claims and prose
+documents are untouched. Tests: `tests/catalog.test.ts`, both pure.
+
+## A scenario id is a name the table may hold (2026-09-04, multirole PRB-EC-001)
+
+`linkDependencies` resolved `ต่อจากเคส E2E-01` against Test Case IDs only, so a
+probation row was refused as *depends on E2E-01, which is not in this catalog*
+while HIR-EC-001 — the row whose Scenario ID column IS `E2E-01` — sat two rows
+above. A reference now resolves against Test Case IDs first, then the Scenario
+ID column: the row's own scenario is itself and never a dependency; another
+scenario in the table is its first row of the same sheet (`dependsOn`); only a
+scenario the table lacks is `externalRefs`. The ids come from the table's own
+columns, never a prefix list. The three NUL bytes the file carried inside
+template-literal keys are the `\u0000` escape now — `grep` had been reading the
+file as binary. Test: `tests/sheet-grammar.test.ts` (CG-12). The generator-side
+half of the same day's work is in `src/generator/CLAUDE.md`, "The last word is
+a rewrite, not a refusal".

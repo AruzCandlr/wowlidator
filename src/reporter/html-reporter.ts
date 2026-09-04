@@ -310,7 +310,7 @@ export const GLOSSARY: Record<string, string> = {
   downstream:
     'This step failed after an earlier step had already failed — its failure may be a consequence of that one, not an independent finding. Fix the first failure and re-read this one.',
   superseded:
-    'This failed attempt was followed by a successful in-run reconstruction of the same step, so it is an attempt, not the outcome — it counts toward nothing. It stays listed because what was tried is evidence.',
+    'This failed attempt was followed by a successful in-run reconstruction of the same step, so it is an attempt, not the outcome — it counts toward nothing. It is folded under the step that replaced it, because what was tried is evidence.',
   'reconstructed in-run':
     'The step as written failed, and the repair model rebuilt it against the live page mid-run. The run is green, but the flow no longer matches the application — update the step so the suite stops paying a model every run.',
 };
@@ -720,7 +720,25 @@ function decisionBlock(decision: StepDecision): string {
  * visible and the turn-by-turn log is one click away. Open by default when
  * the goal was not reached: that is the case a reader came for.
  */
-function agentBlock(agent: AgentRecord): string {
+/**
+ * The agent's own account of a leg, framed by what the STEP then did.
+ *
+ * `agent.success` is what the agent said; the step's status is what the
+ * flow's own selector proved afterwards, and the two disagree often — the
+ * assist rung's agent stalls or errors on its second turn after its first
+ * action already opened the panel, and the step passes. A red "goal not
+ * reached" callout on a green step read as a contradiction and hid the fact
+ * that mattered: the page was prepared and the step held. So a passed step
+ * titles the callout by what happened, and only a step that did NOT pass
+ * opens the trace and wears the failure colour.
+ */
+function agentBlock(agent: AgentRecord, stepPassed = agent.success): string {
+  const failed = !agent.success && !stepPassed;
+  const title = agent.success
+    ? 'Workflow agent took over'
+    : stepPassed
+      ? 'Workflow agent prepared the page — the step then passed on the flow\'s own selector'
+      : 'Workflow agent took over — goal not reached';
   const rows = agent.actions
     .map(
       (a) => `
@@ -735,11 +753,11 @@ function agentBlock(agent: AgentRecord): string {
     .join('');
 
   return `
-    <div class="callout agent ${agent.success ? '' : 'failed'}">
-      <div class="callout-title">Workflow agent took over${agent.success ? '' : ' — goal not reached'}</div>
+    <div class="callout agent ${failed ? 'failed' : ''}">
+      <div class="callout-title">${title}</div>
       <p class="goal"><span>goal</span> ${esc(agent.goal)}</p>
       <p class="reason">${esc(agent.summary)}</p>
-      <details${agent.success ? '' : ' open'}>
+      <details${failed ? ' open' : ''}>
         <summary>What the agent did — ${agent.actions.length} action${agent.actions.length === 1 ? '' : 's'}, turn by turn</summary>
         <table class="agent-trace">
           <thead><tr><th>#</th><th>action</th><th>target</th><th>reasoning</th><th>time</th></tr></thead>
@@ -942,13 +960,16 @@ function traceBlock(step: ProofStep): string {
  * size to show the same pictures twice.
  */
 function filmstripBlock(bundle: ProofBundle): string {
-  const frames = bundle.steps.filter((step) => step.screenshot !== undefined);
+  // Superseded attempts are folded under the step that replaced them and
+  // are not frames of the journey — the filmstrip shows the run as it ended.
+  const live = bundle.steps.filter((step) => !step.superseded);
+  const frames = live.filter((step) => step.screenshot !== undefined);
   if (frames.length < 2) return '';
 
   return `
   <figure class="filmstrip" id="filmstrip" hidden>
     <figcaption>
-      <span>Evidence — ${frames.length} of ${bundle.steps.length} steps</span>
+      <span>Evidence — ${frames.length} of ${live.length} steps</span>
       <span class="hint">click a frame to jump to its step</span>
     </figcaption>
     <div class="frames" id="filmstrip-frames"></div>
@@ -1014,7 +1035,11 @@ function videoBlock(bundle: ProofBundle): string {
   return `
   <figure class="video" data-segments="${esc(JSON.stringify(segments))}">
     <figcaption>
-      <span>Recording — from the start of the flow to ${upTo}</span>
+      <span>Recording — from the start of the flow to ${upTo}${
+        video.condensed
+          ? ` (action moments only: ${video.condensed.moments} held ~${(video.condensed.dwellMs / 1000).toFixed(1)} s each, ${ms(video.durationMs ?? 0)} of ${ms(video.condensed.sourceDurationMs)} filmed)`
+          : ''
+      }</span>
       <span class="hint">each step body has a “play from here”</span>
     </figcaption>
     <video id="run-video" controls preload="metadata" width="${video.width}" height="${video.height}"
@@ -1074,7 +1099,70 @@ function polarityPill(bundle: ProofBundle): string {
   return `<span class="polarity ${negative ? 'neg' : 'pos'}" title="${esc(title)}">${negative ? 'negative test' : 'positive test'}</span>`;
 }
 
-function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): string {
+/**
+ * The failed attempts a reconstruction rescued, folded under the step that
+ * finally held.
+ *
+ * A superseded attempt used to sit in the main list as a red row of its own,
+ * one line above the green step that replaced it — the same headline twice,
+ * once failed and once passed — and a reader had to know the badge to see it
+ * was not a failure. Now the main list shows the run as it ended: the
+ * rebuilt step (and any preparation inserted before it) in place, and the
+ * attempts it replaced behind a closed disclosure on that step, each one
+ * still a full row — error, screenshot, trace — because what was tried is
+ * evidence, just not the outcome. Pure over the bundle: nothing here decides
+ * what was superseded; `supersedeSteps` did, at run time.
+ */
+function replacedAttemptsBlock(attempts: readonly ProofStep[], hasVideo: boolean): string {
+  if (attempts.length === 0) return '';
+  const n = attempts.length;
+  return `
+    <details class="replaced">
+      <summary>Replaced ${n} failed attempt${n === 1 ? '' : 's'} at this step — as written, before the in-run reconstruction (step${n === 1 ? '' : 's'} ${attempts.map((a) => a.index).join(', ')})</summary>
+      <ol class="steps attempts">${attempts.map((a) => stepRow(a, hasVideo, false, true)).join('')}</ol>
+    </details>`;
+}
+
+/**
+ * The step list with every superseded attempt folded under the step that
+ * replaced it. Attempts are buffered as they come and attached to the next
+ * step carrying a `ReconstructionRecord` — the one that finally held;
+ * preparation the reconstruction inserted before it renders as an ordinary
+ * step in between. Should a buffer reach the end of the list with no rescue
+ * after it (a shape the runner never writes), the attempts render in place
+ * rather than vanish.
+ */
+function stepList(bundle: ProofBundle, hasVideo: boolean): string {
+  const steps = bundle.steps;
+  // A superseded failure is history, not a break in the run: the passes that
+  // follow it are not "in doubt", so the first LIVE failure is what counts.
+  const firstFailure = steps.findIndex((s) => s.status !== 'passed' && !s.superseded);
+  const rows: string[] = [];
+  let pending: ProofStep[] = [];
+  for (const step of steps) {
+    if (step.superseded) {
+      pending.push(step);
+      continue;
+    }
+    const afterFailure = firstFailure !== -1 && step.index > firstFailure;
+    if (step.reconstruction && pending.length > 0) {
+      rows.push(stepRow(step, hasVideo, afterFailure, false, pending));
+      pending = [];
+    } else {
+      rows.push(stepRow(step, hasVideo, afterFailure));
+    }
+  }
+  for (const orphan of pending) rows.push(stepRow(orphan, hasVideo, false));
+  return rows.join('');
+}
+
+function stepRow(
+  step: ProofStep,
+  hasVideo = false,
+  afterFailure = false,
+  attempt = false,
+  replaced: readonly ProofStep[] = [],
+): string {
   // The resolved selector, the authored one, or — for a kind with no single
   // selector (`expectAnyVisible`, `signIn`, `upload`) — what the record says
   // it was aimed at. `—` only when the step truly names nothing (a `goto`).
@@ -1093,7 +1181,7 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
   const headline = step.intent ? captured(step.intent) : esc(step.action);
 
   return `
-  <li class="step ${step.status}" id="step-${step.index}" data-step="${step.index}">
+  <li class="step ${step.status}${attempt ? ' attempt' : ''}" id="step-${step.index}" data-step="${step.index}">
     <button class="step-head" aria-expanded="false">
       <span class="dot"></span>
       <span class="idx">${step.index}</span>
@@ -1124,11 +1212,12 @@ function stepRow(step: ProofStep, hasVideo = false, afterFailure = false): strin
       ${step.network ? networkBlock(step.network) : ''}
       ${healBlock(step)}
       ${reconstructionBlock(step)}
+      ${replacedAttemptsBlock(replaced, hasVideo)}
       ${step.request ? requestBlock(step.request) : ''}
       ${step.db ? dbBlock(step.db) : ''}
       ${step.dialog ? dialogBlock(step.dialog) : ''}
       ${step.decision ? decisionBlock(step.decision) : ''}
-      ${step.agent ? agentBlock(step.agent) : ''}
+      ${step.agent ? agentBlock(step.agent, step.status === 'passed') : ''}
       ${observedBlock(step)}
       ${step.snapshot ? snapshotBlock(step) : ''}
       ${step.dataCases ? dataBlock(step.dataCases) : ''}
@@ -1269,6 +1358,10 @@ ol.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
 .chev{color:var(--muted);transition:transform .15s;font-size:11px}
 .step-head[aria-expanded=true] .chev{transform:rotate(180deg)}
 .step-body{padding:4px 14px 16px;border-top:1px solid var(--line)}
+details.replaced{margin:12px 0;font-size:12.5px}
+details.replaced summary{cursor:pointer;color:var(--muted)}
+details.replaced .attempts{margin:10px 0 0;padding:0;list-style:none;display:grid;gap:8px}
+.step.attempt{opacity:.85}
 .callout{border-radius:8px;padding:12px 14px;margin:12px 0}
 .callout-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
 .callout.heal{background:var(--jit-bg);border:1px solid color-mix(in srgb,var(--jit) 30%,transparent)}
@@ -1451,7 +1544,8 @@ for (const head of document.querySelectorAll('.step-head')) {
   });
 }
 // Failed steps start open — that is what the reader came for.
-for (const head of document.querySelectorAll('.step.failed .step-head, .step.error .step-head, .step.dead-end .step-head')) head.click();
+// A replaced attempt is history behind a closed disclosure, not a failure to open.
+for (const head of document.querySelectorAll('.step.failed:not(.attempt) .step-head, .step.error:not(.attempt) .step-head, .step.dead-end:not(.attempt) .step-head')) head.click();
 
 const box = document.getElementById('lightbox');
 if (box) {
@@ -1470,8 +1564,9 @@ const strip = document.getElementById('filmstrip');
 const frames = document.getElementById('filmstrip-frames');
 if (strip && frames) {
   let firstBroken = null;
-  for (const step of document.querySelectorAll('.step')) {
-    const shot = step.querySelector('.shot-wrap img');
+  for (const step of document.querySelectorAll('.step:not(.attempt)')) {
+    // The step's own screenshot — never one from an attempt folded under it.
+    const shot = step.querySelector(':scope > .step-body > .shot-wrap img');
     if (!shot) continue;
     // Every non-pass status is a break in the journey — the step <li> wears
     // its status as a class, and 'failed' alone missed 'error' and 'dead-end'.
@@ -1839,18 +1934,7 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
   ${
     bundle.steps.length === 0
       ? '<div class="empty">No steps were executed.</div>'
-      : `<ol class="steps">${(() => {
-          const firstFailure = bundle.steps.findIndex((s) => s.status !== 'passed');
-          return bundle.steps
-            .map((step) =>
-              stepRow(
-                step,
-                bundle.video?.data !== undefined,
-                firstFailure !== -1 && step.index > firstFailure,
-              ),
-            )
-            .join('');
-        })()}</ol>`
+      : `<ol class="steps">${stepList(bundle, bundle.video?.data !== undefined)}</ol>`
   }
 
   <details class="diagnostics">

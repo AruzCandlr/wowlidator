@@ -113,6 +113,15 @@ export interface JobCase {
   /** True when the plan said this case changes data and must run alone. */
   exclusive: boolean;
   status: 'waiting' | 'running' | 'passed' | 'passed-with-issues' | 'needs-review' | 'failed' | 'error' | 'dead-end' | 'blocked';
+  /**
+   * The reason the CLI printed when it scored this case `blocked` or "no
+   * verdict" — the `BLOCKED <case> — <reason>` and `! no verdict: <reason>`
+   * lines the suite loop writes. Parsed out of the case's own output, never
+   * derived: it is what the row shows under the chip so a person does not
+   * have to open the console to learn why nothing was proved. Null until such
+   * a line arrives.
+   */
+  reason: string | null;
   lines: JobLine[];
   progress: JobProgress;
 }
@@ -195,6 +204,15 @@ const CASE_ROSTER = /^\s{2,}\[c(\d+)\]\s{2,}(alone|shared)\s+(\S.*)$/;
 /** `case "…" started` / `case "…" passed` — the boundaries of one case's life. */
 const CASE_STARTED = /^case "(.+)" started$/;
 const CASE_ENDED = /^case "(.+)" (passed-with-issues|needs-review|passed|failed|error|dead-end|blocked)$/;
+/** The two lines on which the suite loop says why a case delivered no verdict. */
+const CASE_REASON = /^BLOCKED .+? — (.+)$|^\s*! no verdict: (.+)$/;
+
+/** The recorded reason on a case's output line, or null when the line is not one. */
+export function caseReasonOf(text: string): string | null {
+  const m = CASE_REASON.exec(text);
+  const reason = (m?.[1] ?? m?.[2])?.trim();
+  return reason === undefined || reason === '' ? null : reason.slice(0, 300);
+}
 
 /**
  * Milestones for the commands that have no steps to count, in the order they
@@ -516,6 +534,8 @@ export class JobRunner {
         entry.name = ended[1]!;
         entry.status = ended[2] as JobCase['status'];
       }
+      const reason = caseReasonOf(body);
+      if (reason !== null) entry.reason = reason;
       applyProgressLine(entry.progress, body, elapsed);
       this.#emit(job.id, 'cases', summariseCases(job.cases));
       this.#emit(job.id, 'line', line);
@@ -634,6 +654,7 @@ function emptyCase(number: number, name: string, exclusive: boolean): JobCase {
     name,
     exclusive,
     status: 'waiting',
+    reason: null,
     lines: [],
     progress: {
       done: 0,
