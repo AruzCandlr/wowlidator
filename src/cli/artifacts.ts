@@ -7,7 +7,8 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
-import { ensureChrome, portOf, stopChrome, waitForApp } from '../browser/chrome.js';
+import { ensureChrome, ensureChromePool, portOf, stopChrome, waitForApp, type PoolMember } from '../browser/chrome.js';
+import { poolMember } from '../browser/pool.js';
 import type { ProofBundle } from '../engine/proof-bundle.js';
 import { DEFAULT_CDP_URL, type Flow, type FlowStep } from '../engine/runner.js';
 import { decideQuarantine } from '../history/quarantine.js';
@@ -155,33 +156,55 @@ export async function prepare(options: CliOptions, appUrl?: string): Promise<num
 
   if (!options.ensureChrome) return null;
 
-  const result = await ensureChrome({
+  const wanted = {
     cdpUrl: options.cdp ?? DEFAULT_CDP_URL,
     profile: options.chromeProfile,
     headless: options.headless,
     onLog: log,
-  });
-  chromeStartedByUs = result.startedByUs;
+  };
+  // `--browsers <n>`: a pool of n Chromes for a parallel run, the primary on
+  // the CDP port plus n-1 more on the ports after it, each on its own profile
+  // (see `src/browser/pool.ts`). Every member is ensured by the same rules as
+  // the single browser; a member that cannot be had fails the run the same
+  // way, naming which one.
+  const members: PoolMember[] =
+    options.browsers !== undefined && options.browsers > 1
+      ? await ensureChromePool(wanted, options.browsers)
+      : [{ ...(await ensureChrome(wanted)), profile: options.chromeProfile }];
+  chromePool = members.map((m) => ({ cdpUrl: m.cdpUrl, profile: m.profile, startedByUs: m.startedByUs }));
+  chromeStartedByUs = members[0]?.startedByUs === true;
 
-  if (result.status === 'blocked' || result.status === 'missing-chrome' || result.status === 'failed') {
-    // Environment, not usage: the invocation was right, the machine is not
-    // ready, and CI has to be able to tell those apart.
-    process.stderr.write(`wowlidator: ${result.message}\n`);
-    return EXIT.environment;
+  for (const [i, result] of members.entries()) {
+    const who = members.length > 1 ? `browser ${i + 1} of ${members.length}: ` : '';
+    if (result.status === 'blocked' || result.status === 'missing-chrome' || result.status === 'failed') {
+      // Environment, not usage: the invocation was right, the machine is not
+      // ready, and CI has to be able to tell those apart.
+      process.stderr.write(`wowlidator: ${who}${result.message}\n`);
+      return EXIT.environment;
+    }
+    if (result.status !== 'ready') log?.(`${who}${result.message}`);
   }
-  if (result.status !== 'ready') log?.(result.message);
+  if (members.length > 1) {
+    log?.(`browser pool: ${members.length} Chromes — ${members.map((m) => portOf(m.cdpUrl)).join(', ')}`);
+  }
 
   // A reachability check on the page under test, when we know it. Failing here
   // beats failing on step 1 with a selector error about a page that never
   // loaded.
+  // The page gets APP_REACH_GRACE_MS to answer, with a countdown on the
+  // console (2026-09-04): a dev server that is a few seconds from up used to
+  // fail the whole run on one 5 s probe.
   if (appUrl && !options.waitFor) {
-    try {
-      await fetch(appUrl, { signal: AbortSignal.timeout(5_000), redirect: 'follow' });
-    } catch {
+    const ready = await waitForApp(appUrl, APP_REACH_GRACE_MS, log);
+    if (!ready) {
       process.stderr.write(
-        `wowlidator: cannot reach ${appUrl} — is the app running?\n` +
-          'Use --wait-for <url> to wait for it instead of failing.\n',
+        `wowlidator: cannot reach ${appUrl} after ${APP_REACH_GRACE_MS / 1000}s — is the app running?\n` +
+          'Use --wait-for <url> to wait longer (90s) instead of failing.\n',
       );
+      // The browsers were started for a run that is not going to happen;
+      // `--stop-chrome` means what it says on this exit too. Without this a
+      // pool left n headless Chromes behind every time the app was down.
+      await cleanupChrome(options);
       return EXIT.environment;
     }
   }
@@ -189,14 +212,78 @@ export async function prepare(options: CliOptions, appUrl?: string): Promise<num
   return null;
 }
 
+/** How long the page under test gets to answer before a run is refused, when `--wait-for` was not given. */
+export const APP_REACH_GRACE_MS = 10_000;
+
 /** Set by `prepare`; only a browser this process started may be stopped. */
 let chromeStartedByUs = false;
+/** Every browser `prepare` ensured, primary first — what a parallel run leases from. */
+let chromePool: { cdpUrl: string; profile: string; startedByUs: boolean }[] = [];
 
-/** Stop the browser, if we started it and were asked to. */
+/**
+ * The CDP endpoints a parallel run may spread its lanes over, primary first.
+ * One entry unless `--browsers` asked for more; empty before `prepare` ran
+ * (or with `--no-ensure-chrome`), in which case a caller uses `options.cdp`.
+ */
+export function laneBrowsers(): readonly string[] {
+  return chromePool.map((m) => m.cdpUrl);
+}
+
+/**
+ * Make sure the pool holds at least `count` browsers — for a case that needs
+ * one Chrome per persona when `--browsers` did not ask for that many up
+ * front. Catalog runs author their flows in a pipeline, so how many people a
+ * case signs in as is unknown when `prepare` runs; the pool grows the moment
+ * a case says.
+ *
+ * Members are ensured by the same rules as the pool `prepare` builds (see
+ * `ensureChromePool`): consecutive ports from the primary, own profiles,
+ * headless unless `--no-headless` was said. A member that cannot be had is
+ * reported and skipped — the case then shares a browser and says so — never
+ * blocked: a missing Chrome is a convenience lost, not a verdict.
+ *
+ * Returns the pool as it stands afterwards, primary first. Empty when
+ * `prepare` never ran (`--no-ensure-chrome`): there is no pool to grow, and
+ * the caller falls back to `options.cdp` exactly as before.
+ */
+export async function growPool(options: CliOptions, count: number): Promise<readonly string[]> {
+  if (chromePool.length === 0 || !options.ensureChrome) return laneBrowsers();
+  const primary = chromePool[0]!;
+  const log = lineLogger(options);
+  const wanted = Math.max(1, Math.floor(count));
+  for (let i = chromePool.length; i < wanted; i += 1) {
+    const member = poolMember(primary.cdpUrl, options.chromeProfile, i);
+    const result = await ensureChrome({
+      cdpUrl: member.cdpUrl,
+      profile: member.profile,
+      headless: options.headless ?? true,
+      onLog: log ? (line): void => log(`[browser ${i + 1}] ${line}`) : undefined,
+    });
+    if (result.status === 'blocked' || result.status === 'missing-chrome' || result.status === 'failed') {
+      process.stderr.write(`wowlidator: browser ${i + 1}: ${result.message} — personas will share a Chrome\n`);
+      break;
+    }
+    chromePool.push({ cdpUrl: result.cdpUrl, profile: member.profile, startedByUs: result.startedByUs });
+  }
+  if (chromePool.length > 1) {
+    log?.(`browser pool: ${chromePool.length} Chromes — ${chromePool.map((m) => portOf(m.cdpUrl)).join(', ')}`);
+  }
+  return laneBrowsers();
+}
+
+/** Stop the browser(s), if we started them and were asked to. */
 export async function cleanupChrome(options: CliOptions): Promise<void> {
-  if (!chromeStartedByUs || !options.stopChrome) return;
-  lineLogger(options)?.('stopping the Chrome this run started');
-  await stopChrome(portOf(options.cdp ?? DEFAULT_CDP_URL), options.chromeProfile);
+  if (!options.stopChrome) return;
+  const ours = chromePool.length > 0
+    ? chromePool.filter((m) => m.startedByUs)
+    : chromeStartedByUs
+      ? [{ cdpUrl: options.cdp ?? DEFAULT_CDP_URL, profile: options.chromeProfile, startedByUs: true }]
+      : [];
+  if (ours.length === 0) return;
+  lineLogger(options)?.(
+    ours.length === 1 ? 'stopping the Chrome this run started' : `stopping the ${ours.length} Chromes this run started`,
+  );
+  await Promise.all(ours.map((m) => stopChrome(portOf(m.cdpUrl), m.profile)));
 }
 
 /** Open a file with the platform's default handler. */

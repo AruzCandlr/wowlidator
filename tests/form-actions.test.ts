@@ -117,6 +117,14 @@ const FORM_FIXTURE_HTML = `<!doctype html>
     <label><input id="agree" type="checkbox"> I agree</label>
     <button id="notify" type="button" aria-pressed="false">Notify me</button>
 
+    <!-- humi-SIT's HumiDatePicker idiom: a read-only display named by its
+         placeholder, drawn over the hidden date input the label points at. -->
+    <label for="hire-date">Hire Date</label>
+    <div style="position:relative">
+      <input type="text" readonly placeholder="Select date" value="">
+      <input id="hire-date" type="date" style="position:absolute;inset:0;opacity:0">
+    </div>
+
     <label for="search">Search</label>
     <input id="search" type="text" autocomplete="off">
     <div id="suggestions" hidden>Suggested: matches</div>
@@ -186,6 +194,30 @@ describe('form actions against a real page (CDP)', { skip: skipBrowser }, () => 
       server.close((error) => (error ? reject(error) : resolve())),
     );
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it('fills the real date input beneath a read-only "Select date" shell, as an ISO date, fast (HIR-EC-001)', async () => {
+    // The flow as ec10 authored it: the placeholder-named read-only display,
+    // and the date the way the sheet writes it. Before this rung the fill
+    // waited its whole budget on the read-only field at every rung — 56 s —
+    // and entered nothing.
+    const flow: Flow = {
+      name: 'read-only shell',
+      baseUrl: origin,
+      steps: [
+        { action: 'goto', url: '/' },
+        { action: 'fill', selector: 'role=textbox[name="Select date" i]', value: '01 Sep 2027' },
+        { action: 'expectValue', selector: '#hire-date', value: '2027-09-01' },
+      ],
+    };
+    const started = Date.now();
+    const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'shell.json'), healer: null });
+    assert.equal(bundle.status, 'passed', bundle.error ?? 'the shell rung should fill the input beneath');
+    const fill = bundle.steps.find((s) => s.action === 'fill' && (s.selector ?? '').includes('Select date'));
+    assert.equal(fill?.resolution, 'narrow');
+    assert.match(fill?.resolvedSelector ?? '', /input:not\(\[readonly\]\)/);
+    assert.ok((bundle.notes ?? []).some((n) => n.includes('read-only display over the real input') && n.includes('2027-09-01')));
+    assert.ok(Date.now() - started < 20_000, `took ${Date.now() - started}ms — the read-only field must not be waited on rung after rung`);
   });
 
   it('selects a native <select> option by its visible label', async () => {
@@ -284,5 +316,63 @@ describe('form actions against a real page (CDP)', { skip: skipBrowser }, () => 
     };
     const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'type.json') });
     assert.equal(bundle.status, 'passed', bundle.error ?? 'typing should reveal the suggestions');
+  });
+});
+
+/* ------------------------------------------------- paste, the last way in */
+
+describe('the agent can paste (2026-09-02)', () => {
+  it('paste is in every vocabulary an acting run may use, and in none a reveal run may', async () => {
+    const {
+      AGENT_ACTIONS,
+      INTERACTION_ACTIONS,
+      REVEAL_ACTIONS,
+      READ_ONLY_ACTIONS,
+    } = await import('../src/orchestrator/workflow-agent.js');
+    assert.ok((AGENT_ACTIONS as readonly string[]).includes('paste'), 'the agent may paste');
+    // It engages a control, so it counts against a stall the way fill does.
+    assert.ok(INTERACTION_ACTIONS.has('paste'));
+    // An assertion's repair may reveal, never write — a claim typed (or
+    // pasted) into existence proves nothing.
+    assert.ok(!REVEAL_ACTIONS.has('paste'), 'a reveal run must not paste');
+    assert.ok(!READ_ONLY_ACTIONS.has('paste'), 'a read-only run must not paste');
+  });
+});
+
+describe('the entry rung reads the value back (valueMatches)', () => {
+  it('accepts the page\'s own rendering of what was asked for', async () => {
+    const { valueMatches } = await import('../src/engine/runner.js');
+    // ec10 HIR-EC-001: the flow keys `01 Sep 2027`, the field renders `1 Sep 2027`.
+    assert.ok(valueMatches('1 Sep 2027', '1 Sep 2027'));
+    assert.ok(valueMatches('New Hire', 'New Hire'));
+    // A custom control reports its label with the row around it.
+    assert.ok(valueMatches('New Hire', 'Event Reason\nNew Hire'));
+    assert.ok(valueMatches('กรุงเทพมหานคร', ' กรุงเทพมหานคร '));
+    assert.ok(valueMatches('new hire', 'New Hire'), 'case is the page\'s business');
+  });
+
+  it('never calls an empty or different control a match', async () => {
+    const { valueMatches } = await import('../src/engine/runner.js');
+    assert.ok(!valueMatches('1 Sep 2027', ''));
+    assert.ok(!valueMatches('New Hire', 'Rehire'));
+    assert.ok(!valueMatches('1 Sep 2027', '2 Sep 2026'), 'the pinned clock default is not the ask');
+    // Asking for nothing is satisfied only by nothing.
+    assert.ok(valueMatches('', ''));
+    assert.ok(!valueMatches('', 'something'));
+  });
+});
+
+describe('isoDateOf — what a date input will accept', () => {
+  it('converts the ways a sheet writes a date, and leaves ambiguity alone', async () => {
+    const { isoDateOf } = await import('../src/engine/runner.js');
+    assert.equal(isoDateOf('01 Sep 2027'), '2027-09-01');
+    assert.equal(isoDateOf('1 Sep 2027'), '2027-09-01');
+    assert.equal(isoDateOf('1 September 2027'), '2027-09-01');
+    assert.equal(isoDateOf('Sep 1, 2027'), '2027-09-01');
+    assert.equal(isoDateOf('2027-09-01'), '2027-09-01');
+    // January or September? Depends on who wrote it — never guessed.
+    assert.equal(isoDateOf('01/09/2027'), null);
+    assert.equal(isoDateOf('New Hire'), null);
+    assert.equal(isoDateOf('32 Sep 2027'), null);
   });
 });

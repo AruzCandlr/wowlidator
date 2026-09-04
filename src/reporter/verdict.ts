@@ -23,7 +23,7 @@ import type { ProofBundle, ProofStep } from '../engine/proof-bundle.js';
 export type Owner = 'frontend' | 'backend' | 'mixed';
 
 export interface Verdict {
-  status: 'passed' | 'failed' | 'error' | 'dead-end';
+  status: 'passed' | 'passed-with-issues' | 'needs-review' | 'failed' | 'error' | 'dead-end';
   /** One line: outcome, flow name. */
   headline: string;
   /** What broke, in the author's own words where they gave any. */
@@ -43,9 +43,29 @@ export interface Verdict {
  */
 export const VERDICT_COPY = {
   passedHeadline: (name: string) => `PASSED — ${name}`,
+  passedWithIssuesHeadline: (name: string) =>
+    `PASS** — ${name} (every claim held; ** marks a step that only acted and broke — not a validation failure)`,
+  passedWithIssuesWhat: (assertions: number, broken: number) =>
+    `All ${assertions} claim${assertions === 1 ? '' : 's'} held, but ${broken} step${broken === 1 ? '' : 's'} that ` +
+    'only acted (a click, a navigation, an agent leg) broke along the way. The claims are proved ' +
+    'by the assertions that passed; the broken steps are listed below and filed as findings — ' +
+    'read them before trusting the green, because a claim that holds whether or not the action ' +
+    'before it landed may be a claim about the wrong thing.',
+  needsReviewHeadline: (name: string) =>
+    `PROVED-? — ${name} (a human must confirm: the wording on the page is a near-miss of the claim)`,
+  needsReviewWhat: (unsure: number) =>
+    `${unsure} assertion${unsure === 1 ? '' : 's'} failed only on WORDING, and closely: the page ` +
+    'produced the right kind of thing under a name the claim does not quite match. Whether that is ' +
+    'a spec violation or an acceptable rendering is a decision, not a measurement — the unsure ' +
+    'steps below carry the exact expected-vs-actual pair as proof. Confirm the run proved or ' +
+    'failed in the panel (or write `review` into the proof bundle); until then it counts as ' +
+    'neither a pass nor a product failure.',
   failedHeadline: (name: string) => `FAILED — ${name}`,
   errorHeadline: (name: string) => `ERROR — ${name} (the run hit errors; this is not an assertion failure)`,
-  deadEndHeadline: (name: string) => `DEAD END — ${name} (a control could not be found by any means; nothing left to try)`,
+  // Family wording (2026-08-27): a dead end IS the test failing — the page
+  // never offered what the case needed — so the headline leads with that and
+  // keeps the mechanism in the parenthesis.
+  deadEndHeadline: (name: string) => `TEST FAILED — ${name} (dead end: a control the case needed could not be found by any means; nothing left to try)`,
   passedAll: (steps: number) =>
     `All ${steps} step${steps === 1 ? '' : 's'} did what the test said they should.`,
   runError: 'The run could not complete. Nothing below was verified.',
@@ -53,9 +73,37 @@ export const VERDICT_COPY = {
 
   // What broke — chosen by the shape of the failure, not by guesswork.
   couldNotFind: (what: string) => `${what} — the control it needed was never found.`,
+  /**
+   * A step the agent had to judge its way past.
+   *
+   * PB_01_01 met a PDPA consent screen the flow never mentioned; without this
+   * the report showed a bare `agent` badge and a reader had no way to learn
+   * that a decision had been taken on their behalf. The agent's own words are
+   * quoted, never paraphrased — the same rule the report follows for text
+   * captured from the application.
+   */
+  agentDecided: (observed: string, decided: string) =>
+    observed
+      ? `The run met something the flow does not describe — the agent judged "${observed}" and decided to ${decided}.`
+      : `The run met something the flow does not describe; the agent decided to ${decided}.`,
+  // A content mismatch is the OPPOSITE of not-found: the element resolved and
+  // answered, just not with the expected text. Calling it "never found" sent
+  // readers hunting a missing control that was on screen the whole time.
+  contentMismatch: (what: string) =>
+    `${what} — the element was found, but the text it shows is not what the test expected.`,
+  // Same inversion for an absence check: a timeout there means the element
+  // STAYED VISIBLE, which is as far from "never found" as a failure gets.
+  stayedVisible: (what: string) =>
+    `${what} — the element the test expected to be absent was still on the page.`,
   assertionFailed: (what: string) => `${what} — the check did not hold.`,
   backendAnswered: (what: string) => `${what} — the endpoint did not answer as expected.`,
   stepFailed: (what: string) => `${what} — this step failed.`,
+  // Where the failure happened outranks how: a step that ran against a
+  // sign-in page says nothing about the feature it meant to test.
+  strandedSide: (url: string) =>
+    `The failing step ran against a sign-in page (${url}). If the flow did not mean to be ` +
+    `testing that page, the session was never established and this failure says nothing ` +
+    `about the feature — fix the flow's sign-in before reading anything else here.`,
 
   // Which side.
   frontendSide: (calls: number) =>
@@ -82,6 +130,15 @@ export const VERDICT_COPY = {
 /** Actions whose failure is an assertion not holding, rather than a lost control. */
 const ASSERTION_PREFIX = /^expect/;
 
+/** The pathname, or the whole string when it is not a URL — regex fodder only. */
+function pathnameOf(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
+}
+
 /** Describe a step the way its author would: their intent, else what it did. */
 export function describeStep(step: ProofStep): string {
   if (step.intent) return `"${step.intent.replace(/\s+$/, '')}"`;
@@ -92,18 +149,34 @@ export function describeStep(step: ProofStep): string {
 function whatBroke(step: ProofStep): string {
   const described = describeStep(step);
   const error = step.error ?? '';
-  const base = /could not resolve|did not resolve|Timeout .* exceeded/i.test(error)
-    ? VERDICT_COPY.couldNotFind(described)
-    : /expected status|expected .* to (contain|be)|did not match/i.test(error)
-      ? VERDICT_COPY.backendAnswered(described)
-      : ASSERTION_PREFIX.test(step.action)
-        ? VERDICT_COPY.assertionFailed(described)
-        : VERDICT_COPY.stepFailed(described);
+  // Order is load-bearing. A content mismatch is frequently WRAPPED in a
+  // "could not resolve" header (the ladder retried and every rung saw the
+  // same wrong text), so the mismatch check must come first or the reader is
+  // told a control on screen was "never found". An absence check's timeout is
+  // the same inversion: the element was found and stayed.
+  const base = /expected text to contain/i.test(error)
+    ? VERDICT_COPY.contentMismatch(described)
+    : step.action === 'expectHidden' && /Timeout .* exceeded/i.test(error)
+      ? VERDICT_COPY.stayedVisible(described)
+      : /could not resolve|did not resolve|Timeout .* exceeded/i.test(error)
+        ? VERDICT_COPY.couldNotFind(described)
+        : /expected status|expected .* to (contain|be)|did not match/i.test(error)
+          ? VERDICT_COPY.backendAnswered(described)
+          : ASSERTION_PREFIX.test(step.action)
+            ? VERDICT_COPY.assertionFailed(described)
+            : VERDICT_COPY.stepFailed(described);
   // What the page was showing outranks how the machinery failed to find
   // things on it — "the page said Access Denied" is the diagnosis, "could not
   // resolve" is a symptom. Quoted verbatim: evidence, never paraphrase.
   const showing = step.pageContext?.[0];
-  return showing ? `The page was showing "${showing}" at the moment of failure. ${base}` : base;
+  const account = showing ? `The page was showing "${showing}" at the moment of failure. ${base}` : base;
+  // A decision taken on the reader's behalf outranks the machinery's account
+  // of how it failed to find things: "the agent accepted a consent screen and
+  // it still did not resolve" is the diagnosis, "could not resolve" is the
+  // symptom. Appended rather than prefixed — the page's own words still lead.
+  return step.decision
+    ? `${account} ${VERDICT_COPY.agentDecided(step.decision.observed, step.decision.decided)}`
+    : account;
 }
 
 const HISTORY_COPY: Record<string, (bundle: ProofBundle) => string> = {
@@ -151,6 +224,34 @@ export function buildVerdict(bundle: ProofBundle): Verdict {
       firstFailingStep: null,
     };
   }
+  if (bundle.status === 'passed-with-issues') {
+    const counted = bundle.steps.filter((s) => !s.superseded);
+    const assertions = counted.filter((s) => /^expect|^snapshot$|^fillEach$|^fillRetry$/.test(s.action)).length;
+    const broken = counted.filter((s) => s.status !== 'passed').length;
+    return {
+      status: 'passed-with-issues',
+      headline: VERDICT_COPY.passedWithIssuesHeadline(bundle.name),
+      what: VERDICT_COPY.passedWithIssuesWhat(assertions, broken),
+      side: null,
+      history,
+      owner: null,
+      // The first broken step is where the reader should look, even on a pass.
+      firstFailingStep: failing?.index ?? null,
+    };
+  }
+
+  if (bundle.status === 'needs-review') {
+    const unsure = bundle.steps.filter((s) => !s.superseded && s.unsure !== undefined).length;
+    return {
+      status: 'needs-review',
+      headline: VERDICT_COPY.needsReviewHeadline(bundle.name),
+      what: VERDICT_COPY.needsReviewWhat(unsure),
+      side: null,
+      history,
+      owner: null,
+      firstFailingStep: failing?.index ?? null,
+    };
+  }
 
   const what = failing
     ? whatBroke(failing)
@@ -159,7 +260,17 @@ export function buildVerdict(bundle: ProofBundle): Verdict {
       : VERDICT_COPY.noSteps;
 
   let side: string | null = null;
-  if (owner === 'backend') side = VERDICT_COPY.backendSide(summary.networkFailures);
+  // A failing step recorded on a sign-in URL outranks the frontend/backend
+  // split: whatever the summary attributes, a step asserted against a login
+  // page indicts the flow's sign-in, not the feature — the same evidence the
+  // session guard reads, applied to the report's own copy. (Mirrors the
+  // runner's looksLikeSignIn; the bundle is all this module may read.)
+  const strandedUrl =
+    failing?.url && /(^|\/)(login|signin|sign-in|auth|sso)(\/|$)/i.test(pathnameOf(failing.url))
+      ? failing.url
+      : null;
+  if (strandedUrl !== null) side = VERDICT_COPY.strandedSide(strandedUrl);
+  else if (owner === 'backend') side = VERDICT_COPY.backendSide(summary.networkFailures);
   else if (owner === 'frontend') side = VERDICT_COPY.frontendSide(summary.networkCalls);
   else if (owner === 'mixed') side = VERDICT_COPY.mixedSide;
 
@@ -193,13 +304,24 @@ export interface TraceRung {
 const RUNG_PROSE: Record<string, string> = {
   fast: 'Tried the selector exactly as the test wrote it',
   case: 'Retried it ignoring letter-case',
-  narrow: 'Retried the ambiguous text selector as exact text',
+  narrow: "Re-matched the author's text selector against what the page actually renders",
+  // The free rungs added on the humi benchmark (2026-09-03): a control folded
+  // inside a collapsed section, a fixed bar over the control, a claim held
+  // against the label's container, and the two stop rungs that end the
+  // ladder with a verdict instead of paying a model to disprove nothing.
+  reveal: "Opened the collapsed section holding the control and retried the author's own selector",
+  scroll: 'Scrolled the control clear of the fixed bar that was intercepting the pointer and retried',
+  kin: "Checked the claim against the control's container, where a label's value sits beside it",
+  absence: "Stopped — the text is nowhere in the page's visible text, so no repair could find it; the claim fails on the page as it stands",
+  'not-found': 'Stopped — the application had navigated to a page it does not have (a 404 rendered in place); no repair attempted',
   cache: 'Tried a selector repaired on an earlier run',
   late: 'Gave the content one longer window to render',
   backend: 'Stopped without attempting a repair — a request had already failed',
   authorization: 'Stopped without attempting a repair — the page is an authorization failure',
   known: 'Stopped — this exact selector already dead-ended on this page earlier in the run',
+  declined: 'Declined to ask the model for a repair',
   jit: 'Asked the model for a replacement selector',
+  agent: 'Let the agent drive the browser to make the control reachable, then retried',
 };
 
 /**
@@ -214,7 +336,10 @@ export function escalationTrace(error: string | undefined): TraceRung[] {
   if (!error || !error.includes('\n')) return [];
   const rungs: TraceRung[] = [];
   for (const line of error.split('\n')) {
-    const match = /^\s*-\s+([a-z]+)\b[^:]*:\s*(.*)$/i.exec(line);
+    // A rung's name may carry a hyphen (`not-found:` — the app-404 stop rung);
+    // the old `[a-z]+` read it as "not" and the account said "Tried the not
+    // step". A lone `not` never names a rung, so the widening is safe.
+    const match = /^\s*-\s+([a-z]+(?:-[a-z]+)*)\b[^:]*:\s*(.*)$/i.exec(line);
     if (!match) continue;
     const rung = (match[1] ?? '').toLowerCase();
     const detail = (match[2] ?? '').trim();

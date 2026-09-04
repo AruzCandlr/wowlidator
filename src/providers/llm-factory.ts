@@ -24,12 +24,29 @@ import { z } from 'zod';
 
 import {
   PROVIDER_META,
+  PROVIDERS,
+  SERIAL_PROVIDERS,
   loadConfig,
+  localLlmBaseUrl,
   type LlmRole,
   type ProviderName,
   type RoleConfig,
   type WowlidatorConfig,
 } from '../config.js';
+import { localFetch } from './local-fetch.js';
+import { createClaudeCli } from './claude-cli.js';
+import { createClaudeCloud, createClaudeTty } from './claude-tty.js';
+import { maybeLogClaudeQuota } from './claude-quota.js';
+import { dedupeKeyFor, serialGateFor } from './serial-gate.js';
+import { logLlmFailure, logLlmRequest, logLlmResponse } from './llm-log.js';
+import {
+  PACED_PROVIDERS,
+  PACER_MAX_WAIT_MS,
+  estimateTokens,
+  isRateLimitError,
+  pacerFor,
+  type RatePacer,
+} from './rate-pacer.js';
 
 export class MissingApiKeyError extends Error {
   readonly provider: ProviderName;
@@ -43,7 +60,7 @@ export class MissingApiKeyError extends Error {
         `  ${meta.freeTier}\n` +
         `  Add more than one as a comma-separated list (${meta.envKey}=key1,key2) ` +
         `and wowlidator fails over to the next automatically when one is exhausted.\n` +
-        `Or point the role elsewhere: WOWLIDATOR_${role.toUpperCase()}_PROVIDER=<google|groq|openrouter|emmiedev|zai>`,
+        `Or point the role elsewhere: WOWLIDATOR_${role.toUpperCase()}_PROVIDER=<${PROVIDERS.join('|')}>`,
     );
     this.name = 'MissingApiKeyError';
     this.provider = provider;
@@ -114,13 +131,62 @@ export function isKeyExhaustedError(error: unknown): boolean {
   return KEY_FAILURE_PATTERN.test(error instanceof Error ? error.message : String(error));
 }
 
-type ModelBuilder = (apiKey: string, modelId: string) => LanguageModel;
+/** How a (key, model id) becomes a `LanguageModel`. Exported as a test seam only. */
+export type ModelBuilder = (
+  apiKey: string,
+  modelId: string,
+  options?: {
+    baseUrl?: string | undefined;
+    /**
+     * Reasoning effort, for a provider that has the concept. Per role, so a
+     * run can spend it where authoring happens and keep the roles called
+     * every few seconds cheap and quick.
+     */
+    effort?: string | undefined;
+    /** Tools to make available to the provider session (e.g. for `claude-cli`). */
+    tools?: string | readonly string[] | undefined;
+    /** Allowed tools for the provider session. */
+    allowedTools?: string | readonly string[] | undefined;
+    /** Disallowed tools for the provider session. */
+    disallowedTools?: string | readonly string[] | undefined;
+    /**
+     * Whether the session may search the run's registered corpus (repo
+     * context graph + context documents) over the loopback BM25 MCP tool —
+     * `claude-cli` only; other providers ignore it. See `claude-retrieval.ts`.
+     */
+    retrieval?: boolean | undefined;
+    /** The role this model serves — spend attribution for session-billed providers. */
+    role?: string | undefined;
+  },
+) => LanguageModel;
 
 /**
  * One entry per provider. Each returns a `LanguageModel` — the AI SDK's
  * common denominator — so nothing downstream knows which vendor answered.
  */
 const FACTORIES: Record<ProviderName, ModelBuilder> = {
+  // No key: the CLI carries the operator's own session. See `claude-cli.ts`
+  // for why the system prompt is replaced and the process runs from a
+  // neutral directory.
+  'claude-cli': (_apiKey, modelId, options) =>
+    createClaudeCli({
+      modelId,
+      ...(options?.effort === undefined ? {} : { effort: options.effort }),
+      ...(options?.tools === undefined ? {} : { tools: options.tools }),
+      ...(options?.allowedTools === undefined ? {} : { allowedTools: options.allowedTools }),
+      ...(options?.disallowedTools === undefined ? {} : { disallowedTools: options.disallowedTools }),
+      ...(options?.retrieval === undefined ? {} : { retrieval: options.retrieval }),
+      ...(options?.role === undefined ? {} : { role: options.role }),
+    }),
+  // Same session, one warm interactive process per (model, effort) — pooled
+  // in module state, because this builder runs on EVERY failover call.
+  'claude-tty': (_apiKey, modelId, options) =>
+    createClaudeTty({ modelId, ...(options?.effort === undefined ? {} : { effort: options.effort }) }),
+  // The same account with the work in a Claude Code cloud session — the warm
+  // terminal again, launched with `--cloud`. Pooled in module state for the
+  // same reason as `claude-tty`.
+  'claude-cloud': (_apiKey, modelId, options) =>
+    createClaudeCloud({ modelId, ...(options?.effort === undefined ? {} : { effort: options.effort }) }),
   google: (apiKey, modelId) => createGoogleGenerativeAI({ apiKey })(modelId),
   groq: (apiKey, modelId) => createGroq({ apiKey })(modelId),
   openrouter: (apiKey, modelId) => createOpenRouter({ apiKey })(modelId),
@@ -135,6 +201,50 @@ const FACTORIES: Record<ProviderName, ModelBuilder> = {
       name: 'zai',
       baseURL: 'https://api.z.ai/api/paas/v4',
       apiKey,
+    })(modelId),
+  deepseek: (apiKey, modelId) =>
+    createOpenAICompatible({
+      name: 'deepseek',
+      baseURL: 'https://api.deepseek.com/v1',
+      apiKey,
+    })(modelId),
+  airforce: (apiKey, modelId) =>
+    createOpenAICompatible({
+      name: 'airforce',
+      baseURL: 'https://api.airforce/v1',
+      apiKey,
+    })(modelId),
+  cerebras: (apiKey, modelId) =>
+    createOpenAICompatible({
+      name: 'cerebras',
+      baseURL: 'https://api.cerebras.ai/v1',
+      apiKey,
+    })(modelId),
+  requesty: (apiKey, modelId) =>
+    createOpenAICompatible({
+      name: 'requesty',
+      baseURL: 'https://router.requesty.ai/v1',
+      apiKey,
+    })(modelId),
+  local: (apiKey, modelId, options) =>
+    createOpenAICompatible({
+      name: 'local',
+      // The role's own server (`WOWLIDATOR_<ROLE>_BASE_URL`, the panel's port
+      // field) first; the shared `LOCAL_LLM_BASE_URL` otherwise.
+      baseURL: options?.baseUrl ?? localLlmBaseUrl(),
+      apiKey,
+      // The request carries the JSON schema itself (`response_format:
+      // json_schema`). mlx_lm.server ignores the field; the `rerise` wrapper
+      // around it reads the schema and SHAPES the reply to it before it
+      // leaves the server — fences and <think> blocks stripped, the object
+      // pulled out of surrounding prose, every required key present with
+      // its type's empty value. The schema is still stated in the prompt
+      // (`withPromptSchema`): the model is asked for the shape, and the
+      // server guarantees what it can of it.
+      supportsStructuredOutputs: true,
+      // A transport that waits for a minutes-long non-streaming generation —
+      // see `local-fetch.ts`. Node's default fetch hangs up at 300 s.
+      fetch: localFetch,
     })(modelId),
 };
 
@@ -182,7 +292,22 @@ export function createModelForRole(
     role,
     provider: entry.provider,
     modelId: entry.modelId,
-    model: builders[entry.provider](apiKey, entry.modelId),
+    model: builders[entry.provider](apiKey, entry.modelId, {
+      baseUrl: entry.baseUrl,
+      effort: entry.effort,
+      tools: entry.tools,
+      allowedTools: entry.allowedTools,
+      disallowedTools: entry.disallowedTools,
+      // The roles whose questions outgrow their prompt mid-thought: the
+      // generator (what does this route render, which table holds this), the
+      // healer (does anything declare the control it is looking for), and the
+      // agent — which is only ever on the page BECAUSE a step failed as a
+      // blocker, exactly when knowing the application's declared routes and
+      // tables is worth a lookup. `data` stays off: its one job is inventing
+      // a value, and grounding it in the repo would be over-thinking a fill.
+      retrieval: role === 'generator' || role === 'healer' || role === 'agent',
+      role,
+    }),
     id: modelIdFor(entry),
     keyIndex,
     keyCount: keys.length,
@@ -305,6 +430,13 @@ export class LlmFactory {
 
 // --- Structured generation --------------------------------------------------
 
+/** An image the model must read — a diagram photo, a screenshot of a spec. */
+export interface StructuredImage {
+  data: Uint8Array;
+  /** IANA media type, e.g. `image/png`. */
+  mediaType: string;
+}
+
 export interface StructuredRequest<T> {
   model: LanguageModel;
   /** `provider:modelId`, used to make failures name the model that failed. */
@@ -312,10 +444,20 @@ export interface StructuredRequest<T> {
   schema: z.ZodType<T>;
   system: string;
   prompt: string;
+  /**
+   * Images sent alongside the prompt, for vision-capable models. A model
+   * without vision fails the call with its label in the message — the useful
+   * question is which role to repoint, same as every other failure here.
+   */
+  images?: readonly StructuredImage[] | undefined;
   maxOutputTokens?: number | undefined;
   maxRetries?: number | undefined;
   /** Raw provider request fields, keyed by the provider's registry name. */
   providerOptions?: Record<string, Record<string, unknown>> | undefined;
+  /** Who is asking, for the request log — the role, plus anything the caller adds. */
+  task?: string | undefined;
+  /** Set for a paced provider (Google): waits for headroom, honours 429 delays. */
+  pacer?: RatePacer | undefined;
 }
 
 export interface StructuredResponse<T> {
@@ -392,6 +534,44 @@ export class StructuredOutputUnavailableError extends Error {
  * something that was never going to work, which is the same reason
  * `isKeyExhaustedError` exists.
  */
+/**
+ * What to tell the model about its last reply. Appended to the prompt of the
+ * re-ask, so the second ask is a different request from the first.
+ */
+function reaskNote(error: unknown, attempt: number): string {
+  const e = error as { text?: unknown; cause?: unknown } | undefined;
+  const zod = (e?.cause as { issues?: { path?: unknown[]; message?: unknown }[] } | undefined)?.issues;
+  const lines = [
+    `YOUR PREVIOUS REPLY (attempt ${attempt}) WAS REJECTED BEFORE IT WAS READ.`,
+  ];
+  if (Array.isArray(zod) && zod.length > 0) {
+    lines.push('It was JSON, but these fields did not match the schema:');
+    for (const issue of zod.slice(0, 8)) {
+      lines.push(`  - ${(issue.path ?? []).map(String).join('.') || '(root)'}: ${String(issue.message ?? '')}`);
+    }
+  } else if (typeof e?.text === 'string' && e.text !== '') {
+    // The parser's own complaint (the SDK's JSONParseError carries the
+    // SyntaxError as its cause) names the position; the generic list is what
+    // usually sits there. Both, so the note is exact where it can be.
+    const parser = findInChain(e?.cause, (x) => x?.name === 'SyntaxError') as { message?: unknown } | undefined;
+    lines.push(
+      'It was not valid JSON' +
+        (typeof parser?.message === 'string' && parser.message !== '' ? ` (parser: ${parser.message})` : '') +
+        '. Common causes: a double quote inside a string that was not ' +
+        'escaped as \\", a trailing comma, a comment, text before or after the object, ' +
+        'a value that is not a JSON literal.',
+    );
+  } else {
+    lines.push('It was empty.');
+  }
+  lines.push(
+    'Reply again with ONE JSON object and nothing else: valid JSON, every required key ' +
+      'present (use "" for a field you do not need), strings double-quoted with inner ' +
+      'quotes escaped.',
+  );
+  return lines.join('\n');
+}
+
 function worthReasking(error: unknown): boolean {
   return NoObjectGeneratedError.isInstance(error) && !isKeyExhaustedError(error);
 }
@@ -402,10 +582,17 @@ export async function generateStructured<T>(
   // Breaker first: a model that has already burned the full re-ask budget
   // twice does not get a third chance per call site — it gets one immediate
   // system failure, and the run's report says which role to repoint.
-  const tripped = exhaustedCycles.get(request.modelLabel) ?? 0;
+  // Keyed by ROLE and model, not model alone (2026-08-28). Live on be100: two
+  // authoring rows exhausted their re-asks on claude-cli:sonnet, the breaker
+  // opened for the LABEL — shared by generator, healer and agent, all on
+  // that model — and the agent was refused without a call on the very next
+  // case, then the whole catalog aborted. A role that keeps answering must
+  // never be switched off by a sibling's failures on the same model.
+  const breakerKey = `${request.task ?? 'model'}@${request.modelLabel}`;
+  const tripped = exhaustedCycles.get(breakerKey) ?? 0;
   if (tripped >= BREAKER_TRIPS) {
     throw new StructuredOutputUnavailableError(
-      `${request.modelLabel} structured-output circuit is open: it returned unusable ` +
+      `${request.modelLabel} structured-output circuit is open for the ${request.task ?? 'model'} role: it returned unusable ` +
         `objects through ${tripped} full re-ask cycles this session. This is a SYSTEM ` +
         `failure (the model, not the application). Point the role at a model that can ` +
         `do JSON-schema output — run \`wowlidator doctor\`, or set the role's ` +
@@ -415,53 +602,201 @@ export async function generateStructured<T>(
   }
 
   let last: unknown;
+  let budget = request.maxOutputTokens ?? 4096;
+  let feedback = '';
   for (let attempt = 1; attempt <= RECOVERABLE_ATTEMPTS; attempt++) {
     try {
-      const response = await attemptStructured(request);
+      const response = await attemptStructured({
+        ...request,
+        maxOutputTokens: budget,
+        prompt: feedback === '' ? request.prompt : `${request.prompt}\n\n${feedback}`,
+      });
       // A success halves the count rather than clearing it: one good roll
       // from a mostly-broken model must not reset the evidence against it.
-      const seen = exhaustedCycles.get(request.modelLabel) ?? 0;
-      if (seen > 0) exhaustedCycles.set(request.modelLabel, seen - 1);
+      const seen = exhaustedCycles.get(breakerKey) ?? 0;
+      if (seen > 0) exhaustedCycles.set(breakerKey, seen - 1);
       return response;
     } catch (error) {
       last = error;
       if (attempt === RECOVERABLE_ATTEMPTS || !worthReasking(error)) break;
+      // **A response cut at the output budget is re-asked with a BIGGER
+      // budget, never the same one.** Every structured call here runs at
+      // temperature 0, so an identical request is answered identically — a
+      // model that spent the budget on hidden reasoning and was cut off
+      // mid-object will be cut off at the same place three times running,
+      // and that is exactly what happened: "returned an unusable object" ×3,
+      // finish=length each time, then the circuit breaker, then a whole
+      // catalog run dead. Growth is bounded; a cap the answer really needs
+      // is paid once, and a model that stops sooner never bills the room.
+      const truncated = wasCutAtBudget(error);
+      if (truncated) budget = Math.min(budget * 2, MAX_STRUCTURED_OUTPUT_TOKENS);
+      // **A reply that arrived whole and was still unusable is re-asked WITH
+      // the complaint**, for the same temperature-0 reason: an identical
+      // request gets the identical malformed reply. Measured on a local
+      // Qwen3.5-4B: finish=stop, 621 tokens, "could not parse the response",
+      // three times running, then the breaker. The note names what was wrong
+      // (a parse failure, or the fields zod rejected) — the healer's
+      // `rejected` seam applied to the transport.
+      if (!truncated) feedback = reaskNote(error, attempt);
       // Same channel as key rotation: a run's output should say what it spent
       // and why, rather than a retry being invisible in the token count.
       process.stderr.write(
         `[wowlidator] ${request.modelLabel} returned an unusable object ` +
-          `(${summarize(error)}) — re-asking, attempt ${attempt + 1}/${RECOVERABLE_ATTEMPTS}\n`,
+          `(${summarize(error)}) — re-asking, attempt ${attempt + 1}/${RECOVERABLE_ATTEMPTS}` +
+          (truncated ? ` with the output budget raised to ${budget}` : '') +
+          '\n',
       );
     }
   }
   if (worthReasking(last)) {
-    exhaustedCycles.set(request.modelLabel, (exhaustedCycles.get(request.modelLabel) ?? 0) + 1);
+    exhaustedCycles.set(breakerKey, (exhaustedCycles.get(breakerKey) ?? 0) + 1);
   }
   throw describeStructuredFailure(request, last);
 }
 
+/** The most any structured call will be allowed to emit, thinking included. */
+export const MAX_STRUCTURED_OUTPUT_TOKENS = 32_768;
+
+/** Was the model's answer cut off at the output budget, with text arriving? */
+function wasCutAtBudget(error: unknown): boolean {
+  const bearer = evidenceBearer(error) as { finishReason?: unknown } | undefined;
+  return bearer?.finishReason === 'length';
+}
+
+/**
+ * The model was never heard from: the connection dropped, was refused, or the
+ * server closed it before answering. Not a schema fact and not a key fact —
+ * the local server being restarted mid-call read as "failed to produce a valid
+ * structured response … 3 times running" after ONE attempt (2026-08-21).
+ */
+function isTransportError(error: unknown): boolean {
+  if (NoObjectGeneratedError.isInstance(error) || isKeyExhaustedError(error)) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    APICallError.isInstance(error) ||
+    /cannot connect|other side closed|ECONNREFUSED|ECONNRESET|EPIPE|socket hang up|fetch failed|terminated|timeout|timed out|UND_ERR/i.test(message)
+  );
+}
+
 function describeStructuredFailure<T>(request: StructuredRequest<T>, error: unknown): Error {
   const detail = error instanceof Error ? error.message : String(error);
+  if (isTransportError(error)) {
+    return new StructuredOutputUnavailableError(
+      `${request.modelLabel} could not be reached — the connection failed before any answer arrived: ${detail}\n` +
+        'This is the transport, not the model or the schema: the server is down, was restarted ' +
+        'mid-call, or closed the connection. For a local server, check it is running and that ' +
+        'LOCAL_LLM_TIMEOUT_MS is long enough for the prompt; nothing was retried.',
+      request.modelLabel,
+      error,
+    );
+  }
   // The capability advice is wrong for a key failure, and actively
   // misleading: "try a different model id" sends someone changing config
   // when the model was fine and the call was rate-limited. Those failures
   // already rotate keys on their own — see `isKeyExhaustedError`.
+  // A third cause, a third advice: an answer CUT at an output budget is
+  // neither a key nor a model that cannot do JSON — it is a budget, and the
+  // dial is named on line one (2026-09-04: a claude-cli answer cut at the
+  // CLI's own cap used to read "try a different model id").
   const advice = isKeyExhaustedError(error)
     ? 'This looks like the key rather than the model — rate limit, quota, or ' +
       'an expired credential. Retry, or add a second key to rotate into.'
-    : `Not every free-tier model supports JSON-schema output, and this one failed ` +
-      `${RECOVERABLE_ATTEMPTS} times running. Try a different model id for this role, ` +
-      'or point the role at another provider.';
+    : wasCutAtBudget(error)
+      ? 'The answer was cut at an output budget, not refused: raise the budget the ' +
+        'first line names, or ask for a smaller answer.'
+      : `Not every free-tier model supports JSON-schema output, and this one failed ` +
+        `${RECOVERABLE_ATTEMPTS} times running. Try a different model id for this role, ` +
+        'or point the role at another provider.';
+  // Two different headlines for two different facts. "Failed to produce a
+  // valid structured response" is what the model DID say when it answered
+  // and the answer was unusable; a rate limit or quota is the model never
+  // having been asked, and wording it as the former sent a reader to change
+  // model ids over a daily token cap (Groq, 200k TPD, seen live).
+  const headline = isKeyExhaustedError(error)
+    ? `${request.modelLabel} could not be asked — the provider refused the call (rate limit, quota, or credential): ${detail}\n`
+    : `${request.modelLabel} failed to produce a valid structured response: ${detail}\n`;
+  // The evidence rides the FIRST line (2026-08-28). Every consumer that
+  // shows a person why a row was blocked — the case line, the ledger reason,
+  // the fatal — keeps `message.split('\n')[0]`, and the evidence used to sit
+  // on line two: a whole be100 run reported "did not match schema" ten times
+  // with what the model actually said discarded at every one of them.
+  const evidence = describeGenerationFailure(error).trim();
   return new StructuredOutputUnavailableError(
-    `${request.modelLabel} failed to produce a valid structured response: ${detail}\n` +
-      describeGenerationFailure(error) +
-      advice,
+    `${headline.trimEnd()}${evidence === '' ? '' : ` ${evidence}`}\n${advice}`,
     request.modelLabel,
     error,
   );
 }
 
+/** How many times one request may wait out a 429 before the failover sees it. */
+const RATE_LIMIT_RETRIES = 3;
+
 async function attemptStructured<T>(
+  request: StructuredRequest<T>,
+): Promise<StructuredResponse<T>> {
+  const task = request.task ?? 'model';
+  const estTokens = estimateTokens(request.system) + estimateTokens(request.prompt);
+  for (let attempt = 1; ; attempt++) {
+    // Pacing first: arriving under a limit costs seconds, arriving over it
+    // costs a 429, the SDK's blind retries and a key rotation.
+    let pacing: string | undefined;
+    if (request.pacer) {
+      const waited = await request.pacer.reserve(estTokens, task);
+      const snap = request.pacer.snapshot();
+      pacing =
+        `${snap.minute.requests}/${snap.limits.rpm ?? '∞'} RPM · ${snap.minute.tokens}/${snap.limits.tpm ?? '∞'} TPM · ` +
+        `${snap.day.requests}/${snap.limits.rpd ?? '∞'} RPD` +
+        (waited > 0 ? ` · waited ${Math.round(waited / 1000)}s` : '');
+    }
+    logLlmRequest({
+      task,
+      modelLabel: request.modelLabel,
+      system: request.system,
+      prompt: request.prompt,
+      estTokens,
+      attempt,
+      pacing,
+    });
+    const started = Date.now();
+    try {
+      const response = await sendStructured(request);
+      request.pacer?.record(response, estTokens);
+      logLlmResponse({
+        task,
+        modelLabel: request.modelLabel,
+        ms: Date.now() - started,
+        inputTokens: response.inputTokens,
+        outputTokens: response.outputTokens,
+        object: response.object,
+      });
+      // A claude-* call spends the signed-in account's own limits, so its
+      // headroom rides beside the call that spent from it. Fire-and-forget,
+      // cached, throttled — see `claude-quota.ts`; never on the hot path.
+      if (request.modelLabel.startsWith('claude-')) maybeLogClaudeQuota(task);
+      return response;
+    } catch (error) {
+      request.pacer?.release();
+      // A 429 on a paced provider is waited out for as long as the server
+      // asked, then the same request goes again on the same key — rotating
+      // keys over a full minute spends the next key on the same minute.
+      if (request.pacer && isRateLimitError(error) && attempt < RATE_LIMIT_RETRIES) {
+        const delay = request.pacer.learnFrom(error, task);
+        if (delay <= PACER_MAX_WAIT_MS) {
+          logLlmFailure({ task, modelLabel: request.modelLabel, ms: Date.now() - started, error, willRetryInMs: delay });
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+      }
+      logLlmFailure({ task, modelLabel: request.modelLabel, ms: Date.now() - started, error });
+      // A refused claude-* call is exactly when the account's headroom is the
+      // question — say where the limits stand next to the failure.
+      if (request.modelLabel.startsWith('claude-')) maybeLogClaudeQuota(task);
+      throw error;
+    }
+  }
+}
+
+async function sendStructured<T>(
   request: StructuredRequest<T>,
 ): Promise<StructuredResponse<T>> {
   {
@@ -469,7 +804,25 @@ async function attemptStructured<T>(
       model: request.model,
       schema: request.schema,
       system: request.system,
-      prompt: request.prompt,
+      // With images the prompt travels as a text part beside them — the SDK
+      // takes `prompt` or `messages`, never both.
+      ...(request.images?.length
+        ? {
+            messages: [
+              {
+                role: 'user' as const,
+                content: [
+                  { type: 'text' as const, text: request.prompt },
+                  ...request.images.map((image) => ({
+                    type: 'file' as const,
+                    data: image.data,
+                    mediaType: image.mediaType,
+                  })),
+                ],
+              },
+            ],
+          }
+        : { prompt: request.prompt }),
       // Zero, explicitly, for every structured call. Nothing here is creative
       // writing: a healer repairing a selector, an author turning a claim
       // into steps, an agent picking one action — each has a most-likely
@@ -521,7 +874,11 @@ function describeGenerationFailure(error: unknown): string {
     parts.push(
       e.text === ''
         ? 'model text was empty — likely all output budget went to hidden reasoning'
-        : echoedTheSchema(e.text)
+        : e.finishReason === 'length'
+          ? `the JSON was CUT OFF at the output budget (${e.text.length} chars arrived) — a thinking ` +
+            'model spent the budget on hidden reasoning; cap the reasoning (OpenRouter: ' +
+            'reasoning.max_tokens) or raise maxOutputTokens'
+          : echoedTheSchema(e.text)
           ? 'the model replied with the JSON *schema* instead of an instance of it ' +
             '(its answers are inside "const" fields) — see promptSchemaInstruction'
           : `model text began: ${JSON.stringify(e.text.slice(0, 160))}`,
@@ -662,7 +1019,14 @@ const REASONING_OUTPUT_FLOOR: Partial<Record<ProviderName, number>> = {
  * **How that instruction is worded is itself load-bearing — see
  * `promptSchemaInstruction`.**
  */
-const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai']);
+// DeepSeek offers `json_object` mode but no schema-constrained channel the
+// OpenAI-compatible provider can hand a schema to, so it is told the schema in
+// prose like the other two.
+// `claude-cli` is NOT among them: the CLI takes `--json-schema` and validates
+// against it, so restating the schema in the prompt would only cost tokens.
+// `claude-tty` IS: an interactive terminal has no schema channel at all —
+// and `claude-cloud` is that same terminal with the work in a cloud session.
+const SCHEMA_IN_PROMPT_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'zai', 'deepseek', 'local', 'claude-tty', 'claude-cloud']);
 
 /**
  * Silence the one AI SDK warning this codebase makes untrue.
@@ -750,10 +1114,19 @@ function withPromptSchema<T>(
   if (!SCHEMA_IN_PROMPT_PROVIDERS.has(provider)) return request;
   return {
     ...request,
+    // A request the local server has not answered yet is still being
+    // generated; re-sending it queues the copy behind the original and both
+    // time out. The re-ask loop above still handles a reply that arrived and
+    // was unusable — that is a different thing from a reply that has not
+    // arrived.
+    ...(provider === 'local' ? { maxRetries: 0 } : {}),
     system: `${request.system}\n\n${promptSchemaInstruction(request.schema as z.ZodType)}`,
     providerOptions: {
       [provider]: {
-        response_format: { type: 'json_object' },
+        // `local` keeps the SDK's own `json_schema` response_format so the
+        // schema reaches the server (see FACTORIES.local); the others have no
+        // schema channel and get plain JSON mode.
+        ...(provider === 'local' ? {} : { response_format: { type: 'json_object' } }),
         // GLM models think before every answer, and on the free tier that
         // thinking is both slow to produce and billed as output — measured
         // ~340 hidden tokens and 18s to say "ok", 2 tokens and 7s without.
@@ -766,6 +1139,99 @@ function withPromptSchema<T>(
   };
 }
 
+/**
+ * Models that think before they answer, reached through OpenRouter, and how
+ * much thinking a structured call is allowed to buy.
+ *
+ * Measured on `openrouter:google/gemini-3.6-flash` (2026-08-19), one
+ * authoring-sized call, four ways:
+ *
+ * | budget | reasoning              | outcome                                       |
+ * |--------|------------------------|-----------------------------------------------|
+ * | 2048   | default                | finish=length, 241 chars of JSON — ~1.8k hidden |
+ * | 8192   | default                | finish=length, cut mid-object after 38 s — ~7.3k hidden |
+ * | 2048   | effort: none           | refused: "Reasoning is mandatory for this endpoint" |
+ * | 2048   | max_tokens: 256        | finish=stop in 3.6 s, 12 steps, 0 wasted        |
+ *
+ * That is the whole of "returned an unusable object (No object generated:
+ * could not parse the response)": the JSON was fine, it was truncated because
+ * the model spent the output budget thinking, and it spends MORE the more it
+ * is given. `REASONING_OUTPUT_FLOOR` covers the same fact for the `google`
+ * provider by raising the budget; here the measured answer is to CAP the
+ * thinking instead — a floor of 16k would still be a coin toss (row 2 spent
+ * 7.3k and was not done), and would make every call four times slower.
+ *
+ * Gated on the model id, not the provider: OpenRouter fronts hundreds of
+ * models and a `reasoning` field sent to one that has none is at best ignored
+ * and at worst refused. The patterns are the families that think by default.
+ */
+const OPENROUTER_REASONING_MODEL = /gemini|deepseek-r|deepseek-reasoner|\bo[1345](-|$)|gpt-5|qwen3|qwq|thinking|reason|glm-4\.[5-9]|grok-[4-9]/i;
+export const OPENROUTER_REASONING_MAX_TOKENS = 1_024;
+
+/**
+ * Cap the hidden reasoning of a thinking model behind OpenRouter, and give
+ * the visible answer back the budget the cap took. See the table above.
+ */
+function withReasoningCap<T>(
+  request: Omit<StructuredRequest<T>, 'model'>,
+  provider: ProviderName,
+  modelId: string,
+): Omit<StructuredRequest<T>, 'model'> {
+  const existing = (request.providerOptions ?? {}) as Record<string, Record<string, unknown>>;
+  // Gemini reached directly, same fact, its own dial. Measured on
+  // `google:gemini-3.6-flash` with an authoring-sized prompt: default →
+  // 20.6s, 1,727 thinking tokens; `thinkingBudget: 1024` → 10.9s, 303;
+  // `thinkingBudget: 0` → "invalid argument" (thinking is mandatory on this
+  // model). The 16k `REASONING_OUTPUT_FLOOR` stays as the room the soft cap
+  // may still overrun; the cap is what makes the ordinary call fast.
+  if (provider === 'google' && /gemini/i.test(modelId)) {
+    return {
+      ...request,
+      providerOptions: {
+        ...existing,
+        google: {
+          ...(existing['google'] ?? {}),
+          thinkingConfig: {
+            ...((existing['google']?.['thinkingConfig'] as Record<string, unknown> | undefined) ?? {}),
+            thinkingBudget: OPENROUTER_REASONING_MAX_TOKENS,
+          },
+        },
+      },
+    };
+  }
+  // Groq's gpt-oss models reason at "medium" by default. Every call this
+  // codebase makes to them is extraction — a selector, one agent action, one
+  // data value — and measured, "low" answered the same in 766ms. It matters
+  // less for latency than for the free tier's tokens-per-minute cap: four
+  // cases running side by side hit that cap and the SDK's back-off turned an
+  // 8-turn agent leg into 202 seconds. Fewer tokens per call is the one lever
+  // against a per-minute limit that a run does not control.
+  if (provider === 'groq' && /gpt-oss/i.test(modelId)) {
+    return {
+      ...request,
+      providerOptions: {
+        ...existing,
+        groq: { ...(existing['groq'] ?? {}), reasoningEffort: 'low' },
+      },
+    };
+  }
+  if (provider !== 'openrouter' || !OPENROUTER_REASONING_MODEL.test(modelId)) return request;
+  return {
+    ...request,
+    // The cap is spent from the same budget as the answer, so the answer's own
+    // budget is restored on top of it — a healer sized at 1024 visible tokens
+    // still gets 1024 visible tokens.
+    maxOutputTokens: (request.maxOutputTokens ?? 4096) + OPENROUTER_REASONING_MAX_TOKENS,
+    providerOptions: {
+      ...existing,
+      openrouter: {
+        ...(existing['openrouter'] ?? {}),
+        reasoning: { max_tokens: OPENROUTER_REASONING_MAX_TOKENS },
+      },
+    },
+  };
+}
+
 export async function generateStructuredForModel<T>(
   source: ModelSource,
   request: Omit<StructuredRequest<T>, 'model'>,
@@ -773,13 +1239,49 @@ export async function generateStructuredForModel<T>(
   if ('model' in source) {
     return generateStructured({ ...request, model: source.model });
   }
-  return source.factory.callWithFailover(source.role, (resolved) => {
+  const entry = source.factory.config.roles[source.role];
+  // A provider that answers one call at a time is entered through its gate:
+  // bounded in flight, priority by who is waiting, one call per identical
+  // question. Nothing else changes — the failover and every adaptation below
+  // run inside the slot exactly as they would without it.
+  if (SERIAL_PROVIDERS.has(entry.provider)) {
+    const gate = serialGateFor(entry.baseUrl ?? entry.provider);
+    const key = dedupeKeyFor([source.role, entry.provider, entry.modelId, request.system, request.prompt]);
+    const { result, joined } = await gate.run(
+      source.role,
+      request.system.length + request.prompt.length,
+      () => callStructuredWithFailover(source, request),
+      request.images === undefined || request.images.length === 0 ? key : undefined,
+    );
+    // A joiner spent nothing: the tokens belong to the call it rode along with.
+    return joined ? { ...result, inputTokens: 0, outputTokens: 0 } : result;
+  }
+  return callStructuredWithFailover(source, request);
+}
+
+function callStructuredWithFailover<T>(
+  source: { factory: LlmFactory; role: LlmRole },
+  request: Omit<StructuredRequest<T>, 'model'>,
+): Promise<StructuredResponse<T>> {
+  return source.factory.callWithFailover(source.role, async (resolved) => {
+    const pacer = PACED_PROVIDERS.has(resolved.provider)
+      ? await pacerFor(
+          resolved.provider,
+          source.factory.config.apiKeys[resolved.provider]?.[resolved.keyIndex] ?? '',
+          resolved.modelId,
+        )
+      : undefined;
+    const task = request.task === undefined ? source.role : `${source.role} · ${request.task}`;
     const floor = REASONING_OUTPUT_FLOOR[resolved.provider];
     const maxOutputTokens =
       floor === undefined
         ? request.maxOutputTokens
         : Math.max(request.maxOutputTokens ?? 0, floor);
-    const adapted = withPromptSchema({ ...request, maxOutputTokens }, resolved.provider);
-    return generateStructured({ ...adapted, model: resolved.model });
+    const adapted = withReasoningCap(
+      withPromptSchema({ ...request, maxOutputTokens }, resolved.provider),
+      resolved.provider,
+      resolved.modelId,
+    );
+    return generateStructured({ ...adapted, model: resolved.model, task, pacer });
   });
 }

@@ -76,19 +76,39 @@ export {
   DEFAULT_CDP_URL,
   DEFAULT_FAST_TIMEOUT_MS,
   DEFAULT_HEALED_TIMEOUT_MS,
+  MAX_STEP_TIMEOUT_MS,
   BrowserGoneError,
+  PersonaUnknownError,
   SessionLostError,
   SmartRunner,
   StepResolutionError,
   isBrowserGone,
+  isStateContradiction,
   executeFlow,
+  resolvePersona,
+  personasIn,
   runFlow,
+  signsInItself,
+  stepPatience,
   type Flow,
   type FlowStep,
   type RunFlowOptions,
   type ScreenshotMode,
   type SmartRunnerOptions,
+  type StepValueSource,
 } from './engine/runner.js';
+
+// The wave-2 engine helpers (2026-09-03): the deterministic drivers behind
+// selectOption, the calendar rung, expectFieldError, upload/download and the
+// not-found stop, plus the value and date rules every comparator shares.
+export { SessionVault, type StoredSession } from './engine/session-vault.js';
+export { codeAndLabelOf, foldValue, foldedIncludes, foldedMatch, valueEquivalents, type FoldedMatch } from './engine/normalise.js';
+export { dateBuiltin, formatDate, isoDateOf, resolveDateExpression, type DateLocale } from './engine/dates.js';
+export { selectFromListbox, type ListboxSelection, type SelectFromListboxOptions } from './engine/listbox.js';
+export { pickDateInDialog, DateOutOfRangeError, type PickDateResult } from './engine/calendar.js';
+export { readFieldError, readFieldRequired, type FieldError, type FieldRequired } from './engine/field-error.js';
+export { attachFiles, captureDownload, FixtureMissingError, type AttachResult, type CapturedDownload } from './engine/upload.js';
+export { NOT_FOUND_HEADING_PATTERN, notFoundSurface, type NotFoundSurface } from './engine/not-found.js';
 
 export {
   API_STEP_ACTIONS,
@@ -179,6 +199,19 @@ export {
   type DocumentFormat,
   type ExtractedDocument,
 } from './catalog/extract.js';
+
+export {
+  CONTEXT_BUDGET_CHARS,
+  CONTEXT_DOC_MAX_CHARS,
+  CONTEXT_RETRIEVAL_MIN_CHARS,
+  chunkDocument,
+  rankChunks,
+  selectRelevantContext,
+  tokenize,
+  type ContextChunk,
+  type ContextSelection,
+  type ScoredChunk,
+} from './catalog/retrieve.js';
 
 export {
   CatalogError,
@@ -467,9 +500,79 @@ export {
 
 export {
   ApiActions,
+  MethodRefusedError,
+  NoResponseError,
+  methodRefused,
   type ApiActionsOptions,
   type FlowRequestSpec,
 } from './api/api-actions.js';
+
+export {
+  ObservationTruncatedError,
+  ObservationUnavailableError,
+  callSatisfies,
+  describeExpected,
+  matchExpectedCalls,
+  neverViolations,
+  parseExpectedCallEntry,
+  type CallMatch,
+  type ExpectedCall,
+  type FlowExpectCallsSpec,
+  type SequenceMatchResult,
+  type StatusClass,
+} from './api/expect-calls.js';
+
+export {
+  DbGroundingError,
+  DbUnavailableError,
+  connectDb,
+  defaultDbConfig,
+  isLoopbackDsn,
+  maskDsn,
+  type DbClient,
+  type DbColumn,
+  type DbConfig,
+  type DbResult,
+  type DbSchema,
+  type DbTable,
+} from './db/client.js';
+
+export {
+  DEFAULT_DB_TIMEOUT_MS,
+  DbActions,
+  looseEquals,
+  parseDbConditions,
+  quoteIdent,
+  type DbActionsOptions,
+  type DbCheckRecord,
+  type FlowDbCalledSpec,
+  type FlowDbDeltaSpec,
+  type FlowDbRowSpec,
+  type FlowDbSnapshotSpec,
+  type FlowDbUnchangedSpec,
+  type FlowDbValue,
+} from './db/db-actions.js';
+
+export {
+  DB_EVIDENCE_MAX_ROWS,
+  redactRow,
+  redactRows,
+  redactValue,
+  redactWhereSummary,
+} from './db/redact-row.js';
+
+export {
+  SequenceParseError,
+  classifyPlanes,
+  isObservable,
+  looksLikeSequenceDiagram,
+  parseSequenceDiagram,
+  sequenceToClaims,
+  type ParticipantPlane,
+  type SequenceDoc,
+  type SequenceMessage,
+  type SequenceParticipant,
+} from './catalog/sequence.js';
 
 export {
   UnknownVariableError,
@@ -483,6 +586,15 @@ export {
   toRoutePattern,
   type OpenApiIngesterOptions,
 } from './context/ingesters/openapi-ingester.js';
+
+export {
+  SchemaIngester,
+  parsePrismaSchema,
+  parseSqlSchema,
+  type SchemaIngesterOptions,
+} from './context/ingesters/schema-ingester.js';
+
+export { matchesCall } from './context/route-match.js';
 
 export {
   API_GENERATOR_ACTIONS,

@@ -14,11 +14,14 @@ import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promi
 import { dirname, posix, resolve } from 'node:path';
 import type { Dirent } from 'node:fs';
 
+import { matchesCall, matchesRoutePattern, pathnameOf } from './route-match.js';
 import { ManifestIngester } from './ingesters/manifest-ingester.js';
 import { ComponentIngester } from './ingesters/component-ingester.js';
 import { RouteIngester } from './ingesters/route-ingester.js';
 import { TestIngester } from './ingesters/test-ingester.js';
 import { OpenApiIngester } from './ingesters/openapi-ingester.js';
+import { SchemaIngester } from './ingesters/schema-ingester.js';
+import { MessageIngester } from './ingesters/message-ingester.js';
 import {
   PROJECT_GRAPH_VERSION,
   type IngestContext,
@@ -83,36 +86,10 @@ async function computeSignature(rootDir: string, files: readonly string[]): Prom
   return hash.digest('hex');
 }
 
-export function pathnameOf(url: string): string | undefined {
-  try {
-    return new URL(url).pathname;
-  } catch {
-    // A relative url never parses, so strip the query and hash by hand —
-    // `new URL()` would have done it for the absolute case, and a path that
-    // kept `?page=2` would fail to match the route pattern it plainly hits.
-    if (!url.startsWith('/')) return undefined;
-    return url.split(/[?#]/)[0] ?? url;
-  }
-}
-
-/** `:id` and `*catchAll` segments in `pattern` match anything at that position. */
-export function matchesRoutePattern(path: string, pattern: string): boolean {
-  const pathParts = path.split('/').filter(Boolean);
-  const patternParts = pattern.split('/').filter(Boolean);
-
-  const catchAllIndex = patternParts.findIndex((part) => part.startsWith('*'));
-  if (catchAllIndex !== -1) {
-    const fixed = patternParts.slice(0, catchAllIndex);
-    // A catch-all consumes one or more segments — `/blog` alone does not
-    // satisfy `/blog/*slug` (that's what an *optional* catch-all is for, a
-    // distinction this matcher's single `*` encoding does not carry).
-    if (pathParts.length <= fixed.length) return false;
-    return fixed.every((part, i) => part.startsWith(':') || part === pathParts[i]);
-  }
-
-  if (pathParts.length !== patternParts.length) return false;
-  return patternParts.every((part, i) => part.startsWith(':') || part === pathParts[i]);
-}
+// The pure matchers moved to `route-match.ts` (a leaf module, so the
+// `expectCalls` assertion can use them without loading the ingesters); the
+// re-export keeps every existing import of this module working.
+export { matchesCall, matchesRoutePattern, pathnameOf } from './route-match.js';
 
 /**
  * Cross-ingester linking pass: a `wowlidator-flow` test node records the URLs it
@@ -123,7 +100,8 @@ export function matchesRoutePattern(path: string, pattern: string): boolean {
 function linkCoverage(nodes: Map<string, ProjectNode>, edges: ProjectEdge[]): void {
   const routes = [...nodes.values()].filter((node) => node.kind === 'route');
   const operations = [...nodes.values()].filter((node) => node.kind === 'operation');
-  if (routes.length === 0 && operations.length === 0) return;
+  const tables = [...nodes.values()].filter((node) => node.kind === 'table');
+  if (routes.length === 0 && operations.length === 0 && tables.length === 0) return;
 
   const seen = new Set(edges.map((edge) => `${edge.from}>${edge.kind}>${edge.to}`));
   const link = (from: string, to: string): void => {
@@ -150,18 +128,28 @@ function linkCoverage(nodes: Map<string, ProjectNode>, edges: ProjectEdge[]): vo
     // answers "does anything already test this endpoint?" The method must
     // match exactly — `GET /orders` and `DELETE /orders` are different
     // promises, and crediting one for the other would overstate coverage in
-    // precisely the way `ax-coverage.ts` refuses to.
+    // precisely the way `ax-coverage.ts` refuses to. The composition itself
+    // lives in `route-match.ts` as `matchesCall`, shared with `expectCalls`.
     const calls = (test.meta?.calls ?? '').split(',').filter((call) => call !== '');
     for (const call of calls) {
       const spaceAt = call.indexOf(' ');
       if (spaceAt < 0) continue;
       const method = call.slice(0, spaceAt);
-      const path = pathnameOf(call.slice(spaceAt + 1));
-      if (path === undefined) continue;
+      const rest = call.slice(spaceAt + 1);
       for (const operation of operations) {
         const [opMethod, opPattern] = operation.name.split(' ');
-        if (opMethod !== method || opPattern === undefined) continue;
-        if (matchesRoutePattern(path, opPattern)) link(test.id, operation.id);
+        if (opMethod === undefined || opPattern === undefined) continue;
+        if (matchesCall(method, rest, opMethod, opPattern)) link(test.id, operation.id);
+      }
+    }
+
+    // One layer further down again: a DB step records the table it checked,
+    // and a `table` node's name is the table. Same "does anything already
+    // verify this?" answer, for the schema ingester's inventory.
+    const checks = (test.meta?.checks ?? '').split(',').filter((table) => table !== '');
+    for (const table of checks) {
+      for (const node of tables) {
+        if (node.name === table) link(test.id, node.id);
       }
     }
   }
@@ -241,6 +229,16 @@ export interface ContextEngineOptions {
    * among the walked files.
    */
   openApiSpec?: string | undefined;
+  /**
+   * Database schema to index: a `.sql` DDL or `.prisma` file. Omit and the
+   * schema ingester looks for a conventionally-named file, then falls back to
+   * live introspection when `dbUrl` is set.
+   */
+  dbSchema?: string | undefined;
+  /** Connection string for introspection fallback (usually `WOWLIDATOR_DB_URL`). */
+  dbUrl?: string | undefined;
+  /** Allow a non-loopback `dbUrl` — see `connectDb`'s guard. */
+  dbRemoteOk?: boolean | undefined;
   /** Emit a warning to stderr when the cache file is unreadable. Default true. */
   warn?: boolean | undefined;
 }
@@ -260,7 +258,15 @@ export class ContextEngine {
       new ComponentIngester(),
       new RouteIngester(),
       new TestIngester(),
+      // The application's own words (i18n catalogs) — the one kind of fact
+      // the structural ingesters never carried. See message-ingester.ts.
+      new MessageIngester(),
       new OpenApiIngester(options.openApiSpec === undefined ? {} : { source: options.openApiSpec }),
+      new SchemaIngester({
+        source: options.dbSchema,
+        dbUrl: options.dbUrl,
+        dbRemoteOk: options.dbRemoteOk,
+      }),
     ];
     this.#warn = options.warn ?? true;
   }

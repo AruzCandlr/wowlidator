@@ -28,6 +28,7 @@ import * as t from '@babel/types';
 
 import type { IngestContext, IngestResult, Ingester, ProjectEdge, ProjectNode } from '../types.js';
 import { componentId, pascalFromFilename } from '../naming.js';
+import { isMessageFile, messageNodeId } from './message-ingester.js';
 
 const COMPONENT_EXTENSIONS = new Set(['.tsx', '.jsx']);
 const RESOLVE_SUFFIXES = ['', '.tsx', '.ts', '.jsx', '.js', '/index.tsx', '/index.ts', '/index.jsx', '/index.js'];
@@ -44,6 +45,57 @@ interface ParsedFile {
   components: Map<string, ParsedComponent>;
   imports: Array<{ localName: string; source: string; isDefault: boolean }>;
   usagesByComponent: Map<string, Set<string>>;
+  /** The words a component renders from its OWN source — see `collectJsxWords`. */
+  wordsByComponent: Map<string, Set<string>>;
+}
+
+/** JSX attributes whose string value is something a person reads on the page. */
+const LABEL_ATTR = /^(title|label|aria-label|placeholder|alt|heading|caption|tooltip)$/;
+/** A word list longer than this is a component's whole copy deck, not its labels. */
+const MAX_WORDS_PER_COMPONENT = 24;
+const MAX_WORD_CHARS = 80;
+
+/** Every string a JSX attribute value can hold: a literal, a template, either branch of a ternary. */
+function stringsIn(node: t.Node | null | undefined, out: Set<string>, depth = 0): void {
+  if (!node || depth > 4) return;
+  if (t.isStringLiteral(node)) out.add(node.value);
+  else if (t.isTemplateLiteral(node)) {
+    const text = node.quasis.map((q) => q.value.cooked ?? q.value.raw).join(' ').trim();
+    if (text !== '') out.add(text);
+  } else if (t.isJSXExpressionContainer(node)) stringsIn(node.expression as t.Node, out, depth + 1);
+  else if (t.isConditionalExpression(node)) {
+    stringsIn(node.consequent, out, depth + 1);
+    stringsIn(node.alternate, out, depth + 1);
+  } else if (t.isLogicalExpression(node)) stringsIn(node.right, out, depth + 1);
+  else if (t.isTSAsExpression(node) || t.isTSNonNullExpression(node) || t.isParenthesizedExpression(node)) {
+    stringsIn(node.expression, out, depth + 1);
+  }
+}
+
+/**
+ * The words a component renders from its own source: JSX text ("Create") and
+ * the label-shaped attributes (`title={isTh ? 'สร้าง…' : 'Create Benefit
+ * Plan'}`) — both branches of a locale ternary, since either is what a user
+ * may see. Measured 2026-08-28: the modal title a wording case asked about
+ * was exactly such a literal, in no i18n catalog and in no index. Capped,
+ * and a string without a letter (a number, punctuation) is not a word.
+ */
+function collectJsxWords(root: t.Node, out: Set<string>): void {
+  const keep = (raw: string): void => {
+    const word = raw.replace(/\s+/g, ' ').trim();
+    if (word.length < 2 || word.length > MAX_WORD_CHARS || !/\p{L}/u.test(word)) return;
+    if (out.size < MAX_WORDS_PER_COMPONENT) out.add(word);
+  };
+  const visit = (node: t.Node): void => {
+    if (t.isJSXText(node)) keep(node.value);
+    else if (t.isJSXAttribute(node) && t.isJSXIdentifier(node.name) && LABEL_ATTR.test(node.name.name)) {
+      const found = new Set<string>();
+      stringsIn(node.value as t.Node | null, found);
+      for (const s of found) keep(s);
+    }
+    forEachChild(node, visit);
+  };
+  visit(root);
 }
 
 function isUpper(name: string): boolean {
@@ -177,6 +229,7 @@ function parseFile(file: string, text: string): ParsedFile {
 
   const components = new Map<string, ParsedComponent>();
   const usagesByComponent = new Map<string, Set<string>>();
+  const wordsByComponent = new Map<string, Set<string>>();
   for (const name of exportedNames) {
     const body = candidates.get(name);
     if (!body) continue;
@@ -184,9 +237,12 @@ function parseFile(file: string, text: string): ParsedFile {
     const usages = new Set<string>();
     collectJsxUsage(body, usages);
     usagesByComponent.set(name, usages);
+    const words = new Set<string>();
+    collectJsxWords(body, words);
+    wordsByComponent.set(name, words);
   }
 
-  return { file, components, imports, usagesByComponent };
+  return { file, components, imports, usagesByComponent, wordsByComponent };
 }
 
 /** Resolve a relative import specifier against the set of files this walk actually parsed. */
@@ -222,10 +278,23 @@ export class ComponentIngester implements Ingester {
     }
 
     const parsed = new Map<string, ParsedFile>();
+    // Which i18n namespaces each FILE binds (`useTranslations('plans')`,
+    // `getTranslations('plans')`) — attributed to every component in the
+    // file, since a hook call cannot be tied to one of them syntactically
+    // without a scope analysis this parse deliberately does not do.
+    const namespacesByFile = new Map<string, string[]>();
+    const messageFiles = ctx.files.filter(isMessageFile);
     for (const file of targets) {
       try {
         const text = await readFile(posix.join(ctx.rootDir, file), 'utf8');
         parsed.set(file, parseFile(file, text));
+        if (messageFiles.length > 0) {
+          const found = new Set<string>();
+          for (const m of text.matchAll(/\b(?:useTranslations|getTranslations|useScopedI18n)\(\s*['"]([\w.-]+)['"]/g)) {
+            if (m[1]) found.add(m[1].split('.')[0] as string);
+          }
+          if (found.size > 0) namespacesByFile.set(file, [...found]);
+        }
       } catch (error) {
         warnings.push(`could not parse ${file}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -237,11 +306,15 @@ export class ComponentIngester implements Ingester {
 
     for (const entry of parsed.values()) {
       for (const [name, component] of entry.components) {
+        const words = [...(entry.wordsByComponent.get(name) ?? [])];
         nodes.push({
           id: component.id,
           kind: 'component',
           name,
           file: entry.file,
+          // Its own rendered words, quoted — what the prompt slice prints as
+          // "says: …" and the retrieval corpus indexes.
+          ...(words.length === 0 ? {} : { detail: words.map((w) => JSON.stringify(w)).join(' · ') }),
           meta: { default: String(component.isDefault) },
         });
 
@@ -265,6 +338,15 @@ export class ComponentIngester implements Ingester {
           // No import for this tag — check whether it's a sibling component defined in the same file.
           const local = entry.components.get(tag);
           if (local) edges.push({ from: component.id, to: local.id, kind: 'uses' });
+        }
+
+        // The strings this component renders: one `uses` edge per locale file
+        // for each namespace its file binds. A namespace no message file
+        // declares dangles and is pruned by the engine, like every guess here.
+        for (const namespace of namespacesByFile.get(entry.file) ?? []) {
+          for (const messageFile of messageFiles) {
+            edges.push({ from: component.id, to: messageNodeId(messageFile, namespace), kind: 'uses' });
+          }
         }
       }
     }

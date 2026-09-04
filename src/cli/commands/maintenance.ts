@@ -3,16 +3,27 @@
  * history, and context. Split out of cli.ts verbatim.
  */
 
-import { readdir, rm } from 'node:fs/promises';
+import { readdir, rm, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
-import { generateText } from 'ai';
-
 import { CacheManager } from '../../cache/cache-manager.js';
-import { LLM_ROLES, PROVIDER_META, describeRouting } from '../../config.js';
+import { connectDb, defaultDbConfig, maskDsn } from '../../db/client.js';
+import { LLM_ROLES, describeRouting } from '../../config.js';
 import { ContextEngine } from '../../context/context-engine.js';
+import { detectDbHint } from '../../context/db-hint.js';
+import {
+  graphFileFor,
+  listRepos,
+  mergedContextDocs,
+  mergedScanInputs,
+  resolveRepo,
+  slugFor,
+  upsertRepo,
+} from '../../context/repo-registry.js';
+import { SUPPORTED_EXTENSIONS, formatFor } from '../../catalog/extract.js';
 import { summarize as summarizeContext } from '../../context/query.js';
 import { RunHistory } from '../../history/run-history.js';
+import { probeIsUsable, probeRole } from '../../providers/probe.js';
 import type { CliOptions } from '../options.js';
 
 /**
@@ -28,41 +39,55 @@ export async function cmdDoctor(options: CliOptions): Promise<number> {
     const entry = options.config.roles[role];
     const label = `${role.padEnd(9)} ${entry.provider}:${entry.modelId}`;
 
-    if (!options.factory.canResolve(role)) {
-      process.stdout.write(`  ✗ ${label}\n      no API key — ${PROVIDER_META[entry.provider].envKey} is unset\n`);
+    // The probe is shared with the panel's Machinery page: one real call over
+    // the failover path a run would take, classified by cause. Sequential
+    // here on purpose — a rotation discovered for one role stays active for
+    // every later role sharing the provider, which is what a run gets too.
+    const probe = await probeRole(options.factory, role);
+    if (!probeIsUsable(probe.status)) {
+      process.stdout.write(`  ✗ ${label}\n      ${probe.detail}\n`);
+      for (const attempt of probe.attempts.slice(0, -1)) {
+        process.stdout.write(`      key ${attempt.keyIndex + 1}: ${attempt.detail}\n`);
+      }
       failures += 1;
       continue;
     }
+    const mark = probe.status === 'empty' ? '!' : '✓';
+    const reply = probe.reply === null ? '' : ` (${JSON.stringify(probe.reply)})`;
+    const quota =
+      probe.quota?.remainingTokens !== null && probe.quota?.remainingTokens !== undefined
+        ? `\n      ${probe.quota.remainingTokens.toLocaleString()} tokens left` +
+          (probe.quota.limitTokens !== null ? ` of ${probe.quota.limitTokens.toLocaleString()}` : '') +
+          (probe.quota.resetTokens !== null ? ` (resets in ${probe.quota.resetTokens})` : '')
+        : '';
+    process.stdout.write(`  ${mark} ${label}\n      ${probe.detail}${reply}${quota}\n`);
+    for (const attempt of probe.attempts) {
+      process.stdout.write(`      key ${attempt.keyIndex + 1}: ${attempt.detail}\n`);
+    }
+  }
 
+  // The database, on the same make-a-real-call philosophy as the roles: a
+  // SELECT 1 over the exact connection a run would use, plus the schema read
+  // the grounding gate depends on. Printed only when a connection is
+  // configured — silence for the unconfigured majority, the no-spec rule.
+  const dbConfig = defaultDbConfig();
+  if (dbConfig !== null) {
     const started = Date.now();
     try {
-      // Routed through failover so `doctor` exercises the exact path a real
-      // run would take — if key 1 is dead, this both proves key 2 works and
-      // leaves it active for every subsequent role sharing the provider.
-      const { text, usage } = await options.factory.callWithFailover(role, (resolved) =>
-        // Smallest possible round trip that still proves the model id is real.
-        generateText({
-          model: resolved.model,
-          prompt: 'Reply with the single word: ok',
-          // Generous on purpose: reasoning models spend output budget on
-          // thinking, and a 16-token cap makes a healthy model look empty.
-          maxOutputTokens: 512,
-          maxRetries: 0,
-        }),
-      );
-      const reply = text.trim();
-      const tokens = `${usage.inputTokens ?? '?'} in / ${usage.outputTokens ?? '?'} out`;
-      const keyCount = options.config.apiKeys[entry.provider]?.length ?? 1;
-      const keyNote =
-        keyCount > 1 ? `, key ${options.factory.activeKeyIndex(entry.provider) + 1}/${keyCount}` : '';
-      process.stdout.write(
-        `  ${reply === '' ? '!' : '✓'} ${label}\n` +
-          `      responded in ${Date.now() - started}ms, ${tokens}${keyNote}` +
-          `${reply === '' ? ' — EMPTY reply; model may not suit this role' : ` (${JSON.stringify(reply.slice(0, 24))})`}\n`,
-      );
+      const client = await connectDb(dbConfig);
+      try {
+        await client.query('SELECT 1', []);
+        const schema = await client.introspect();
+        process.stdout.write(
+          `\n  ✓ db        ${maskDsn(dbConfig.url ?? '')}\n` +
+            `      read-only session up in ${Date.now() - started}ms — ${schema.tables.length} table(s) visible\n`,
+        );
+      } finally {
+        await client.close().catch(() => undefined);
+      }
     } catch (error) {
       const detail = error instanceof Error ? error.message.split('\n')[0] : String(error);
-      process.stdout.write(`  ✗ ${label}\n      ${detail}\n`);
+      process.stdout.write(`\n  ✗ db        ${detail}\n`);
       failures += 1;
     }
   }
@@ -185,14 +210,130 @@ export async function cmdHistory(sub: string | undefined, options: CliOptions): 
   }
 }
 
-export async function cmdContext(sub: string | undefined, options: CliOptions): Promise<number> {
+export async function cmdContext(
+  sub: string | undefined,
+  options: CliOptions,
+  arg?: string,
+): Promise<number> {
   const engine = new ContextEngine({
     rootDir: options.root,
     cacheFile: options.contextOut,
     openApiSpec: options.openapi,
+    dbSchema: options.dbSchema,
+    // Introspection fallback: when no schema file exists but a connection is
+    // configured, the live database is the source of truth.
+    dbUrl: process.env['WOWLIDATOR_DB_URL'],
+    dbRemoteOk: process.env['WOWLIDATOR_DB_REMOTE_OK'] === '1',
   });
 
   switch (sub) {
+    // Scan a repository and REMEMBER it — the difference from `build`, whose
+    // single cache file is last-writer-wins. Saved repos are selected on a run
+    // with `--repo <slug|path>` (or the wowUI dropdown).
+    case 'add': {
+      if (!arg) {
+        process.stderr.write('wowlidator context add: missing <path> to the repository\n');
+        return 2;
+      }
+      const slug = slugFor(arg);
+      // A re-add without flags falls back to what the entry remembered —
+      // wowUI's Re-scan posts only the path, and building bare would drop
+      // every operation/table node. See `mergedScanInputs`: the one merged
+      // pair feeds both the build and the entry, so they cannot drift.
+      // Made absolute HERE, at the command boundary, before the engine or the
+      // registry sees them. The schema ingester resolves a relative source
+      // against the repository being indexed — right for a file inside it,
+      // and wrong for the way people actually type this: from their own
+      // directory, naming a schema file that lives elsewhere. Seen live: a
+      // repo saved with `--db-schema examples/hrms/x.sql` re-indexed with zero
+      // tables and a warning nobody read, and every catalog against it
+      // authored without DB checks. A URL (`--openapi https://…`) is left as
+      // typed.
+      const prior = await resolveRepo(arg);
+      // Context documents remembered with the repo — markdown, text, PDF,
+      // PowerPoint, Excel or CSV, validated here where a refusal can name the
+      // file. Paths are stored absolute and read fresh at authoring time, so
+      // an edited file updates the remembered context by itself; re-adding a
+      // file of the same name replaces the remembered path.
+      const rememberedDocs: string[] = [];
+      for (const doc of options.contextDocs) {
+        const absolute = resolve(doc);
+        if (formatFor(absolute) === undefined) {
+          process.stderr.write(
+            `wowlidator context add: cannot remember "${doc}" — it reads ${SUPPORTED_EXTENSIONS.join(' ')}\n`,
+          );
+          return 2;
+        }
+        try {
+          await stat(absolute);
+        } catch {
+          process.stderr.write(`wowlidator context add: no such context document: ${doc}\n`);
+          return 2;
+        }
+        rememberedDocs.push(absolute);
+      }
+      const contextDocs = mergedContextDocs(prior, rememberedDocs);
+      const { openapi, dbSchema } = mergedScanInputs(prior, {
+        openapi: options.openapi === undefined || /^[a-z]+:\/\//i.test(options.openapi) ? options.openapi : resolve(options.openapi),
+        dbSchema: options.dbSchema === undefined ? undefined : resolve(options.dbSchema),
+      });
+      const repoEngine = new ContextEngine({
+        rootDir: arg,
+        cacheFile: graphFileFor(slug),
+        openApiSpec: openapi,
+        dbSchema,
+        dbUrl: process.env['WOWLIDATOR_DB_URL'],
+        dbRemoteOk: process.env['WOWLIDATOR_DB_REMOTE_OK'] === '1',
+      });
+      const graph = await repoEngine.build({ force: options.force });
+      // What the repo's own files say about its database — a hint for the
+      // panel and for anyone asking "what do I set WOWLIDATOR_DB_URL to?".
+      // Best-effort file parsing; never a connection, never a password.
+      const dbHint = (await detectDbHint(resolve(arg))) ?? prior?.dbHint;
+      if (dbHint !== undefined) {
+        process.stdout.write(
+          `  db hint    ${dbHint.engine} at ${dbHint.host ?? '?'}:${dbHint.port ?? '?'}` +
+            `${dbHint.database === undefined ? '' : `/${dbHint.database}`} (from ${dbHint.source})` +
+            `${dbHint.passwordAt === undefined ? '' : ` — password: ${dbHint.passwordAt}`}\n`,
+        );
+      }
+      await upsertRepo({
+        slug,
+        path: resolve(arg),
+        indexedAt: new Date().toISOString(),
+        nodes: graph.nodes.length,
+        openapi,
+        dbSchema,
+        // A re-scan must not forget what a signed-in capture learned or the
+        // documents remembered alongside the code — same rule as
+        // `mergedScanInputs` for the scan's own inputs.
+        nav: prior?.nav,
+        contextDocs,
+        dbHint,
+      });
+      process.stdout.write(
+        `${summarizeContext(graph)}\n\nsaved as ${slug} — ground a run in it with --repo ${slug}\n` +
+          (contextDocs === undefined
+            ? ''
+            : `  remembers  ${contextDocs.length} context document(s): ${contextDocs.map((d) => d.split('/').pop()).join(', ')}\n`),
+      );
+      return 0;
+    }
+
+    case 'list': {
+      const repos = await listRepos();
+      if (repos.length === 0) {
+        process.stdout.write('no repositories saved — wowlidator context add <path>\n');
+        return 0;
+      }
+      for (const repo of repos) {
+        process.stdout.write(
+          `${repo.slug}\n  ${repo.path}\n  ${repo.nodes} node(s), scanned ${repo.indexedAt}\n`,
+        );
+      }
+      return 0;
+    }
+
     case 'build': {
       const graph = await engine.build({ force: options.force });
       process.stdout.write(`${summarizeContext(graph)}\n\nwritten to ${engine.cacheFile}\n`);
@@ -206,7 +347,178 @@ export async function cmdContext(sub: string | undefined, options: CliOptions): 
     }
 
     default:
-      process.stderr.write(`wowlidator context: unknown subcommand ${sub ?? '(none)'} (expected build or show)\n`);
+      process.stderr.write(`wowlidator context: unknown subcommand ${sub ?? '(none)'} (expected build, show, add or list)\n`);
       return 2;
+  }
+}
+
+/**
+ * `wowlidator report [<ledger.progress.json> | <dir>]` — rebuild the catalog
+ * report and its passed-cases Excel export from a suite ledger on disk,
+ * without re-running anything. Exists so the exports added after a run can be
+ * applied to the runs already in the folders: the ledger names every planned
+ * case and where its proof bundle landed, which is all the report is built
+ * from at the suite roll-up too.
+ *
+ * Defaults to every ledger under `.wowlidator/catalogs/`. A proof bundle that
+ * no longer exists is reported, never fatal — its case renders without
+ * evidence, exactly as a never-ran row does.
+ */
+export async function cmdCatalogReport(target: string | undefined, _options: CliOptions): Promise<number> {
+  const { readFile } = await import('node:fs/promises');
+  const { readLedger } = await import('../suite-progress.js');
+  const { buildCatalogReportCases, writeCatalogArtifacts } = await import('../catalog-live-report.js');
+  type Bundle = import('../../engine/proof-bundle.js').ProofBundle;
+
+  const ledgerPaths: string[] = [];
+  const chosen = target === undefined ? resolve('.wowlidator', 'catalogs') : resolve(target);
+  if (chosen.endsWith('.progress.json')) {
+    ledgerPaths.push(chosen);
+  } else {
+    const names = await readdir(chosen).catch(() => [] as string[]);
+    for (const name of names) if (name.endsWith('.progress.json')) ledgerPaths.push(join(chosen, name));
+    if (ledgerPaths.length === 0) {
+      process.stderr.write(`wowlidator report: no *.progress.json ledgers found in ${chosen}\n`);
+      return 2;
+    }
+  }
+
+  let failures = 0;
+  for (const ledgerPath of ledgerPaths) {
+    const ledger = await readLedger(ledgerPath);
+    if (ledger === null) {
+      process.stderr.write(`  ! ${ledgerPath} is not a readable suite ledger\n`);
+      failures += 1;
+      continue;
+    }
+    let missingProofs = 0;
+    const cases = await buildCatalogReportCases(ledger, async (id) => {
+      const proofPath = ledger.outcomes[id]?.proofPath;
+      if (typeof proofPath !== 'string' || proofPath === '') return null;
+      try {
+        return JSON.parse(await readFile(proofPath, 'utf8')) as Bundle;
+      } catch {
+        missingProofs += 1;
+        return null;
+      }
+    });
+    const recorded = ledger.planned.filter((id) => ledger.outcomes[id] !== undefined).length;
+    if (recorded > 0 && missingProofs === recorded) {
+      // Every recorded case's evidence is gone: regenerating would OVERWRITE a
+      // report that may still hold it, with one that holds nothing.
+      process.stderr.write(
+        `  ! ${ledger.runKey ?? ledger.title}: all ${recorded} proof bundle(s) are gone — skipped rather than ` +
+          'overwriting a report that may still carry the evidence\n',
+      );
+      failures += 1;
+      continue;
+    }
+    try {
+      const { htmlPath, excel } = await writeCatalogArtifacts({
+        title: ledger.title,
+        runKey: ledger.runKey,
+        generatedAt: ledger.generatedAt,
+        cases,
+        // A ledger still marked running keeps the page reloading itself.
+        live: ledger.ended === null,
+      });
+      process.stdout.write(
+        `  catalog report ${htmlPath}\n` +
+          `  passed xlsx ${excel.xlsxPath} — ${excel.passedCases} passed case(s), ${excel.caseXlsxPaths.length} per-case workbook(s), ${excel.videoPaths.length} recording(s)` +
+          (excel.removed.length > 0 ? ` · ${excel.removed.length} stale export(s) removed` : '') +
+          (missingProofs > 0 ? ` · ${missingProofs} proof bundle(s) no longer exist; those cases carry no evidence` : '') +
+          '\n',
+      );
+    } catch (error) {
+      process.stderr.write(
+        `  ! ${ledger.runKey ?? ledger.title}: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}\n`,
+      );
+      failures += 1;
+    }
+  }
+  return failures === 0 ? 0 : 1;
+}
+
+/**
+ * `wowlidator db restore [<baseline.json> | <runKey> | <ledger.progress.json>]`
+ * — put the tables back for a run whose own restore never ran (it was paused
+ * or killed, or it ran in snapshot mode and the operator decided to restore
+ * afterwards). Reads the baseline the run wrote, connects the WRITE credential
+ * (`WOWLIDATOR_DB_RESTORE_URL`) and the read-only one for verification, and
+ * runs the same `restoreBaseline` the end of a run does. Never touches a table
+ * outside the baseline; every statement is printed before it runs.
+ *
+ * With no argument it restores the newest baseline under `.wowlidator/db-baselines/`.
+ */
+export async function cmdDb(sub: string | undefined, target: string | undefined, _options: CliOptions): Promise<number> {
+  if (sub !== 'restore') {
+    process.stderr.write(`wowlidator db: unknown subcommand ${sub ?? '(none)'} (expected: restore)\n`);
+    return 2;
+  }
+  const { readdir } = await import('node:fs/promises');
+  const { readLedger } = await import('../suite-progress.js');
+  const { readBaseline, restoreBaseline, BASELINE_DIR } = await import('../../db/baseline.js');
+  const { connectDb, connectDbWritable, defaultDbConfig, maskDsn, restoreDbConfig } = await import('../../db/client.js');
+
+  // Resolve the baseline file from what was given: a .json baseline, a ledger
+  // (its `dbBaseline.path`), a run key, or nothing (newest baseline on disk).
+  let baselinePath: string | null = null;
+  if (target === undefined) {
+    const dir = resolve(BASELINE_DIR);
+    const names = (await readdir(dir).catch(() => [] as string[])).filter((n) => n.endsWith('.json'));
+    if (names.length === 0) {
+      process.stderr.write(`wowlidator db restore: no baselines under ${dir}\n`);
+      return 2;
+    }
+    const withTimes = await Promise.all(
+      names.map(async (n) => ({ n, t: (await stat(join(dir, n)).catch(() => null))?.mtimeMs ?? 0 })),
+    );
+    withTimes.sort((a, b) => b.t - a.t);
+    baselinePath = join(dir, withTimes[0]!.n);
+  } else if (target.endsWith('.progress.json')) {
+    const ledger = await readLedger(resolve(target));
+    baselinePath = ledger?.dbBaseline?.path ?? null;
+    if (baselinePath === null) {
+      process.stderr.write(`wowlidator db restore: ${target} records no database baseline\n`);
+      return 2;
+    }
+  } else if (target.endsWith('.json')) {
+    baselinePath = resolve(target);
+  } else {
+    baselinePath = resolve(BASELINE_DIR, `${target.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}.json`);
+  }
+
+  const restoreConfig = restoreDbConfig();
+  const readConfig = defaultDbConfig();
+  if (restoreConfig === null) {
+    process.stderr.write('wowlidator db restore: WOWLIDATOR_DB_RESTORE_URL is not set — nothing to restore through\n');
+    return 3;
+  }
+  if (readConfig === null) {
+    process.stderr.write('wowlidator db restore: WOWLIDATOR_DB_URL is not set — the restore is verified through it\n');
+    return 3;
+  }
+  let baseline;
+  try {
+    baseline = await readBaseline(baselinePath);
+  } catch (error) {
+    process.stderr.write(`wowlidator db restore: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 2;
+  }
+  const reader = await connectDb(readConfig);
+  const writable = await connectDbWritable(restoreConfig);
+  try {
+    process.stdout.write(
+      `restoring ${baseline.tables.filter((t) => t.restorable).length} table(s) from ${baselinePath}\n` +
+        `  write  ${maskDsn(restoreConfig.url ?? '')}\n`,
+    );
+    const result = await restoreBaseline(writable, reader, baseline, {
+      onStatement: (sql) => process.stderr.write(`  sql  ${sql}\n`),
+    });
+    process.stdout.write(`  ${result.detail}\n`);
+    return result.ok ? 0 : 3;
+  } finally {
+    await writable.close().catch(() => undefined);
+    await reader.close().catch(() => undefined);
   }
 }

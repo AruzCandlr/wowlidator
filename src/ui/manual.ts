@@ -112,12 +112,13 @@ export const MANUAL: readonly ManualSection[] = [
       <table class="ref">
         <tr><th>Policy</th><th>May do</th><th>Never</th></tr>
         <tr><td><code>read-only</code></td><td>Navigate, read, assert.</td><td>Submit anything at all.</td></tr>
-        <tr><td><code>forms</code><br><span class="muted">the default</span></td><td>Submit <b>empty or invalid</b> input and assert the validation error appears.</td><td>Submit valid data that would write.</td></tr>
-        <tr><td><code>mutations</code></td><td>Create and update.</td><td>Delete, purchase, bulk operations.</td></tr>
+        <tr><td><code>forms</code></td><td>Submit <b>empty or invalid</b> input and assert the validation error appears.</td><td>Submit valid data that would write.</td></tr>
+        <tr><td><code>mutations</code><br><span class="muted">the default</span></td><td>Fill, submit, create and update — like a human tester.</td><td>Delete, purchase, bulk operations.</td></tr>
       </table>
-      <p><code>forms</code> is the interesting tier: submitting an empty required field is not
-      destructive — validation is what stops the write, and checking that validation works is
-      the entire point. <b>Nothing deletes at any tier</b>, including <code>mutations</code>.</p>
+      <p><code>mutations</code> is the default: a human QA fills forms with real data and submits
+      them, and the suite does the same out of the box. Narrow to <code>forms</code> for
+      validation-only negative testing, or <code>read-only</code> where even an invalid submit is
+      unwelcome. <b>Nothing deletes at any tier</b>, including <code>mutations</code>.</p>
     `,
   },
 

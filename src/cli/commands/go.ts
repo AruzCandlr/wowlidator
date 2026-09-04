@@ -2,9 +2,12 @@
  * `wowlidator go` — the one-command dispatch. Split out of cli.ts verbatim.
  */
 
+import { existsSync } from 'node:fs';
+
+import { isDiagramImage } from '../../catalog/diagram-image.js';
 import { EXIT } from '../exit.js';
 import type { CliOptions } from '../options.js';
-import { cmdAuthor, cmdGenerate } from './authoring.js';
+import { cmdAuthor, cmdCatalog, cmdGenerate } from './authoring.js';
 import { cmdRun } from './run.js';
 
 /**
@@ -20,12 +23,20 @@ export async function cmdGo(target: string | undefined, options: CliOptions): Pr
       'wowlidator go: missing target.\n\n' +
         '  wowlidator go <flow.json>              run an existing test\n' +
         '  wowlidator go <url>                    let wowlidator write tests for a page\n' +
+        '  wowlidator go <diagram.png>            read a sequence-diagram image as a catalog\n' +
         '  wowlidator go "<what to test>" --url <url>   describe a test, write it, run it\n',
     );
     return EXIT.usage;
   }
 
-  if (target.endsWith('.json')) return cmdRun(target, options);
+  if (target.endsWith('.json')) return cmdRun([target], options);
+  // A sequence-diagram image is a catalog, and the evidence is kept concrete:
+  // the name alone is not enough — the file must exist on disk, or a stray
+  // "diagram.png" in a sentence would hijack the description path below.
+  // (An image URL never lands here: it does not exist as a local file.)
+  if (isDiagramImage(target) && existsSync(target)) {
+    return cmdCatalog(target, { ...options, run: true });
+  }
   if (/^https?:\/\//.test(target)) return cmdGenerate(target, { ...options, run: true });
 
   if (!options.url) {

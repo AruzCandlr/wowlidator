@@ -18,13 +18,14 @@ import { z } from 'zod';
 import { lenientObject } from '../providers/model-output.js';
 
 import { SELECTOR_SYNTAX_RULES, captureAxTree } from '../healer/jit-healer.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 import {
   LlmFactory,
   generateStructuredForModel,
   type ModelSource,
 } from '../providers/llm-factory.js';
 import { hasAssertion } from '../engine/runner.js';
-import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
+import { withQualifiedRole, withRelaxedRoleName, withStableGreeting } from '../engine/selector.js';
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
 import type { Defect, DefectCategory, DefectSeverity } from '../engine/proof-bundle.js';
 import type { Flow, FlowStep } from '../engine/runner.js';
@@ -44,18 +45,18 @@ export type TestKind = (typeof TEST_KINDS)[number];
 /**
  * How much the generator is allowed to change.
  *
- * `forms` is the default: submitting an *empty or invalid* form is not
- * destructive — the validation under test is exactly what stops the write —
- * and it is the entire negative-testing surface, which a `read-only` default
- * silently excluded from every generated suite. `read-only` remains for
- * pages where even an invalid submit is unwelcome; `mutations` additionally
- * permits create and update, and stays opt-in because an autonomous test
- * writer that can change your data is not something to opt *out* of. DELETE
- * appears at no tier.
+ * `mutations` is the default (2026-09-02, by request): a human QA fills forms
+ * with real data, submits them, creates and updates records, and the suite is
+ * expected to do the same out of the box. `forms` narrows that to empty/invalid
+ * submits only — the validation-focused negative-testing surface — and
+ * `read-only` narrows it further to navigate-and-assert, for a page where even
+ * an invalid submit is unwelcome. The knob stays: a run that must not write
+ * still passes `--policy forms` / `--policy read-only`. DELETE appears at no
+ * tier, and `mutations` still refuses purchases and bulk/irreversible ops.
  */
 export const MUTATION_POLICIES = ['read-only', 'forms', 'mutations'] as const;
 export type MutationPolicy = (typeof MUTATION_POLICIES)[number];
-export const DEFAULT_MUTATION_POLICY: MutationPolicy = 'forms';
+export const DEFAULT_MUTATION_POLICY: MutationPolicy = 'mutations';
 
 const POLICY_RULES: Record<MutationPolicy, string> = {
   'read-only':
@@ -103,6 +104,8 @@ export const GENERATOR_ACTIONS = [
   'expectUrl',
   'expectValue',
   'expectScrollable',
+  'saveCount',
+  'saveText',
 ] as const;
 
 /**
@@ -249,10 +252,17 @@ Actions available:
 - expectText  element's text contains "value".
 - expectVisible / expectHidden        element is / is not visible.
 - expectEnabled / expectDisabled      control is / is not interactive.
-- expectCount element matches exactly "value" elements (a number as a string).
+- expectCount element matches exactly "value" elements (a number as a string,
+              or a {{variable}} saved earlier by saveCount/saveText).
+- saveCount   read HOW MANY elements match into a variable named "value"; a later
+              expectCount/expectText carrying {{that-name}} compares it. Use it for
+              any claim that two readings agree or that a number did not change —
+              asserting one side exists proves no agreement.
+- saveText    read the element's visible text into a variable named "value".
 - expectUrl   current URL contains "value". When asserting where a link goes, take
               the path from that link's url= in the tree — never from its visible
-              label. A card labelled "E-Patient" can point at /benefits-hub/referral,
+              label. A card's label and its destination often differ — "Reports"
+              can point at /analytics/overview —
               and a guessed path is a test that fails for the wrong reason.
 - expectValue an input's current value equals "value".
 - expectScrollable  the page, or a container if you give a selector, can really be
@@ -278,7 +288,25 @@ answer is "none", write a different assertion.
 - Leave unused fields as empty strings.
 ${POLICY_RULES[policy]}
 
+${DETERMINISM_RULES}
+
+${procedure('HOW TO BUILD THE SUITE', [
+  'Inventory the page from the tree: its forms (fields + submit), its navigation (links with url=), its lists/tables (repeated rows), its filters/toggles. Only what the tree shows.',
+  'For each inventoried thing, in TREE ORDER, decide the one functional case that proves it works, then the one edge case the policy allows, then a usability case only where the tree shows friction. Stop at the case limit; earlier things in the tree win.',
+  'Name each case "<kind>: <what it proves>" using the control\'s own accessible name — the same control always yields the same name.',
+  'For each case: the fewest steps that reach the claim, then the assertion that would FAIL if it did not hold. Every selector in canonical form from the tree.',
+  'List defects last, only those the tree positively shows.',
+])}
+
 ${SELECTOR_SYNTAX_RULES}
+
+${selfCheck([
+  'Every case has at least one expect* step that would fail if the feature were broken.',
+  'No case asserts a value it just typed, and no expectText repeats the text used to find the element.',
+  'Every selector token appears in the tree, in canonical form; every expectUrl fragment comes from a url= in the tree.',
+  'Cases follow tree order, and no two cases prove the same thing.',
+  'The policy\'s limits are respected: nothing submits valid data under read-only, nothing writes under forms, nothing deletes ever.',
+])}
 
 If a "Project context" section is present below, it describes what this route
 renders, what that component uses, and what already covers it, drawn from a
@@ -301,6 +329,13 @@ function buildUserPrompt(request: GenerateRequest): string {
     `Page URL: ${request.url}`,
     `Generate at most ${request.maxCases} test cases.`,
   ];
+  if (request.focus) lines.push(`Focus area: ${request.focus}`);
+  if (request.projectContext) lines.push('', request.projectContext);
+  lines.push('', 'Accessibility tree:', request.axTree);
+  if (request.interactions) lines.push('', request.interactions);
+  // Rejection feedback last — the tree and context above stay a byte-identical
+  // prefix across retries, so a provider's implicit prompt cache can bill the
+  // resent capture at cache rates.
   if (request.feedback?.length) {
     lines.push(
       '',
@@ -308,10 +343,6 @@ function buildUserPrompt(request: GenerateRequest): string {
       ...request.feedback.map((entry) => `  - ${entry}`),
     );
   }
-  if (request.focus) lines.push(`Focus area: ${request.focus}`);
-  if (request.projectContext) lines.push('', request.projectContext);
-  lines.push('', 'Accessibility tree:', request.axTree);
-  if (request.interactions) lines.push('', request.interactions);
   return lines.join('\n');
 }
 
@@ -458,6 +489,8 @@ const ASSERTION_GENERATOR_ACTIONS = [
   'expectUrl',
   'expectValue',
   'expectScrollable',
+  'saveCount',
+  'saveText',
 ] as const;
 
 /** Narrow the flat generated shape back into the runner's step union. Exported — see `GeneratedStepSchema`. */
@@ -468,7 +501,9 @@ export function toFlowStep(raw: z.infer<typeof GeneratedStepSchema>): FlowStep |
   // see `src/engine/selector.ts`. Relaxing case here, at the one point every
   // generated step is narrowed, means the flow written to disk is a selector
   // that actually resolves rather than one the runner has to rescue.
-  const selector = raw.selector === '' ? '' : withRelaxedRoleName(withQualifiedRole(raw.selector));
+  // And a time-of-day greeting is written as the name after it: the page
+  // chooses the greeting by the clock, so it is never the fact a step proves.
+  const selector = raw.selector === '' ? '' : withStableGreeting(withRelaxedRoleName(withQualifiedRole(raw.selector)));
   switch (raw.action) {
     case 'goto':
       return raw.url === '' ? null : { action: 'goto', url: raw.url };
@@ -503,13 +538,25 @@ export function toFlowStep(raw: z.infer<typeof GeneratedStepSchema>): FlowStep |
     case 'expectDisabled':
       return selector === '' ? null : { action: 'expectDisabled', selector, intent };
     case 'expectCount': {
-      // The schema carries every field as a string; a non-numeric count is
-      // unusable rather than something to guess at.
+      // The schema carries every field as a string; digits or a {{variable}}
+      // saved by saveCount/saveText — anything else is unusable rather than
+      // something to guess at.
+      if (/^\{\{[\w.-]+\}\}$/.test(raw.value.trim())) {
+        return selector === '' ? null : { action: 'expectCount', selector, count: raw.value.trim(), intent };
+      }
       const count = Number(raw.value);
       return selector === '' || !Number.isInteger(count) || count < 0
         ? null
         : { action: 'expectCount', selector, count, intent };
     }
+    case 'saveCount':
+      return selector === '' || raw.value.trim() === ''
+        ? null
+        : { action: 'saveCount', selector, as: raw.value.trim(), intent };
+    case 'saveText':
+      return selector === '' || raw.value.trim() === ''
+        ? null
+        : { action: 'saveText', selector, as: raw.value.trim(), intent };
     case 'expectUrl':
       return raw.value === '' ? null : { action: 'expectUrl', value: raw.value, intent };
     case 'expectValue':
@@ -646,11 +693,29 @@ export class TestGenerator {
       }
 
       attempts.push({ cases, rejected, result });
-      if (rejected.length === 0) break;
+      // Stop only when this attempt produced usable cases AND nothing was
+      // rejected. Zero usable cases is a failed attempt, not a finished one:
+      // the informed re-ask exists for exactly this, but an empty
+      // `result.cases` also leaves `rejected` empty, so the old
+      // `rejected.length === 0` check mistook "the model returned nothing" for
+      // "the model got it right" and broke without ever re-asking.
+      if (cases.length > 0 && rejected.length === 0) break;
+      if (cases.length === 0 && rejected.length === 0) {
+        feedback.push(
+          'Your previous attempt returned NO cases. If the page exposes any usable control, form or link, ' +
+            'return at least one runnable case with an assertion that would fail if that feature were broken.',
+        );
+      }
       feedback.push(...rejected.map((r) => `"${r.name}": ${r.reason}`));
     }
 
-    const best = attempts.reduce((a, b) => (b.cases.length > a.cases.length ? b : a));
+    // The better attempt wins — a re-ask must never make the result worse:
+    // more usable cases first, then fewer rejected on a tie, then the earlier
+    // attempt (reduce keeps `a` when neither is strictly better).
+    const best = attempts.reduce((a, b) => {
+      if (b.cases.length !== a.cases.length) return b.cases.length > a.cases.length ? b : a;
+      return b.rejected.length < a.rejected.length ? b : a;
+    });
     const { cases, rejected, result } = best;
 
     const defects: Defect[] = result.defects.map((defect, index) => ({

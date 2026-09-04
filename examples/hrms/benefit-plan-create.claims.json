@@ -1,0 +1,144 @@
+{
+  "catalog": "benefit-plan-create.mmd",
+  "summary": "Sequence diagram (mermaid): 4 participant(s), 8 message(s), 1 alt fork(s) — each branch is its own case",
+  "documentNote": "",
+  "model": "read from the diagram (no model call)",
+  "extractedAt": "2026-08-17T09:24:48.837Z",
+  "claims": [
+    {
+      "claim": "HR Admin → Web App (localhost:3200): open Benefits › Plans and click Create Plan",
+      "priority": "medium",
+      "source": "line 7",
+      "testable": true,
+      "approved": true
+    },
+    {
+      "claim": "HR Admin → Web App (localhost:3200): fill the plan form and save",
+      "priority": "medium",
+      "source": "line 8",
+      "testable": true,
+      "approved": true
+    },
+    {
+      "claim": "Web App (localhost:3200) → Next route /api/benefit-plans: POST /api/benefit-plans",
+      "priority": "medium",
+      "source": "line 9",
+      "testable": true,
+      "approved": true
+    },
+    {
+      "claim": "Next route /api/benefit-plans → PostgreSQL HRCenter-DEV: INSERT INTO benefit_management.benefit_plan",
+      "priority": "medium",
+      "source": "line 10 (beyond the browser boundary: backend → external — held as an assumption)",
+      "testable": false,
+      "approved": true
+    },
+    {
+      "claim": "PostgreSQL HRCenter-DEV → Next route /api/benefit-plans: id",
+      "priority": "medium",
+      "source": "line 11 (beyond the browser boundary: external → backend — held as an assumption)",
+      "testable": false,
+      "approved": true
+    },
+    {
+      "claim": "Next route /api/benefit-plans → Web App (localhost:3200): 200 { ok: true, dbId }",
+      "priority": "medium",
+      "source": "line 13 [alt: valid plan]",
+      "testable": true,
+      "approved": true
+    },
+    {
+      "claim": "Web App (localhost:3200) → Next route /api/benefit-plans: GET /api/benefit-plans",
+      "priority": "medium",
+      "source": "line 14 [alt: valid plan]",
+      "testable": true,
+      "approved": true
+    },
+    {
+      "claim": "Next route /api/benefit-plans → Web App (localhost:3200): 400 { ok: false }",
+      "priority": "medium",
+      "source": "line 16 [alt: missing id or name]",
+      "testable": true,
+      "approved": true
+    }
+  ],
+  "sequence": {
+    "notation": "mermaid",
+    "participants": [
+      {
+        "name": "HR",
+        "label": "HR Admin",
+        "plane": "user",
+        "guessed": false
+      },
+      {
+        "name": "UI",
+        "label": "Web App (localhost:3200)",
+        "plane": "page",
+        "guessed": true
+      },
+      {
+        "name": "API",
+        "label": "Next route /api/benefit-plans",
+        "plane": "backend",
+        "guessed": true
+      },
+      {
+        "name": "DB",
+        "label": "PostgreSQL HRCenter-DEV",
+        "plane": "external",
+        "guessed": true
+      }
+    ],
+    "messages": [
+      {
+        "claim": 0,
+        "from": "HR",
+        "to": "UI",
+        "reply": false
+      },
+      {
+        "claim": 1,
+        "from": "HR",
+        "to": "UI",
+        "reply": false
+      },
+      {
+        "claim": 2,
+        "from": "UI",
+        "to": "API",
+        "reply": false
+      },
+      {
+        "claim": 3,
+        "from": "API",
+        "to": "DB",
+        "reply": false
+      },
+      {
+        "claim": 4,
+        "from": "DB",
+        "to": "API",
+        "reply": true
+      },
+      {
+        "claim": 5,
+        "from": "API",
+        "to": "UI",
+        "reply": true
+      },
+      {
+        "claim": 6,
+        "from": "UI",
+        "to": "API",
+        "reply": false
+      },
+      {
+        "claim": 7,
+        "from": "API",
+        "to": "UI",
+        "reply": true
+      }
+    ]
+  }
+}

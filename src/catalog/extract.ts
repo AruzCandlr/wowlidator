@@ -35,7 +35,27 @@ import { readFile } from 'node:fs/promises';
 import { inflateRawSync, inflateSync } from 'node:zlib';
 import { basename, extname } from 'node:path';
 
-export type DocumentFormat = 'text' | 'markdown' | 'csv' | 'html' | 'json' | 'yaml' | 'xlsx' | 'pdf';
+import { parseSequenceDiagram } from './sequence.js';
+
+export type DocumentFormat =
+  | 'text'
+  | 'markdown'
+  | 'csv'
+  | 'html'
+  | 'json'
+  | 'yaml'
+  | 'xlsx'
+  | 'pdf'
+  | 'sequence'
+  /**
+   * An IMAGE of a sequence diagram. Deliberately absent from `FORMATS`: this
+   * extractor is deterministic and never calls a model, so it cannot read
+   * pixels — `catalog` routes images through the vision transcriber in
+   * `diagram-image.ts` first, and what reaches extraction is the transcribed
+   * `.mmd`. The member exists so uploads can carry the format label.
+   */
+  | 'pptx'
+  | 'sequence-image';
 
 /** Extensions this module will attempt, and what it treats each as. */
 const FORMATS: Record<string, DocumentFormat> = {
@@ -53,7 +73,16 @@ const FORMATS: Record<string, DocumentFormat> = {
   '.yml': 'yaml',
   '.xlsx': 'xlsx',
   '.xlsm': 'xlsx',
+  '.pptx': 'pptx',
+  '.ppsx': 'pptx',
   '.pdf': 'pdf',
+  // Sequence diagrams — Mermaid and PlantUML source. Decided by extension
+  // like everything else here; a fenced ```mermaid block inside a `.md` keeps
+  // the markdown path it always had.
+  '.mmd': 'sequence',
+  '.mermaid': 'sequence',
+  '.puml': 'sequence',
+  '.plantuml': 'sequence',
 };
 
 /** Formats worth naming in an error, and in the UI's file picker. */
@@ -136,6 +165,12 @@ export function extractDocument(
       note = sheets.note;
       break;
     }
+    case 'pptx': {
+      const deck = readPptx(bytes);
+      text = deck.text;
+      note = deck.note;
+      break;
+    }
     case 'pdf': {
       const pdf = readPdf(bytes);
       text = pdf.text;
@@ -151,6 +186,17 @@ export function extractDocument(
     case 'html':
       text = htmlToText(decodeText(bytes));
       break;
+    case 'sequence': {
+      // The text goes through verbatim — the deterministic claims path
+      // re-parses it — but it is validated *here*, where a refusal can name
+      // the file, and anything the parser will skip (unsupported blocks,
+      // ignored lines) comes back on `note` so the person sees it before the
+      // claims do. Parsing twice is cheap; a silent skip is not.
+      text = decodeText(bytes);
+      const doc = parseSequenceDiagram(text); // throws SequenceParseError when unreadable
+      note = joinNotes(...doc.notes);
+      break;
+    }
     default:
       text = decodeText(bytes);
       break;
@@ -243,7 +289,7 @@ function decodeEntities(value: string): string {
 
 // --- ZIP (the container .xlsx is) -------------------------------------------
 
-interface ZipEntry {
+export interface ZipEntry {
   name: string;
   data: Buffer;
 }
@@ -257,7 +303,7 @@ interface ZipEntry {
  * middle of a compressed stream. The central directory always has the true
  * sizes.
  */
-function readZip(bytes: Buffer): ZipEntry[] {
+export function readZip(bytes: Buffer): ZipEntry[] {
   const eocd = findEndOfCentralDirectory(bytes);
   if (eocd === -1) throw new UnsupportedDocumentError('this file is not a readable .xlsx (no ZIP directory)');
 
@@ -312,6 +358,77 @@ function findEndOfCentralDirectory(bytes: Buffer): number {
  * flattening it would silently move data under the wrong heading.
  */
 function readXlsx(bytes: Buffer): { text: string; note: string } {
+  const workbook = readWorkbook(bytes);
+
+  const blocks: string[] = [];
+  let skipped = 0;
+  for (const sheet of workbook) {
+    const rows = sheet.cells.map(rowToText).filter((line) => line !== '');
+    if (rows.length === 0) {
+      skipped += 1;
+      continue;
+    }
+    blocks.push(`## ${sheet.name}\n${rows.join('\n')}`);
+  }
+
+  return {
+    text: blocks.join('\n\n'),
+    note: skipped > 0 ? `${skipped} empty sheet(s) skipped` : '',
+  };
+}
+
+/** One worksheet, cells kept whole. */
+export interface WorkbookSheet {
+  /** The tab's name, as the workbook names it (`EC`, `Benefit Plan`). */
+  name: string;
+  /**
+   * Rows as the grid has them: `rows[r][c]` is the cell in column `c` (A = 0),
+   * empty string where the sheet has nothing. Cell text is verbatim — a cell
+   * with line breaks keeps them — because a test-case sheet's Steps column IS
+   * a multi-line cell, and flattening it is what loses the row boundary.
+   */
+  rows: string[][];
+}
+
+/**
+ * A workbook as a grid per sheet, for readers that need the columns rather
+ * than the prose — `parseWorkbookCases` in `test-case-table.ts`.
+ *
+ * Why this exists beside the text form: the text form is for a model to read
+ * and the table parser was re-parsing it as a delimited file — which, on a
+ * real QA workbook (2026-09-03, 1,286 cases over four sheets), returned 289
+ * "rows" for a 272-row sheet with bug-ticket cells as case ids, kept the
+ * `A: … B: …` letter prefixes of a sparse row as cell text, and refused the
+ * sheet whose header row was sparse. Every one of those is a fact the grid
+ * still has and the text no longer does.
+ */
+export function extractWorkbookSheets(bytes: Buffer): WorkbookSheet[] {
+  return readWorkbook(bytes).map((sheet) => ({
+    name: sheet.name,
+    rows: sheet.cells.map((cells) => {
+      const width = cells.reduce((max, cell) => Math.max(max, columnIndex(cell.column)), 0);
+      const row: string[] = new Array<string>(width).fill('');
+      for (const cell of cells) {
+        const at = columnIndex(cell.column) - 1;
+        if (at >= 0) row[at] = cell.value;
+      }
+      return row;
+    }),
+  }));
+}
+
+interface RawCell {
+  column: string;
+  /** Verbatim, line breaks included. */
+  value: string;
+}
+
+interface RawSheet {
+  name: string;
+  cells: RawCell[][];
+}
+
+function readWorkbook(bytes: Buffer): RawSheet[] {
   const entries = readZip(bytes);
   const shared = readSharedStrings(entries.find((entry) => entry.name === 'xl/sharedStrings.xml')?.data);
   const names = readSheetNames(entries.find((entry) => entry.name === 'xl/workbook.xml')?.data);
@@ -324,21 +441,94 @@ function readXlsx(bytes: Buffer): { text: string; note: string } {
     throw new EmptyDocumentError('this workbook has no worksheets wowlidator can read');
   }
 
+  return sheets.map((sheet, index) => ({
+    name: names[index] ?? `Sheet ${index + 1}`,
+    cells: readSheetCells(sheet.data.toString('utf8'), shared),
+  }));
+}
+
+/** The text form of one row: dense rows tab-joined, sparse rows with their column letters. */
+function rowToText(cells: RawCell[]): string {
+  const flat = cells
+    .map((cell) => ({ column: cell.column, value: cell.value.replace(/[\t\n]+/g, ' ').trim() }))
+    .filter((cell) => cell.value !== '');
+  if (flat.length === 0) return '';
+  // A dense row is a table row; a sparse one keeps its column letters so a
+  // value cannot end up read under a heading it never sat beneath.
+  const dense = isDense(flat.map((cell) => cell.column));
+  return dense
+    ? flat.map((cell) => cell.value).join('\t')
+    : flat.map((cell) => `${cell.column}: ${cell.value}`).join('\t');
+}
+
+/**
+ * A PowerPoint deck, read the same way the workbook is: through the ZIP's
+ * central directory, taking the one narrow thing needed — the text runs.
+ *
+ * One slide is one `ppt/slides/slideN.xml`; visible text lives in `<a:t>`
+ * runs, one paragraph per `<a:p>` (joining runs within a paragraph is what
+ * keeps a title split by formatting from reading as two lines). Slide notes
+ * (`ppt/notesSlides/`) are read too, labelled apart — a speaker note is the
+ * author talking, not the slide asserting — and everything else in the
+ * package (themes, layouts, media) is never touched. A deck whose slides are
+ * pictures of text yields nothing readable and is refused with the cause
+ * named, the same rule as a PDF with no text layer.
+ */
+function readPptx(bytes: Buffer): { text: string; note: string } {
+  const entries = readZip(bytes);
+  const slides = entries
+    .filter((entry) => /^ppt\/slides\/slide\d+\.xml$/.test(entry.name))
+    .sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
+
+  if (slides.length === 0) {
+    throw new EmptyDocumentError('this presentation has no slides wowlidator can read');
+  }
+
+  const notesByslide = new Map<string, string[]>();
+  for (const entry of entries) {
+    const m = /^ppt\/notesSlides\/notesSlide(\d+)\.xml$/.exec(entry.name);
+    if (m) notesByslide.set(m[1] as string, slideParagraphs(entry.data.toString('utf8')));
+  }
+
   const blocks: string[] = [];
-  let skipped = 0;
-  for (const [index, sheet] of sheets.entries()) {
-    const rows = readSheet(sheet.data.toString('utf8'), shared);
-    if (rows.length === 0) {
-      skipped += 1;
+  let empty = 0;
+  for (const slide of slides) {
+    const n = (/slide(\d+)\.xml$/.exec(slide.name)?.[1] ?? '') as string;
+    const paragraphs = slideParagraphs(slide.data.toString('utf8'));
+    const notes = (notesByslide.get(n) ?? []).filter((line) => !/^\d+$/.test(line));
+    if (paragraphs.length === 0 && notes.length === 0) {
+      empty += 1;
       continue;
     }
-    blocks.push(`## ${names[index] ?? `Sheet ${index + 1}`}\n${rows.join('\n')}`);
+    blocks.push(
+      `## Slide ${n}\n${paragraphs.join('\n')}` +
+        (notes.length > 0 ? `\n\n(speaker notes)\n${notes.join('\n')}` : ''),
+    );
+  }
+
+  if (blocks.length === 0) {
+    throw new EmptyDocumentError(
+      'no readable text on any slide — a deck of images (screenshots, exported pictures) has no text layer to read',
+    );
   }
 
   return {
     text: blocks.join('\n\n'),
-    note: skipped > 0 ? `${skipped} empty sheet(s) skipped` : '',
+    note: empty > 0 ? `${empty} slide(s) with no readable text skipped` : '',
   };
+}
+
+/** The visible paragraphs of one slide (or notes) XML part, in document order. */
+function slideParagraphs(xml: string): string[] {
+  const paragraphs: string[] = [];
+  for (const para of xml.matchAll(/<a:p\b[^>]*>([\s\S]*?)<\/a:p>/g)) {
+    const runs = [...(para[1] ?? '').matchAll(/<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g)].map((run) =>
+      decodeEntities(run[1] ?? ''),
+    );
+    const line = runs.join('').trim();
+    if (line !== '') paragraphs.push(line);
+  }
+  return paragraphs;
 }
 
 function readSharedStrings(data: Buffer | undefined): string[] {
@@ -363,11 +553,11 @@ function readSheetNames(data: Buffer | undefined): string[] {
   );
 }
 
-function readSheet(xml: string, shared: string[]): string[] {
-  const rows: string[] = [];
+function readSheetCells(xml: string, shared: string[]): RawCell[][] {
+  const rows: RawCell[][] = [];
 
   for (const rowMatch of xml.matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)) {
-    const cells: { column: string; value: string }[] = [];
+    const cells: RawCell[] = [];
 
     for (const cellMatch of (rowMatch[1] ?? '').matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/g)) {
       const attributes = cellMatch[1] ?? '';
@@ -389,19 +579,15 @@ function readSheet(xml: string, shared: string[]): string[] {
         value = decodeEntities(/<v>([\s\S]*?)<\/v>/.exec(body)?.[1] ?? '');
       }
 
-      value = value.replace(/[\t\n]+/g, ' ').trim();
+      // Verbatim: `\r\n` from Excel becomes `\n`, and nothing else is touched.
+      // A Steps cell is a numbered list on several lines, and the line breaks
+      // are the list.
+      value = value.replace(/\r\n?/g, '\n').replace(/^\s+|\s+$/g, '');
       if (value !== '') cells.push({ column, value });
     }
 
     if (cells.length === 0) continue;
-    // A dense row is a table row; a sparse one keeps its column letters so a
-    // value cannot end up read under a heading it never sat beneath.
-    const dense = isDense(cells.map((cell) => cell.column));
-    rows.push(
-      dense
-        ? cells.map((cell) => cell.value).join('\t')
-        : cells.map((cell) => `${cell.column}: ${cell.value}`).join('\t'),
-    );
+    rows.push(cells);
   }
 
   return rows;
@@ -488,7 +674,7 @@ const LONG_CELL_CHARS = 120;
  * thing it must never do. The rows stay adjacent and in order, and the model
  * reads the grouping the same way a person does.
  */
-export function csvToText(raw: string, forceTab = false): { text: string; note: string } {
+function csvToText(raw: string, forceTab = false): { text: string; note: string } {
   const delimiter = forceTab ? '\t' : sniffDelimiter(raw);
   const rows = parseDelimited(raw, delimiter).filter((row) =>
     row.some((cell) => cell.trim() !== ''),

@@ -17,9 +17,11 @@ import { join } from 'node:path';
 import { captureAxTree } from '../healer/jit-healer.js';
 import { runFlow, withPage, type Flow, type FlowStep, type RunFlowOptions } from '../engine/runner.js';
 import type { ProofBundle, ProofStep } from '../engine/proof-bundle.js';
+import { isPassing } from '../engine/proof-bundle.js';
 import type { AgentRecord } from '../engine/proof-bundle.js';
 import type { WorkflowAgent } from '../orchestrator/workflow-agent.js';
 import type { FlowRepairModel, RepairInvestigation, RepairProposal } from './flow-repair-model.js';
+import type { RepairMemory } from './repair-memory.js';
 
 export const DEFAULT_MAX_REPAIR_ATTEMPTS = 3;
 export const DEFAULT_REPAIR_MAX_AX_NODES = 150;
@@ -59,6 +61,14 @@ export interface FlowRepairLoopOptions {
    * returns anyway is discarded.
    */
   regenerateFrom?: boolean | undefined;
+  /**
+   * Suite-wide memory of proven fixes (`run-cases.ts` shares one across a
+   * catalog's cases). Remembered fixes are pre-applied before the first
+   * attempt; a fix this loop generates is recorded only after the re-run's
+   * bundle shows the repaired step itself passed — the proposal working is
+   * the evidence, never the model saying it would.
+   */
+  memory?: RepairMemory | null | undefined;
 }
 
 export interface RepairFileRecord {
@@ -78,7 +88,7 @@ export interface RepairAttempt {
 }
 
 export interface FlowRepairOutcome {
-  status: 'passed' | 'dead-end';
+  status: 'passed' | 'dead-end' | 'needs-review';
   attempts: RepairAttempt[];
   /** The flow that finally passed, or the last one attempted if dead-ended. */
   finalFlow: Flow;
@@ -217,6 +227,7 @@ export class FlowRepairLoop {
   readonly #onLog: ((line: string) => void) | undefined;
   readonly #agent: WorkflowAgent | null;
   readonly #regenerateFrom: boolean;
+  readonly #memory: RepairMemory | null;
 
   constructor(options: FlowRepairLoopOptions) {
     this.#model = options.model;
@@ -227,6 +238,7 @@ export class FlowRepairLoop {
     this.#onLog = options.onLog;
     this.#agent = options.agent ?? null;
     this.#regenerateFrom = options.regenerateFrom ?? false;
+    this.#memory = options.memory ?? null;
   }
 
   /**
@@ -238,15 +250,73 @@ export class FlowRepairLoop {
     const history: Array<{ attempt: number; summary: string; outcome: string }> = [];
     let current = flow;
 
+    // Fixes other cases in this suite already proved, applied before the
+    // first attempt — the whole point of the memory is that the second case
+    // to hit a known break never pays for rediscovery.
+    if (this.#memory) {
+      const adapted = this.#memory.adapt(current);
+      for (const note of adapted.applied) this.#onLog?.(`  remembered repair: ${note}`);
+      current = adapted.flow;
+    }
+
+    // A fix applied for the next attempt, awaiting its evidence: recorded
+    // into the memory only if that attempt's bundle shows the repaired step
+    // itself passed. `repairedIndex` is within `section` after the splice.
+    let pending: {
+      url: string;
+      failedStep: FlowStep;
+      precededBy: FlowStep | null;
+      proposal: RepairProposal;
+      section: FailureLocation['section'];
+      repairedIndex: number;
+    } | null = null;
+
     for (let attempt = 1; attempt <= this.#maxAttempts; attempt++) {
       this.#onLog?.(`\n— attempt ${attempt}/${this.#maxAttempts} —`);
       const bundle = await runFlow(current, this.#runOptions);
       const record: RepairAttempt = { attempt, flow: current, bundle };
       attempts.push(record);
 
-      if (bundle.status === 'passed') {
+      if (pending && this.#memory) {
+        const setupLen = current.setup?.length ?? 0;
+        const flatIndex = (pending.section === 'setup' ? 0 : setupLen) + pending.repairedIndex;
+        if (bundle.steps[flatIndex]?.status === 'passed') {
+          const stored = this.#memory.record({
+            url: pending.url,
+            failedStep: pending.failedStep,
+            precededBy: pending.precededBy,
+            proposal: pending.proposal,
+            learnedFrom: baseName,
+          });
+          if (stored) this.#onLog?.(`  remembered this repair for the rest of the suite`);
+        }
+        pending = null;
+      }
+
+      if (isPassing(bundle.status)) {
         this.#onLog?.(`✓ passed`);
         return { status: 'passed', attempts, finalFlow: current };
+      }
+
+      // A wording near-miss is a VERDICT question, not a breakage: the page
+      // answered, and the judge (which runs inside each attempt when built)
+      // or a human decides whether the answer satisfies the claim. Ruled
+      // proved → the run passed. Ruled failed at the bar → a genuine failure,
+      // and the repair gets its turn (regeneration may rewrite a stale
+      // claim). Unruled → stop and leave it for a human: re-running the flow
+      // can only arrive at the same pair of strings, and a repair must never
+      // overwrite a question nobody has answered.
+      if (bundle.status === 'needs-review') {
+        const ruling = bundle.review?.verdict;
+        if (ruling === 'proved') {
+          this.#onLog?.(`✓ passed — the judge ruled the wording satisfies the claim`);
+          return { status: 'passed', attempts, finalFlow: current };
+        }
+        if (ruling === undefined) {
+          this.#onLog?.(`? needs review — a wording question for the judge or a human, not a breakage to repair`);
+          return { status: 'needs-review', attempts, finalFlow: current };
+        }
+        // ruled failed: fall through to the repair below.
       }
 
       if (attempt === this.#maxAttempts) {
@@ -260,15 +330,30 @@ export class FlowRepairLoop {
         break; // not a repairable section (teardown, or a run-level connect error)
       }
 
-      const sourceArray = location.section === 'setup' ? current.setup : current.steps;
-      const failedStep = sourceArray?.[location.index];
+      // Annotated to break a type-inference cycle (TS7022): runner ⇄ repair
+      // are already in a type-only import loop, and `repair-memory` joining
+      // it pushed these four initializers over into self-reference.
+      const sourceArray: FlowStep[] | undefined =
+        location.section === 'setup' ? current.setup : current.steps;
+      const failedStep: FlowStep | undefined = sourceArray?.[location.index];
       if (!failedStep) break; // defensive — locateFailedStep's bounds should make this unreachable
+
+      // An action the repair schema cannot spell (DB, HTTP, workflow) makes
+      // the model echo it and fail validation on every identical
+      // temperature-0 retry — a guaranteed breaker trip, never a fix.
+      if (this.#model.canExpress?.(failedStep.action) === false) {
+        this.#onLog?.(
+          `✗ ${failedStep.action} at ${location.section}[${location.index}] is outside the repair ` +
+            `schema's vocabulary — a proposal cannot express it, so none is asked for`,
+        );
+        break;
+      }
 
       const setupLen = current.setup?.length ?? 0;
       const recordedIndex = (location.section === 'setup' ? 0 : setupLen) + location.index;
-      const failedRecord = bundle.steps[recordedIndex];
+      const failedRecord: ProofStep | undefined = bundle.steps[recordedIndex];
       const error = describeFailure(failedRecord);
-      const url = failedRecord?.url ?? current.baseUrl ?? '';
+      const url: string = failedRecord?.url ?? current.baseUrl ?? '';
       this.#onLog?.(`✗ failed at ${location.section}[${location.index}]: ${error}`);
 
       let axTree = '(page unavailable for a fresh accessibility-tree read)';
@@ -365,6 +450,17 @@ export class FlowRepairLoop {
 
       record.repair = { reasoning: proposal.reasoning, flowPath, patchPath };
       history.push({ attempt, summary: proposal.reasoning, outcome: 'retrying with this fix' });
+      pending = {
+        url,
+        failedStep,
+        // Within-section predecessor only: across the setup/steps boundary
+        // null is the honest answer, and adapt() treats null as "match the
+        // insert alone".
+        precededBy: location.index > 0 ? (sourceArray?.[location.index - 1] ?? null) : null,
+        proposal,
+        section: location.section,
+        repairedIndex: location.index + proposal.insertBefore.length,
+      };
       current = revised;
     }
 

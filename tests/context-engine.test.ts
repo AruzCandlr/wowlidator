@@ -13,10 +13,22 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { ContextEngine, matchesRoutePattern, pathnameOf } from '../src/context/context-engine.js';
-import { DEFAULT_CONTEXT_MAX_NODES, findRouteForUrl, summarize, toPromptContext } from '../src/context/query.js';
+import { concreteRouteUrl } from '../src/context/route-match.js';
+import {
+  DEFAULT_CONTEXT_MAX_NODES,
+  findRouteForUrl,
+  routesForDescription,
+  summarize,
+  toPromptContext,
+} from '../src/context/query.js';
+import { HEAL_REPO_HINTS_MAX_LINES, healHintsFrom } from '../src/context/heal-hints.js';
+import { detectDbHint } from '../src/context/db-hint.js';
 import { ManifestIngester } from '../src/context/ingesters/manifest-ingester.js';
 import { ComponentIngester } from '../src/context/ingesters/component-ingester.js';
+import { MessageIngester, isMessageFile } from '../src/context/ingesters/message-ingester.js';
+import { toPromptContext } from '../src/context/query.js';
 import { RouteIngester } from '../src/context/ingesters/route-ingester.js';
+import { nearestRoutes, routeIsDeclared } from '../src/context/route-match.js';
 import { TestIngester } from '../src/context/ingesters/test-ingester.js';
 import type { IngestContext, IngestResult, Ingester, ProjectGraph } from '../src/context/types.js';
 
@@ -68,8 +80,50 @@ const NEXT_APP_FIXTURE = {
       return <div>About</div>;
     }
   `,
+  // An i18n catalog (next-intl shape) and a page whose screen binds one of
+  // its namespaces — the application's words, indexed and linked.
+  'messages/en.json': JSON.stringify({
+    plans: { title: 'Benefit Plan Catalog', createPlan: 'Create Plan', intro: 'x'.repeat(200) },
+    common: { save: 'Save' },
+  }),
+  'messages/th.json': JSON.stringify({ plans: { title: 'แคตตาล็อกแผนสวัสดิการ', createPlan: 'สร้างแผน' } }),
+  'src/components/PlanHeader.tsx': `
+    import { useTranslations } from 'next-intl';
+    export function PlanHeader({ isTh }: { isTh: boolean }) {
+      const t = useTranslations('plans');
+      return (
+        <div>
+          <h1>{t('title')}</h1>
+          <button title={isTh ? 'สร้างแผนสวัสดิการใหม่' : 'Create Benefit Plan'}>Create</button>
+          <span>42</span>
+        </div>
+      );
+    }
+  `,
+  'app/plans/page.tsx': `
+    import { PlanHeader } from '../../src/components/PlanHeader';
+    export default function PlansPage() {
+      return <PlanHeader />;
+    }
+  `,
+  // An App Router page that awaits its data — the shape 21 of the indexed
+  // app's 212 pages have, and the one the renders-edge guess used to miss.
+  'app/reports/page.tsx': `
+    export default async function ReportsPage() {
+      const rows = await Promise.resolve([]);
+      return <div>{rows.length}</div>;
+    }
+  `,
   'app/api/employees/route.ts': `
     export function GET() { return new Response('[]'); }
+  `,
+  // The PL_03_03 shape: a real path that answers writes only. Its GET does
+  // not exist, and before methods were indexed nothing could say so.
+  'app/api/benefit-plans/route.ts': `
+    export const dynamic = 'force-dynamic';
+    export async function POST(request: Request) { return new Response('{}'); }
+    export async function PUT(request: Request) { return new Response('{}'); }
+    export const DELETE = async (request: Request) => new Response('{}');
   `,
   'pages/blog/[slug].tsx': `
     export default function BlogPost() {
@@ -173,21 +227,111 @@ describe('context engine', () => {
     });
   });
 
+  describe('nearestRoutes and routeIsDeclared', () => {
+    const routes = [
+      '/:locale/admin/benefits/plans',
+      '/:locale/admin/benefits/records/:planId',
+      '/:locale/admin/benefits',
+      '/:locale/admin/employees/:id',
+      '/:locale/profile/:tab/benefits',
+    ];
+
+    it('names the route a near-miss path plainly meant', () => {
+      // be100 PL_02_03 (2026-08-25): a flow navigated to a path that answered
+      // 404, and every step after it failed against the error page — filed
+      // against the application. The real route was in the index all along.
+      assert.equal(
+        nearestRoutes('/en/admin/benefits/plans/create', routes)[0]?.pattern,
+        '/:locale/admin/benefits/plans',
+      );
+      // A singular/plural slip is the commonest mistake of all.
+      assert.equal(
+        nearestRoutes('/en/admin/benefits/plan', routes)[0]?.pattern,
+        '/:locale/admin/benefits/plans',
+      );
+    });
+
+    it('says nothing when nothing literal is shared — silence beats a wrong guess', () => {
+      // Every route here has a `:param` first segment, so a purely positional
+      // match would "resemble" this path three ways. Three suggestions, all
+      // noise, and a reader learns to skip the line.
+      assert.deepEqual(nearestRoutes('/en/totally/made/up', routes), []);
+      assert.deepEqual(nearestRoutes('', routes), []);
+    });
+
+    it('answers whether a path is declared, and declines when nothing is indexed', () => {
+      assert.equal(routeIsDeclared('/en/admin/benefits/plans', routes), true);
+      assert.equal(routeIsDeclared('/en/admin/benefits/plans?tab=1', routes), true, 'a query is not part of the route');
+      assert.equal(routeIsDeclared('/en/admin/benefits/nope', routes), false);
+      // No index, no opinion — the caller must not read this as "undeclared".
+      assert.equal(routeIsDeclared('/en/anything', []), null);
+    });
+  });
+
   describe('RouteIngester', () => {
     it('converts App Router dynamic segments and drops route groups', async () => {
       const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
       const result = await new RouteIngester().ingest(ctx);
-      const byFile = new Map(result.nodes.map((node) => [node.file, node]));
+      // Routes only: an api handler now contributes its `operation` nodes to
+      // the same file, and this test is about the route path.
+      const byFile = new Map(
+        result.nodes.filter((node) => node.kind === 'route').map((node) => [node.file, node]),
+      );
 
       assert.equal(byFile.get('app/employees/[id]/page.tsx')?.name, '/employees/:id');
       assert.equal(byFile.get('app/(marketing)/about/page.tsx')?.name, '/about');
       assert.equal(byFile.get('app/api/employees/route.ts')?.meta?.type, 'api');
     });
 
+    it('reads which HTTP methods an api route exports, and emits one operation each', async () => {
+      // be100 PL_03_03 (2026-08-25): `/api/benefit-plans` was indexed from its
+      // file path alone, the author took the real path and guessed GET, and
+      // the app answered 405 — two `high` defects against correct behaviour.
+      // The method is half of what an endpoint is.
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+
+      const plans = result.nodes.find((n) => n.file === 'app/api/benefit-plans/route.ts' && n.kind === 'route');
+      assert.equal(plans?.meta?.['methods'], 'POST,PUT,DELETE', 'all three export shapes are read');
+
+      const operations = result.nodes.filter((n) => n.kind === 'operation').map((n) => n.name).sort();
+      assert.deepEqual(operations, [
+        'DELETE /api/benefit-plans',
+        'GET /api/employees',
+        'POST /api/benefit-plans',
+        'PUT /api/benefit-plans',
+      ]);
+      // The id and `METHOD /path` name are the OpenAPI ingester's own shape,
+      // so every consumer reads one vocabulary whichever source found it.
+      const post = result.nodes.find((n) => n.name === 'POST /api/benefit-plans');
+      assert.equal(post?.id, 'operation:POST /api/benefit-plans');
+      assert.equal(post?.file, 'app/api/benefit-plans/route.ts');
+    });
+
+    it('emits no operation for a page, a layout, or a handler it cannot read', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+      const fromPages = result.nodes.filter(
+        (n) => n.kind === 'operation' && !n.file.startsWith('app/api/'),
+      );
+      assert.deepEqual(fromPages, [], 'only api handlers declare methods');
+      // A file the walk lists but disk does not hold: silence, never a guess —
+      // the route node still stands, with no methods claimed.
+      const missing = await new RouteIngester().ingest({
+        rootDir: dir,
+        files: ['app/api/ghost/route.ts'],
+      });
+      assert.equal(missing.nodes.length, 1);
+      assert.equal(missing.nodes[0]?.kind, 'route');
+      assert.equal(missing.nodes[0]?.meta?.['methods'], undefined);
+    });
+
     it('handles Pages Router index and dynamic files', async () => {
       const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
       const result = await new RouteIngester().ingest(ctx);
-      const byFile = new Map(result.nodes.map((node) => [node.file, node]));
+      const byFile = new Map(
+        result.nodes.filter((node) => node.kind === 'route').map((node) => [node.file, node]),
+      );
 
       assert.equal(byFile.get('pages/index.tsx')?.name, '/');
       assert.equal(byFile.get('pages/blog/[slug].tsx')?.name, '/blog/:slug');
@@ -201,6 +345,20 @@ describe('context engine', () => {
         result.edges.some(
           (e) => e.kind === 'renders' && e.from === employeeRoute?.id && e.to.endsWith('#EmployeePage'),
         ),
+      );
+    });
+
+    it('guesses the renders edge for an ASYNC default export too (2026-08-28: 23 orphan routes)', async () => {
+      // `export default async function ReportsPage` used to fall through to
+      // the filename guess ("Page"), dangle, be pruned — and the generator's
+      // repository slice for that page walked to nothing.
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new RouteIngester().ingest(ctx);
+      const reports = result.nodes.find((n) => n.file === 'app/reports/page.tsx');
+      assert.ok(reports, 'the async page is a route');
+      assert.ok(
+        result.edges.some((e) => e.kind === 'renders' && e.from === reports?.id && e.to.endsWith('#ReportsPage')),
+        'the edge names the async default export, not the filename',
       );
     });
   });
@@ -222,6 +380,62 @@ describe('context engine', () => {
       const node = result.nodes.find((n) => n.file === 'employee.flow.json');
       assert.equal(node?.meta?.hasAssertion, 'true');
       assert.equal(node?.meta?.urls, '/employees/42');
+    });
+  });
+
+  describe('MessageIngester', () => {
+    it('recognises i18n catalogs by convention, and nothing else', () => {
+      assert.equal(isMessageFile('messages/en.json'), true);
+      assert.equal(isMessageFile('public/locales/th/common.json'), true);
+      assert.equal(isMessageFile('src/i18n/en-US.json'), true);
+      assert.equal(isMessageFile('package.json'), false);
+      assert.equal(isMessageFile('messages/README.json'), false, 'a stem that is not a locale');
+      assert.equal(isMessageFile('src/data/en.json'), false, 'not under an i18n directory');
+    });
+
+    it('indexes one node per namespace and locale, with the strings as its detail', async () => {
+      const ctx = await ingestContextFor(dir, Object.keys(NEXT_APP_FIXTURE));
+      const result = await new MessageIngester().ingest(ctx);
+      const en = result.nodes.find((n) => n.file === 'messages/en.json' && n.name === 'plans');
+      const th = result.nodes.find((n) => n.file === 'messages/th.json' && n.name === 'plans');
+      assert.ok(en && th, 'a node per locale');
+      assert.equal(en?.kind, 'message');
+      assert.equal(en?.meta?.locale, 'en');
+      assert.equal(en?.meta?.keys, '3');
+      assert.match(en?.detail ?? '', /title: "Benefit Plan Catalog"/);
+      // Short labels come first; a paragraph is quoted cut, never whole.
+      assert.ok((en?.detail ?? '').indexOf('createPlan') < (en?.detail ?? '').indexOf('intro'));
+      assert.doesNotMatch(en?.detail ?? '', /x{150}/);
+      assert.ok(result.nodes.some((n) => n.name === 'common'), 'every namespace, bound or not');
+    });
+
+    it('links a component to the namespaces its file binds, and the prompt slice prints the words', async () => {
+      const engine = new ContextEngine({ rootDir: dir, cacheFile: join(dir, '.wowlidator/context-graph.json') });
+      const graph = await engine.build({ force: true });
+      const header = graph.nodes.find((n) => n.name === 'PlanHeader');
+      const en = graph.nodes.find((n) => n.kind === 'message' && n.file === 'messages/en.json' && n.name === 'plans');
+      assert.ok(header && en);
+      assert.ok(graph.edges.some((e) => e.kind === 'uses' && e.from === header?.id && e.to === en?.id), 'PlanHeader uses en plans');
+      assert.ok(graph.edges.some((e) => e.kind === 'uses' && e.from === header?.id && e.to.endsWith('th.json#plans')), 'and th');
+      // The route-centred slice the generator reads now carries the rendering.
+      const slice = toPromptContext(graph, { url: 'http://x.test/plans' });
+      assert.match(slice, /renders the plans strings \[en, messages\/en\.json\]: .*Benefit Plan Catalog/);
+      assert.match(slice, /แคตตาล็อกแผนสวัสดิการ/, 'the other locale too — the bilingual anyOf needs both');
+    });
+
+    it('captures the words a component renders from its own source — both branches of a locale ternary', async () => {
+      // The modal title a wording case asked about was a hardcoded JSX
+      // attribute (`title={isTh ? 'สร้าง…' : 'Create Benefit Plan'}`) in no
+      // catalog — invisible to the index until the component carried it.
+      const engine = new ContextEngine({ rootDir: dir, cacheFile: join(dir, '.wowlidator/context-graph.json') });
+      const graph = await engine.build({ force: true });
+      const header = graph.nodes.find((n) => n.name === 'PlanHeader');
+      assert.match(header?.detail ?? '', /"Create Benefit Plan"/);
+      assert.match(header?.detail ?? '', /"สร้างแผนสวัสดิการใหม่"/);
+      assert.match(header?.detail ?? '', /"Create"/, 'JSX text too');
+      assert.doesNotMatch(header?.detail ?? '', /"42"/, 'a number is not a word');
+      const slice = toPromptContext(graph, { url: 'http://x.test/plans' });
+      assert.match(slice, /PlanHeader .*— says: .*"Create Benefit Plan"/);
     });
   });
 
@@ -397,6 +611,67 @@ describe('context engine', () => {
       assert.equal(toPromptContext(graph), '');
     });
 
+    it('finds the routes a described journey is about', () => {
+      const routes = routesForDescription(graph, 'open the blog post for a slug');
+      assert.ok(
+        routes.some((route) => route.name === '/blog/:slug'),
+        `the description names the blog route; got ${routes.map((r) => r.name).join(', ')}`,
+      );
+    });
+
+    it('names no route for a description the repository has nothing to do with', () => {
+      assert.deepEqual(routesForDescription(graph, 'reconcile the quarterly warehouse manifest'), []);
+      assert.deepEqual(routesForDescription(graph, ''), []);
+    });
+
+    it('walks from the described routes as well as the starting page', () => {
+      // The journey the describe path actually gets: it STARTS on one page and
+      // is ABOUT another. Seeded from the start URL alone this section carried
+      // two lines about a login screen while everything the test was about sat
+      // unread in the same graph — measured on a real `go` invocation against
+      // a 1,874-node index.
+      const text = toPromptContext(graph, {
+        url: 'http://localhost:3000/employees/42',
+        query: 'open an employee, then read the blog post about them',
+      });
+      assert.match(text, /Project context for \/employees\/:id/, 'the page it starts on');
+      assert.match(text, /\/blog\/:slug/, 'and the page the description names');
+      assert.match(
+        text,
+        /not the page you are on/,
+        'the two claims are labelled apart, or a flow clicks its way to a page it never opened',
+      );
+    });
+
+    it('is byte-for-byte the url-only walk when no description is given', () => {
+      const url = 'http://localhost:3000/employees/42';
+      assert.equal(toPromptContext(graph, { url, query: '' }), toPromptContext(graph, { url }));
+    });
+
+    it('still reports a url no route matches, so callers can tell it apart from silence', () => {
+      const text = toPromptContext(graph, { url: 'http://localhost:3000/nowhere' });
+      assert.match(text, /^Project context: no indexed route matches/);
+    });
+
+    // The healer's slice of this graph: bounded, and the no-match sentinel is
+    // suppressed — a healer told "nothing matches" learns nothing about the
+    // tree in front of it (`heal-hints.ts`).
+    it('heal hints trim the graph slice to the hint budget and drop the sentinel', () => {
+      const hints = healHintsFrom(graph, [])({
+        url: 'http://localhost:3000/employees/42',
+        selector: 'role=link[name="Employee" i]',
+        intent: 'open the employee page',
+      });
+      assert.ok(hints.repoHints !== undefined);
+      assert.match(hints.repoHints!, /Project context for \/employees\/:id/);
+      assert.ok(hints.repoHints!.split('\n').length <= HEAL_REPO_HINTS_MAX_LINES);
+      const nowhere = healHintsFrom(graph, [])({
+        url: 'http://localhost:3000/nowhere',
+        selector: 'role=button[name="Save" i]',
+      });
+      assert.equal(nowhere.repoHints, undefined);
+    });
+
     it('truncates at the node budget and says so', () => {
       const text = toPromptContext(graph, { url: 'http://localhost:3000/employees/42', maxNodes: 2 });
       assert.match(text, /context truncated at 2 nodes/);
@@ -406,6 +681,61 @@ describe('context engine', () => {
       const text = summarize(graph);
       assert.match(text, /nodes\s+\d+ \(/);
       assert.match(text, /edges\s+\d+/);
+    });
+  });
+
+  describe('turning a route pattern into a page to open', () => {
+    // The resolver behind `--capture-journey`. Its refusals are the feature:
+    // every parameter it cannot fill from evidence is a segment that would
+    // otherwise be invented, and an invented `:id` navigates somewhere
+    // meaningless while looking exactly like a real destination.
+    const start = 'http://localhost:3200/en/login';
+
+    it('fills :locale from the start url, at the same position', () => {
+      assert.deepEqual(concreteRouteUrl('/:locale/overtime', start), {
+        ok: true,
+        url: 'http://localhost:3200/en/overtime',
+      });
+    });
+
+    it('accepts a wholly static pattern', () => {
+      assert.deepEqual(concreteRouteUrl('/admin/employees', start), {
+        ok: true,
+        url: 'http://localhost:3200/admin/employees',
+      });
+    });
+
+    it('refuses a parameter that is not the locale', () => {
+      const got = concreteRouteUrl('/:locale/employees/:id', start);
+      assert.equal(got.ok, false);
+      assert.match(got.ok === false ? got.reason : '', /:id/);
+    });
+
+    it('refuses a catch-all', () => {
+      const got = concreteRouteUrl('/blog/*slug', start);
+      assert.equal(got.ok, false);
+      assert.match(got.ok === false ? got.reason : '', /catch-all/);
+    });
+
+    it('refuses when the start url has no locale where one is needed', () => {
+      // "/login" is not a locale, and filling :locale with it would produce
+      // /login/overtime — a URL that grounds nothing and reads like one that does.
+      const got = concreteRouteUrl('/:locale/overtime', 'http://localhost:3200/login');
+      assert.equal(got.ok, false);
+      assert.match(got.ok === false ? got.reason : '', /locale/);
+    });
+
+    it('accepts a regional locale and keeps the origin, port and all', () => {
+      assert.deepEqual(concreteRouteUrl('/:locale/overtime', 'https://app.test:8443/en-GB/login'), {
+        ok: true,
+        url: 'https://app.test:8443/en-GB/overtime',
+      });
+    });
+
+    it('refuses a start url that is not absolute', () => {
+      const got = concreteRouteUrl('/:locale/overtime', '/en/login');
+      assert.equal(got.ok, false);
+      assert.match(got.ok === false ? got.reason : '', /not absolute/);
     });
   });
 
@@ -426,5 +756,76 @@ describe('context engine', () => {
 
   it('default max node budget stays in sync with the exported constant', () => {
     assert.equal(DEFAULT_CONTEXT_MAX_NODES, 40);
+  });
+});
+
+describe('db-hint', () => {
+  // What a scan learns about the CONNECTION (engine, host, port — never a
+  // password value) from the repo's own files, as a hint for the panel.
+  it('reads a dotenv DSN, reporting the password location but never its value', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wowlidator-dbhint-'));
+    await writeFixture(root, {
+      '.env': 'DATABASE_URL="postgres://app:s3cret@localhost:5432/hrcenter"\n',
+    });
+    const hint = await detectDbHint(root);
+    assert.equal(hint?.engine, 'postgres');
+    assert.equal(hint?.host, 'localhost');
+    assert.equal(hint?.port, 5432);
+    assert.equal(hint?.database, 'hrcenter');
+    assert.equal(hint?.user, 'app');
+    assert.match(hint?.passwordAt ?? '', /\.env: DATABASE_URL/);
+    // The one rule that matters: the secret never survives into the hint.
+    assert.ok(!JSON.stringify(hint).includes('s3cret'));
+    assert.equal(hint?.suggestedUrl, 'postgres://app@localhost:5432/hrcenter');
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('reads a compose postgres service, publishing port and password location', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wowlidator-dbhint-'));
+    await writeFixture(root, {
+      'docker-compose.yml': [
+        'services:',
+        '  db:',
+        '    image: postgres:16',
+        '    ports:',
+        '      - "15432:5432"',
+        '    environment:',
+        '      POSTGRES_DB: hrcenter',
+        '      POSTGRES_USER: app',
+        '      POSTGRES_PASSWORD: s3cret',
+        '',
+      ].join('\n'),
+    });
+    const hint = await detectDbHint(root);
+    assert.equal(hint?.engine, 'postgres');
+    // localhost, not the service name: the hint is for connecting from the
+    // machine running wowlidator, which is what a published port means.
+    assert.equal(hint?.host, 'localhost');
+    assert.equal(hint?.port, 15432);
+    assert.equal(hint?.database, 'hrcenter');
+    assert.match(hint?.passwordAt ?? '', /docker-compose\.yml: POSTGRES_PASSWORD/);
+    assert.ok(!JSON.stringify(hint).includes('s3cret'));
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('resolves a Prisma datasource through the repo dotenv files, whatever the var is named', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wowlidator-dbhint-'));
+    await writeFixture(root, {
+      'prisma/schema.prisma': 'datasource db {\n  provider = "postgresql"\n  url = env("HR_DSN")\n}\n',
+      '.env.example': 'HR_DSN=postgres://localhost/hrcenter\n',
+    });
+    const hint = await detectDbHint(root);
+    assert.equal(hint?.engine, 'postgres');
+    assert.equal(hint?.database, 'hrcenter');
+    assert.equal(hint?.port, 5432); // postgres default when the DSN names none
+    assert.equal(hint?.passwordAt, undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('says nothing rather than guessing when the repo declares no database', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wowlidator-dbhint-'));
+    await writeFixture(root, { '.env': 'API_KEY=abc\n', 'docker-compose.yml': 'services:\n  web:\n    image: nginx\n' });
+    assert.equal(await detectDbHint(root), null);
+    await rm(root, { recursive: true, force: true });
   });
 });

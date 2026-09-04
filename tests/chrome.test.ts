@@ -26,11 +26,13 @@ import {
   chromeIsOurs,
   chromeMatchPattern,
   ensureChrome,
+  ensureChromePool,
   findChrome,
   portOf,
   stopChrome,
   waitForApp,
 } from '../src/browser/chrome.js';
+import { poolMember } from '../src/browser/pool.js';
 
 describe('chrome — decisions', () => {
   it('reads the port out of a CDP url, and falls back sensibly', () => {
@@ -73,6 +75,17 @@ describe('chrome — decisions', () => {
     const ready = await waitForApp('http://127.0.0.1:9/nothing', 1_200);
     assert.equal(ready, false);
     assert.ok(Date.now() - started < 6_000, 'the timeout must be a budget, not a suggestion');
+  });
+
+  it('counts the wait down on the console, one line per second, and stops at the deadline', async () => {
+    const lines: string[] = [];
+    const ready = await waitForApp('http://127.0.0.1:9/nothing', 2_500, (l) => lines.push(l));
+    assert.equal(ready, false);
+    assert.deepEqual(lines, [
+      'waiting for http://127.0.0.1:9/nothing … 3s left',
+      'waiting for http://127.0.0.1:9/nothing … 2s left',
+      'waiting for http://127.0.0.1:9/nothing … 1s left',
+    ]);
   });
 });
 
@@ -177,6 +190,54 @@ describe('chrome — starting and recycling (real browsers)', { skip }, () => {
  * second run of the day silently kept the window from the first: you pass the
  * flag, windows keep appearing, and nothing says why.
  */
+describe('chrome — a pool of browsers (real browsers)', { skip }, () => {
+  const PORT = 9350;
+  const CDP = `http://127.0.0.1:${PORT}`;
+  const PROFILE = join(tmpdir(), 'wowlidator-chrome-pool-profile');
+  const members = [0, 1, 2].map((i) => poolMember(CDP, PROFILE, i));
+
+  const cleanup = async (): Promise<void> => {
+    for (const m of members) {
+      await stopChrome(portOf(m.cdpUrl), m.profile);
+      for (let i = 0; i < 20 && (await cdpAnswers(m.cdpUrl, 300)); i++) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+  };
+
+  before(cleanup);
+  after(async () => {
+    await cleanup();
+    for (const m of members) await rm(m.profile, { recursive: true, force: true });
+  });
+
+  it('starts n browsers on consecutive ports, each driveable, the extras headless', async () => {
+    const results = await ensureChromePool({ cdpUrl: CDP, profile: PROFILE }, 3);
+    assert.deepEqual(
+      results.map((r) => r.status),
+      ['started', 'started', 'started'],
+    );
+    assert.deepEqual(
+      results.map((r) => r.cdpUrl),
+      members.map((m) => m.cdpUrl),
+    );
+    for (const m of members) assert.equal(await cdpDrivable(m.cdpUrl), true);
+    // No preference for the primary; the extras run without a window.
+    assert.equal(await chromeIsHeadless(portOf(members[1]!.cdpUrl), members[1]!.profile), true);
+    assert.equal(await chromeIsHeadless(portOf(members[2]!.cdpUrl), members[2]!.profile), true);
+  });
+
+  it('stops one member without touching its neighbours', async () => {
+    await stopChrome(portOf(members[1]!.cdpUrl), members[1]!.profile);
+    for (let i = 0; i < 20 && (await cdpAnswers(members[1]!.cdpUrl, 300)); i++) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.equal(await cdpAnswers(members[1]!.cdpUrl), false);
+    assert.equal(await cdpAnswers(members[0]!.cdpUrl), true);
+    assert.equal(await cdpAnswers(members[2]!.cdpUrl), true);
+  });
+});
+
 describe('chrome — running without a window (real browsers)', { skip }, () => {
   const PORT = 9348;
   const CDP = `http://127.0.0.1:${PORT}`;

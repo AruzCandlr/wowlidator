@@ -21,7 +21,7 @@ import type { AddressInfo } from 'node:net';
 
 import { z } from 'zod';
 
-import { jsonModel } from './helpers.js';
+import { jsonModel, scriptedModel } from './helpers.js';
 import { MockLanguageModelV4 } from 'ai/test';
 
 import { ProofBundleBuilder, type Defect } from '../src/engine/proof-bundle.js';
@@ -51,7 +51,7 @@ import {
   slugify,
   writeHtmlReport,
 } from '../src/reporter/html-reporter.js';
-import { ConfigError, DEFAULT_ROLE_MODELS, loadConfig } from '../src/config.js';
+import { CLAUDE_CLI_PLACEHOLDER_KEY, ConfigError, DEFAULT_ROLE_MODELS, loadConfig, DEFAULT_PROVIDER_MODELS, LOCAL_LLM_PLACEHOLDER_KEY } from '../src/config.js';
 import { hasAssertion, hasStorableOrigin, type FlowStep } from '../src/engine/runner.js';
 import {
   canonicalSelector,
@@ -85,6 +85,33 @@ const PAGES: Record<string, string> = {
   '/details': `<h1>Application details</h1>
     <input id="applicant" aria-label="Applicant name" placeholder="Applicant name">
     <p id="stage">Stage: details</p>`,
+  // A form the agent must fill the way a human does — a checkbox, a native
+  // select, and a per-keystroke field. Each control reflects its state into a
+  // visible text node so the test reads it back with a plain locator.
+  '/form': `<h1>Benefit enrolment</h1>
+    <label><input type="checkbox" id="paperless"> Go paperless</label>
+    <span id="cbstate">paperless:off</span>
+    <label for="plan">Plan</label>
+    <select id="plan" aria-label="Plan">
+      <option value="">Choose…</option>
+      <option value="std">Standard</option>
+      <option value="prm">Premium cover</option>
+    </select>
+    <span id="selstate">plan:none</span>
+    <input id="dependant" aria-label="Dependant" placeholder="Dependant">
+    <span id="typed">keystrokes: 0</span>
+    <script>
+      document.getElementById('paperless').addEventListener('change', function (e) {
+        document.getElementById('cbstate').textContent = 'paperless:' + (e.target.checked ? 'on' : 'off');
+      });
+      document.getElementById('plan').addEventListener('change', function (e) {
+        document.getElementById('selstate').textContent = 'plan:' + e.target.value;
+      });
+      var n = 0;
+      document.getElementById('dependant').addEventListener('keydown', function () {
+        document.getElementById('typed').textContent = 'keystrokes: ' + (++n);
+      });
+    </script>`,
 };
 
 function page(body: string): string {
@@ -726,6 +753,70 @@ describe('form-case generation honesty', () => {
 
 });
 
+describe('a response cut at the output budget', () => {
+  // The live failure, 2026-08-19: a thinking model spent the budget on hidden
+  // reasoning, the JSON arrived cut off, and — at temperature 0 — the re-ask
+  // repeated the identical request and was cut identically, three times, and
+  // then the circuit breaker put a whole catalog run down. A length cut is
+  // deterministic; only a bigger budget can change it.
+  it('is re-asked with a bigger budget, not the same one', async () => {
+    resetStructuredBreaker();
+    const budgets: number[] = [];
+    const model = new MockLanguageModelV4({
+      provider: 'mock',
+      modelId: 'thinker',
+      doGenerate: async (options) => {
+        budgets.push(options.maxOutputTokens ?? -1);
+        const cut = budgets.length === 1;
+        return {
+          content: [{ type: 'text', text: cut ? '{"ok": "yes' : '{"ok": "yes"}' }],
+          finishReason: { unified: cut ? 'length' : 'stop', raw: cut ? 'length' : 'stop' },
+          usage: {
+            inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 5, text: 5, reasoning: 0 },
+          },
+          warnings: [],
+        };
+      },
+    });
+    const result = await generateStructured({
+      model,
+      modelLabel: 'mock:thinker',
+      schema: z.object({ ok: z.string() }),
+      system: 's',
+      prompt: 'p',
+      maxOutputTokens: 1024,
+      maxRetries: 0,
+    });
+    assert.equal(result.object.ok, 'yes');
+    assert.deepEqual(budgets, [1024, 2048], 'the second ask doubles the budget');
+    resetStructuredBreaker();
+  });
+
+  it('never grows the budget for a failure that was not a cut', async () => {
+    resetStructuredBreaker();
+    const budgets: number[] = [];
+    const model = scriptedModel('mock:prose', ['not json at all', { ok: 'yes' }]);
+    const original = model.doGenerate;
+    (model as unknown as { doGenerate: typeof original }).doGenerate = async (options) => {
+      budgets.push(options.maxOutputTokens ?? -1);
+      return original(options);
+    };
+    const result = await generateStructured({
+      model,
+      modelLabel: 'mock:prose',
+      schema: z.object({ ok: z.string() }),
+      system: 's',
+      prompt: 'p',
+      maxOutputTokens: 1024,
+      maxRetries: 0,
+    });
+    assert.equal(result.object.ok, 'yes');
+    assert.deepEqual(budgets, [1024, 1024], 'a prose reply is re-asked at the same budget');
+    resetStructuredBreaker();
+  });
+});
+
 describe('structured-output circuit breaker', () => {
   it('declares a model broken after two exhausted cycles, and stops paying it', async () => {
     resetStructuredBreaker();
@@ -780,10 +871,62 @@ describe('structured-output circuit breaker', () => {
     resetStructuredBreaker();
   });
 
+  it('opens per ROLE, not per model — a sibling role on the same model is still asked', async () => {
+    // be100, 2026-08-28: generator and agent both on claude-cli:sonnet; two
+    // bad authoring rows opened the breaker for the LABEL and the agent was
+    // refused without a call. The key is task@label now.
+    resetStructuredBreaker();
+    let asks = 0;
+    const neverJson = new MockLanguageModelV4({
+      provider: 'mock',
+      modelId: 'shared',
+      doGenerate: async () => {
+        asks += 1;
+        return {
+          content: [{ type: 'text', text: '{"steps":[]}' }],
+          finishReason: { unified: 'stop', raw: 'stop' },
+          usage: {
+            inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 5, text: 5, reasoning: 0 },
+          },
+          warnings: [],
+        };
+      },
+    });
+    const base = {
+      model: neverJson,
+      modelLabel: 'mock:shared',
+      schema: z.object({ steps: z.array(z.string()).min(1) }),
+      system: 's',
+      prompt: 'p',
+      maxRetries: 0,
+    };
+    for (let cycle = 0; cycle < 2; cycle++) {
+      await assert.rejects(() => generateStructured({ ...base, task: 'generator' }), (e: unknown) =>
+        e instanceof StructuredOutputUnavailableError &&
+        // The evidence is on the FIRST line, where every consumer reads it.
+        /model text began: "\{\\"steps\\":\[\]\}"/.test(e.message.split('\n')[0] ?? '') &&
+        /rejected steps: too_small/.test(e.message.split('\n')[0] ?? ''),
+      );
+    }
+    await assert.rejects(() => generateStructured({ ...base, task: 'generator' }), /circuit is open for the generator role/);
+    const before = asks;
+    // The healer shares the model and is NOT switched off by the generator.
+    await assert.rejects(() => generateStructured({ ...base, task: 'healer' }), /failed to produce a valid structured response/);
+    assert.ok(asks > before, 'the healer was actually asked');
+    resetStructuredBreaker();
+  });
+
   it('is classified as an environment failure by the exit contract', async () => {
     const { classifyError, EXIT } = await import('../src/cli/exit.js');
     assert.equal(
       classifyError(new Error('openrouter:google/gemini-3.6-flash failed to produce a valid structured response: …')),
+      EXIT.environment,
+    );
+    // A provider that refused the call (quota, rate limit) is environment too —
+    // worded apart from "could not do JSON", because the fix is different.
+    assert.equal(
+      classifyError(new Error('groq:openai/gpt-oss-120b could not be asked — the provider refused the call (rate limit, quota, or credential): Rate limit reached')),
       EXIT.environment,
     );
     assert.equal(
@@ -800,8 +943,17 @@ describe('config & llm-factory', () => {
     assert.equal(config.roles.generator.provider, 'google', 'generator wants the biggest context');
     assert.equal(config.roles.agent.provider, DEFAULT_ROLE_MODELS.agent.provider);
     assert.equal(config.roles.generator.modelId, DEFAULT_ROLE_MODELS.generator.modelId);
-    // No keys present, so nothing should claim to be resolvable.
-    assert.deepEqual(config.apiKeys, {});
+    // No keys present, so nothing should claim to be resolvable — except the
+    // two providers that need none: the local server, and the Claude CLI,
+    // which carries the operator's own signed-in session. Each keeps a
+    // placeholder so a role pointed at it passes every "has a key" gate,
+    // rather than being modelled as a provider whose credential is missing.
+    assert.deepEqual(config.apiKeys, {
+      local: [LOCAL_LLM_PLACEHOLDER_KEY],
+      'claude-cli': [CLAUDE_CLI_PLACEHOLDER_KEY],
+      'claude-tty': [CLAUDE_CLI_PLACEHOLDER_KEY],
+      'claude-cloud': [CLAUDE_CLI_PLACEHOLDER_KEY],
+    });
   });
 
   it('lets any role be re-pointed at any provider', () => {
@@ -825,6 +977,18 @@ describe('config & llm-factory', () => {
     assert.equal(resolved.id, 'groq:some-other-model');
     // Resolution is memoised — the same object comes back.
     assert.equal(factory.forRole('generator'), resolved);
+  });
+
+  it('gives a re-pointed provider its own default model, never another provider\'s', () => {
+    // Live: `WOWLIDATOR_GENERATOR_PROVIDER=zai` alone resolved to
+    // `zai:gemini-3.6-flash` — the generator role's Google default — and the
+    // provider read as broken when only the id was.
+    const config = loadConfig({ WOWLIDATOR_GENERATOR_PROVIDER: 'zai', WOWLIDATOR_AGENT_PROVIDER: 'zai' });
+    assert.equal(config.roles.generator.provider, 'zai');
+    assert.equal(config.roles.generator.modelId, DEFAULT_PROVIDER_MODELS.zai);
+    assert.equal(config.roles.agent.modelId, DEFAULT_PROVIDER_MODELS.zai);
+    // A role left on its own provider keeps its own, role-specific default.
+    assert.equal(config.roles.healer.modelId, DEFAULT_ROLE_MODELS.healer.modelId);
   });
 
   it('rejects an unknown provider rather than failing later', () => {
@@ -1122,19 +1286,62 @@ describe('workflow agent (CDP)', { skip: skipBrowser }, () => {
     });
 
     assert.equal(result.success, true, result.summary);
-    // landing -> consent -> details, then finish.
-    assert.equal(result.turns, 3);
+    // landing -> consent -> details, then finish. The consent interstitial
+    // is the loop's to clear (2026-08-25): a gate on a consent URL with a
+    // name-gated accept control costs no model turn, on any turn — and
+    // since the journey was under way, the agent stays where the accept
+    // lands rather than being returned to the landing page.
+    assert.equal(result.turns, 2);
     assert.equal(result.actions.length, 3);
     assert.equal(result.actions[0]?.action, 'click');
     assert.equal(result.actions[1]?.action, 'click');
+    assert.match(result.actions[1]?.reasoning ?? '', /consent gate/, 'cleared by the loop, not the model');
     assert.equal(result.actions[2]?.action, 'finish');
     assert.ok(result.actions.every((a) => a.ok));
-    assert.equal(result.inputTokens, 580);
+    assert.equal(model.seen.length, 2, 'the model never saw the consent page');
+    assert.equal(result.inputTokens, 280, 'only the landing click was a model turn');
 
-    // History must accumulate, or the model cannot avoid repeating itself.
-    assert.equal(model.seen.length, 3);
+    // History must accumulate, or the model cannot avoid repeating itself:
+    // the second turn reads the landing click and the gate the loop cleared.
     assert.equal(model.seen[0]?.history.length, 0);
-    assert.equal(model.seen[2]?.history.length, 2);
+    assert.equal(model.seen[1]?.history.length, 2);
+    assert.match(model.seen[1]?.history[1] ?? '', /cleared a consent gate on turn 2/);
+  });
+
+  it('fills a form like a human — check, selectOption by label, and per-keystroke type', async () => {
+    const script: AgentDecision[] = [
+      { action: 'check', selector: 'role=checkbox[name="Go paperless" i]', value: '', url: '', reasoning: 'opt in' },
+      { action: 'selectOption', selector: 'role=combobox[name="Plan" i]', value: 'Premium cover', url: '', reasoning: 'pick the plan' },
+      { action: 'type', selector: 'role=textbox[name="Dependant" i]', value: 'Rae', url: '', reasoning: 'name the dependant' },
+      { action: 'finish', selector: '', value: '', url: '', reasoning: 'the form is filled' },
+    ];
+    let turn = 0;
+    const model: AgentModel = {
+      id: 'form-filler',
+      async decide() {
+        return script[turn++] ?? { action: 'fail', selector: '', value: '', url: '', reasoning: 'script exhausted' };
+      },
+    };
+    const agent = new WorkflowAgent({ model, maxSteps: 8, actionTimeoutMs: 2_000 });
+
+    const state = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/form`, { waitUntil: 'domcontentloaded' });
+      const result = await agent.run(page, 'enrol the applicant — go paperless, choose Premium cover, and add dependant Rae');
+      assert.equal(result.success, true, result.summary);
+      assert.ok(result.actions.every((a) => a.ok), `every action landed: ${result.summary}`);
+      return {
+        cb: (await page.locator('#cbstate').textContent())?.trim(),
+        sel: (await page.locator('#selstate').textContent())?.trim(),
+        keystrokes: Number(((await page.locator('#typed').textContent()) ?? '').split(' ')[1]),
+      };
+    });
+
+    assert.equal(state.cb, 'paperless:on', 'check ticked the box and fired change');
+    assert.equal(state.sel, 'plan:prm', 'selectOption chose by visible label');
+    // "Rae" is 3 characters; a capital letter also fires a Shift keydown, so
+    // the count is per-character, not exactly the string length — `fill`
+    // would have fired none of these.
+    assert.ok(state.keystrokes >= 3, `type fired a real keydown per character (saw ${state.keystrokes})`);
   });
 
   it('refuses to navigate off the starting origin', async () => {
@@ -1242,6 +1449,47 @@ describe('generation → multi-page run → report (CDP)', { skip: skipBrowser }
       assert.equal(suite.cases.length, 1);
       assert.equal(suite.cases[0]?.name, 'validation shows');
       assert.equal(suite.rejected.length, 0, 'the better attempt is the one reported');
+    } finally {
+      await stopFixture(server);
+    }
+  });
+
+  it('re-asks when the model returns zero cases — an empty reply is a failed attempt, not a done one', async () => {
+    const { server, origin } = await startFixture();
+    try {
+      const good = {
+        name: 'validation shows',
+        kind: 'edge-case' as const,
+        rationale: 'second try',
+        steps: [
+          { action: 'goto', url: '/', value: '', selector: '', key: '', intent: 'open' },
+          { action: 'fill', selector: 'role=textbox[name="Applicant name" i]', value: 'x', url: '', key: '', intent: 'type' },
+          { action: 'click', selector: 'role=button[name="Start application" i]', value: '', url: '', key: '', intent: 'submit' },
+          { action: 'expectVisible', selector: 'role=heading[name="Consent required" i]', value: '', url: '', key: '', intent: 'real check' },
+        ],
+      };
+      const requests: GenerateRequest[] = [];
+      const model: GeneratorModel = {
+        id: 'stub:generator',
+        async generate(request) {
+          requests.push(request);
+          if (requests.length === 1) return { cases: [], defects: [] } as never;
+          return {
+            cases: [{ name: good.name, kind: good.kind, rationale: good.rationale, steps: good.steps as never }],
+            defects: [],
+          } as never;
+        },
+      };
+
+      const suite = await withPage(CDP_URL, async (page) => {
+        await page.goto(`${origin}/details`, { waitUntil: 'domcontentloaded' });
+        return new TestGenerator({ model }).generate(page);
+      });
+
+      assert.equal(requests.length, 2, 'zero cases must earn one informed re-ask');
+      assert.match(requests[1]?.feedback?.[0] ?? '', /returned NO cases/);
+      assert.equal(suite.cases.length, 1);
+      assert.equal(suite.cases[0]?.name, 'validation shows');
     } finally {
       await stopFixture(server);
     }
@@ -1360,8 +1608,10 @@ describe('generation → multi-page run → report (CDP)', { skip: skipBrowser }
     assert.ok(agentStep);
     assert.equal(agentStep.agent?.success, true);
     assert.equal(agentStep.agent?.actions.length, 3);
-    // The agent's token spend must roll into the run summary.
-    assert.equal(bundle.summary.inputTokens, 580);
+    // The agent's token spend must roll into the run summary. One model
+    // turn (the landing click, 280 in); the consent interstitial is cleared
+    // by the loop and the finish carries no tokens.
+    assert.equal(bundle.summary.inputTokens, 280);
 
     // The final assertion ran on /details, which only the agent could reach.
     const finalStep = bundle.steps.at(-1);

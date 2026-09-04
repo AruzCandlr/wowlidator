@@ -343,3 +343,411 @@ function verify(out: Buffer, expectedLastTime: number): boolean {
   }
   return frames > 0 && latest === expectedLastTime;
 }
+
+// ---------------------------------------------------------------------------
+// Condensing: keep the moments something happened, drop the idle between.
+//
+// The film of a run is the run's wall clock: a 25 fps constant-rate recording
+// in which every ladder timeout, model call and hydration settle is minutes
+// of a page doing nothing. Measured (2026-09-04, three catalog films under
+// `reports/*-media`): 25.0 fps throughout, a keyframe every 128 frames
+// (5.12 s, libvpx's default), each keyframe 60–90 KB of a 960-wide frame and
+// each idle second another 5–8 KB of "nothing changed" frames — so a 59 s film
+// with twelve moments in it weighed 1.6 MB, and most of that was the idle.
+//
+// There is still no encoder here (see the header above), and that fixes what
+// "condense" can mean: only frames that can be decoded from what is kept may
+// be kept. A VP8 frame decodes against the frames before it back to the last
+// keyframe, so every kept span begins at a keyframe — the most recent one
+// at or before the moment asked for — and runs, frame for frame in source
+// order, through the moment and its dwell. Nothing is synthesised and nothing
+// is reordered; what changes is the clock: the frames between that keyframe
+// and the moment (the pre-roll the codec forces on us) are packed into a
+// short burst (`IDLE_BURST_MS`), the last frame before each cut is held
+// (`CUT_HOLD_MS`), and the frames outside every span are gone. The mapping from source
+// time to output time rides the result so per-step seeks can follow it.
+// ---------------------------------------------------------------------------
+
+/** A span of the source film, in ms, that must survive at real speed. */
+export interface KeptWindow {
+  fromMs: number;
+  toMs: number;
+}
+
+/**
+ * One linear stretch of the condensed film mapped back to the source clock.
+ * `idle` marks a codec-forced pre-roll played fast rather than a moment.
+ */
+export interface CondenseSegment {
+  sourceFromMs: number;
+  sourceToMs: number;
+  outputFromMs: number;
+  outputToMs: number;
+  idle: boolean;
+}
+
+export interface CondenseResult {
+  data: Buffer;
+  /** Playing time of the condensed film — the last kept frame's output time. */
+  durationMs: number;
+  /** Playing time of the source film, for the report to say what was dropped. */
+  sourceDurationMs: number;
+  frames: number;
+  sourceFrames: number;
+  segments: CondenseSegment[];
+}
+
+/**
+ * Longest a run of idle frames — the pre-roll a keyframe forces, or the
+ * gap between two moments that share one — plays for, ms.
+ *
+ * Replaces the 8× fast-forward (2026-09-04, PL_07_06's film): at 8× a
+ * 25 fps stream became 5 ms frames, which a browser presents at most one in
+ * three of, so every pre-roll was a 0.2–0.6 s strobe of the page jumping
+ * about. Idle frames still have to be decoded (a VP8 frame refers to every
+ * frame back to its keyframe), so they are packed into this budget — about
+ * four presented frames at most — which reads as a cut, not a scrub. Short
+ * idle runs whose real pace fits the budget keep their real pace.
+ */
+export const IDLE_BURST_MS = 160;
+
+/**
+ * How long the last frame before a cut is held, ms: before a new span opens
+ * on its keyframe, and before a moment gives way to idle. A jump between two
+ * page states with one frame period between them reads as a glitch; a beat
+ * on the state that was reached, then the jump, reads as an edit. Free —
+ * a frame's duration is the gap to the next timestamp.
+ */
+export const CUT_HOLD_MS = 400;
+
+/**
+ * Two moments closer than this (window edge to window edge) are kept as one
+ * stretch at real speed: the film between them is the pointer travelling
+ * from one control to the next, and dropping it left a 2-frame sliver of
+ * "idle" between them (PL_07_06: source 3560–3600 → 5 ms of output).
+ */
+export const BRIDGE_MS = 1_000;
+
+export interface CondenseOptions {
+  bridgeMs?: number | undefined;
+  holdMs?: number | undefined;
+  burstMs?: number | undefined;
+}
+
+interface Frame {
+  /** Byte range of the whole SimpleBlock element. */
+  start: number;
+  end: number;
+  /** Offset of the 16-bit relative timecode inside the element. */
+  timeAt: number;
+  /** Absolute time in TimecodeScale units. */
+  time: number;
+  key: boolean;
+}
+
+function uintBytes(value: number): Buffer {
+  const bytes: number[] = [];
+  let remaining = Math.max(0, Math.floor(value));
+  do {
+    bytes.unshift(remaining % 256);
+    remaining = Math.floor(remaining / 256);
+  } while (remaining > 0);
+  return Buffer.from(bytes);
+}
+
+/** Every video frame of the film, in order, with its absolute time. */
+function readFrames(input: Buffer, clusters: Element[]): Frame[] | null {
+  const frames: Frame[] = [];
+  for (const cluster of clusters) {
+    const inner = children(input, cluster.dataStart, cluster.end);
+    const timecodeElement = inner.find((e) => e.id === ID_TIMECODE);
+    if (!timecodeElement) return null;
+    const base = readUint(input, timecodeElement);
+    for (const element of inner) {
+      if (element.id === ID_BLOCK_GROUP) return null; // not Playwright's muxer; not handled
+      if (element.id !== ID_SIMPLE_BLOCK) continue;
+      const track = readVint(input, element.dataStart);
+      if (!track) return null;
+      const timeAt = element.dataStart + track.length;
+      if (timeAt + 3 > element.end) return null;
+      const flags = input[timeAt + 2]!;
+      frames.push({
+        start: element.start,
+        end: element.end,
+        timeAt,
+        time: base + input.readInt16BE(timeAt),
+        key: (flags & 0x80) !== 0,
+      });
+    }
+  }
+  return frames;
+}
+
+/**
+ * Map a source moment to where it now sits in the condensed film.
+ *
+ * Inside a kept segment the mapping is linear; a moment that was dropped maps
+ * to the start of the first segment after it (the next thing that happened),
+ * and one past the last kept frame to the end.
+ */
+export function mapToCondensed(segments: readonly CondenseSegment[], sourceMs: number): number {
+  let last = 0;
+  for (const segment of segments) {
+    if (sourceMs < segment.sourceFromMs) return segment.outputFromMs;
+    if (sourceMs <= segment.sourceToMs) {
+      const span = segment.sourceToMs - segment.sourceFromMs;
+      if (span <= 0) return segment.outputFromMs;
+      const ratio = (sourceMs - segment.sourceFromMs) / span;
+      return Math.round(segment.outputFromMs + ratio * (segment.outputToMs - segment.outputFromMs));
+    }
+    last = segment.outputToMs;
+  }
+  return last;
+}
+
+/**
+ * Keep only the frames around `windows` and re-time them into one short film.
+ *
+ * Returns `null` on the same terms as `trimWebm`: an unreadable container, a
+ * block layout this reader does not handle, no frame kept, or a result that
+ * fails to re-parse. The caller then falls back to the whole film — a bigger
+ * true record beats a smaller doubtful one.
+ */
+export function condenseWebm(
+  input: Buffer,
+  windows: readonly KeptWindow[],
+  options: CondenseOptions = {},
+): CondenseResult | null {
+  try {
+    return condense(input, windows, {
+      bridgeMs: options.bridgeMs ?? BRIDGE_MS,
+      holdMs: options.holdMs ?? CUT_HOLD_MS,
+      burstMs: options.burstMs ?? IDLE_BURST_MS,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Every frame of a film, with its time in ms and whether it is a keyframe. */
+export interface FrameIndexEntry {
+  timeMs: number;
+  key: boolean;
+}
+
+/**
+ * The film's frames as a player would see them, or `null` for a container
+ * this reader does not handle. For tests and reports: whether timestamps
+ * advance, and whether every cut lands on a keyframe, are facts about the
+ * file, not about the code that wrote it.
+ */
+export function frameIndex(input: Buffer): FrameIndexEntry[] | null {
+  try {
+    const top = children(input, 0, input.length);
+    const segment = top.find((e) => e.id === ID_SEGMENT);
+    if (!segment) return null;
+    const parts = children(input, segment.dataStart, segment.end);
+    const info = parts.find((e) => e.id === ID_INFO);
+    const scaleElement = info && children(input, info.dataStart, info.end).find((e) => e.id === ID_TIMECODE_SCALE);
+    const scaleNs = scaleElement ? readUint(input, scaleElement) : NS_PER_MS;
+    const frames = readFrames(input, parts.filter((e) => e.id === ID_CLUSTER));
+    return frames ? frames.map((f) => ({ timeMs: (f.time * scaleNs) / NS_PER_MS, key: f.key })) : null;
+  } catch {
+    return null;
+  }
+}
+
+function condense(
+  input: Buffer,
+  windows: readonly KeptWindow[],
+  { bridgeMs, holdMs, burstMs }: { bridgeMs: number; holdMs: number; burstMs: number },
+): CondenseResult | null {
+  if (!(bridgeMs >= 0) || !(holdMs >= 0) || !(burstMs >= 0)) return null;
+  const top = children(input, 0, input.length);
+  const header = top.find((e) => e.id === ID_EBML);
+  const segment = top.find((e) => e.id === ID_SEGMENT);
+  if (!header || !segment) return null;
+
+  const parts = children(input, segment.dataStart, segment.end);
+  const info = parts.find((e) => e.id === ID_INFO);
+  const clusters = parts.filter((e) => e.id === ID_CLUSTER);
+  if (!info || clusters.length === 0) return null;
+
+  const infoParts = children(input, info.dataStart, info.end);
+  const scaleElement = infoParts.find((e) => e.id === ID_TIMECODE_SCALE);
+  const durationElement = infoParts.find((e) => e.id === ID_DURATION);
+  const scaleNs = scaleElement ? readUint(input, scaleElement) : NS_PER_MS;
+  if (scaleNs <= 0) return null;
+  const toUnits = (ms: number) => (ms * NS_PER_MS) / scaleNs;
+  const toMs = (units: number) => (units * scaleNs) / NS_PER_MS;
+
+  const frames = readFrames(input, clusters);
+  if (!frames || frames.length === 0) return null;
+  for (let i = 1; i < frames.length; i++) {
+    if (frames[i]!.time < frames[i - 1]!.time) return null; // never reorder; refuse a film that is not in order
+  }
+  const sourceLast = frames[frames.length - 1]!.time;
+
+  // Windows: clipped to the film, sorted, merged where they overlap.
+  const wanted = windows
+    .map((w) => ({ from: Math.max(0, toUnits(w.fromMs)), to: Math.min(sourceLast, toUnits(w.toMs)) }))
+    .filter((w) => w.to >= w.from)
+    .sort((a, b) => a.from - b.from);
+  // Bridged too: a gap shorter than `bridgeMs` is the pointer travelling
+  // between two controls, kept at real speed rather than cut to a sliver.
+  const bridge = toUnits(bridgeMs);
+  const merged: { from: number; to: number }[] = [];
+  for (const w of wanted) {
+    const prev = merged[merged.length - 1];
+    if (prev && w.from <= prev.to + bridge) prev.to = Math.max(prev.to, w.to);
+    else merged.push({ ...w });
+  }
+  if (merged.length === 0) return null;
+
+  // Each window's span opens at the last keyframe at or before it — the
+  // frames from there to the window are decodable and nothing earlier is
+  // needed. Spans that reach each other merge into one contiguous run.
+  const spans: { from: number; to: number }[] = [];
+  for (const w of merged) {
+    let anchor: Frame | undefined;
+    for (const frame of frames) {
+      if (frame.time > w.from) break;
+      if (frame.key) anchor = frame;
+    }
+    if (!anchor) {
+      anchor = frames.find((f) => f.key && f.time >= w.from && f.time <= w.to);
+      if (!anchor) continue;
+    }
+    const prev = spans[spans.length - 1];
+    if (prev && anchor.time <= prev.to) prev.to = Math.max(prev.to, w.to);
+    else spans.push({ from: anchor.time, to: w.to });
+  }
+  if (spans.length === 0) return null;
+
+  const inWindow = (time: number) => merged.some((w) => time >= w.from && time <= w.to);
+
+  // The kept frames, each with its standing: a moment (inside a window) or
+  // idle (the pre-roll a keyframe forces, or a gap between two moments on
+  // one keyframe). Gathered first, because an idle run's pacing depends on
+  // how long the run is.
+  const kept: { frame: Frame; out: number; idle: boolean; span: number }[] = [];
+  let spanIndex = 0;
+  for (const frame of frames) {
+    while (spanIndex < spans.length && frame.time > spans[spanIndex]!.to) spanIndex += 1;
+    if (spanIndex >= spans.length) break;
+    const span = spans[spanIndex]!;
+    if (frame.time < span.from) continue;
+    kept.push({ frame, out: 0, idle: !inWindow(frame.time), span: spanIndex });
+  }
+  if (kept.length === 0 || !kept[0]!.frame.key) return null;
+
+  // Re-time. A moment frame keeps its distance from the frame before it; the
+  // last frame before a cut — a new span, or a moment giving way to idle —
+  // is held `holdMs`; an idle run of n frames is packed to fit `burstMs`
+  // (never faster than one unit a frame, never slower than it happened).
+  // Output times are integers in TimecodeScale units, strictly increasing.
+  const hold = Math.max(1, Math.round(toUnits(holdMs)));
+  const burst = toUnits(burstMs);
+  let runEnd = -1;
+  let runSpacing = 1;
+  for (let i = 0; i < kept.length; i++) {
+    const entry = kept[i]!;
+    const previous = kept[i - 1];
+    if (!previous) {
+      entry.out = 0;
+      continue;
+    }
+    const realGap = Math.max(1, entry.frame.time - previous.frame.time);
+    if (previous.span !== entry.span || (!previous.idle && entry.idle)) {
+      entry.out = previous.out + hold;
+      continue;
+    }
+    if (!entry.idle) {
+      entry.out = previous.out + realGap;
+      continue;
+    }
+    if (i > runEnd) {
+      // The start of an idle run: measure it once and pace it to the budget.
+      runEnd = i;
+      while (runEnd + 1 < kept.length && kept[runEnd + 1]!.idle && kept[runEnd + 1]!.span === entry.span) runEnd += 1;
+      const gaps = runEnd - i + 1;
+      runSpacing = Math.max(1, Math.floor(burst / gaps));
+    }
+    entry.out = previous.out + Math.min(realGap, runSpacing);
+  }
+  if (kept.length === 0 || !kept[0]!.frame.key) return null;
+
+  // Clusters: a new one whenever the relative timecode would overflow the
+  // signed 16 bits a SimpleBlock carries, or a span begins (which also keeps
+  // every cluster opening on a keyframe when a span does).
+  const relLimit = Math.min(32_000, Math.floor(toUnits(30_000)));
+  const clustersOut: Buffer[] = [];
+  let clusterBase = -1;
+  let blocks: Buffer[] = [];
+  const flush = () => {
+    if (blocks.length === 0) return;
+    const body = Buffer.concat([
+      Buffer.concat([idBytes(ID_TIMECODE), vint(uintBytes(clusterBase).length), uintBytes(clusterBase)]),
+      ...blocks,
+    ]);
+    clustersOut.push(Buffer.concat([idBytes(ID_CLUSTER), vint(body.length), body]));
+    blocks = [];
+  };
+  for (const { frame, out } of kept) {
+    if (clusterBase < 0 || out - clusterBase > relLimit || frame.key) {
+      flush();
+      clusterBase = out;
+    }
+    const copy = Buffer.from(input.subarray(frame.start, frame.end));
+    copy.writeInt16BE(out - clusterBase, frame.timeAt - frame.start);
+    blocks.push(copy);
+  }
+  flush();
+
+  const head = Buffer.from(input.subarray(0, clusters[0]!.start));
+  const seekHead = parts.find((e) => e.id === ID_SEEK_HEAD);
+  if (seekHead) voidOut(head, seekHead.start, seekHead.end);
+  const lastTime = kept[kept.length - 1]!.out;
+  if (durationElement && durationElement.size === 8) {
+    head.writeDoubleBE(lastTime, durationElement.dataStart);
+  } else if (durationElement && durationElement.size === 4) {
+    head.writeFloatBE(lastTime, durationElement.dataStart);
+  }
+  const body = Buffer.concat(clustersOut);
+  const segmentSize = head.length - segment.dataStart + body.length;
+  if (segment.sizeLen < 2) return null;
+  writeVint(segmentSize, segment.sizeLen).copy(head, segment.dataStart - segment.sizeLen);
+  const out = Buffer.concat([head, body]);
+  if (!verify(out, lastTime)) return null;
+
+  // The clock map: one segment per maximal run of kept frames from one span
+  // with the same standing (pre-roll or moment) — coarse enough to ride the
+  // bundle, exact enough that a seek lands on the frame it names.
+  const segments: CondenseSegment[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    const entry = kept[i]!;
+    const previous = kept[i - 1];
+    const current = segments[segments.length - 1];
+    if (current && previous && previous.span === entry.span && previous.idle === entry.idle) {
+      current.sourceToMs = Math.round(toMs(entry.frame.time));
+      current.outputToMs = Math.round(toMs(entry.out));
+    } else {
+      segments.push({
+        sourceFromMs: Math.round(toMs(entry.frame.time)),
+        sourceToMs: Math.round(toMs(entry.frame.time)),
+        outputFromMs: Math.round(toMs(entry.out)),
+        outputToMs: Math.round(toMs(entry.out)),
+        idle: entry.idle,
+      });
+    }
+  }
+
+  return {
+    data: out,
+    durationMs: Math.round(toMs(lastTime)),
+    sourceDurationMs: Math.round(toMs(sourceLast)),
+    frames: kept.length,
+    sourceFrames: frames.length,
+    segments,
+  };
+}

@@ -14,7 +14,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { EXIT, exitCodeFor, neverRan, suiteExit, type CaseOutcome } from '../src/cli.js';
+import { EXIT, exitCodeFor, harnessOnly, neverRan, suiteExit, type CaseOutcome } from '../src/cli.js';
 import { isBrowserGone } from '../src/engine/runner.js';
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 
@@ -120,6 +120,56 @@ describe('a case that never produced a verdict', () => {
   });
 });
 
+describe('a run the harness ended', () => {
+  const errorStep = (error: string): ProofStep => ({ ...step('failed'), status: 'error', error }) as ProofStep;
+
+  it('is not an application failure: every broken step is a runtime error', () => {
+    // The live shape, 22 bundles over: WOWLIDATOR_DB_URL unset, so every DB
+    // check errored — and every case was scored "failed", as if the test had
+    // found a bug in an application it never actually asked.
+    const bundle = bundleOf({
+      status: 'error',
+      steps: [
+        step('passed'),
+        errorStep('database unavailable: no connection is configured — set WOWLIDATOR_DB_URL to a postgres:// connection string'),
+      ],
+      error: 'run completed with 1 error',
+    });
+    const reason = String(harnessOnly(bundle));
+    assert.match(reason, /the harness ended this case, not the application/);
+    assert.match(reason, /database unavailable/);
+    // One line, like neverRan — the roll-up gives each case one.
+    assert.equal(reason.includes('\n'), false);
+  });
+
+  it('never softens a real finding: one failed or dead-end step keeps the verdict', () => {
+    // "run completed with 1 failed, 2 error" — the failed step is a claim the
+    // application contradicted, and the errors beside it must not hide that.
+    const bundle = bundleOf({
+      status: 'error',
+      steps: [step('failed'), errorStep('database unavailable: no connection is configured')],
+    });
+    assert.equal(harnessOnly(bundle), null);
+    const deadEnd = { ...step('failed'), status: 'dead-end' } as ProofStep;
+    assert.equal(harnessOnly(bundleOf({ status: 'error', steps: [deadEnd, errorStep('x')] })), null);
+  });
+
+  it('leaves the zero-broken-steps shape to neverRan, and passes alone', () => {
+    assert.equal(harnessOnly(bundleOf({ status: 'failed', steps: [step('passed')] })), null);
+    assert.equal(harnessOnly(bundleOf({ status: 'passed', steps: [step('passed')] })), null);
+  });
+
+  it('ignores superseded attempts — a rescued step is not the failure', () => {
+    const rescuedError = { ...step('failed'), status: 'error', superseded: true, error: 'x' } as ProofStep;
+    // The only live breakage is the error step; the superseded failure is history.
+    const bundle = bundleOf({
+      status: 'error',
+      steps: [rescuedError, errorStep('agent model failed: the provider refused the call')],
+    });
+    assert.match(String(harnessOnly(bundle)), /provider refused/);
+  });
+});
+
 describe('the exit code for a list of cases', () => {
   const outcome = (verdict: CaseOutcome['verdict']): CaseOutcome => ({
     name: verdict,
@@ -141,5 +191,20 @@ describe('the exit code for a list of cases', () => {
     // an environment problem, not a defect in the application.
     const outcomes = [...Array<CaseOutcome>(9).fill(outcome('passed')), outcome('blocked')];
     assert.equal(suiteExit(outcomes), EXIT.environment);
+  });
+});
+
+describe('vacuous assertion scoring (S5)', () => {
+  it('a passing run whose expectVisible resolved a nameless element is needs-review, never green', async () => {
+    const { ProofBundleBuilder } = await import('../src/engine/proof-bundle.js');
+    const b = new ProofBundleBuilder({ name: 'PL_04_13', cdpUrl: null, cachePath: null, healerModel: null } as never);
+    b.addStep({ ...step('passed'), action: 'goto', index: 0 } as ProofStep);
+    b.addStep({
+      ...step('passed'), action: 'expectVisible', index: 1, selector: 'role=combobox >> nth=0',
+      detail: { expected: 'visible', actual: 'visible', vacuous: 'resolved an element with no accessible name or text — this assertion cannot fail and proves nothing' },
+    } as ProofStep);
+    const bundle = b.finish();
+    assert.equal(bundle.status, 'needs-review');
+    assert.match(bundle.steps[1]?.unsure ?? '', /cannot fail/);
   });
 });

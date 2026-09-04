@@ -12,7 +12,9 @@
  * very timing that produced it. So the run is recorded as it happens.
  */
 
-import type { Page } from 'playwright';
+import type { Locator, Page } from 'playwright';
+
+import { drawTargetHighlight, removeTargetHighlight } from './target.js';
 
 /**
  * When to spend time on a screenshot.
@@ -78,6 +80,8 @@ const SETTLE_BUDGET_MS = 750;
  * and encode, and a timeout here loses the evidence entirely.
  */
 const FULL_PAGE_SHUTTER_MS = 30_000;
+/** Bringing the step's target into view before the shutter — bounded, never fatal. */
+const SCROLL_INTO_VIEW_MS = 1_000;
 
 /** Pause per viewport while walking down, for lazy content to start loading. */
 const SCROLL_STEP_DELAY_MS = 120;
@@ -157,7 +161,7 @@ async function settleRendering(page: Page): Promise<void> {
   }
 }
 
-export function wantsEvidence(mode: ScreenshotMode, kind: EvidenceKind): boolean {
+function wantsEvidence(mode: ScreenshotMode, kind: EvidenceKind): boolean {
   switch (mode) {
     case 'all':
       return true;
@@ -199,8 +203,17 @@ export async function captureEvidence(
   mode: ScreenshotMode,
   kind: EvidenceKind,
   delayMs: number = DEFAULT_CAPTURE_DELAY_MS,
+  /**
+   * The step's target, when it has one and the run wants it marked: a red
+   * rectangle is drawn around it for the shutter and removed right after —
+   * added only once the page has settled and lazy content is primed, so it
+   * is drawn from the element's final rectangle, and removed in a `finally`
+   * so a failed shutter cannot leave it in the page (`engine/target.ts`).
+   */
+  highlight?: Locator | undefined,
 ): Promise<string | undefined> {
   if (!wantsEvidence(mode, kind)) return undefined;
+  let highlighted = false;
   try {
     // Ordered by what each one waits for: the document's own resources, then
     // whatever the app fetched once it was running, then the frame it drew.
@@ -216,6 +229,16 @@ export async function captureEvidence(
     // evidence never changes what the next step sees.
     await primeLazyContent(page);
     await settleRendering(page);
+    // The target's section, not the page top. `fullPage` photographs the
+    // DOCUMENT; an app shell whose content scrolls inside an inner panel is
+    // viewport-tall as a document, so the still showed the panel wherever the
+    // step left it — for a section the agent reached by scrolling, that was
+    // the top (asked for 2026-09-02). Scrolling the target into view moves the
+    // inner panel too, whichever element owns the scroll.
+    if (highlight !== undefined) {
+      await highlight.scrollIntoViewIfNeeded({ timeout: SCROLL_INTO_VIEW_MS }).catch(() => undefined);
+      highlighted = await drawTargetHighlight(highlight);
+    }
 
     const buffer = await page.screenshot({
       type: 'jpeg',
@@ -227,5 +250,7 @@ export async function captureEvidence(
     return buffer.toString('base64');
   } catch {
     return undefined;
+  } finally {
+    if (highlighted) await removeTargetHighlight(page);
   }
 }

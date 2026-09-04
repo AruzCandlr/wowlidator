@@ -118,9 +118,50 @@ describe('cli — argument handling and gating', () => {
     assert.equal(result.code, EXIT.usage);
   });
 
+  it('exits 2 on a --scope that is neither unit nor e2e', async () => {
+    // Rejects rather than falling back: "--scope e2ee" quietly authoring a
+    // unit test is exactly the surprise the flag exists to remove.
+    const result = await runCli(['author', 'check the journey', '--scope', 'e2ee']);
+    assert.equal(result.code, EXIT.usage);
+    assert.match(result.stderr, /--scope must be unit or e2e/);
+  });
+
+  it('exits 2 on a --context-budget that is not a count of characters', async () => {
+    // Rejects rather than clamps: typed wrong it is either a prompt with no
+    // background in it or one with all of it, and both are quiet.
+    const result = await runCli(['catalog', 'cases.md', '--context-budget', 'lots']);
+    assert.equal(result.code, EXIT.usage);
+    assert.match(result.stderr, /--context-budget must be a non-negative integer/);
+  });
+
+  it('exits 2 on an --as that is not <email>:<password>', async () => {
+    // Rejects rather than ignores: a pair silently dropped puts the author
+    // straight back to inventing a password, which is the whole failure this
+    // flag exists to remove.
+    const result = await runCli(['author', 'check the page', '--as', 'employee@cnext.test']);
+    assert.equal(result.code, EXIT.usage);
+    assert.match(result.stderr, /--as must be <email>:<password>/);
+  });
+
   it('exits 2 when the flow file does not exist', async () => {
     const result = await runCli(['run', '/nope/missing.flow.json']);
     assert.equal(result.code, EXIT.usage);
+  });
+
+  it('run with several flows fails at the boundary when any file is bad', async () => {
+    // The multi-flow form (wowUI's "Rerun all" / "Heal all") reads every file
+    // before any browser time is spent — a typo in the second path is a usage
+    // error naming that file, never a half-run suite.
+    const dir = await mkdtemp(join(tmpdir(), 'wow-run-many-'));
+    try {
+      const good = join(dir, 'good.flow.json');
+      await writeFile(good, JSON.stringify({ name: 'ok', steps: [] }));
+      const result = await runCli(['run', good, '/nope/missing.flow.json']);
+      assert.equal(result.code, EXIT.usage, result.stdout + result.stderr);
+      assert.match(result.stderr, /no such flow file: \/nope\/missing\.flow\.json/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('exits 3, naming the role, when a command needs a key it does not have', async () => {
@@ -129,6 +170,25 @@ describe('cli — argument handling and gating', () => {
     const result = await runCli(['generate', 'http://localhost:1/x'], {}, { cwd: keyless });
     assert.equal(result.code, EXIT.environment, result.stdout + result.stderr);
     assert.match(result.stderr, /"generator" role has no API key/);
+  });
+
+  it('go routes a diagram image on disk to the catalog path, not to prose authoring', async () => {
+    // Catalog's role gate fires before the file is read, so an empty png is
+    // evidence enough of the DISPATCH: the pre-fix path fell through to
+    // "describe a test" and demanded --url (exit 2) about a drawing.
+    const image = join(keyless, 'checkout.png');
+    await writeFile(image, '');
+    const result = await runCli(['go', image], {}, { cwd: keyless });
+    assert.equal(result.code, EXIT.environment, result.stdout + result.stderr);
+    assert.match(result.stderr, /wowlidator catalog:/);
+  });
+
+  it('go still reads a diagram-image NAME with no file behind it as a description', async () => {
+    // Evidence-based dispatch: the file must exist on disk. A sentence that
+    // merely ends in .png is a description, and describing needs --url.
+    const result = await runCli(['go', 'the missing chart.png'], {}, { cwd: keyless });
+    assert.equal(result.code, EXIT.usage, result.stdout + result.stderr);
+    assert.match(result.stderr, /needs a page/);
   });
 
   it('prints usage on --help and exits 0', async () => {

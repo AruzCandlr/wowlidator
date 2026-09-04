@@ -174,13 +174,26 @@ export class KeySelection {
       const index = this.#active.get(provider);
       if (index === undefined || index === 0) continue;
       const keys = config.apiKeys[provider] ?? [];
-      const chosen = keys[index];
-      if (chosen === undefined) continue;
-      overlay[PROVIDER_META[provider].envKey] = [
-        chosen,
-        ...keys.filter((_, i) => i !== index),
-      ].join(',');
+      if (keys[index] === undefined) continue;
+      overlay[PROVIDER_META[provider].envKey] = this.orderedKeyIndexes(provider, config)
+        .map((i) => keys[i] as string)
+        .join(',');
     }
     return overlay;
+  }
+
+  /**
+   * The order a run started now would walk this provider's keys: the chosen
+   * one first, every other in its original order behind it. Indexes into
+   * `config.apiKeys[provider]`, so a caller can name the real key afterwards
+   * — the panel's model check reports "answered on key 2" in the numbering
+   * the key cards use, not in the reordered list's.
+   */
+  orderedKeyIndexes(provider: ProviderName, config: WowlidatorConfig): number[] {
+    const count = config.apiKeys[provider]?.length ?? 0;
+    const all = Array.from({ length: count }, (_, i) => i);
+    const chosen = this.#active.get(provider) ?? 0;
+    if (chosen === 0 || chosen >= count) return all;
+    return [chosen, ...all.filter((i) => i !== chosen)];
   }
 }

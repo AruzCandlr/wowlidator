@@ -33,6 +33,7 @@
 import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, extname, join, resolve } from 'node:path';
 
+import { DIAGRAM_IMAGE_EXTENSIONS, isDiagramImage } from '../catalog/diagram-image.js';
 import { MAX_FILE_BYTES, SUPPORTED_EXTENSIONS, formatFor } from '../catalog/extract.js';
 
 export const CATALOG_DIR = '.wowlidator/catalogs';
@@ -51,7 +52,7 @@ export interface StoredDocument {
   format: string;
 }
 
-export function directoryFor(kind: UploadKind): string {
+function directoryFor(kind: UploadKind): string {
   return resolve(kind === 'catalog' ? CATALOG_DIR : CONTEXT_DOC_DIR);
 }
 
@@ -65,7 +66,10 @@ export function directoryFor(kind: UploadKind): string {
 export function safeName(rawName: string, fallbackExtension = '.txt'): string {
   const name = basename(String(rawName ?? '')).trim();
   const extension = extname(name).toLowerCase();
-  const usable = SUPPORTED_EXTENSIONS.includes(extension) ? extension : fallbackExtension;
+  const usable =
+    SUPPORTED_EXTENSIONS.includes(extension) || DIAGRAM_IMAGE_EXTENSIONS.includes(extension)
+      ? extension
+      : fallbackExtension;
 
   const stem = name
     .slice(0, name.length - extname(name).length)
@@ -109,9 +113,19 @@ export async function saveDocument(request: SaveRequest): Promise<StoredDocument
   if (bytes.byteLength === 0) throw new UploadError('that document is empty');
 
   const name = safeName(request.name, typeof request.text === 'string' ? '.md' : '.txt');
-  if (formatFor(name) === undefined) {
+  // A diagram image is a catalog input only: the catalog command transcribes
+  // it with a vision model before the deterministic path runs. As a context
+  // document it would reach the extractor directly, which reads no pixels —
+  // refuse at upload, before the error can happen three steps later.
+  if (isDiagramImage(name)) {
+    if (request.kind !== 'catalog') {
+      throw new UploadError(
+        'a diagram image can only be a catalog — context documents are text the model reads directly',
+      );
+    }
+  } else if (formatFor(name) === undefined) {
     throw new UploadError(
-      `wowlidator cannot read "${request.name}" — it reads ${SUPPORTED_EXTENSIONS.join(' ')}`,
+      `wowlidator cannot read "${request.name}" — it reads ${SUPPORTED_EXTENSIONS.join(' ')} (and ${DIAGRAM_IMAGE_EXTENSIONS.join(' ')} as a sequence-diagram catalog)`,
     );
   }
 
@@ -126,7 +140,7 @@ export async function saveDocument(request: SaveRequest): Promise<StoredDocument
     path,
     bytes: info.size,
     modified: info.mtime.toISOString(),
-    format: formatFor(name) ?? 'text',
+    format: formatFor(name) ?? (isDiagramImage(name) ? 'sequence-image' : 'text'),
   };
 }
 
@@ -142,7 +156,8 @@ export async function listDocuments(kind: UploadKind): Promise<StoredDocument[]>
   const documents: StoredDocument[] = [];
   for (const entry of entries) {
     if (!entry.isFile()) continue;
-    const format = formatFor(entry.name);
+    const format =
+      formatFor(entry.name) ?? (isDiagramImage(entry.name) ? ('sequence-image' as const) : undefined);
     if (format === undefined) continue;
     const path = join(dir, entry.name);
     const info = await stat(path).catch(() => null);
@@ -173,7 +188,7 @@ export async function deleteDocument(kind: UploadKind, path: string): Promise<vo
   if (resolve(join(dir, basename(target))) !== target) {
     throw new UploadError('that path is not a document this panel stored');
   }
-  if (formatFor(target) === undefined) {
+  if (formatFor(target) === undefined && !isDiagramImage(target)) {
     throw new UploadError('that is not a document this panel stored');
   }
   await unlink(target);

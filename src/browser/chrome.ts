@@ -36,6 +36,8 @@ import { access, constants } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 
+import { poolMember } from './pool.js';
+
 const run = promisify(execFile);
 
 export const DEFAULT_CHROME_PROFILE = '/tmp/wowlidator-chrome-profile';
@@ -360,6 +362,42 @@ export async function ensureChrome(options: EnsureOptions): Promise<EnsureResult
   return { status: 'started', cdpUrl, startedByUs: true, message: `started Chrome on port ${port}` };
 }
 
+/** One browser of a pool, with where it lives so it can be stopped later. */
+export interface PoolMember extends EnsureResult {
+  profile: string;
+}
+
+/**
+ * A pool of browsers for a parallel run — the primary on `options.cdpUrl`
+ * plus `count - 1` more on the ports after it, each on its own profile
+ * (`poolMember`). Every member goes through `ensureChrome`, so a stale one is
+ * recycled and one that belongs to somebody else is reported and left alone,
+ * exactly as the primary is.
+ *
+ * The extras run headless unless a window was explicitly asked for
+ * (`--no-headless`): with no preference stated the primary is left as it is,
+ * but four more windows nobody asked for is not "as it is". Members are
+ * started in parallel — Chrome boots in seconds and a pool of five booted one
+ * after another would cost the run what it exists to save.
+ */
+export async function ensureChromePool(options: EnsureOptions, count: number): Promise<PoolMember[]> {
+  const profile = options.profile ?? DEFAULT_CHROME_PROFILE;
+  const wanted = Math.max(1, Math.floor(count));
+  const members = Array.from({ length: wanted }, (_, i) => poolMember(options.cdpUrl, profile, i));
+  return Promise.all(
+    members.map(async (member, i) => {
+      const result = await ensureChrome({
+        ...options,
+        cdpUrl: member.cdpUrl,
+        profile: member.profile,
+        headless: i === 0 ? options.headless : options.headless ?? true,
+        onLog: options.onLog ? (line): void => options.onLog?.(i === 0 ? line : `[browser ${i + 1}] ${line}`) : undefined,
+      });
+      return { ...result, profile: member.profile };
+    }),
+  );
+}
+
 /**
  * Stop the browser on this port and start a fresh one in its place.
  *
@@ -430,17 +468,19 @@ export async function waitForApp(
   onLog?: (line: string) => void,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  let announced = false;
   while (Date.now() < deadline) {
+    const attemptAt = Date.now();
     try {
-      await fetch(url, { signal: AbortSignal.timeout(3_000), redirect: 'follow' });
+      await fetch(url, { signal: AbortSignal.timeout(Math.min(3_000, Math.max(250, deadline - attemptAt))), redirect: 'follow' });
       return true;
     } catch {
-      if (!announced) {
-        onLog?.(`waiting for ${url} …`);
-        announced = true;
-      }
-      await sleep(1_000);
+      // A countdown, one line per second, so a person watching the console
+      // sees the wait is bounded and how much of it is left — a single
+      // "waiting …" line read as a hang.
+      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      if (left === 0) break;
+      onLog?.(`waiting for ${url} … ${left}s left`);
+      await sleep(Math.min(1_000, deadline - Date.now()));
     }
   }
   return false;

@@ -20,8 +20,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { z } from 'zod';
 
+import { MockLanguageModelV4 } from 'ai/test';
+
 import { callsTo, jsonModel, scriptedModel } from './helpers.js';
-import { generateStructured } from '../src/providers/llm-factory.js';
+import { ClaudeAnswerError } from '../src/providers/claude-envelope.js';
+import { generateStructured, resetStructuredBreaker } from '../src/providers/llm-factory.js';
 import { lenientObject } from '../src/providers/model-output.js';
 
 /** The shape that actually failed: a nested array of flat, all-required steps. */
@@ -119,6 +122,20 @@ describe('re-asking a model that answered badly', () => {
     assert.equal(callsTo(model), 3, 'bounded — a model that cannot comply must not loop');
   });
 
+  it('re-asks with the complaint attached, never the identical request', async () => {
+    // At temperature 0 the same request gets the same malformed reply, so a
+    // bare retry can only fail identically — measured three times running on
+    // a local model. The second ask must differ, and what differs is the
+    // complaint: what was wrong with the first reply.
+    const model = scriptedModel('stubborn', ['{"name":"ok","steps":[{"action":"click","selector":"a"', good]);
+    await generateStructured({ ...request, model });
+    const calls = (model as unknown as { doGenerateCalls: { prompt: unknown }[] }).doGenerateCalls;
+    const second = JSON.stringify(calls[1]?.prompt);
+    assert.match(second, /PREVIOUS REPLY/);
+    assert.match(second, /not valid JSON/);
+    assert.doesNotMatch(JSON.stringify(calls[0]?.prompt), /PREVIOUS REPLY/);
+  });
+
   it('does not re-ask when the first answer was already good', async () => {
     const model = jsonModel('fine', good, { inputTokens: 1, outputTokens: 1 });
     await generateStructured({ ...request, model });
@@ -159,5 +176,96 @@ describe('what the failure message says', () => {
         return true;
       },
     );
+  });
+});
+
+describe('a connection that dropped is not a schema failure', () => {
+  it('is worded as transport, without the "3 times running" advice', async () => {
+    const { MockLanguageModelV4 } = await import('ai/test');
+    const model = new MockLanguageModelV4({
+      modelId: 'gone',
+      doGenerate: async () => {
+        throw new Error('Cannot connect to API: other side closed');
+      },
+    });
+    await assert.rejects(
+      generateStructured({ modelLabel: 'local:default_model', schema: z.object({ a: z.string() }), system: 's', prompt: 'p', model: model as never }),
+      (error: Error) => {
+        assert.match(error.message, /could not be reached/);
+        assert.doesNotMatch(error.message, /3 times running|valid structured response/);
+        return true;
+      },
+    );
+  });
+});
+
+/**
+ * An answer CUT at a provider's own output cap (2026-09-04, claude-cli on a
+ * multirole Thai catalog: 17k–24.5k-token authoring answers against the CLI's
+ * 32,000 cap). The provider throws a typed error carrying `finishReason:
+ * 'length'`; `generateStructured` must put `finish=length` on line one, must
+ * NOT re-ask the identical request (temperature 0 — the same cut), and must
+ * NOT count it against the breaker (a budget is not a model that cannot do
+ * JSON).
+ */
+describe('an answer cut at the provider\'s own output cap', () => {
+  const request = {
+    modelLabel: 'mock:capped',
+    schema: Suite,
+    system: 'You write tests.',
+    prompt: 'Write one.',
+    task: 'generator',
+  };
+
+  function cappedModel(): MockLanguageModelV4 {
+    return new MockLanguageModelV4({
+      provider: 'mock',
+      modelId: 'capped',
+      doGenerate: async () => {
+        throw new ClaudeAnswerError(
+          "claude CLI answer was CUT OFF at the CLI's own output cap of 32000 tokens (finish=length; nothing of the object arrived) — this is the model's ceiling; the answer must be smaller",
+          { finishReason: 'length', outputCap: 32000, modelCeiling: 32000 },
+        );
+      },
+    });
+  }
+
+  it('names the cut on line one, asks once, and gives budget advice — not "try another model"', async () => {
+    resetStructuredBreaker();
+    const model = cappedModel();
+    await assert.rejects(generateStructured({ ...request, model }), (error: Error) => {
+      const first = error.message.split('\n')[0] ?? '';
+      assert.match(first, /failed to produce a valid structured response/);
+      assert.match(first, /CUT OFF/);
+      assert.match(first, /finish=length/);
+      assert.match(error.message, /cut at an output budget/);
+      assert.doesNotMatch(error.message, /Try a different model id/);
+      assert.equal(error.name, 'StructuredOutputUnavailableError');
+      return true;
+    });
+    assert.equal(callsTo(model), 1, 'an identical re-ask can only be cut identically');
+  });
+
+  it('does not trip the breaker — two cuts in a row still let a good answer through', async () => {
+    resetStructuredBreaker();
+    await assert.rejects(generateStructured({ ...request, model: cappedModel() }));
+    await assert.rejects(generateStructured({ ...request, model: cappedModel() }));
+    const good = { name: 'ok', steps: [{ action: 'click', selector: '#a', value: '', url: '' }] };
+    const fine = jsonModel('capped', good, { inputTokens: 1, outputTokens: 1 });
+    const result = await generateStructured({ ...request, model: fine });
+    assert.deepEqual(result.object, good);
+    assert.equal(callsTo(fine), 1, 'the circuit for generator@mock:capped must still be closed');
+  });
+});
+
+describe('the re-ask note carries the parser\'s own complaint', () => {
+  it('quotes the SyntaxError position, not only the generic list of causes', async () => {
+    resetStructuredBreaker();
+    const good = { name: 'ok', steps: [{ action: 'click', selector: '#a', value: '', url: '' }] };
+    const model = scriptedModel('sloppy', ['{"name": "ok", "steps": [}', good]);
+    await generateStructured({ modelLabel: 'mock:sloppy', schema: Suite, system: 's', prompt: 'p', model });
+    const calls = (model as unknown as { doGenerateCalls: { prompt: unknown }[] }).doGenerateCalls;
+    const second = JSON.stringify(calls[1]?.prompt);
+    assert.match(second, /not valid JSON \(parser: /);
   });
 });

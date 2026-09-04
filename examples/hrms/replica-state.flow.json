@@ -1,0 +1,26 @@
+{
+  "name": "HRCenter-DEV replica — benefit catalog state",
+  "setup": [
+    { "action": "dbSnapshot", "tables": ["benefit_management.benefit_plan", "benefit_management.benefit_eligibility_rule", "benefit_management.master_hospitals"], "as": "before",
+      "intent": "baseline row counts of the benefit catalog" }
+  ],
+  "steps": [
+    { "action": "expectDbRow", "table": "benefit_management.benefit_plan",
+      "where": { "benefit_plan_id": "BP-DENTAL-01" }, "values": { "status": "A", "benefit_category": "Dental" },
+      "intent": "the Dental plan exists and is active" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_plan",
+      "where": { "benefit_plan_id": "BP-MEDICAL-OPD-01" }, "values": { "status": "A", "benefit_type": "REIMBURSEMENT_EMPLOYEE_HR" },
+      "intent": "the OPD plan is an active employee/HR reimbursement plan" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_plan",
+      "where": { "status": "A" }, "count": 3,
+      "intent": "exactly three plans are active — what the catalog screen should list" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_eligibility_rule",
+      "where": { "rule_type": "STANDARD", "is_active": true }, "count": 3,
+      "intent": "every eligibility rule is a STANDARD active rule" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_plan",
+      "where": { "benefit_plan_id": "BP-NOPE-99" }, "count": 0, "timeoutMs": 500,
+      "intent": "a plan id nobody created must not exist" },
+    { "action": "expectDbUnchanged", "tables": ["benefit_management.benefit_plan", "benefit_management.benefit_eligibility_rule", "benefit_management.master_hospitals"], "since": "before",
+      "intent": "reading changed nothing — the session is read-only" }
+  ]
+}

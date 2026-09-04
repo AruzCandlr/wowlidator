@@ -25,6 +25,7 @@
  */
 
 import type { ProofBundle } from '../engine/proof-bundle.js';
+import { isPassing } from '../engine/proof-bundle.js';
 import type { HistoryEntry } from './run-history.js';
 
 /** Consecutive passes required before a quarantined case counts normally again. */
@@ -50,7 +51,7 @@ export function decideQuarantine(
   if (!options.enabled) {
     return { quarantined: false, reason: 'quarantine not requested' };
   }
-  if (bundle.status === 'passed') {
+  if (isPassing(bundle.status)) {
     return { quarantined: false, reason: 'run passed' };
   }
   if (bundle.trend?.verdict !== 'flaky') {
@@ -82,7 +83,7 @@ export function decideQuarantine(
 function countTrailingPasses(history: readonly HistoryEntry[]): number {
   let streak = 0;
   for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i]?.status !== 'passed') break;
+    if (!isPassing(history[i]?.status ?? '')) break;
     streak += 1;
   }
   return streak;

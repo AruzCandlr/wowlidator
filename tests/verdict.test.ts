@@ -14,6 +14,7 @@ import { describe, it } from 'node:test';
 import { ProofBundleBuilder, type ProofBundle } from '../src/engine/proof-bundle.js';
 import { GLOSSARY, renderReport } from '../src/reporter/html-reporter.js';
 import { buildVerdict, escalationTrace, ownerOf, describeStep } from '../src/reporter/verdict.js';
+import { decisionFrom } from '../src/engine/runner.js';
 
 const base = { startedAt: '2026-08-03T00:00:00.000Z', durationMs: 12, url: 'http://app/x' };
 
@@ -337,5 +338,225 @@ describe('the rendered report', () => {
       }),
     );
     assert.ok(!/badge res-fast/.test(html));
+  });
+});
+
+describe('verdict — the failure shape decides the copy, not the header', () => {
+  it('a content mismatch says the element was found, even wrapped in a resolve header', () => {
+    // PB-05-01's live shape: expectText role=main resolved on every rung and
+    // failed on TEXT, and the verdict said the control was never found —
+    // sending a reader hunting a control that was on screen the whole time.
+    const bundle = bundleOf((b) => {
+      b.addStep({
+        action: 'expectText',
+        intent: 'Confirm case ID PB-001 exists on probation reviews list',
+        selector: 'role=main',
+        resolvedSelector: null,
+        resolution: null,
+        status: 'failed',
+        ...base,
+        error:
+          'could not resolve "role=main" after 3 attempt(s):\n' +
+          '  - fast "role=main": expected text to contain "PB-001", got "Probation Review…"',
+      });
+    });
+    const verdict = buildVerdict(bundle);
+    assert.match(verdict.what, /the element was found/);
+    assert.doesNotMatch(verdict.what, /never found/);
+  });
+
+  it('a failed absence check says the element stayed, not that it was never found', () => {
+    // The inversion: an expectHidden timeout means the element WAS there for
+    // the whole window.
+    const bundle = bundleOf((b) => {
+      b.addStep({
+        action: 'expectHidden',
+        intent: 'Verify extended key does not appear raw',
+        selector: 'text=extended',
+        resolvedSelector: null,
+        resolution: null,
+        status: 'failed',
+        ...base,
+        error: 'locator.waitFor: Timeout 2000ms exceeded.',
+      });
+    });
+    const verdict = buildVerdict(bundle);
+    assert.match(verdict.what, /expected to be absent was still on the page/);
+    assert.doesNotMatch(verdict.what, /never found/);
+  });
+
+  it('a failing step on a sign-in page overrides the side copy with the stranded note', () => {
+    // DB-04-01's live shape: every body step failed against /en/login and the
+    // verdict said "FRONTEND problem … suggested owner: frontend" about an
+    // app whose only act was redirecting an unauthenticated run.
+    const bundle = bundleOf((b) => {
+      b.addStep({
+        action: 'click',
+        intent: 'Open Create Plan modal',
+        selector: 'role=button[name="Create Plan" i]',
+        resolvedSelector: null,
+        resolution: null,
+        status: 'failed',
+        ...base,
+        url: 'http://localhost:3200/en/login',
+        error: 'could not resolve "role=button[name="Create Plan" i]" after 2 attempt(s):\n  - fast: Timeout',
+      });
+    });
+    const verdict = buildVerdict(bundle);
+    assert.match(verdict.side ?? '', /sign-in page/);
+    assert.match(verdict.side ?? '', /fix the flow's sign-in/);
+    assert.doesNotMatch(verdict.side ?? '', /FRONTEND problem/);
+  });
+});
+
+
+/**
+ * The agent deciding for itself when a run meets something the flow does not
+ * describe (PB_01_01's PDPA "Accept and continue" screen — not an ARIA dialog,
+ * so the modal rung is blind to it; not a pointer-interception, so the overlay
+ * rung is too).
+ *
+ * `decisionFrom` is pure, so what the agent said and what is recorded can be
+ * checked without a browser. The three rendering tests are the other half:
+ * a decision nobody can read is a decision that was not recorded.
+ */
+describe('a decision the agent took on the reader\u2019s behalf', () => {
+  const consentAction = {
+    index: 0,
+    action: 'click',
+    selector: 'role=button[name="Accept and continue"]',
+    value: null,
+    url: 'http://app/x',
+    reasoning: 'a PDPA consent screen is covering the page',
+    ok: true,
+    durationMs: 40,
+  };
+  const record = {
+    goal: 'the test expected …',
+    model: 'stub-agent',
+    success: true,
+    summary: 'accepted the consent screen so the page underneath could be reached',
+    actions: [consentAction, { ...consentAction, index: 1, action: 'finish', selector: null, reasoning: 'done' }],
+    turns: 2,
+    maxSteps: 8,
+    latencyMs: 900,
+  };
+
+  it('records what the agent judged, chose and did — in its own words', () => {
+    const decision = decisionFrom(record, true);
+    assert.equal(decision.observed, 'a PDPA consent screen is covering the page');
+    assert.match(decision.decided, /^click role=button\[name="Accept and continue"\]/);
+    assert.equal(decision.because, record.summary);
+    assert.equal(decision.resolved, true);
+    assert.equal(decision.model, 'stub-agent');
+    assert.equal(decision.actions.length, 2, 'the acts are kept whole, finish included');
+  });
+
+  it('records a decision NOT to act, rather than recording nothing', () => {
+    // "The agent looked and saw nothing in the way" and "the agent was never
+    // consulted" are different facts about a dead-ended step, and only the
+    // first one tells a reader the ladder was exhausted honestly.
+    const declined = {
+      ...record,
+      success: false,
+      summary: 'nothing is covering the page; the control simply is not present',
+      actions: [{ ...consentAction, action: 'finish', selector: null, reasoning: 'nothing to do' }],
+    };
+    const decision = decisionFrom(declined, false);
+    assert.equal(decision.observed, '', 'it claimed no sighting, so none is invented');
+    assert.match(decision.decided, /nothing/);
+    assert.equal(decision.resolved, false);
+  });
+
+  it('never synthesises words the agent did not say', () => {
+    const silent = { ...record, summary: '', actions: [] };
+    const decision = decisionFrom(silent, false);
+    assert.equal(decision.observed, '');
+    assert.equal(decision.because, '');
+  });
+
+  it('renders the decision, and separates the claim from the evidence', () => {
+    const html = renderReport(
+      bundleOf((b) => {
+        b.addStep({
+          action: 'click',
+          intent: 'Open the probation record',
+          selector: '#open',
+          resolvedSelector: '#open',
+          resolution: 'agent',
+          status: 'passed',
+          decision: decisionFrom(record, true),
+          ...base,
+        });
+      }),
+    );
+    assert.match(html, /a PDPA consent screen is covering the page/, 'what it judged');
+    assert.match(html, /Accept and continue/, 'what it chose');
+    assert.match(html, /the flow does not describe/, 'named as an undescribed interaction');
+    assert.match(html, /own selector then/, 'the evidence is stated apart from the claim');
+  });
+
+  it('shows nothing when no decision was taken', () => {
+    // The assertion rail is structural — `#agentRescue` returns before the
+    // agent is ever called for an `ASSERTION_ACTIONS` step, so no record
+    // exists to derive a decision from. This is the visible half of it: a step
+    // with no decision must not grow a block or a badge implying one.
+    const html = renderReport(
+      bundleOf((b) => {
+        b.addStep({
+          action: 'expectVisible',
+          selector: '#open',
+          resolvedSelector: null,
+          resolution: null,
+          status: 'failed',
+          error: 'could not resolve',
+          ...base,
+        });
+      }),
+    );
+    assert.ok(!/agent decided/.test(html));
+    assert.ok(!/does not describe/.test(html));
+  });
+
+  it('explains the badge it adds', () => {
+    const html = renderReport(
+      bundleOf((b) => {
+        b.addStep({
+          action: 'click',
+          selector: '#open',
+          resolvedSelector: '#open',
+          resolution: 'agent',
+          status: 'passed',
+          decision: decisionFrom(record, true),
+          ...base,
+        });
+      }),
+    );
+    for (const match of html.matchAll(/<span class="badge res-[a-z]+">(?:<abbr title="([^"]*)">)?([^<]*)/g)) {
+      const [, explanation, label] = match;
+      assert.ok(explanation || GLOSSARY[label ?? ''], `badge "${label}" has no glossary entry`);
+    }
+    assert.ok(GLOSSARY['agent decided'], 'the new badge is explained');
+  });
+
+  it('tells a failing step\u2019s reader that a decision was taken for them', () => {
+    const bundle = bundleOf((b) => {
+      b.addStep({
+        action: 'click',
+        intent: 'Open the probation record',
+        selector: '#open',
+        resolvedSelector: null,
+        resolution: null,
+        status: 'failed',
+        error: 'could not resolve "#open" after 3 attempt(s):\n  - fast: timeout',
+        decision: decisionFrom({ ...record, success: false }, false),
+        ...base,
+      });
+    });
+    // Through buildVerdict: describeStep only NAMES the step, the account of
+    // what broke is the verdict's `what`.
+    const prose = buildVerdict(bundle).what;
+    assert.match(prose, /does not describe/);
+    assert.match(prose, /PDPA consent screen/);
   });
 });

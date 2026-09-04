@@ -43,6 +43,20 @@ export const DEFAULT_REPORT_DIR = '.wowlidator/reports';
 
 const sel = z.string();
 const intent = z.string().optional();
+/**
+ * A step's own wait (2026-09-03): the patience window for a presence or
+ * absence claim that is honestly slow — a payroll run's "Complete", an
+ * import's "100%", a toast that auto-dismisses. Capped by the engine at
+ * MAX_STEP_TIMEOUT_MS (10 minutes); when it expires the wait IS the verdict
+ * and no model is paid.
+ */
+const patienceMs = z
+  .number()
+  .int()
+  .min(1)
+  .max(600_000)
+  .optional()
+  .describe('How long, in ms, this claim may take to hold. Omit for the default budgets.');
 
 const flowStepSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('goto'), url: z.string() }),
@@ -52,7 +66,31 @@ const flowStepSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('check'), selector: sel, intent }),
   z.object({ action: z.literal('uncheck'), selector: sel, intent }),
   z.object({ action: z.literal('type'), selector: sel, value: z.string(), intent }),
-  z.object({ action: z.literal('waitFor'), selector: sel, intent }),
+  z.object({ action: z.literal('waitFor'), selector: sel, intent, timeoutMs: patienceMs }),
+  // Files (2026-09-03): attach through the input, a dropzone, a label, or the
+  // native chooser; capture a download the click starts.
+  z.object({
+    action: z.literal('upload'),
+    selector: sel.describe('The file input, the dropzone hiding one, its label, or the button that opens the chooser.'),
+    files: z.array(z.string()).min(1).describe('Paths, relative to the flow file.'),
+    intent,
+  }),
+  z.object({
+    action: z.literal('download'),
+    selector: sel.describe('The control whose click starts the download.'),
+    as: z.string().min(1).describe('Variable name the saved file path is stored under, for {{as}} later.'),
+    intent,
+  }),
+  // Persona switch (2026-09-03): sign in as a named persona from the run's
+  // persona map — never credentials in the flow. Each persona gets a browser
+  // of their own and keeps it; a persona already signed in is switched to,
+  // not re-authenticated.
+  z.object({
+    action: z.literal('signIn'),
+    as: z.string().min(1).describe('A persona label (HR_ADMIN_ACCOUNT, <MANAGER_ACCOUNT>, "manager") or the email of one. A persona already signed in earlier in the flow is switched back to, session kept.'),
+    url: z.string().optional().describe('The sign-in page. Omit to use the one the flow already named, else /login.'),
+    intent,
+  }),
   z.object({
     action: z.literal('workflow'),
     goal: z.string().describe('Goal for the multi-page agent, e.g. "reach the plan detail page".'),
@@ -100,6 +138,23 @@ const flowStepSchema = z.discriminatedUnion('action', [
   // State seeding, for preconditions such as authentication.
   z.object({ action: z.literal('setLocalStorage'), key: z.string(), value: z.string() }),
   z.object({ action: z.literal('clearStorage') }),
+  z.object({
+    action: z.literal('signOut'),
+    intent,
+  }).describe(
+    "End the session through the application's own sign-out control (searched name-gated, " +
+      'then behind ARIA-marked identity menus). The persona-switch step: signOut, goto the ' +
+      "sign-in page, fill the next account's credentials.",
+  ),
+  z.object({
+    action: z.literal('setClock'),
+    time: z
+      .string()
+      .describe(
+        'ISO date or date-time to pin the page clock to. Put it in setup, before the first goto.',
+      ),
+    intent,
+  }),
   // Assertions.
   z.object({
     action: z.literal('expectText'),
@@ -113,12 +168,40 @@ const flowStepSchema = z.discriminatedUnion('action', [
           'forms of one name on a bilingual page. Omit to enforce the one rendering in "value".',
       ),
     intent,
+    timeoutMs: patienceMs,
   }),
-  z.object({ action: z.literal('expectVisible'), selector: sel, intent }),
-  z.object({ action: z.literal('expectHidden'), selector: sel, intent }),
+  z.object({ action: z.literal('expectVisible'), selector: sel, intent, timeoutMs: patienceMs }),
+  z.object({ action: z.literal('expectHidden'), selector: sel, intent, timeoutMs: patienceMs }),
   z.object({ action: z.literal('expectEnabled'), selector: sel, intent }),
   z.object({ action: z.literal('expectDisabled'), selector: sel, intent }),
-  z.object({ action: z.literal('expectCount'), selector: sel, count: z.number().int().min(0), intent }),
+  z.object({
+    action: z.literal('expectCount'),
+    selector: sel,
+    count: z.union([z.number().int().min(0), z.string()]),
+    intent,
+    timeoutMs: patienceMs,
+  }),
+  // Either/or (2026-09-03): the request accepts EITHER outcome — "สำเร็จหรือ
+  // แสดง error ตามเงื่อนไข ไม่ crash". One selector per acceptable outcome.
+  z.object({
+    action: z.literal('expectAnyVisible'),
+    selectors: z.array(sel).min(1).describe('One selector per acceptable outcome; the first visible wins.'),
+    intent,
+    timeoutMs: patienceMs,
+  }),
+  // The validation message FOR a field (2026-09-03): aria-errormessage /
+  // aria-describedby / the field's own container — never the whole page.
+  z.object({
+    action: z.literal('expectFieldError'),
+    selector: sel.describe('The field (input, select, button-combobox) the message belongs to.'),
+    value: z.string().optional().describe('The message text. Omit to require any non-empty message.'),
+    intent,
+  }),
+  // Read a count / an element's text into the run's variable store, for a
+  // later `expectCount`/`expectText` carrying `{{name}}` — how "A matches B"
+  // and "no change after the action" claims are proved (EN-2 audit).
+  z.object({ action: z.literal('saveCount'), selector: sel, as: z.string().min(1), intent }),
+  z.object({ action: z.literal('saveText'), selector: sel, as: z.string().min(1), intent }),
   z.object({ action: z.literal('expectUrl'), value: z.string(), intent }),
   z.object({ action: z.literal('expectValue'), selector: sel, value: z.string(), intent }),
   z.object({
@@ -201,8 +284,9 @@ const flowStepSchema = z.discriminatedUnion('action', [
   // Modals — dialogs/popups, detected by role="dialog"/"alertdialog" or a native <dialog open>.
   z.object({
     action: z.literal('expectModal'),
-    name: z.string().optional().describe('Substring the open dialog should mention.'),
+    name: z.string().optional().describe('Substring the open dialog should mention — its label, heading or text.'),
     intent,
+    timeoutMs: patienceMs,
   }),
   z.object({
     action: z.literal('closeModal'),
@@ -211,6 +295,84 @@ const flowStepSchema = z.discriminatedUnion('action', [
   }),
   // Visual regression.
   z.object({ action: z.literal('snapshot'), name: z.string(), selector: sel.optional() }),
+  // Sequence assertion over the page's observed traffic. This is an MCP
+  // *input* schema, so the structured form is fine here (the flat string form
+  // exists only for model *output* — see `flow-author.ts`).
+  z.object({
+    action: z.literal('expectCalls'),
+    calls: z
+      .array(
+        z.object({
+          method: z.string(),
+          url: z.string().describe('Path template — /api/orders/:id and /api/orders/{id} both work.'),
+          status: z
+            .union([z.number().int(), z.enum(['2xx', '3xx', '4xx', '5xx'])])
+            .optional()
+            .describe('Exact status or class. Omitted means "completed, any status".'),
+        }),
+      )
+      .optional()
+      .describe('Ordered subsequence the window must contain; other traffic interleaves freely.'),
+    never: z
+      .array(z.object({ method: z.string(), url: z.string() }))
+      .optional()
+      .describe('Templates no observed call may match.'),
+    since: z
+      .enum(['mark', 'run'])
+      .optional()
+      .describe('"mark" (default): since the previous expectCalls settled. "run": the whole buffer.'),
+    timeoutMs: z.number().int().min(1).optional(),
+    intent,
+  }),
+  // Database verification — read-only, schema-grounded; see `src/db/`.
+  z.object({
+    action: z.literal('dbSnapshot'),
+    tables: z.array(z.string()).min(1),
+    as: z.string().optional().describe('Snapshot name later deltas refer to. Default "before".'),
+    intent,
+  }),
+  z.object({
+    action: z.literal('expectDbRow'),
+    table: z.string(),
+    where: z
+      .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
+      .describe('Column → value. Prefer a {{variable}} the run saved — that ties the row to this run.'),
+    values: z
+      .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
+      .optional(),
+    count: z
+      .union([z.number().int().min(0), z.string()])
+      .optional()
+      .describe(
+        'Exact matching-row count; omitted means "at least one". A string interpolates ' +
+          '{{variables}} first — how an API-reported number is compared to the database.',
+      ),
+    timeoutMs: z.number().int().min(1).optional(),
+    intent,
+  }),
+  z.object({
+    action: z.literal('expectDbDelta'),
+    table: z.string(),
+    delta: z.number().int(),
+    since: z.string().optional(),
+    timeoutMs: z.number().int().min(1).optional(),
+    intent,
+  }),
+  z.object({
+    action: z.literal('expectDbUnchanged'),
+    tables: z.array(z.string()).min(1),
+    since: z.string().optional(),
+    intent,
+  }),
+  z.object({
+    action: z.literal('expectDbCalled'),
+    match: z.string().describe('Case-insensitive substring of the normalized statement.'),
+    since: z.string().optional(),
+    delta: z.number().int().min(0).optional(),
+    atLeast: z.number().int().min(1).optional(),
+    timeoutMs: z.number().int().min(1).optional(),
+    intent,
+  }),
 ]);
 
 export interface ServerConfig {
@@ -475,9 +637,8 @@ export function createServer(config: ServerConfig = configFromEnv()): McpServer 
           .enum(MUTATION_POLICIES)
           .optional()
           .describe(
-            "How much the suite may change. 'forms' (default) submits only empty/invalid input to exercise validation; 'read-only' never submits; " +
-              "'forms' submits empty/invalid input to exercise validation (negative testing); " +
-              "'mutations' may also create or update. None ever delete.",
+            "How much the suite may change. 'mutations' (default) fills, submits, creates and updates like a human tester; " +
+              "'forms' narrows that to empty/invalid submits only (negative testing); 'read-only' never submits. None ever delete.",
           ),
         context: z
           .boolean()
@@ -526,10 +687,17 @@ export function createServer(config: ServerConfig = configFromEnv()): McpServer 
           .string()
           .optional()
           .describe('Path or URL of an OpenAPI/Swagger spec to index alongside the code.'),
+        dbSchema: z
+          .string()
+          .optional()
+          .describe('Path of a schema.sql / schema.prisma to index alongside the code.'),
       },
     },
-    async ({ url, force, openapi }) => {
-      const engine = new ContextEngine(openapi === undefined ? {} : { openApiSpec: openapi });
+    async ({ url, force, openapi, dbSchema }) => {
+      const engine = new ContextEngine({
+        ...(openapi === undefined ? {} : { openApiSpec: openapi }),
+        ...(dbSchema === undefined ? {} : { dbSchema }),
+      });
       const graph = await engine.build({ force: force ?? false });
 
       if (url === undefined) {
@@ -539,6 +707,7 @@ export function createServer(config: ServerConfig = configFromEnv()): McpServer 
           operations: graph.nodes
             .filter((node) => node.kind === 'operation')
             .map((node) => node.name),
+          tables: graph.nodes.filter((node) => node.kind === 'table').map((node) => node.name),
         });
       }
       return json({ promptContext: toPromptContext(graph, { url }) });

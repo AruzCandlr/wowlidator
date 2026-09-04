@@ -1,0 +1,16 @@
+@startuml
+title Order submission
+actor Customer
+participant "Web App" as Web
+participant "Order API" as API
+database Orders
+
+Customer -> Web : submit the order form
+Web -> API : POST /api/orders
+API -> Orders : INSERT order row
+Orders --> API : ok
+API --> Web : 201 Created
+note right of Web
+  the confirmation banner appears
+end note
+@enduml

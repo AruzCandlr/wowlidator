@@ -28,7 +28,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { trimWebm } from './webm.js';
+import { condenseWebm, mapToCondensed, trimWebm, type CondenseSegment, type KeptWindow } from './webm.js';
 
 /**
  * Whether to record.
@@ -38,11 +38,16 @@ import { trimWebm } from './webm.js';
  * and evidence is stills alone.
  */
 /**
- * `on`     — film every run, keep the recording only when a step fails
- *            (cut to the failure). The default.
- * `always` — keep the whole recording whatever the outcome: the film of the
- *            mock user performing the task, end to end. This is what "view
- *            actual flow" records on demand for a run that passed.
+ * `on`     — film every run and keep the ACTION MOMENTS: every step that
+ *            acted or asserted, and every action the workflow agent took,
+ *            each held for `VIDEO_ACTION_DWELL_MS`, with the idle between
+ *            them (ladder timeouts, model calls, waits) dropped. A failure
+ *            keeps the film through the break as before. The default since
+ *            2026-09-04; before that `on` kept the whole wall-clock film.
+ * `always` — keep the WHOLE recording, untrimmed and uncondensed, plus
+ *            viewer pacing: the film of the mock user performing the task
+ *            end to end, at the speed it happened. The opt-out from
+ *            condensing.
  * `off`    — no filming; stills on every step instead.
  */
 export type VideoMode = 'on' | 'always' | 'off';
@@ -64,15 +69,98 @@ export interface VideoRecording {
   /** Bytes on disk before base64 — what the recording actually weighs. */
   bytes: number;
   /**
-   * Set instead of `data` when the recording was too large to embed. The
-   * report says so rather than silently showing no video: "we recorded it and
-   * it is over there" and "there is no recording" are different facts.
+   * Set instead of `data` when a recording was made but could not be carried
+   * into the bundle. The report says so rather than silently showing no
+   * video: "we recorded it and it is over there" and "there is no recording"
+   * are different facts. Size is no longer a reason (the cap was removed
+   * 2026-09-03); the field stays for embedders that supply their own bundles.
    */
   omitted?: string | undefined;
   /** Index of the step the recording was cut at — the one that failed. */
   endsAtStep?: number | undefined;
   /** Playing time of the kept segment. */
   durationMs?: number | undefined;
+  /**
+   * Set when the film was condensed to its action moments (`video: 'on'`):
+   * what the whole recording measured, how many moments were kept, how long
+   * each is held, and the clock map from the source film to this one — the
+   * report's per-step seeks and every `videoOffsetMs` are on THIS clock.
+   */
+  condensed?: CondensedFilm | undefined;
+}
+
+/** How a condensed film relates to the recording it was cut from. */
+export interface CondensedFilm {
+  sourceDurationMs: number;
+  sourceBytes: number;
+  moments: number;
+  dwellMs: number;
+  segments: CondenseSegment[];
+}
+
+/**
+ * How long each action moment is held on screen — the second after a step
+ * completed, or an agent action landed, in which the page reacts to it.
+ */
+export const VIDEO_ACTION_DWELL_MS = 1000;
+
+/**
+ * How much before the moment is kept at real speed: the pointer arriving on
+ * the control and the press itself, which happen just before a step is
+ * recorded complete.
+ */
+export const VIDEO_ACTION_LEAD_MS = 400;
+
+/**
+ * Longest a moment's own lead may grow to, ms. A humanised step (see
+ * `humanize.ts`) performs for longer than the fixed lead — the pointer's
+ * approach, a value going in key by key — and the film keeps that whole
+ * performance; a step that waited on a network read-back for seconds does
+ * not turn into seconds of film.
+ */
+export const VIDEO_LEAD_CAP_MS = 5_000;
+
+/**
+ * A moment on the film, with the lead it is owed. `leadMs` is what the
+ * action took to PERFORM (the approach, the typing) plus the fixed lead;
+ * absent, the fixed lead alone.
+ */
+export interface ActionMoment {
+  at: number;
+  leadMs?: number | undefined;
+}
+
+/** The lead a moment keeps before it, bounded. */
+export function leadOf(moment: number | ActionMoment, leadMs = VIDEO_ACTION_LEAD_MS): number {
+  if (typeof moment === 'number' || moment.leadMs === undefined || !Number.isFinite(moment.leadMs)) return leadMs;
+  return Math.min(VIDEO_LEAD_CAP_MS, Math.max(leadMs, moment.leadMs));
+}
+
+/**
+ * The spans of the source film an action moment list keeps at real speed.
+ *
+ * Each moment is the instant an action COMPLETED (a step's start plus its
+ * duration; an agent action's `finishedAt`), so a step that walked the
+ * ladder for forty seconds keeps its last second — when it finally acted —
+ * not the forty in which nothing happened. `endMs` clips every window, so a
+ * film cut at a failure ends where the cut says.
+ */
+export function actionWindows(
+  moments: readonly (number | ActionMoment)[],
+  dwellMs = VIDEO_ACTION_DWELL_MS,
+  endMs = Number.POSITIVE_INFINITY,
+  leadMs = VIDEO_ACTION_LEAD_MS,
+): KeptWindow[] {
+  return moments
+    .map((m) => ({ at: typeof m === 'number' ? m : m.at, lead: leadOf(m, leadMs) }))
+    .filter((m) => Number.isFinite(m.at) && m.at >= 0)
+    .map((m) => ({ fromMs: Math.max(0, m.at - m.lead), toMs: Math.min(endMs, m.at + dwellMs) }))
+    .filter((w) => w.toMs >= w.fromMs);
+}
+
+/** Where a source-clock moment sits in a (possibly condensed) recording. */
+export function onRecordingClock(video: VideoRecording, sourceMs: number): number {
+  return video.condensed ? mapToCondensed(video.condensed.segments, sourceMs) : sourceMs;
 }
 
 /**
@@ -97,16 +185,6 @@ const FAILURE_TAIL_MS = 750;
  */
 const MAX_VIDEO_EDGE = 960;
 
-/**
- * Ceiling on an embedded recording.
- *
- * The report is one file that has to open off a USB stick, and base64 inflates
- * by a third on top of this. A long run against a busy page can exceed it, and
- * the honest response is to keep the run's verdict and say the video was too
- * large — never to fail the run, and never to quietly produce a report with a
- * video element that plays nothing.
- */
-const MAX_EMBED_BYTES = 24 * 1024 * 1024;
 
 /**
  * Frame size for a given viewport.
@@ -170,7 +248,8 @@ export const CURSOR_OVERLAY_SOURCE = `(() => {
         '<style>' +
         '#c{position:fixed;left:-999px;top:-999px;width:20px;height:20px;margin:-10px 0 0 -10px;' +
         'border-radius:50%;background:rgba(20,20,20,.35);border:2px solid #fff;' +
-        'box-shadow:0 1px 4px rgba(0,0,0,.5);transition:transform .08s ease-out,background .08s}' +
+        'box-shadow:0 1px 4px rgba(0,0,0,.5);' +
+        'transition:left .05s linear,top .05s linear,transform .08s ease-out,background .08s}' +
         '#r{position:fixed;left:-999px;top:-999px;width:20px;height:20px;margin:-10px 0 0 -10px;' +
         'border-radius:50%;border:2px solid #21c07a;opacity:0}' +
         '#r.go{animation:w .5s ease-out}' +
@@ -324,6 +403,13 @@ export async function sealVideo(
   dir: string,
   size: { width: number; height: number },
   cut: VideoCut,
+  /**
+   * The action moments to condense the film to (source clock, ms). Given for
+   * `video: 'on'`; absent (or empty) keeps the film as `cut` alone says —
+   * which is what `'always'` asks for.
+   */
+  moments?: readonly (number | ActionMoment)[] | undefined,
+  dwellMs = VIDEO_ACTION_DWELL_MS,
 ): Promise<VideoRecording | undefined> {
   try {
     const video = page.video();
@@ -365,20 +451,42 @@ export async function sealVideo(
       endsAtStep = cut.stepIndex;
     }
 
+    let condensed: CondensedFilm | undefined;
+    if (moments !== undefined && moments.length > 0) {
+      // The film's clock ends where the cut ends: the windows are clipped to
+      // it, so a failure's tail is the last thing kept, exactly as before.
+      const endMs = cut === 'full' ? Number.POSITIVE_INFINITY : (durationMs ?? Number.POSITIVE_INFINITY);
+      const short = condenseWebm(buffer, actionWindows(moments, dwellMs, endMs));
+      // Condensed, or whole: a film that could not be condensed faithfully is
+      // handed over as it was — larger, never doubtful. Same rule as the
+      // cut, in the other direction: the fallback is more evidence, not less.
+      if (short) {
+        condensed = {
+          sourceDurationMs: short.sourceDurationMs,
+          sourceBytes: buffer.byteLength,
+          moments: moments.length,
+          dwellMs,
+          segments: short.segments,
+        };
+        buffer = short.data;
+        durationMs = short.durationMs;
+      }
+    }
+
     const recording: VideoRecording = {
       width: size.width,
       height: size.height,
       bytes: buffer.byteLength,
       endsAtStep,
       durationMs,
+      condensed,
     };
-    if (buffer.byteLength > MAX_EMBED_BYTES) {
-      recording.omitted =
-        `recording was ${Math.round(buffer.byteLength / 1024 / 1024)}MB, over the ` +
-        `${Math.round(MAX_EMBED_BYTES / 1024 / 1024)}MB limit for embedding in a self-contained report`;
-    } else {
-      recording.data = buffer.toString('base64');
-    }
+    // No size ceiling (removed 2026-09-03): a long run against a busy page
+    // produced a recording the report then said was "too large", and a report
+    // with no film is worth less than a large one. The bytes always ride
+    // along; the readers stream them from a Blob, so size costs load time,
+    // never playback.
+    recording.data = buffer.toString('base64');
     return recording;
   } catch {
     return undefined;

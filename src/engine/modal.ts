@@ -15,12 +15,75 @@
 
 import type { Locator, Page } from 'playwright';
 
+import { includeHidden } from './reveal.js';
+
 const DIALOG_SELECTOR = '[role="dialog"], [role="alertdialog"], dialog[open]';
 
-/** Common dismiss/accept affordances, matched against a button's full accessible text. */
-const DISMISS_NAME_PATTERN =
-  /^(close|dismiss|cancel|ok|okay|got it|accept|accept all|accept cookies|i agree|agree|no,? thanks|maybe later|not now|continue)$/i;
+/**
+ * Dismiss affordances that only CLOSE — "Cancel" on a confirm, "ปิด" on a
+ * notice. Safe for the automatic rung: the worst a neutral click does is put
+ * the page back where it was. Thai added 2026-09-03 (EH-02): humi's consent,
+ * probation and TM dialogs say ปิด/ยกเลิก/ย้อนกลับ, so a genuinely blocking
+ * Thai dialog was never cleared.
+ */
+export const NEUTRAL_DISMISS_NAME_PATTERN =
+  /^(close|dismiss|cancel|no,? thanks|maybe later|not now|later|skip|ปิด|ยกเลิก|ย้อนกลับ|ไม่ใช่ตอนนี้|ข้าม|ไว้ทีหลัง)$/i;
+
+/**
+ * Affordances that CONFIRM something — "OK" on a delete, "Continue" on a
+ * wizard, "ตกลง" on anything. The automatic rung used to click these too and
+ * confirmed whatever the dialog asked (the engine CLAUDE.md records the
+ * ladder closing a deliberately-opened "Edit rule" dialog; BE's Create Plan
+ * popup discards the whole form on "Cancel", and "OK" on a delete confirm
+ * DELETES). Under `policy: 'automatic'` these are clicked only on a
+ * consent/cookie notice, where accepting is the neutral act.
+ */
+export const AFFIRMATIVE_DISMISS_NAME_PATTERN =
+  /^(ok|okay|got it|accept|accept all|accept cookies|allow all|i agree|agree|i understand|continue|ตกลง|รับทราบ|ยอมรับ|ยอมรับทั้งหมด|เข้าใจแล้ว|ดำเนินการต่อ)$/i;
+
+/** Either family — what an explicit `closeModal` without a `button` searches. */
+export const DISMISS_NAME_PATTERN = new RegExp(
+  `${NEUTRAL_DISMISS_NAME_PATTERN.source}|${AFFIRMATIVE_DISMISS_NAME_PATTERN.source}`,
+  'i',
+);
+
+/** A dialog whose acceptance is the neutral act: cookies, PDPA, terms. */
+export const CONSENT_DIALOG_PATTERN = /cookie|consent|pdpa|privacy|terms|ความยินยอม|คุกกี้|นโยบายความเป็นส่วนตัว|ข้อกำหนด/i;
+
 const DISMISS_SYMBOL_PATTERN = /^[×✕✖⨯]$/;
+
+/**
+ * The previous step's actions after which an open dialog is the flow's OWN
+ * context — an edit modal the next step is about to fill — and must not be
+ * dismissed automatically. Was `click`/`press` only; a `fill`/`selectOption`
+ * INSIDE the modal followed by a miss (an option list still loading) then
+ * dismissed the modal the flow had just opened (EH-02: ~220 modal-form cases
+ * across BE PL_06..09/RU_05..08, consent CNS-EC-002/015/032, TM cancel-request).
+ */
+export const DIALOG_CONTEXT_ACTIONS: ReadonlySet<string> = new Set([
+  'click', 'press', 'fill', 'type', 'selectOption', 'check', 'uncheck', 'paste',
+  'expectModal', 'closeModal', 'upload',
+]);
+
+/** True when the step before this one makes an open dialog the intended context. */
+export function dialogIsIntendedContext(lastAction: string | null | undefined): boolean {
+  return lastAction !== null && lastAction !== undefined && DIALOG_CONTEXT_ACTIONS.has(lastAction);
+}
+
+/**
+ * Does the failing selector name something INSIDE the open dialog? A step
+ * aimed at the dialog's own field must never close it, whatever came before.
+ * Hidden elements count (the field may be in a collapsed section of the
+ * dialog, or not rendered yet); a selector Playwright cannot parse counts
+ * as "no". Cheap: one `count()`, no waiting.
+ */
+export async function selectorInsideDialog(dialog: Locator, selector: string): Promise<boolean> {
+  try {
+    return (await dialog.locator(includeHidden(selector)).count()) > 0;
+  } catch {
+    return false;
+  }
+}
 
 export interface DismissButton {
   locator: Locator;
@@ -80,9 +143,60 @@ export async function waitForDialog(page: Page, timeoutMs: number): Promise<Loca
 export async function describeDialog(dialog: Locator): Promise<string> {
   const label = await dialog.getAttribute('aria-label').catch(() => null);
   if (label) return label;
+  // Then the heading a person reads as its title — humi's Create Plan modal
+  // starts its text with an eyebrow, so the first 80 chars named the wrong
+  // thing and `expectModal name:"Confirm delete plan"` could not match.
+  const heading = await dialogHeading(dialog);
+  if (heading !== null) return heading;
   const text = (await dialog.textContent().catch(() => '')) ?? '';
   const trimmed = text.replace(/\s+/g, ' ').trim();
   return trimmed === '' ? 'unnamed dialog' : trimmed.slice(0, 80);
+}
+
+/** The first visible heading inside the dialog (`aria-labelledby` first, then h1–h3/`role=heading`), or null. */
+export async function dialogHeading(dialog: Locator): Promise<string | null> {
+  const labelledBy = await dialog.getAttribute('aria-labelledby').catch(() => null);
+  if (labelledBy) {
+    for (const id of labelledBy.split(/\s+/).filter((s) => s !== '')) {
+      const text = await dialog
+        .page()
+        .locator(`[id="${id.replace(/"/g, '\\"')}"]`)
+        .first()
+        .innerText({ timeout: 250 })
+        .catch(() => '');
+      const trimmed = text.replace(/\s+/g, ' ').trim();
+      if (trimmed !== '') return trimmed.slice(0, 120);
+    }
+  }
+  const headings = dialog.locator('h1, h2, h3, [role="heading"]');
+  const count = await headings.count().catch(() => 0);
+  for (let i = 0; i < Math.min(count, 4); i++) {
+    const candidate = headings.nth(i);
+    if (!(await candidate.isVisible().catch(() => false))) continue;
+    const text = (await candidate.innerText({ timeout: 250 }).catch(() => '')).replace(/\s+/g, ' ').trim();
+    if (text !== '') return text.slice(0, 120);
+  }
+  return null;
+}
+
+/**
+ * Does the dialog mention `name` — in its label, its heading, or anywhere
+ * in its text? Case-insensitive substring, the same reading `expectModal`
+ * makes, widened past the first 80 characters so a name that sits below an
+ * eyebrow still counts. Returns where it was found, or null.
+ */
+export async function dialogMentions(
+  dialog: Locator,
+  name: string,
+): Promise<{ via: 'label' | 'heading' | 'text'; text: string } | null> {
+  const wanted = name.toLowerCase();
+  const label = await dialog.getAttribute('aria-label').catch(() => null);
+  if (label && label.toLowerCase().includes(wanted)) return { via: 'label', text: label };
+  const heading = await dialogHeading(dialog);
+  if (heading !== null && heading.toLowerCase().includes(wanted)) return { via: 'heading', text: heading };
+  const text = ((await dialog.innerText({ timeout: 500 }).catch(() => '')) ?? '').replace(/\s+/g, ' ').trim();
+  if (text.toLowerCase().includes(wanted)) return { via: 'text', text: text.slice(0, 200) };
+  return null;
 }
 
 /**
@@ -105,8 +219,28 @@ export async function describeDialog(dialog: Locator): Promise<string> {
  * exactly why `closeModal` accepts an explicit `button` override rather than
  * relying on this alone.
  */
-export async function findDismissButton(dialog: Locator): Promise<DismissButton | null> {
-  const explicitClose = dialog.getByRole('button', { name: /^close$/i }).first();
+export interface FindDismissOptions {
+  /**
+   * `any` (default, the explicit `closeModal` request): neutral and
+   * affirmative names alike — the author asked for the dialog closed.
+   * `automatic` (the ladder's unrequested-dialog rung): neutral names only,
+   * plus affirmative ones when the dialog reads as a consent/cookie notice —
+   * never "OK" on a delete confirm or "Continue" on a wizard.
+   */
+  policy?: 'any' | 'automatic' | undefined;
+}
+
+export async function findDismissButton(
+  dialog: Locator,
+  options: FindDismissOptions = {},
+): Promise<DismissButton | null> {
+  const policy = options.policy ?? 'any';
+  let pattern: RegExp = DISMISS_NAME_PATTERN;
+  if (policy === 'automatic') {
+    const text = ((await dialog.innerText({ timeout: 500 }).catch(() => '')) ?? '').slice(0, 2_000);
+    pattern = CONSENT_DIALOG_PATTERN.test(text) ? DISMISS_NAME_PATTERN : NEUTRAL_DISMISS_NAME_PATTERN;
+  }
+  const explicitClose = dialog.getByRole('button', { name: /^(close|ปิด)$/i }).first();
   if (await explicitClose.isVisible().catch(() => false)) {
     const text =
       (await explicitClose.getAttribute('aria-label').catch(() => null)) ??
@@ -115,7 +249,7 @@ export async function findDismissButton(dialog: Locator): Promise<DismissButton 
     return { locator: explicitClose, text: text.trim() || 'Close' };
   }
 
-  const common = dialog.getByRole('button', { name: DISMISS_NAME_PATTERN }).first();
+  const common = dialog.getByRole('button', { name: pattern }).first();
   if (await common.isVisible().catch(() => false)) {
     const text =
       ((await common.textContent().catch(() => '')) ||

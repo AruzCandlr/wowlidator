@@ -4,6 +4,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { isPassing, type AgentRecord } from '../../engine/proof-bundle.js';
 import { basename, dirname, resolve } from 'node:path';
 
 import { CacheManager } from '../../cache/cache-manager.js';
@@ -40,46 +41,42 @@ import {
   isFlow,
   openReport,
   prepare,
+  writeFlowFile,
   writeMachineReports,
 } from '../artifacts.js';
-import { EXIT, exitCodeFor } from '../exit.js';
+import { withWorkflowScripts } from '../case-plan.js';
+import { EXIT, exitCodeFor, suiteExit } from '../exit.js';
 import type { CliOptions } from '../options.js';
+import { runCases, type SuiteCase } from '../run-cases.js';
 import {
   assertRolesResolvable,
   buildAgent,
   buildDataModel,
   buildHealer,
   buildStepRepair,
+  buildReviewJudge,
   buildInvestigationAgent,
   lineLogger,
   planLogger,
+  runPersonas,
   stepLogger,
 } from '../runtime.js';
 
-export async function cmdRun(flowPath: string | undefined, options: CliOptions): Promise<number> {
-  if (!flowPath) {
+export async function cmdRun(flowPaths: readonly string[], options: CliOptions): Promise<number> {
+  if (flowPaths.length === 0) {
     process.stderr.write('wowlidator run: missing <flow.json>\n');
     return 2;
   }
+  // Several files run as one suite through `runCases` — the same loop behind
+  // `catalog --run` — so the roll-up, the suite index, `--repair` autoheal and
+  // the per-case `[cN]` output all come along. One file is byte-for-byte the
+  // run it always was.
+  if (flowPaths.length > 1) return cmdRunMany(flowPaths, options);
+  const flowPath = flowPaths[0]!;
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readFile(flowPath, 'utf8'));
-  } catch (error) {
-    // A missing or malformed file is the caller's mistake, not a failed test —
-    // exit 2, and say which of the two it was rather than leaking an ENOENT.
-    const detail = error instanceof Error ? error.message : String(error);
-    process.stderr.write(
-      /ENOENT/.test(detail)
-        ? `wowlidator run: no such flow file: ${flowPath}\n`
-        : `wowlidator run: ${flowPath} is not valid JSON — ${detail}\n`,
-    );
-    return EXIT.usage;
-  }
-  if (!isFlow(parsed)) {
-    process.stderr.write(`wowlidator run: ${flowPath} is not a valid flow (needs "name" and "steps")\n`);
-    return EXIT.usage;
-  }
+  const loaded = await loadFlow(flowPath);
+  if (typeof loaded === 'number') return loaded;
+  const parsed = loaded;
 
   // A flow of pure HTTP steps never opens a page, so it must not open a
   // browser either — `runFlow` already dispatches it to the browser-free path.
@@ -99,24 +96,57 @@ export async function cmdRun(flowPath: string | undefined, options: CliOptions):
     // `use` paths are relative to the flow that used them, not to wherever
     // the command was typed.
     flowDir: dirname(resolve(flowPath)),
+    // A re-run of an authored case belongs to the pass that authored it, not
+    // to a pile of hand-written flows. See `Flow.authoredBy`.
+    ...(parsed.authoredBy === undefined ? {} : { generatedBy: parsed.authoredBy }),
     cdpUrl: options.cdp,
     cachePath: options.cache,
     screenshots: options.screenshots,
+    highlightTarget: options.highlightTarget,
     video: options.video,
+    humanize: options.humanize,
     agentAssist: options.agentAssist,
+    backend: options.backend,
     captureDelayMs: options.captureDelayMs,
       stepDelayMs: options.stepDelayMs,
     makeHealer: buildHealer(options),
       stepRepair: buildStepRepair(options),
+      reviewJudge: buildReviewJudge(options),
     healer: options.heal ? undefined : null,
     agent: buildAgent(options),
     dataModel: buildDataModel(options),
     updateBaselines: options.updateBaselines,
     network: options.network,
+    // Carried for masking only: a password the person supplied must not
+    // reach the proof bundle or the emailable report in cleartext.
+    credentials: options.credentials,
+    personas: runPersonas(options),
     historyPath: options.history ? options.historyPath : null,
     onStep: stepLogger(options),
     onPlan: planLogger(options),
   });
+
+  // Fold successful agent journeys back into the flow file as deterministic
+  // scripts — the same move `runCases` makes for suites (see run-cases.ts),
+  // so a single-flow run also leaves a $0 replay behind: the next run of
+  // this exact file replays the recorded steps with no model turn, and the
+  // proof written below keeps the full agent action log as the evidence.
+  // Best-effort on purpose: a script that could not be written costs a few
+  // model turns next run, never a verdict.
+  {
+    const journeys = bundle.steps
+      .map((step) => step.agent)
+      .filter((record): record is AgentRecord => record !== undefined && record.success);
+    const scripted = withWorkflowScripts(parsed, journeys);
+    if (scripted !== null) {
+      await writeFlowFile(resolve(flowPath), scripted)
+        .then(() =>
+          // stderr: `--json` owns stdout, and this is narration, not the result.
+          process.stderr.write('  scripted   agent journey recorded in the flow for $0 replay\n'),
+        )
+        .catch(() => undefined);
+    }
+  }
 
   const proofPath = await writeProofBundle(bundle, options.out);
   const target = resolveReportPath(
@@ -151,13 +181,88 @@ export async function cmdRun(flowPath: string | undefined, options: CliOptions):
   return quarantine.quarantined ? EXIT.ok : exitCodeFor(bundle);
 }
 
+/** Read and validate one flow file, or the exit code its failure earns. */
+async function loadFlow(flowPath: string): Promise<Flow | number> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(flowPath, 'utf8'));
+  } catch (error) {
+    // A missing or malformed file is the caller's mistake, not a failed test —
+    // exit 2, and say which of the two it was rather than leaking an ENOENT.
+    const detail = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      /ENOENT/.test(detail)
+        ? `wowlidator run: no such flow file: ${flowPath}\n`
+        : `wowlidator run: ${flowPath} is not valid JSON — ${detail}\n`,
+    );
+    return EXIT.usage;
+  }
+  if (!isFlow(parsed)) {
+    process.stderr.write(`wowlidator run: ${flowPath} is not a valid flow (needs "name" and "steps")\n`);
+    return EXIT.usage;
+  }
+  return parsed;
+}
+
+/**
+ * `wowlidator run a.flow.json b.flow.json …` — the listed flows as one suite.
+ *
+ * Exists for wowUI's group-level "Rerun all" / "Heal all" buttons: re-running a
+ * catalog's cases used to mean one job per case, clicked one at a time, against
+ * a server that refuses a second browser command while one runs. A list is one
+ * job holding the browser once. Every file is read up front — a typo in the
+ * fifth path fails the command before any browser time is spent, the same
+ * "fail at the boundary" rule `parseArgs` follows.
+ *
+ * Each flow keeps its own provenance (`authoredBy`), so a re-run of an authored
+ * case still lands in the pass's group in wowUI rather than reading as a
+ * hand-written flow. With `--repair`, `runCases`' ordinary autoheal applies.
+ */
+async function cmdRunMany(flowPaths: readonly string[], options: CliOptions): Promise<number> {
+  const cases: SuiteCase[] = [];
+  for (const flowPath of flowPaths) {
+    const loaded = await loadFlow(flowPath);
+    if (typeof loaded === 'number') return loaded;
+    cases.push({
+      name: loaded.name,
+      flow: loaded,
+      flowPath,
+      kind: 'run',
+      generatedBy: loaded.authoredBy,
+    });
+  }
+
+  // One `prepare` for the lot — the same browser serves every case. A list of
+  // pure API flows never opens one, exactly as a single API flow does not.
+  const browserFlow = cases.find((c) => hasIncludes(c.flow) || !isBrowserFree(c.flow));
+  if (browserFlow !== undefined) {
+    const blocked = await prepare(
+      options,
+      typeof browserFlow.flow.baseUrl === 'string' ? browserFlow.flow.baseUrl : undefined,
+    );
+    if (blocked !== null) return blocked;
+  }
+
+  const outcomes = await runCases(cases, options, {
+    dir: resolve(options.reportDir),
+    group: undefined,
+    indexTitle: `wowlidator run — ${cases.length} flow(s)`,
+  });
+
+  const ran = outcomes.flatMap((o) => (o.bundle === null ? [] : [o.bundle]));
+  await writeMachineReports(ran, options);
+  await openReport(outcomes.find((o) => o.reportPath !== undefined)?.reportPath ?? null, options);
+  await cleanupChrome(options);
+  return suiteExit(outcomes);
+}
+
 /**
  * `wowlidator run --repair`: on failure, ask the generator role to rewrite the
  * flow around it and retry, up to `options.repairAttempts` total runs.
  * Never touches `flowPath` itself — see `FlowRepairLoop`'s module comment
  * for why each attempt lands as its own reviewable file instead.
  */
-export async function cmdRunWithRepair(flowPath: string, flow: Flow, options: CliOptions): Promise<number> {
+async function cmdRunWithRepair(flowPath: string, flow: Flow, options: CliOptions): Promise<number> {
   // Reinvestigation drives a browser through the agent role, so its key is
   // checked up front for the same reason the generator's is.
   const roles: ('healer' | 'generator' | 'agent')[] = options.repairInvestigate
@@ -187,17 +292,25 @@ export async function cmdRunWithRepair(flowPath: string, flow: Flow, options: Cl
       cdpUrl: options.cdp,
       cachePath: options.cache,
       screenshots: options.screenshots,
+      highlightTarget: options.highlightTarget,
       video: options.video,
+      humanize: options.humanize,
       agentAssist: options.agentAssist,
+      backend: options.backend,
       captureDelayMs: options.captureDelayMs,
       stepDelayMs: options.stepDelayMs,
       makeHealer: buildHealer(options),
       stepRepair: buildStepRepair(options),
+      reviewJudge: buildReviewJudge(options),
       healer: options.heal ? undefined : null,
       agent: buildAgent(options),
       dataModel: buildDataModel(options),
       updateBaselines: options.updateBaselines,
       network: options.network,
+      // Carried for masking only: a password the person supplied must not
+      // reach the proof bundle or the emailable report in cleartext.
+      credentials: options.credentials,
+      personas: runPersonas(options),
       historyPath: options.history ? options.historyPath : null,
       onStep: stepLogger(options),
       onPlan: planLogger(options),
@@ -421,19 +534,28 @@ export async function cmdWatch(flowPath: string | undefined, options: CliOptions
     iteration += 1;
     const bundle = await runFlow(flow, {
       flowDir: dirname(resolve(flowPath)),
+      ...(flow.authoredBy === undefined ? {} : { generatedBy: flow.authoredBy }),
       cdpUrl: options.cdp,
       cachePath: options.cache,
       screenshots: options.screenshots,
+      highlightTarget: options.highlightTarget,
       video: options.video,
+      humanize: options.humanize,
       agentAssist: options.agentAssist,
+      backend: options.backend,
       captureDelayMs: options.captureDelayMs,
       stepDelayMs: options.stepDelayMs,
       makeHealer: buildHealer(options),
       stepRepair: buildStepRepair(options),
+      reviewJudge: buildReviewJudge(options),
       healer: options.heal ? undefined : null,
       agent: buildAgent(options),
       dataModel: buildDataModel(options),
       network: options.network,
+      // Carried for masking only: a password the person supplied must not
+      // reach the proof bundle or the emailable report in cleartext.
+      credentials: options.credentials,
+      personas: runPersonas(options),
       historyPath: options.history ? options.historyPath : null,
     });
 
@@ -456,7 +578,7 @@ export async function cmdWatch(flowPath: string | undefined, options: CliOptions
     state.previousTrend = bundle.trend?.verdict;
     lastCode = exitCodeFor(bundle);
 
-    if (options.untilFail && bundle.status !== 'passed') {
+    if (options.untilFail && !isPassing(bundle.status)) {
       process.stdout.write('stopping: --until-fail and the run failed\n');
       return lastCode;
     }

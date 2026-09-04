@@ -17,7 +17,7 @@ import {
   grimTheme,
   toneOf,
 } from '../src/reporter/theme.js';
-import { renderApp } from '../src/ui/app-html.js';
+import { renderLedger } from '../src/ui/ledger-html.js';
 
 describe('the theme carries both grim-agent palettes', () => {
   it('has the QA Command Center light palette', () => {
@@ -119,8 +119,8 @@ describe('toneOf is the one place a word becomes a colour', () => {
 });
 
 describe('every surface actually adopts the theme', () => {
-  it('the control panel renders both palettes and no external request', () => {
-    const html = renderApp();
+  it('the home page renders both palettes and no external request', () => {
+    const html = renderLedger();
     assert.match(html, /#F7F7F4/, 'light');
     assert.match(html, /#06b6d4/, 'dark');
     assert.doesNotMatch(html, /<script src=|rel="stylesheet"|fonts\.googleapis/);

@@ -24,8 +24,21 @@ import { jsonModel, nonJsonModel } from './helpers.js';
 
 import { CacheManager, type HealedSelectorCacheFile } from '../src/cache/cache-manager.js';
 import { PROVIDER_META, loadConfig } from '../src/config.js';
-import { ProofBundleBuilder, formatStepLine, type ProofStep } from '../src/engine/proof-bundle.js';
-import { parseInterception, runFlow, scriptMismatchNote, type Flow } from '../src/engine/runner.js';
+import { ProofBundleBuilder, formatStepLine, isPassing, type ProofStep } from '../src/engine/proof-bundle.js';
+import {
+  NATIVE_SUBMIT_UNNAMED,
+  StepResolutionError,
+  triageVerdictOf,
+  fillsLostToHydration,
+  nativeFormResubmitDetected,
+  signInDidNotTakeMessage,
+  parseInterception,
+  runFlow,
+  scriptMismatchNote,
+  type Flow,
+  type FlowStep,
+} from '../src/engine/runner.js';
+import { WorkflowAgent, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
 import {
   LlmHealerModel,
   JitHealer,
@@ -132,12 +145,72 @@ describe('cache-manager', () => {
     assert.equal(afterDelete.size, 0);
   });
 
+  // Two cases of one suite, running side by side, each holding its own
+  // manager loaded at its own start. Before the merge-on-flush, the second
+  // flush wrote its snapshot over the first's and a repair that had just been
+  // paid for vanished; and the temp file was named by pid, identical for both.
+  it('two concurrent managers on one file keep each other\'s repairs', async () => {
+    const path = join(dir, 'shared.json');
+    const entry = (key: string, healed: string) => ({
+      key,
+      original: key.split(' :: ')[1]!,
+      healed,
+      strategy: 'role',
+      url: 'https://example.test/p',
+      confidence: 0.9,
+      reasoning: 'r',
+      model: 'stub',
+    });
+    const a = new CacheManager({ filePath: path });
+    const b = new CacheManager({ filePath: path });
+    await a.load();
+    await b.load();
+    a.set(entry('https://example.test/p :: #a', 'role=button[name="A"]'));
+    b.set(entry('https://example.test/p :: #b', 'role=button[name="B"]'));
+    // Flushed together, as siblings finishing at once do.
+    await Promise.all([a.flush(), b.flush()]);
+
+    const reader = new CacheManager({ filePath: path });
+    await reader.load();
+    assert.equal(reader.size, 2, 'neither repair may clobber the other');
+    assert.equal(reader.get('https://example.test/p :: #a')?.healed, 'role=button[name="A"]');
+    assert.equal(reader.get('https://example.test/p :: #b')?.healed, 'role=button[name="B"]');
+
+    // A later delete by one side must not resurrect from the other's stale view.
+    assert.equal(a.delete('https://example.test/p :: #a'), true);
+    await a.flush();
+    b.recordUse('https://example.test/p :: #b');
+    await b.flush();
+    const after = new CacheManager({ filePath: path });
+    await after.load();
+    assert.equal(after.has('https://example.test/p :: #a'), false, 'the delete must hold');
+    assert.equal(after.get('https://example.test/p :: #b')?.hits, 1);
+  });
+
   it('starts empty rather than throwing on a corrupt cache file', async () => {
     const path = join(dir, 'corrupt.json');
     await (await import('node:fs/promises')).writeFile(path, '{ not json', 'utf8');
     const cache = new CacheManager({ filePath: path, warn: false });
     await cache.load();
     assert.equal(cache.size, 0);
+  });
+});
+
+describe('triageVerdictOf', () => {
+  it('reads the three verdicts, and treats anything else as fail', () => {
+    // The verdict rides in the decision's `value` — a field the structured
+    // schema already has, so no prompt in the system pays for a new one.
+    assert.equal(triageVerdictOf('proved'), 'proved');
+    assert.equal(triageVerdictOf('  PROVED — the card shows it '), 'proved');
+    assert.equal(triageVerdictOf('can-heal'), 'can-heal');
+    assert.equal(triageVerdictOf('can heal, the menu is closed'), 'can-heal');
+    assert.equal(triageVerdictOf('fail'), 'fail');
+    // The safe direction: anything unrecognised spends nothing further and
+    // lets the step fail on the evidence it already had.
+    assert.equal(triageVerdictOf('maybe?'), 'fail');
+    assert.equal(triageVerdictOf(''), 'fail');
+    assert.equal(triageVerdictOf(null), 'fail');
+    assert.equal(triageVerdictOf(undefined), 'fail');
   });
 });
 
@@ -232,6 +305,8 @@ describe('proof-bundle', () => {
       dataRetries: 0,
       apiRequests: 0,
       apiFailures: 0,
+      dbChecks: 0,
+      dbFailures: 0,
       // No observer was attached to this builder, so the network totals stay
       // at zero — which is the honest answer for "nothing was watching",
       // distinct from a run that watched and saw nothing.
@@ -359,8 +434,10 @@ describe('formatStepLine', () => {
       resolution: 'fast',
       status: 'passed',
     });
-    assert.match(line, /^✓ \[2\] click role=button\[name="Edit"\] \(42ms\)$/m);
-    assert.match(line, /^ {6}Open the edit dialog$/m);
+    // Columns: mark, `[index]` (5 wide), action (14 wide), duration
+    // right-aligned in 15, then the target — so durations line up down a log.
+    assert.match(line, /^✓ \[2\]   click {10} {9}\(42ms\)  role=button\[name="Edit"\]$/m);
+    assert.match(line, /^ {8}Open the edit dialog$/m);
   });
 
   it('tags a healed step with its resolution source', () => {
@@ -747,6 +824,134 @@ describe('ladder guards: dead ends, denial, timing (CDP)', { skip: skipBrowser }
       server.close((error) => (error ? reject(error) : resolve())),
     );
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it('spends one look on a fail verdict, and never a second call', async () => {
+    // The rule: a step whose deterministic ladder has failed gets ONE look
+    // and, only if that look earns it, ONE repair. A page that genuinely does
+    // not offer the thing costs exactly one call — `fail` returns at once.
+    const calls: string[] = [];
+    const agentModel = {
+      id: 'stub:triage',
+      async decide(observation: AgentObservation) {
+        calls.push(observation.goal);
+        return {
+          action: 'finish' as const,
+          selector: '',
+          value: 'fail',
+          url: '',
+          reasoning: 'the page does not offer this at all',
+        };
+      },
+    };
+    const bundle = await runFlow(
+      {
+        name: 'fail verdict',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          // A NEAR MISS, deliberately: "Sign in" IS on the page (as a
+          // button), so the absence stop rung lets this through to the agent —
+          // what this test is about is the triage economy, not absence.
+          { action: 'expectVisible', selector: 'role=link[name="Sign in" i]' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'triage-fail.json'),
+        fastTimeoutMs: 400,
+        healer: null,
+        agent: new WorkflowAgent({ model: agentModel, maxSteps: 3 }),
+        agentAssist: true,
+      },
+    );
+
+    assert.notEqual(bundle.status, 'passed', 'a page that lacks the control still fails');
+    assert.equal(calls.length, 1, 'one look, and no repair bought by a fail verdict');
+    const step = bundle.steps.find((one) => one.action === 'expectVisible');
+    assert.match(step?.error ?? '', /agent-look: fail/);
+  });
+
+  it('spends a second call only on can-heal, and still checks the result', async () => {
+    // `can-heal` is the one verdict that buys a repair — and the repair is
+    // checked, never believed: the author's own selector must resolve
+    // afterwards or the step fails exactly as it would have.
+    const goals: string[] = [];
+    const agentModel = {
+      id: 'stub:triage',
+      async decide(observation: AgentObservation) {
+        const first = !goals.includes(observation.goal);
+        if (first) goals.push(observation.goal);
+        // Look: say it can be reached. Repair: claim to have done it.
+        return goals.length === 1
+          ? { action: 'finish' as const, selector: '', value: 'can-heal', url: '', reasoning: 'a menu is closed' }
+          : { action: 'finish' as const, selector: '', value: '', url: '', reasoning: 'opened it' };
+      },
+    };
+    const bundle = await runFlow(
+      {
+        name: 'can-heal verdict',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          // A near miss for the same reason as the test above.
+          { action: 'expectVisible', selector: 'role=link[name="Sign in" i]' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'triage-heal.json'),
+        fastTimeoutMs: 400,
+        healer: null,
+        agent: new WorkflowAgent({ model: agentModel, maxSteps: 3 }),
+        agentAssist: true,
+      },
+    );
+
+    assert.equal(goals.length, 2, 'exactly two goals: one look, one repair — never a third');
+    // The agent said it opened the way; the control still is not there, so
+    // the step fails. Its account of itself decides nothing.
+    assert.notEqual(bundle.status, 'passed');
+    const step = bundle.steps.find((one) => one.action === 'expectVisible');
+    assert.match(step?.error ?? '', /agent-look: can-heal/);
+    assert.match(step?.error ?? '', /agent-heal/);
+  });
+
+  it('will not act on a can-heal verdict unless acting was opted into', async () => {
+    // The look is ungated — it cannot change anything. The repair changes the
+    // application, and that has always been a decision about someone's
+    // system rather than a default.
+    const goals: string[] = [];
+    const agentModel = {
+      id: 'stub:triage',
+      async decide(observation: AgentObservation) {
+        goals.push(observation.goal);
+        return { action: 'finish' as const, selector: '', value: 'can-heal', url: '', reasoning: 'a menu is closed' };
+      },
+    };
+    const bundle = await runFlow(
+      {
+        name: 'can-heal, no assist',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          // A near miss for the same reason as the two tests above.
+          { action: 'expectVisible', selector: 'role=link[name="Sign in" i]' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'triage-noassist.json'),
+        fastTimeoutMs: 400,
+        healer: null,
+        agent: new WorkflowAgent({ model: agentModel, maxSteps: 3 }),
+        // agentAssist deliberately absent — the default.
+      },
+    );
+
+    assert.equal(goals.length, 1, 'the look happened; the repair did not');
+    const step = bundle.steps.find((one) => one.action === 'expectVisible');
+    assert.match(step?.error ?? '', /acting on the page is opt-in \(--agent-assist\)/);
   });
 
   it('never repays an identical dead end — one fast attempt, no second heal', async () => {
@@ -1328,5 +1533,352 @@ describe(`healer (live ${healerRole.provider} API)`, {
     assert.equal(bundle.status, 'passed', bundle.error ?? 'live healed run should pass');
     assert.equal(bundle.summary.jitHeals, 1);
     assert.ok((bundle.summary.inputTokens ?? 0) > 0, 'usage should be reported');
+  });
+});
+
+describe('a failure message must describe the failure it carries', () => {
+  it('all-content-mismatch attempts headline as content, not resolution', () => {
+    // "Could not resolve" over attempts that each RESOLVED and failed on text
+    // reads as "the control is missing" and files the wrong defect.
+    const error = new StepResolutionError('role=main', [
+      'fast "role=main": expected text to contain "PB-001", got "Probation Review…"',
+      'late "role=main": expected text to contain "PB-001", got "Probation Review…"',
+    ]);
+    assert.match(error.message, /^"role=main" resolved, but its content did not hold/);
+  });
+
+  it('mixed attempts keep the resolution header', () => {
+    const error = new StepResolutionError('role=main', [
+      'fast "role=main": locator.waitFor: Timeout 2000ms exceeded.',
+      'late "role=main": expected text to contain "PB-001", got "…"',
+    ]);
+    assert.match(error.message, /^could not resolve "role=main"/);
+  });
+
+  it('a memoed content repeat stays content — the wording reaches the judge, not a dead-end', () => {
+    // PL_02_07: the retry of a wording mismatch hit the dead-end memo, the
+    // step read as "could not resolve", and the dead-end status hid the
+    // near-miss from the judge.
+    const error = new StepResolutionError('[aria-label="breadcrumb"]', [
+      'fast "[aria-label="breadcrumb"]": expected text to contain "Benefit Plans", got "Benefit Plan Catalog"',
+      "known content mismatch: step 10 already read this element on this same page — not repaid; the text has not changed, and the wording is the judge's to rule on",
+    ]);
+    assert.equal(error.contentOnly, true);
+    assert.match(error.message, /resolved, but its content did not hold/);
+  });
+
+  it('a memo line alone proves nothing was read — resolution header, not content', () => {
+    const error = new StepResolutionError('#gone', [
+      'fast "#gone": locator.waitFor: Timeout 2000ms exceeded.',
+      "known content mismatch: step 3 already read this element on this same page — not repaid; the text has not changed, and the wording is the judge's to rule on",
+    ]);
+    assert.equal(error.contentOnly, false);
+    assert.match(error.message, /^could not resolve/);
+  });
+});
+
+describe('native form resubmit detection', () => {
+  const passwordFill: FlowStep = {
+    action: 'fill',
+    selector: 'role=textbox >> nth=1',
+    value: 's3cret',
+    intent: 'Fill admin password',
+  };
+
+  it('reads a password parameter off the URL', async () => {
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/login?email=a%40b.c&password=s3cret',
+      [passwordFill],
+      50,
+    );
+    assert.equal(param, 'password', 'the first parameter carrying evidence names the submit');
+  });
+
+  it('recognises a typed value under any parameter name', async () => {
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/login?user_secret=s3cret',
+      [passwordFill],
+      50,
+    );
+    assert.equal(param, 'user_secret');
+  });
+
+  it('never fires without a credential-shaped fill — and returns without waiting', async () => {
+    const started = Date.now();
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/search?q=anything',
+      [{ action: 'fill', selector: 'role=searchbox', value: 'anything', intent: 'search' }],
+      600,
+    );
+    assert.equal(param, null);
+    assert.ok(Date.now() - started < 100, 'ordinary clicks must not pay the recheck window');
+  });
+
+  it('a clean URL after the recheck window is a clean submit', async () => {
+    const param = await nativeFormResubmitDetected(() => 'http://x/en/home', [passwordFill], 50);
+    assert.equal(param, null);
+  });
+
+  it('a bare "?" that appeared across the click is the unnamed-fields submit', async () => {
+    // The signature this missed for a whole catalog run: the app's login
+    // inputs carry no name attribute, so its pre-hydration GET submitted
+    // "/en/login?" — no parameters, no evidence, no replay, and a silently
+    // failed login behind 21 of the 25 defects DB_01_01…DB_09_01 filed.
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/login?',
+      [passwordFill],
+      50,
+      'http://x/en/login',
+    );
+    assert.equal(param, NATIVE_SUBMIT_UNNAMED);
+  });
+
+  it('does not fire when the login URL already carried a query string', async () => {
+    // /login?redirect=/somewhere is an ordinary way to arrive. The evidence is
+    // that the search APPEARED, never that a login URL has one.
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/login?redirect=%2Fadmin',
+      [passwordFill],
+      50,
+      'http://x/en/login?redirect=%2Fadmin',
+    );
+    assert.equal(param, null);
+  });
+
+  it('does not fire once the submit has left the sign-in page', async () => {
+    const param = await nativeFormResubmitDetected(
+      () => 'http://x/en/home?welcome=1',
+      [passwordFill],
+      50,
+      'http://x/en/login',
+    );
+    assert.equal(param, null);
+  });
+
+  it('needs the baseline — without it the third signature is off', async () => {
+    const param = await nativeFormResubmitDetected(() => 'http://x/en/login?', [passwordFill], 50);
+    assert.equal(param, null);
+  });
+});
+
+describe('a run whose session guard fired cannot pass', () => {
+  const base = { startedAt: new Date().toISOString(), durationMs: 1, url: 'http://x/en/login' };
+
+  it('turns an otherwise clean run into an error', () => {
+    // DB_04_02 finalised passed, 7/7, carrying the high defect "the session
+    // is not established, so nothing after this point can say anything about
+    // the feature under test". Its SessionLostError was swallowed on a path
+    // that is right to swallow it, so no step failed and no run error was
+    // recorded — the verdict has to come from the guard itself.
+    const builder = new ProofBundleBuilder({ name: 'stranded' });
+    builder.addStep({
+      action: 'expectCount', selector: 'text="BE-MED-001"', resolvedSelector: 'text="BE-MED-001"',
+      resolution: 'fast', status: 'passed', ...base,
+    });
+    assert.equal(builder.finish().status, 'passed', 'the premise: nothing else fails this run');
+
+    const stranded = new ProofBundleBuilder({ name: 'stranded' });
+    stranded.addStep({
+      action: 'expectCount', selector: 'text="BE-MED-001"', resolvedSelector: 'text="BE-MED-001"',
+      resolution: 'fast', status: 'passed', ...base,
+    });
+    stranded.noteSessionLost();
+    assert.equal(
+      stranded.finish().status,
+      'error',
+      'the application was never reached — an environment fact, not a verdict about the feature',
+    );
+  });
+
+  it('leaves a worse status alone', () => {
+    const builder = new ProofBundleBuilder({ name: 'stranded-and-broken' });
+    builder.addStep({
+      action: 'click', selector: '#a', resolvedSelector: '#a', resolution: 'fast',
+      status: 'dead-end', ...base,
+    });
+    builder.noteSessionLost();
+    assert.equal(builder.finish().status, 'dead-end', 'worst-first still decides');
+  });
+});
+
+describe('the sign-in that never took effect', () => {
+  it('fires once the flow asks for a page that needs a session', () => {
+    // DB_04_01/DB_06_01/DB_07_01/DB_08_01: the login silently failed and the
+    // run carried on, filing 19 high "functional" defects between them about
+    // an application that was working. The existing stranded guard cannot see
+    // this — it asks "were we bounced away from what we asked for?", and here
+    // the most recent goto WAS the login page.
+    const message = signInDidNotTakeMessage({
+      signInDidNotTake: true,
+      lastGotoAskedSignIn: false,
+      lastGotoPath: '/en/admin/benefits/rules',
+    });
+    assert.match(message ?? '', /the sign-in did not take effect/);
+    assert.match(message ?? '', /\/en\/admin\/benefits\/rules/);
+    assert.match(message ?? '', /not a redirect/, 'the wording must not claim a bounce');
+  });
+
+  it('never fires for a flow that stays on the sign-in page', () => {
+    // A negative sign-in test asserting "Incorrect password" is a legitimate
+    // flow and must not be stopped.
+    assert.equal(
+      signInDidNotTakeMessage({
+        signInDidNotTake: true,
+        lastGotoAskedSignIn: true,
+        lastGotoPath: '/en/login',
+      }),
+      null,
+    );
+  });
+
+  it('never fires without positive evidence that the submit failed', () => {
+    assert.equal(
+      signInDidNotTakeMessage({
+        signInDidNotTake: false,
+        lastGotoAskedSignIn: false,
+        lastGotoPath: '/en/admin',
+      }),
+      null,
+    );
+  });
+
+  it('never fires before the flow has navigated anywhere', () => {
+    assert.equal(
+      signInDidNotTakeMessage({
+        signInDidNotTake: true,
+        lastGotoAskedSignIn: false,
+        lastGotoPath: null,
+      }),
+      null,
+    );
+  });
+});
+
+describe('lost-fill detection — the hydration race, second signature', () => {
+  const emailFill: FlowStep = {
+    action: 'fill',
+    selector: 'input[type=email]',
+    value: 'admin@cnext.test',
+    intent: 'Enter work email',
+  };
+  const passwordFill: FlowStep = {
+    action: 'fill',
+    selector: 'input[type=password]',
+    value: 'admin2026',
+    intent: 'Enter password',
+  };
+
+  it('a credential field that reads back different is the evidence', async () => {
+    // DB_04_01/DB_06_01/DB_07_01 live: the click landed pre-hydration, the
+    // form did not navigate, and React reset the password to empty.
+    const lost = await fillsLostToHydration(
+      async (selector) => (selector.includes('password') ? '' : 'admin@cnext.test'),
+      [emailFill, passwordFill],
+    );
+    assert.equal(lost, 'input[type=password]');
+  });
+
+  it('fields that kept their values are a clean submit', async () => {
+    const lost = await fillsLostToHydration(
+      async (selector) => (selector.includes('password') ? 'admin2026' : 'admin@cnext.test'),
+      [emailFill, passwordFill],
+    );
+    assert.equal(lost, null);
+  });
+
+  it('a non-credential block never reads the page at all', async () => {
+    let reads = 0;
+    const lost = await fillsLostToHydration(
+      async () => {
+        reads += 1;
+        return '';
+      },
+      [{ action: 'fill', selector: 'role=searchbox', value: 'leave', intent: 'search' }],
+    );
+    assert.equal(lost, null);
+    assert.equal(reads, 0, 'ordinary form interactions must not pay a page round-trip');
+  });
+
+  it('an unreadable field is skipped, never guessed lost', async () => {
+    const lost = await fillsLostToHydration(async () => null, [passwordFill]);
+    assert.equal(lost, null);
+  });
+});
+
+describe('passed-with-issues: the claims held, the path did not', () => {
+  const base = { startedAt: new Date().toISOString(), durationMs: 5, url: 'https://x.test/app' };
+  const step = (action: string, status: ProofStep['status'], selector = '#s') => ({
+    action, selector, resolvedSelector: selector, resolution: 'fast' as const, status, ...base,
+  });
+
+  // The live shape (BE_Test2 PL_02_03): a click dead-ends, a later click on
+  // the same control passes, every assertion passes.
+  it('is the verdict when every assertion passed and only actions broke', () => {
+    const b = new ProofBundleBuilder({ name: 'pl_02_03' });
+    b.addStep(step('goto', 'passed'));
+    b.addStep(step('click', 'dead-end', 'role=button[name="Create Plan" i]'));
+    b.addStep(step('click', 'passed', 'role=button[name="Create Plan" i]'));
+    b.addStep(step('expectVisible', 'passed', 'heading="Benefit Plan Catalog"'));
+    const bundle = b.finish();
+    assert.equal(bundle.status, 'passed-with-issues');
+    assert.equal(isPassing(bundle.status), true);
+    assert.equal(bundle.summary.failed, 1, 'the broken action is still counted as an issue');
+  });
+
+  it('is NOT the verdict when an assertion itself failed', () => {
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('click', 'dead-end'));
+    b.addStep(step('expectVisible', 'failed'));
+    assert.equal(b.finish().status, 'dead-end');
+  });
+
+  it('is NOT the verdict when the run made no assertion at all', () => {
+    // A flow that only acts proves nothing; a broken action in it is a failure.
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('click', 'error'));
+    b.addStep(step('click', 'passed'));
+    assert.equal(b.finish().status, 'error');
+  });
+
+  it('never outranks a run-level error', () => {
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('click', 'dead-end'));
+    b.addStep(step('expectVisible', 'passed'));
+    b.recordRunError('the run is on the sign-in page after asking for /app');
+    assert.notEqual(b.finish().status, 'passed-with-issues');
+  });
+
+  it('is NOT the verdict over an error step — the harness itself could not proceed', () => {
+    // A request whose save path missed, then an assertion that happens to
+    // hold: the claim is proved, the run is not what it said it was.
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('request', 'error'));
+    b.addStep(step('expectStatus', 'passed'));
+    assert.equal(b.finish().status, 'error');
+  });
+
+  it('a clean run is plain passed, never qualified', () => {
+    const b = new ProofBundleBuilder({ name: 'x' });
+    b.addStep(step('click', 'passed'));
+    b.addStep(step('expectVisible', 'passed'));
+    assert.equal(b.finish().status, 'passed');
+  });
+});
+
+// --- Wave 2 (2026-09-03): the verdict stops --------------------------------
+
+describe('a StepResolutionError carrying a verdict classifies as content-only', () => {
+  it('an absence or a not-found stop is a failed verdict, never a dead end, and keeps its attempts', () => {
+    const attempts = [
+      'fast "text=Employee Profile": locator.waitFor: Timeout 400ms exceeded.',
+      'not-found: the page is showing "404 — ไม่พบหน้าที่ค้นหา" at http://x/missing — the application navigated to a page it does not have; no repair attempted',
+    ];
+    const error = new StepResolutionError('text=Employee Profile', attempts, { verdict: "the page is the application's not-found page" });
+    assert.equal(error.contentOnly, true);
+    assert.deepEqual(error.attempts, attempts);
+    assert.match(error.message, /not-found: the page is showing/);
+    // Without the option the same lines are a dead end — the ladder's own
+    // classification is untouched.
+    assert.equal(new StepResolutionError('text=Employee Profile', attempts).contentOnly, false);
   });
 });

@@ -37,6 +37,7 @@
 import { z } from 'zod';
 
 import { lenientObject } from '../providers/model-output.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 
 import {
   LlmFactory,
@@ -44,9 +45,11 @@ import {
   type ModelSource,
 } from '../providers/llm-factory.js';
 import type { ExtractedDocument } from './extract.js';
+import type { PersonaNeed } from './test-case-table.js';
 
 /** Claims asked for in one call. Beyond this a catalog wants splitting up. */
 export const DEFAULT_MAX_CLAIMS = 40;
+export const END_SUPPORTING_CONTEXT = '--- END SUPPORTING CONTEXT ---';
 
 export interface CatalogClaim {
   /** One thing the document says must be true, in the document's own terms. */
@@ -118,7 +121,24 @@ Rules:
 - NEVER invent a claim the document does not make. A short document yields few claims; that is a correct answer.
 - Mark a line that only sets up context (who is logged in, what data exists) as testable=false.
 - "source" is where you found it: a heading, a row identifier, a section number. If there is no marker, quote three or four words of the line.
-- "priority" is high, medium or low — as the document states it, or your reading of how central it is.`;
+- "priority" is high, medium or low — as the document states it, or your reading of how central it is.
+
+${DETERMINISM_RULES}
+
+${procedure('HOW TO LIST THE CLAIMS', [
+  'Walk the catalog top to bottom, in its own order. Claims come out in DOCUMENT ORDER — never regrouped, never sorted by importance.',
+  'For each row, section or paragraph: one claim per assertion it makes. A sentence with "and" between two checkable things is two claims; a numbered "Expected output" list is one claim per number.',
+  'Keep the document\'s identifiers: "source" is the case id / row id / heading exactly as written (TC_01_01, "3.2 Session timeout"), or the first four words of the line when there is none.',
+  'Priority: the document\'s own word when it has one (High/Medium/Low → high/medium/low); otherwise medium. Never infer high from tone.',
+  'testable=false for a line that only states who is signed in, what data exists, or what environment is running; everything that says what the application must show or do is testable=true.',
+])}
+
+${selfCheck([
+  'Every claim quotes or closely paraphrases a line of the CATALOG section, none of the SUPPORTING CONTEXT.',
+  'Claims are in document order and no two claims restate one line.',
+  'Every claim with a document identifier carries it verbatim in "source".',
+  'No claim mentions a selector, a click, a step, or code.',
+])}`;
 
 /** Exported for the test that asserts the two kinds of document stay apart. */
 export function buildClaimsPrompt(request: ClaimsRequest): string {
@@ -223,7 +243,93 @@ export async function extractClaims(
   request: ClaimsRequest,
 ): Promise<CatalogClaims> {
   const result = await model.extractClaims(request);
-  return { ...result, documentNote: request.document.note };
+  return { ...result, claims: groupClaimsByRow(result.claims, request.document.text), documentNote: request.document.note };
+}
+
+const ROW_HEADING = /^## row (\d+)\n/;
+const PRIORITY_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
+
+/**
+ * One row of a table is one case, however many sentences it asserts.
+ *
+ * The extractor is told to split ("a numbered Expected output list is one
+ * claim per number"), which is right for a prose document and wrong for a
+ * test-case sheet read as text: ec09.csv's single row came back as fifteen
+ * claims, and the run authored, opened a browser for and reported fifteen
+ * cases about one scenario — each proving a fragment of a journey that only
+ * makes sense whole. The sheet's own parser (`test-case-table.ts`) has always
+ * made one case per row; this is the same rule for a sheet that reached the
+ * model instead (an unrecognised header, a shifted row the realigner did not
+ * catch).
+ *
+ * Rows are the `## row N` blocks `csvToText` writes. A claim belongs to the
+ * one block that contains its `source` (the case id, or the words the model
+ * quoted); a claim that matches no block, or several, is left alone. The
+ * testable claims of a row become one claim: the row's Test Case ID (or the
+ * first identifier-shaped line) as the source, the sentences joined in the
+ * order the model listed them, the highest priority among them. Context
+ * claims keep their own lines — they are never run, so there is nothing to
+ * merge. A document with no row blocks is returned as it was.
+ */
+export function groupClaimsByRow(claims: CatalogClaim[], documentText: string): CatalogClaim[] {
+  const blocks: { n: number; text: string; id: string }[] = [];
+  for (const chunk of documentText.split(/\n(?=## row \d+\n)/)) {
+    const m = ROW_HEADING.exec(chunk);
+    if (m === null) continue;
+    const text = chunk.slice(m[0].length);
+    const id =
+      /^(?:Test Case ID|Case ID|ID|Case)\s*:\s*(.+)$/im.exec(text)?.[1]?.trim() ??
+      /^[A-Z][A-Z0-9]*(?:[_-][A-Za-z0-9]+)+$/m.exec(text)?.[0] ??
+      '';
+    blocks.push({ n: Number(m[1]), text, id });
+  }
+  if (blocks.length === 0) return claims;
+
+  const rowOf = (claim: CatalogClaim): number | null => {
+    const source = claim.source.trim();
+    if (source === '') return null;
+    const explicit = /^row\s+(\d+)$/i.exec(source);
+    if (explicit !== null) return Number(explicit[1]);
+    const hits = blocks.filter((b) => b.id !== '' && (b.id === source || source.includes(b.id) || b.id.includes(source)));
+    if (hits.length === 1) return hits[0]!.n;
+    const containing = blocks.filter((b) => b.text.includes(source));
+    return containing.length === 1 ? containing[0]!.n : null;
+  };
+
+  const groups = new Map<number, CatalogClaim[]>();
+  const order: Array<{ row: number } | { claim: CatalogClaim }> = [];
+  for (const claim of claims) {
+    const row = claim.testable ? rowOf(claim) : null;
+    if (row === null) {
+      order.push({ claim });
+      continue;
+    }
+    const group = groups.get(row);
+    if (group === undefined) {
+      groups.set(row, [claim]);
+      order.push({ row });
+    } else {
+      group.push(claim);
+    }
+  }
+
+  return order.map((entry) => {
+    if ('claim' in entry) return entry.claim;
+    const group = groups.get(entry.row)!;
+    if (group.length === 1) return group[0]!;
+    const block = blocks.find((b) => b.n === entry.row);
+    const id = block?.id ?? '';
+    const priority = group.reduce(
+      (best, c) => ((PRIORITY_RANK[c.priority] ?? 0) > (PRIORITY_RANK[best] ?? 0) ? c.priority : best),
+      group[0]!.priority,
+    );
+    return {
+      claim: group.map((c) => c.claim.replace(/[.;]\s*$/, '')).join('; '),
+      priority,
+      source: id !== '' ? id : `row ${entry.row}`,
+      testable: true,
+    };
+  });
 }
 
 export class CatalogError extends Error {
@@ -247,6 +353,24 @@ export interface ApprovedClaim extends CatalogClaim {
   approved: boolean;
 }
 
+/**
+ * The gate's participant table, present only for a sequence-diagram catalog.
+ * The diagram never says which host is "the API" — plane assignments start as
+ * deterministic defaults (`guessed` marks the ones the notation did not
+ * state), and this block is where the person confirms or corrects them.
+ */
+export interface SequenceGateInfo {
+  notation: string;
+  participants: Array<{ name: string; label: string; plane: string; guessed: boolean }>;
+  /**
+   * Which claim came from which message — `claim` indexes the claims array.
+   * What lets a gate that edits a plane recompute testability instead of
+   * asking the person to re-derive it by hand. Absent in files written before
+   * it existed; everything degrades to the read-only lane display.
+   */
+  messages?: Array<{ claim: number; from: string; to: string; reply: boolean }> | undefined;
+}
+
 export interface ClaimsFile {
   /** Name of the document the claims were read out of. */
   catalog: string;
@@ -255,9 +379,33 @@ export interface ClaimsFile {
   model: string;
   extractedAt: string;
   claims: ApprovedClaim[];
+  sequence?: SequenceGateInfo | undefined;
+  /**
+   * The accounts this document's cases sign in as, and which cases need each
+   * (`tablePersonas`). Labels and case ids only — never an email, never a
+   * password: this file is plain JSON a person opens and mails around.
+   *
+   * It is here because this is the first parsed artefact a surface holds. Two
+   * of the five steps of a hand-off case say `Login ด้วย <SOMEONE_ACCOUNT>`,
+   * and until this field existed nothing downstream could see them: the claim
+   * text is built from the title, the expectation and the note, so a catalog
+   * needing two logins was indistinguishable from one needing none until the
+   * authoring loop refused a row with a browser already open.
+   *
+   * Absent on a claims file written before this existed, and on the document
+   * kinds that have no rows to read it from — a surface must treat "absent"
+   * as "not known", never as "none needed".
+   */
+  personas?: readonly PersonaNeed[] | undefined;
 }
 
-export function toClaimsFile(catalog: string, claims: CatalogClaims, extractedAt: string): ClaimsFile {
+export function toClaimsFile(
+  catalog: string,
+  claims: CatalogClaims,
+  extractedAt: string,
+  sequence?: SequenceGateInfo,
+  personas?: readonly PersonaNeed[],
+): ClaimsFile {
   return {
     catalog,
     summary: claims.summary,
@@ -267,6 +415,11 @@ export function toClaimsFile(catalog: string, claims: CatalogClaims, extractedAt
     // Everything starts ticked: the review is for striking things out, and a
     // gate that begins empty is a gate everyone clicks "select all" through.
     claims: claims.claims.map((claim) => ({ ...claim, approved: true })),
+    ...(sequence !== undefined ? { sequence } : {}),
+    // Omitted rather than written empty: a document with no rows to read
+    // personas from has not said there are none, and a surface must be able
+    // to tell "this catalog needs nobody" from "nobody looked".
+    ...(personas !== undefined && personas.length > 0 ? { personas } : {}),
   };
 }
 
@@ -281,12 +434,19 @@ export function parseClaimsFile(raw: string): ClaimsFile {
   if (!Array.isArray(file.claims)) {
     throw new CatalogError('claims file has no "claims" array — is this the file --claims-only wrote?');
   }
+  const sequence =
+    typeof file.sequence === 'object' &&
+    file.sequence !== null &&
+    Array.isArray(file.sequence.participants)
+      ? file.sequence
+      : undefined;
   return {
     catalog: typeof file.catalog === 'string' ? file.catalog : 'catalog',
     summary: typeof file.summary === 'string' ? file.summary : '',
     documentNote: typeof file.documentNote === 'string' ? file.documentNote : '',
     model: typeof file.model === 'string' ? file.model : 'unknown',
     extractedAt: typeof file.extractedAt === 'string' ? file.extractedAt : '',
+    ...(sequence !== undefined ? { sequence } : {}),
     claims: file.claims.map((claim: Partial<ApprovedClaim>) => ({
       claim: String(claim.claim ?? '').trim(),
       priority: normalisePriority(String(claim.priority ?? '')),
@@ -337,6 +497,18 @@ export function buildAuthoringPrompt(
   const setup = claims.filter((claim) => !claim.testable);
   const parts: string[] = [];
 
+  // The mission, first — before the background — so the model (and anyone
+  // reading the request log) sees the task ahead of the documents that serve
+  // it. Constant across every row of a catalog, so the shared prompt prefix
+  // the caching comment below relies on is unchanged: this line + the docs
+  // are byte-identical from row to row.
+  parts.push(
+    'Create a runnable JSON flow that navigates the website exactly as the test steps say, and takes ' +
+      'the expected output in the test case VERBATIM as the expected output — without modification. ' +
+      'If the case alone gives too little context, find what is missing in the SUPPORTING CONTEXT ' +
+      'documents and the repository sections included below. Every test case has something to test.',
+  );
+
   for (const document of options.context ?? []) {
     parts.push(
       `--- SUPPORTING CONTEXT: ${document.name} ---\n` +
@@ -344,6 +516,12 @@ export function buildAuthoringPrompt(
         document.text,
     );
   }
+  // A parseable boundary after the documents. Docs sit FIRST deliberately —
+  // identical across every row of a catalog, they form a shared prompt prefix
+  // a provider's implicit cache can bill at cache rates — and this sentinel is
+  // what lets the reviewer elide them instead of paying for the whole document
+  // set a second time per reviewed flow.
+  if ((options.context ?? []).length > 0) parts.push(END_SUPPORTING_CONTEXT);
 
   if (options.summary !== undefined && options.summary !== '') {
     parts.push(`The catalog this comes from: ${options.summary}`);
@@ -363,6 +541,45 @@ export function buildAuthoringPrompt(
         'them, what should be true afterwards. Follow the steps; turn each expected ' +
         'output into an assertion. An expectation numbered 3.2 belongs after the ' +
         'step numbered 3.\n\n' +
+        // Expected values are the sheet's word, and a citation is a pointer,
+        // never a licence to invent: the value lives in the cited source, and
+        // retrieval has already placed that source's relevant passage in the
+        // SUPPORTING CONTEXT above.
+        'EXPECTED VALUES: the test case itself is the authority — quote its expected ' +
+        'output wording and values exactly. When a case refers to another source for a ' +
+        'value ("as per …", "according to …", "ตาม…", a named document, master list or ' +
+        'section), that source\'s relevant passage is in the SUPPORTING CONTEXT above: ' +
+        'take the exact value from there. Never invent a value neither the case nor ' +
+        'the context states — if the cited value is genuinely absent from both, assert ' +
+        'what the case itself states and nothing more.\n\n' +
+        // Rounds (CG-10): the sheet writes one row and means several runs of
+        // it — "รอบที่ 1 ใช้ TD-01 … รอบที่ 2 ใช้ TD-42" (HIR, 40 rows), "Case 1:
+        // งวดปกติ / Case 2: งวดพิเศษ" (PY, 31 sub-cases), "--Insert R1/R2/R3--"
+        // (BE), "Country/Min/Max ว่างทีละช่อง" (TC_SSO_009: one round per field
+        // left empty). Without this the model truncated to round 1 or folded
+        // the rounds into one agent leg; the DO-NOT-TRUNCATE rule has no round
+        // vocabulary. The parser lists them as "Rounds (N):" with per-round
+        // data; the case label carries the round so each is its own run.
+        'ROUNDS: when a case lists "Rounds (N):" — รอบที่ k, Case k:, ครั้งที่ k, Insert Rk, ' +
+        'or a "ว่างทีละช่อง" loop over several fields — write the FULL script once per round ' +
+        'as its own case, labelled with the case id and the round ("<caseId> รอบ k" for a ' +
+        'numbered round, "<caseId> ว่าง <field>" for a per-field loop), applying that ' +
+        'round\'s own data: the "[phase]" pairs in the Test data whose phase is that round, ' +
+        'the round\'s named data set (TD-21), and the overrides the Rounds line gives ' +
+        '(a value not overridden keeps round 1\'s). "ทำซ้ำขั้นตอนที่ A ถึง B" repeats steps ' +
+        'A–B for that round; a per-field loop is ONE case per field, each leaving only ' +
+        'that field empty and asserting the error under that field. Never fold the rounds ' +
+        'into one case and never stop after the first.\n\n' +
+        // The route (CG-11): every row opens with the sidebar path ("เข้าสู่
+        // เมนูที่กำหนด", "กด Menu > ME > …"); the PY rows put the destination
+        // URL and a tab in the steps instead. The parser normalises both to
+        // "Menu path:" and "Destination:"; this says what to do with them.
+        'MENU PATH AND DESTINATION: "Menu path: A > B > C" is the sidebar route to the page ' +
+        'under test — after the sign-in, click each crumb in order, as the tree names it; a ' +
+        'crumb that is a collapsed group is expanded by clicking its header first, then the ' +
+        'entry under it. "Destination: <url> (tab "X")" is the page named outright: goto that ' +
+        'URL, then click the tab. The first leg of every case is that route, never a path ' +
+        'guessed from a label.\n\n' +
         options.cases.join('\n\n'),
     );
   } else {

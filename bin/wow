@@ -76,7 +76,7 @@ fi
 # where that person was working.
 PATH_FLAGS=(
   --report --report-dir --out --cache --flow --suite
-  --claims --claims-out --context-out --context-doc --root --openapi
+  --claims --claims-out --context-out --context-doc --root --openapi --db-schema
 )
 
 # Absolute against the caller's own directory. A path that is already absolute,
@@ -117,9 +117,40 @@ run_cli() {
       args+=("$arg")
     fi
   done
+  exec_cli "${args[@]}"
+}
+
+# --- which copy of the engine actually runs ----------------------------------
+# `dist/cli.js` starts much faster than tsx, so it is preferred — but only while
+# it is genuinely newer than the source it was built from. The old rule was
+# "use dist if the file exists", which has no notion of freshness at all: a
+# build from days ago silently won over current source, and `wow` ran a CLI
+# that did not have the flags its own --help described.
+#
+# Measured 2026-08-18: dist/cli.js was 20 source files behind and contained no
+# `--as`, `--scope` or `--capture-journey` anywhere in it, so those flags were
+# rejected as unknown and the panel `wow` served had none of them either. The
+# failure is silent by construction — a stale build is a working build, just of
+# something else — which is exactly why the check belongs here rather than in
+# someone's memory to run `npm run build`.
+build_is_stale() {
+  [[ -f "$ROOT/dist/cli.js" ]] || return 0
+  [[ -n "$(find "$ROOT/src" -name '*.ts' -newer "$ROOT/dist/cli.js" 2>/dev/null | head -1)" ]]
+}
+
+# The one place the choice is made. It used to be made in two, which is how the
+# two drift: a fix applied to `wow run` would miss `wow` itself.
+exec_cli() {
   cd "$ROOT"
-  if [[ -f dist/cli.js ]]; then exec node dist/cli.js "${args[@]}"; fi
-  exec npx tsx src/cli.ts "${args[@]}"
+  if [[ -f dist/cli.js ]] && ! build_is_stale; then
+    exec node dist/cli.js "$@"
+  fi
+  # Only worth saying when there IS a build being passed over. No build at all
+  # is the ordinary state of a checkout, and a line on every run is noise.
+  if [[ -f dist/cli.js ]]; then
+    echo "wow: dist/ is older than src/ — running from source. \`npm run build\` to speed this up." >&2
+  fi
+  exec npx tsx src/cli.ts "$@"
 }
 
 port_pids() { lsof -ti ":$1" 2>/dev/null || true; }
@@ -202,10 +233,7 @@ case "${1:-up}" in
     echo "wowUI          http://127.0.0.1:$PANEL_PORT/wow   runs, verdicts, evidence"
     echo "control panel  http://127.0.0.1:$PANEL_PORT       run, generate, crawl, watch"
     echo
-    if [[ -f dist/cli.js ]]; then
-      exec node dist/cli.js ui --port "$PANEL_PORT" --wow "$@"
-    fi
-    exec npx tsx src/cli.ts ui --port "$PANEL_PORT" --wow "$@"
+    exec_cli ui --port "$PANEL_PORT" --wow "$@"
     ;;
 
   *)

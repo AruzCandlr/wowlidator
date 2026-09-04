@@ -15,7 +15,18 @@
  * because the two answer different questions — a route renders a page, an
  * operation accepts a request — and because two operations can share one path.
  */
-export type ProjectNodeKind = 'package' | 'component' | 'route' | 'test' | 'operation';
+/**
+ * `table` follows the same precedent one layer further down: one table from a
+ * database schema (DDL, Prisma, or live introspection). Its own kind because
+ * a table is a different promise again — an operation accepts a request, a
+ * table holds the state the request was supposed to change.
+ */
+/**
+ * `message` — one i18n namespace of one locale file (`messages/en.json` ›
+ * `admin_benefits_plans`): the application's own rendered words, which the
+ * structural kinds never carried. See `ingesters/message-ingester.ts`.
+ */
+export type ProjectNodeKind = 'package' | 'component' | 'route' | 'test' | 'operation' | 'table' | 'message';
 
 export interface ProjectNode {
   /** Stable id, e.g. `component:src/components/Button.tsx#Button`. */
@@ -28,7 +39,8 @@ export interface ProjectNode {
   meta?: Record<string, string> | undefined;
 }
 
-export type ProjectEdgeKind = 'uses' | 'renders' | 'covers';
+/** `references` — a foreign key from one `table` node to another. */
+export type ProjectEdgeKind = 'uses' | 'renders' | 'covers' | 'references';
 
 export interface ProjectEdge {
   from: string;

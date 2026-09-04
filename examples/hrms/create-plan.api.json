@@ -1,0 +1,35 @@
+{
+  "name": "HRMS — Create Plan writes benefit_management.benefit_plan as planned",
+  "baseUrl": "http://localhost:3200",
+  "setup": [
+    { "action": "dbSnapshot", "tables": ["benefit_management.benefit_plan", "benefit_management.benefit_eligibility_rule"], "as": "before",
+      "intent": "row counts before the journey" }
+  ],
+  "steps": [
+    { "action": "request", "method": "POST", "url": "/api/benefit-plans",
+      "body": { "id": "BP-WOW-0001", "nameEn": "wowlidator smoke plan", "nameTh": "แผนทดสอบ wowlidator",
+                "category": "dental", "status": "active", "benefitTypeGroup": "reimbursement-hr",
+                "enrolment": "manual", "claimPeriod": "year", "eligibleClaimDate": 45, "company": "CRC, CFR" },
+      "save": { "dbId": "$.dbId" },
+      "intent": "create a plan the way the catalog screen's Create Plan does" },
+    { "action": "expectStatus", "status": 200, "intent": "the route answers ok" },
+    { "action": "expectJson", "path": "$.ok", "value": "true" },
+    { "action": "expectDbRow", "table": "benefit_management.benefit_plan",
+      "where": { "id": "{{dbId}}" },
+      "values": { "benefit_plan_id": "BP-WOW-0001", "benefit_category": "Dental", "status": "A",
+                  "benefit_type": "REIMBURSEMENT_HR", "enrollment_type": "MANUAL", "claim_period": "YEAR",
+                  "eligible_claim_day": "45", "created_by": "cnext-ui" },
+      "intent": "the row the API returned the id of holds exactly the values the route maps from the UI shape" },
+    { "action": "expectDbDelta", "table": "benefit_management.benefit_plan", "delta": 1, "since": "before",
+      "intent": "one plan row was added, no more" },
+    { "action": "expectDbUnchanged", "tables": ["benefit_management.benefit_eligibility_rule"], "since": "before",
+      "intent": "creating a plan does not touch eligibility rules" },
+    { "action": "dbSnapshot", "tables": ["benefit_management.benefit_plan"], "as": "after-create" },
+    { "action": "request", "method": "POST", "url": "/api/benefit-plans",
+      "body": { "nameEn": "no id here" },
+      "intent": "an invalid body — the route requires an id" },
+    { "action": "expectStatus", "status": 400, "intent": "rejected by the route's own validation" },
+    { "action": "expectDbUnchanged", "tables": ["benefit_management.benefit_plan"], "since": "after-create",
+      "intent": "a rejected create writes nothing" }
+  ]
+}

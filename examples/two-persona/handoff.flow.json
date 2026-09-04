@@ -1,0 +1,22 @@
+{
+  "name": "Two personas — one hands the case to the other, and the first comes back",
+  "baseUrl": "http://127.0.0.1:3210",
+  "steps": [
+    { "action": "signIn", "as": "<HR_ADMIN_ACCOUNT>", "url": "http://127.0.0.1:3210/login",
+      "intent": "the first identity binds the primary browser — the label is written the way a sheet writes it, angle brackets and all. The URL is absolute on purpose: goto resolves against baseUrl, signIn.url does not" },
+    { "action": "goto", "url": "/app" },
+    { "action": "expectText", "selector": "#who", "value": "Signed in as admin@b.test",
+      "intent": "the page agrees about who is signed in, not merely that someone is" },
+
+    { "action": "signIn", "as": "MANAGER_ACCOUNT",
+      "intent": "the hand-off: a second identity takes over. Through a catalog run it takes a browser of its own and nobody is signed out; through `run` there is no persona lane, so this is a sign-out and a fresh sign-in — the record says which" },
+    { "action": "goto", "url": "/app" },
+    { "action": "expectText", "selector": "#who", "value": "Signed in as manager@b.test",
+      "intent": "the second person sees the application as themselves" },
+
+    { "action": "signIn", "as": "HR_ADMIN_ACCOUNT",
+      "intent": "and the return: a switch with keptSession when each persona has a browser, a second login when they share one. Either way the identity is proved by the next step, never assumed" },
+    { "action": "expectText", "selector": "#who", "value": "Signed in as admin@b.test",
+      "intent": "…which is provable only because the page names the account" }
+  ]
+}

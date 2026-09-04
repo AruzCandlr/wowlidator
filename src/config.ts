@@ -25,10 +25,10 @@ import { DEFAULT_REPORT_DIR as REPORTER_DEFAULT_DIR } from './reporter/html-repo
 import { DEFAULT_CAPTURE_DELAY_MS } from './engine/evidence.js';
 import type { ScreenshotMode, VideoMode } from './engine/runner.js';
 
-export const LLM_ROLES = ['healer', 'generator', 'agent', 'data'] as const;
+export const LLM_ROLES = ['healer', 'generator', 'agent', 'data', 'governor'] as const;
 export type LlmRole = (typeof LLM_ROLES)[number];
 
-export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai'] as const;
+export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli', 'claude-tty', 'claude-cloud', 'airforce', 'cerebras', 'requesty'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 /** Which env var carries each provider's key, and where to get one. */
@@ -36,6 +36,38 @@ export const PROVIDER_META: Record<
   ProviderName,
   { envKey: string; label: string; consoleUrl: string; freeTier: string }
 > = {
+  'claude-cli': {
+    // Deliberately empty: the CLI carries the operator's own logged-in
+    // session, so there is no key to set and the role gate must not demand
+    // one. `KEYLESS_PROVIDERS` is what makes that structural rather than a
+    // special case scattered through the callers.
+    envKey: '',
+    label: 'Claude Code CLI (this machine\'s own session)',
+    consoleUrl: 'https://claude.com/claude-code',
+    freeTier: 'billed to the session already signed in here — no key to configure',
+  },
+  // The same session, kept warm: one interactive `claude` per (model, effort)
+  // answers every call instead of a process start per call. See
+  // `providers/claude-tty.ts` for what it cannot promise (no native schema,
+  // no usage figures).
+  'claude-tty': {
+    envKey: '',
+    label: 'Claude Code TTY (this machine\'s session, one warm process)',
+    consoleUrl: 'https://claude.com/claude-code',
+    freeTier: 'billed to the session already signed in here — no key to configure',
+  },
+  // The same signed-in account, but the model runs in a Claude Code CLOUD
+  // session (`claude --cloud`) rather than on this machine. The CLI refuses
+  // `--cloud` without a TTY, so this rides the same warm interactive terminal
+  // as `claude-tty` — see `createClaudeCloud` in `providers/claude-tty.ts`.
+  // `WOWLIDATOR_CLAUDE_CLOUD_SESSION` attaches to an existing session by id or
+  // claude.ai/code URL; unset, a fresh cloud session is created per worker.
+  'claude-cloud': {
+    envKey: '',
+    label: 'Claude Code Cloud (a cloud session on this account)',
+    consoleUrl: 'https://claude.ai/code',
+    freeTier: 'billed to the signed-in account\'s cloud sessions — no key to configure',
+  },
   google: {
     envKey: 'GOOGLE_GENERATIVE_AI_API_KEY',
     label: 'Google AI Studio (Gemini)',
@@ -71,7 +103,92 @@ export const PROVIDER_META: Record<
     consoleUrl: 'https://z.ai/manage-apikey/apikey-list',
     freeTier: 'paid API with free trial credit; GLM models',
   },
+  // DeepSeek — OpenAI-compatible endpoint at api.deepseek.com. `deepseek-chat`
+  // (V3) for every role here; `deepseek-reasoner` (R1) thinks before it
+  // answers and bills the thinking against the output budget.
+  deepseek: {
+    envKey: 'DEEPSEEK_API_KEY',
+    label: 'DeepSeek',
+    consoleUrl: 'https://platform.deepseek.com/api_keys',
+    freeTier: 'paid API, low per-token price; deepseek-chat / deepseek-reasoner',
+  },
+  airforce: {
+    envKey: 'AIRFORCE_API_KEY',
+    label: 'Airforce',
+    consoleUrl: 'https://api.airforce',
+    freeTier: 'OpenAI-compatible /v1 API',
+  },
+  cerebras: {
+    envKey: 'CEREBRAS_API_KEY',
+    label: 'Cerebras',
+    consoleUrl: 'https://cloud.cerebras.ai',
+    freeTier: 'Fast AI Inference',
+  },
+  requesty: {
+    envKey: 'REQUESTY_API_KEY',
+    label: 'Requesty',
+    consoleUrl: 'https://requesty.ai',
+    freeTier: 'OpenAI-compatible /v1 API',
+  },
+  // A model served on this machine — mlx_lm.server, llama.cpp, vLLM, LM Studio:
+  // anything speaking the OpenAI-compatible /v1 API. Default base URL is
+  // http://localhost:8080/v1 (`LOCAL_LLM_BASE_URL` overrides). No key is
+  // required: `LOCAL_LLM_API_KEY` is optional and a placeholder is supplied
+  // when it is unset, so every "does this role have a key" gate stays true.
+  local: {
+    envKey: 'LOCAL_LLM_API_KEY',
+    label: 'Local (localhost:8080)',
+    consoleUrl: 'http://localhost:8080/v1/models',
+    freeTier: 'your own hardware; OpenAI-compatible server (mlx_lm, llama.cpp, vLLM)',
+  },
 };
+
+/**
+ * Providers that answer one call at a time — a local MLX server prefills
+ * serially. Authoring runs one row at a time on them (`authorWorkers`) and
+ * every structured call goes through `SerialGate` (`providers/serial-gate.ts`).
+ */
+// `claude-tty` is one terminal answering one request at a time — the same
+// shape, so it takes the same admission control (and authors one row at a
+// time). `WOWLIDATOR_CLAUDE_TTY_WORKERS` widens the terminal pool behind it.
+// `claude-cloud` is that same terminal with the work happening in a cloud
+// session behind it — still one request at a time per terminal.
+export const SERIAL_PROVIDERS: ReadonlySet<string> = new Set(['local', 'claude-tty', 'claude-cloud']);
+
+/** Where the `local` provider's server listens. */
+export const DEFAULT_LOCAL_LLM_BASE_URL = 'http://localhost:8080/v1';
+export function localLlmBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.LOCAL_LLM_BASE_URL?.trim();
+  return raw === undefined || raw === '' ? DEFAULT_LOCAL_LLM_BASE_URL : raw.replace(/\/+$/, '');
+}
+
+/**
+ * A base URL for a local server on this port — what the panel's port field
+ * turns into. Two `rerise` instances (a 9B for authoring, a 4B for repairs)
+ * differ only by port, so a port is the whole of what a person picks.
+ */
+export function localBaseUrlForPort(port: number): string {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new ConfigError(`"${port}" is not a TCP port`);
+  }
+  return `http://localhost:${port}/v1`;
+}
+
+/** The port a local base URL points at, or null when it names none we can read. */
+export function portOfBaseUrl(baseUrl: string): number | null {
+  try {
+    const u = new URL(baseUrl);
+    if (u.port !== '') return Number(u.port);
+    return u.protocol === 'https:' ? 443 : u.protocol === 'http:' ? 80 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Sent as the bearer token when `LOCAL_LLM_API_KEY` is unset; local servers ignore it. */
+export const LOCAL_LLM_PLACEHOLDER_KEY = 'local';
+/** The same idea for the Claude CLI — see where it is assigned. */
+export const CLAUDE_CLI_PLACEHOLDER_KEY = 'claude-cli-session';
 
 /**
  * Defaults chosen to match each role's shape.
@@ -90,12 +207,109 @@ export const DEFAULT_ROLE_MODELS: Record<LlmRole, { provider: ProviderName; mode
   // Same job shape as healer — small, latency-sensitive, rarely called (most
   // data generation is deterministic and never reaches a model at all).
   data: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
+  // The queue governor: a handful of event-driven turns per SUITE, each a
+  // compact observation and one structured decision. Cheap by default; the
+  // person may point it at an expensive model (claude-cli opus) precisely
+  // because the turn budget, not the model, bounds the spend.
+  governor: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
 };
+
+/**
+ * The id sent to a provider whose server decides the model.
+ *
+ * One alias per provider, because servers differ: mlx_lm.server maps
+ * `default_model` (its literal default for a missing `model` field) to the
+ * `--model` it was started with, and treats ANY other id — `default`
+ * included — as a Hugging Face repo to fetch, failing with "cannot find an
+ * appropriate cached snapshot" offline. Measured live 2026-08-21. EmmieDev's
+ * alias is `default`.
+ */
+export const FIXED_MODEL_ALIAS: Readonly<Partial<Record<ProviderName, string>>> = {
+  emmiedev: 'default',
+  local: 'default_model',
+};
+export function fixedModelFor(provider: ProviderName): string | undefined {
+  return FIXED_MODEL_ALIAS[provider];
+}
+
+/**
+ * Providers that serve exactly one model and ignore the `model` field of a
+ * request: the loaded model answers whatever id is named. EmmieDev's `default`
+ * is the original case; the `local` server is the same shape — the model is
+ * chosen where the server is started, not per request. For these a role has
+ * no model to pick: `WOWLIDATOR_<ROLE>_MODEL` is ignored, the panel shows no
+ * model field, and the alias is what gets recorded as the run's model label.
+ */
+export const FIXED_MODEL_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'local']);
+
+/**
+ * The model a provider is known to run this codebase's structured calls on,
+ * for a role whose provider was re-pointed without naming a model. Starting
+ * points, not facts — `wowlidator doctor` is the only way to know an id still
+ * resolves, the same caveat `DEFAULT_ROLE_MODELS` carries.
+ */
+export const DEFAULT_PROVIDER_MODELS: Record<ProviderName, string> = {
+  google: 'gemini-3.6-flash',
+  groq: 'openai/gpt-oss-120b',
+  openrouter: 'google/gemini-3.6-flash',
+  emmiedev: 'default',
+  zai: 'glm-4.5-flash',
+  deepseek: 'deepseek-chat',
+  airforce: 'default',
+  cerebras: 'llama3.1-8b',
+  requesty: 'default',
+  local: 'default_model',
+  // An alias, not a dated id: the CLI resolves `fable` to whatever the
+  // current Fable is. A DEFAULT and not a fixed model — each role keeps its
+  // own `WOWLIDATOR_<ROLE>_MODEL`, so a run can put the expensive model where
+  // authoring happens and a cheaper one on the healer and the agent.
+  'claude-cli': 'fable',
+  // The warm terminal is for the roles called every few seconds — healer,
+  // agent, data — where the cheap fast model at low effort measured best.
+  'claude-tty': 'sonnet',
+  // A cloud session pays network latency on every exchange anyway, so the
+  // default leans on capability — the natural home for the agent role.
+  'claude-cloud': 'sonnet',
+};
+
 
 export interface RoleConfig {
   role: LlmRole;
   provider: ProviderName;
   modelId: string;
+  /**
+   * Where this role's server listens — set only for the `local` provider,
+   * from `WOWLIDATOR_<ROLE>_BASE_URL`, else `LOCAL_LLM_BASE_URL`, else the
+   * default port. Per role, because one machine can run two local servers
+   * and a role is the unit a provider is chosen at.
+   */
+  baseUrl?: string | undefined;
+  /**
+   * Reasoning effort for a provider that has the concept (`claude-cli`), from
+   * `WOWLIDATOR_<ROLE>_EFFORT`.
+   *
+   * Per role, because the roles differ in what they are for: the healer, the
+   * agent and the data model each make one small decision and are called
+   * every few seconds, while authoring is one large call per case. Measured
+   * 2026-08-26 at 15k tokens of prompt: fable at high effort answered in
+   * 6.1 s against sonnet at low effort's 3.0 s, and cost four times as much.
+   */
+  effort?: string | undefined;
+  /**
+   * Available tools for a CLI provider (`claude-cli`), from
+   * `WOWLIDATOR_<ROLE>_TOOLS`.
+   */
+  tools?: string | undefined;
+  /**
+   * Allowed tools for a CLI provider (`claude-cli`), from
+   * `WOWLIDATOR_<ROLE>_ALLOWED_TOOLS`.
+   */
+  allowedTools?: string | undefined;
+  /**
+   * Disallowed tools for a CLI provider (`claude-cli`), from
+   * `WOWLIDATOR_<ROLE>_DISALLOWED_TOOLS`.
+   */
+  disallowedTools?: string | undefined;
 }
 
 export interface WowlidatorConfig {
@@ -130,6 +344,8 @@ export interface WowlidatorConfig {
   screenshots: ScreenshotMode | undefined;
   /** Film the run, with a drawn-in pointer. See `engine/video.ts`. */
   video: VideoMode;
+  /** Perform like a person while filming; undefined follows the recording. `WOWLIDATOR_HUMANIZE`. */
+  humanize: boolean | undefined;
   /** Pause before each screenshot, so the page has painted. See `evidence.ts`. */
   captureDelayMs: number;
   healing: boolean;
@@ -157,18 +373,54 @@ const videoSchema = z.enum(['on', 'off']);
 const envSchema = z.object({
   WOWLIDATOR_HEALER_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_HEALER_MODEL: z.string().min(1).optional(),
+  // Reasoning effort per role, for a provider that has the concept. Left
+  // loose on purpose: the set of levels belongs to the provider, and a schema
+  // that pinned it here would reject a level added later.
+  WOWLIDATOR_HEALER_EFFORT: z.string().min(1).optional(),
+  WOWLIDATOR_GENERATOR_EFFORT: z.string().min(1).optional(),
+  WOWLIDATOR_AGENT_EFFORT: z.string().min(1).optional(),
+  WOWLIDATOR_DATA_EFFORT: z.string().min(1).optional(),
+  WOWLIDATOR_HEALER_TOOLS: z.string().optional(),
+  WOWLIDATOR_GENERATOR_TOOLS: z.string().optional(),
+  WOWLIDATOR_AGENT_TOOLS: z.string().optional(),
+  WOWLIDATOR_DATA_TOOLS: z.string().optional(),
+  WOWLIDATOR_GOVERNOR_TOOLS: z.string().optional(),
+  WOWLIDATOR_HEALER_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_GENERATOR_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_AGENT_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_DATA_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_GOVERNOR_ALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_HEALER_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_GENERATOR_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_AGENT_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_DATA_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_GOVERNOR_DISALLOWED_TOOLS: z.string().optional(),
+  WOWLIDATOR_HEALER_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_GENERATOR_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_GENERATOR_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_GENERATOR_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_AGENT_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_AGENT_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_AGENT_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_DATA_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_DATA_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_DATA_BASE_URL: z.string().url().optional(),
+  WOWLIDATOR_GOVERNOR_PROVIDER: providerSchema.optional(),
+  WOWLIDATOR_GOVERNOR_MODEL: z.string().min(1).optional(),
+  WOWLIDATOR_GOVERNOR_BASE_URL: z.string().url().optional(),
+  WOWLIDATOR_GOVERNOR_EFFORT: z.string().optional(),
 
   GOOGLE_GENERATIVE_AI_API_KEY: z.string().min(1).optional(),
   GROQ_API_KEY: z.string().min(1).optional(),
   OPENROUTER_API_KEY: z.string().min(1).optional(),
   EMMIEDEV_API_KEY: z.string().min(1).optional(),
   ZAI_API_KEY: z.string().min(1).optional(),
+  DEEPSEEK_API_KEY: z.string().min(1).optional(),
+  AIRFORCE_API_KEY: z.string().min(1).optional(),
+  CEREBRAS_API_KEY: z.string().min(1).optional(),
+  REQUESTY_API_KEY: z.string().min(1).optional(),
+  LOCAL_LLM_API_KEY: z.string().min(1).optional(),
+  LOCAL_LLM_BASE_URL: z.string().url().optional(),
 
   WOWLIDATOR_LLM_MAX_RETRIES: z.coerce.number().int().min(0).max(10).optional(),
   WOWLIDATOR_CDP_URL: z.string().min(1).optional(),
@@ -180,6 +432,7 @@ const envSchema = z.object({
   WOWLIDATOR_DISABLE_REPORT: z.string().optional(),
   WOWLIDATOR_SCREENSHOTS: screenshotEnvSchema.optional(),
   WOWLIDATOR_VIDEO: videoSchema.optional(),
+  WOWLIDATOR_HUMANIZE: z.string().optional(),
   WOWLIDATOR_CAPTURE_DELAY_MS: z.coerce.number().int().min(0).max(30_000).optional(),
   WOWLIDATOR_DISABLE_HEALING: z.string().optional(),
   WOWLIDATOR_DISABLE_AGENT: z.string().optional(),
@@ -294,11 +547,63 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
     name: LlmRole,
     provider: ProviderName | undefined,
     modelId: string | undefined,
-  ): RoleConfig => ({
-    role: name,
-    provider: provider ?? DEFAULT_ROLE_MODELS[name].provider,
-    modelId: modelId ?? DEFAULT_ROLE_MODELS[name].modelId,
-  });
+    baseUrl?: string | undefined,
+    effort?: string | undefined,
+    tools?: string | undefined,
+    allowedTools?: string | undefined,
+    disallowedTools?: string | undefined,
+  ): RoleConfig => {
+    // Authoring is one large call per case and earns the thinking; the roles
+    // called every few seconds do not. A role that says nothing takes the
+    // default for its kind rather than the most expensive setting.
+    const resolvedEffort =
+      (effort?.trim() || undefined) ?? (name === 'generator' ? 'high' : 'low');
+    const resolvedTools = tools?.trim() || undefined;
+    const resolvedAllowedTools = allowedTools?.trim() || undefined;
+    const resolvedDisallowedTools = disallowedTools?.trim() || undefined;
+    const resolvedProvider = provider ?? DEFAULT_ROLE_MODELS[name].provider;
+    // Only `local` has a server to point at; a base URL on any other provider
+    // is ignored rather than sent somewhere the SDK would not honour it.
+    const resolvedBase =
+      resolvedProvider === 'local'
+        ? (baseUrl?.trim() || undefined)?.replace(/\/+$/, '') ?? localLlmBaseUrl(env)
+        : undefined;
+    // A provider named without a model must not inherit a model id that
+    // belongs to a DIFFERENT provider. Seen live: `WOWLIDATOR_GENERATOR_PROVIDER=zai`
+    // alone resolved to `zai:gemini-3.6-flash` — the generator role's Google
+    // default — and `doctor` reported the provider broken when the id was.
+    // The role's own default is kept only when the provider is its own; any
+    // other provider gets that provider's known-good model.
+    // A fixed-model provider has nothing to choose — whatever `.env` names,
+    // the server answers with the model it loaded, so the alias is the truth.
+    const fixed = fixedModelFor(resolvedProvider);
+    if (fixed !== undefined) {
+      return {
+        role: name,
+        provider: resolvedProvider,
+        modelId: fixed,
+        baseUrl: resolvedBase,
+        effort: resolvedEffort,
+        tools: resolvedTools,
+        allowedTools: resolvedAllowedTools,
+        disallowedTools: resolvedDisallowedTools,
+      };
+    }
+    const resolvedModel =
+      modelId ??
+      (resolvedProvider === DEFAULT_ROLE_MODELS[name].provider
+        ? DEFAULT_ROLE_MODELS[name].modelId
+        : DEFAULT_PROVIDER_MODELS[resolvedProvider]);
+    return {
+      role: name,
+      provider: resolvedProvider,
+      modelId: resolvedModel,
+      effort: resolvedEffort,
+      tools: resolvedTools,
+      allowedTools: resolvedAllowedTools,
+      disallowedTools: resolvedDisallowedTools,
+    };
+  };
 
   const apiKeys: Partial<Record<ProviderName, string[]>> = {};
   const googleKeys = parseApiKeys(e.GOOGLE_GENERATIVE_AI_API_KEY);
@@ -306,18 +611,83 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
   const openrouterKeys = parseApiKeys(e.OPENROUTER_API_KEY);
   const emmiedevKeys = parseApiKeys(e.EMMIEDEV_API_KEY);
   const zaiKeys = parseApiKeys(e.ZAI_API_KEY);
+  const deepseekKeys = parseApiKeys(e.DEEPSEEK_API_KEY);
+  const airforceKeys = parseApiKeys(e.AIRFORCE_API_KEY);
+  const cerebrasKeys = parseApiKeys(e.CEREBRAS_API_KEY);
+  const requestyKeys = parseApiKeys(e.REQUESTY_API_KEY);
   if (googleKeys.length > 0) apiKeys.google = googleKeys;
   if (groqKeys.length > 0) apiKeys.groq = groqKeys;
   if (openrouterKeys.length > 0) apiKeys.openrouter = openrouterKeys;
   if (emmiedevKeys.length > 0) apiKeys.emmiedev = emmiedevKeys;
   if (zaiKeys.length > 0) apiKeys.zai = zaiKeys;
+  if (deepseekKeys.length > 0) apiKeys.deepseek = deepseekKeys;
+  if (airforceKeys.length > 0) apiKeys.airforce = airforceKeys;
+  if (cerebrasKeys.length > 0) apiKeys.cerebras = cerebrasKeys;
+  if (requestyKeys.length > 0) apiKeys.requesty = requestyKeys;
+  // A local server needs no key; the placeholder keeps the role-readiness gates honest.
+  const localKeys = parseApiKeys(e.LOCAL_LLM_API_KEY);
+  apiKeys.local = localKeys.length > 0 ? localKeys : [LOCAL_LLM_PLACEHOLDER_KEY];
+  // The Claude CLI carries the operator's own signed-in session, so there is
+  // no key to set and none to miss. A placeholder keeps `hasKeyForRole` and
+  // the role gate structural — the same move `local` makes above, for the
+  // same reason: a provider that needs no credential must not be modelled as
+  // a provider whose credential is absent.
+  apiKeys['claude-cli'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
+  apiKeys['claude-tty'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
+  apiKeys['claude-cloud'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
 
   return {
     roles: {
-      healer: role('healer', e.WOWLIDATOR_HEALER_PROVIDER, e.WOWLIDATOR_HEALER_MODEL),
-      generator: role('generator', e.WOWLIDATOR_GENERATOR_PROVIDER, e.WOWLIDATOR_GENERATOR_MODEL),
-      agent: role('agent', e.WOWLIDATOR_AGENT_PROVIDER, e.WOWLIDATOR_AGENT_MODEL),
-      data: role('data', e.WOWLIDATOR_DATA_PROVIDER, e.WOWLIDATOR_DATA_MODEL),
+      healer: role(
+        'healer',
+        e.WOWLIDATOR_HEALER_PROVIDER,
+        e.WOWLIDATOR_HEALER_MODEL,
+        e.WOWLIDATOR_HEALER_BASE_URL,
+        e.WOWLIDATOR_HEALER_EFFORT,
+        e.WOWLIDATOR_HEALER_TOOLS,
+        e.WOWLIDATOR_HEALER_ALLOWED_TOOLS,
+        e.WOWLIDATOR_HEALER_DISALLOWED_TOOLS,
+      ),
+      generator: role(
+        'generator',
+        e.WOWLIDATOR_GENERATOR_PROVIDER,
+        e.WOWLIDATOR_GENERATOR_MODEL,
+        e.WOWLIDATOR_GENERATOR_BASE_URL,
+        e.WOWLIDATOR_GENERATOR_EFFORT,
+        e.WOWLIDATOR_GENERATOR_TOOLS,
+        e.WOWLIDATOR_GENERATOR_ALLOWED_TOOLS,
+        e.WOWLIDATOR_GENERATOR_DISALLOWED_TOOLS,
+      ),
+      agent: role(
+        'agent',
+        e.WOWLIDATOR_AGENT_PROVIDER,
+        e.WOWLIDATOR_AGENT_MODEL,
+        e.WOWLIDATOR_AGENT_BASE_URL,
+        e.WOWLIDATOR_AGENT_EFFORT,
+        e.WOWLIDATOR_AGENT_TOOLS,
+        e.WOWLIDATOR_AGENT_ALLOWED_TOOLS,
+        e.WOWLIDATOR_AGENT_DISALLOWED_TOOLS,
+      ),
+      data: role(
+        'data',
+        e.WOWLIDATOR_DATA_PROVIDER,
+        e.WOWLIDATOR_DATA_MODEL,
+        e.WOWLIDATOR_DATA_BASE_URL,
+        e.WOWLIDATOR_DATA_EFFORT,
+        e.WOWLIDATOR_DATA_TOOLS,
+        e.WOWLIDATOR_DATA_ALLOWED_TOOLS,
+        e.WOWLIDATOR_DATA_DISALLOWED_TOOLS,
+      ),
+      governor: role(
+        'governor',
+        e.WOWLIDATOR_GOVERNOR_PROVIDER,
+        e.WOWLIDATOR_GOVERNOR_MODEL,
+        e.WOWLIDATOR_GOVERNOR_BASE_URL,
+        e.WOWLIDATOR_GOVERNOR_EFFORT,
+        e.WOWLIDATOR_GOVERNOR_TOOLS,
+        e.WOWLIDATOR_GOVERNOR_ALLOWED_TOOLS,
+        e.WOWLIDATOR_GOVERNOR_DISALLOWED_TOOLS,
+      ),
     },
     apiKeys,
     maxRetries: e.WOWLIDATOR_LLM_MAX_RETRIES ?? DEFAULT_MAX_RETRIES,
@@ -337,6 +707,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
     reportEnabled: e.WOWLIDATOR_DISABLE_REPORT !== '1',
     screenshots: e.WOWLIDATOR_SCREENSHOTS === 'auto' ? undefined : e.WOWLIDATOR_SCREENSHOTS,
     video: e.WOWLIDATOR_VIDEO ?? 'on',
+    humanize: e.WOWLIDATOR_HUMANIZE === undefined || e.WOWLIDATOR_HUMANIZE === '' ? undefined : e.WOWLIDATOR_HUMANIZE !== '0' && e.WOWLIDATOR_HUMANIZE !== 'off',
     captureDelayMs: e.WOWLIDATOR_CAPTURE_DELAY_MS ?? DEFAULT_CAPTURE_DELAY_MS,
     healing: e.WOWLIDATOR_DISABLE_HEALING !== '1',
     agentEnabled: e.WOWLIDATOR_DISABLE_AGENT !== '1',
@@ -356,7 +727,9 @@ export function describeRouting(config: WowlidatorConfig): string {
     const meta = PROVIDER_META[entry.provider];
     const keys = config.apiKeys[entry.provider] ?? [];
     const key =
-      keys.length === 0
+      meta.envKey === ''
+        ? "this machine's own session"
+        : keys.length === 0
         ? `MISSING ${meta.envKey}`
         : keys.length === 1
           ? 'key set'

@@ -173,8 +173,13 @@ describe('expectModal / closeModal (CDP)', { skip: skipBrowser }, () => {
       cachePath: join(dir, 'expect-wrong-name.json'),
       healedTimeoutMs: 500,
     });
-    assert.equal(bundle.status, 'failed');
+    // The step fails; the RUN defers — a modal-name mismatch is exactly the
+    // wording call the judge gate covers since it broadened (2026-08-24):
+    // this is PL_02_03's shape ("Create Plan" vs "Create Benefit Plan"), and
+    // the judge (or a human in the panel) rules it, not a string comparison.
+    assert.equal(bundle.status, 'needs-review');
     const step = bundle.steps.find((s) => s.action === 'expectModal');
+    assert.equal(step?.status, 'failed');
     assert.match(step?.error ?? '', /does not mention "Checkout"/);
   });
 
@@ -283,5 +288,28 @@ describe('automatic blocking-dialog recovery (CDP)', { skip: skipBrowser }, () =
     const defect = bundle.defects.find((d) => d.category === 'usability');
     assert.ok(defect, 'an unexpected-dialog defect should be recorded');
     assert.equal(defect?.severity, 'medium');
+  });
+});
+
+// --- Dismiss vocabulary (EH-02, 2026-09-03) — pure, runs always ---------------
+
+describe('dismiss names: neutral vs affirmative, Thai included', () => {
+  it('keeps confirming words out of the neutral family the automatic rung uses', async () => {
+    const { AFFIRMATIVE_DISMISS_NAME_PATTERN, NEUTRAL_DISMISS_NAME_PATTERN, DISMISS_NAME_PATTERN, dialogIsIntendedContext } =
+      await import('../src/engine/modal.js');
+    for (const neutral of ['Close', 'Cancel', 'Dismiss', 'ปิด', 'ยกเลิก', 'ย้อนกลับ']) {
+      assert.ok(NEUTRAL_DISMISS_NAME_PATTERN.test(neutral), neutral);
+      assert.ok(!AFFIRMATIVE_DISMISS_NAME_PATTERN.test(neutral), neutral);
+    }
+    for (const affirmative of ['OK', 'Continue', 'Accept all', 'ตกลง', 'รับทราบ', 'ยอมรับ']) {
+      assert.ok(AFFIRMATIVE_DISMISS_NAME_PATTERN.test(affirmative), affirmative);
+      assert.ok(!NEUTRAL_DISMISS_NAME_PATTERN.test(affirmative), affirmative);
+      assert.ok(DISMISS_NAME_PATTERN.test(affirmative), 'an explicit closeModal still searches both');
+    }
+    assert.ok(!DISMISS_NAME_PATTERN.test('ยืนยันการปฏิเสธ'), 'a confirm-decline button is never a dismiss');
+    // A fill inside the modal the flow opened is context, not a blocker.
+    assert.ok(dialogIsIntendedContext('fill'));
+    assert.ok(dialogIsIntendedContext('selectOption'));
+    assert.ok(!dialogIsIntendedContext('goto'));
   });
 });

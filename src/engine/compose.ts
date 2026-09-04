@@ -165,7 +165,10 @@ export function hasIncludes(flow: Flow): boolean {
 function substitute(steps: readonly FlowStep[], params: Record<string, string>): FlowStep[] {
   const walk = (value: unknown): unknown => {
     if (typeof value === 'string') {
-      return value.replace(/\{\{(\w+)\}\}/g, (whole, name: string) =>
+      // `[\w-]`, not `\w`: a hyphen is part of a parameter name, the same rule
+      // the runtime store uses (`api/variables.ts` PLACEHOLDER). `\w` alone
+      // silently left `{{rows-before}}` unsubstituted here too.
+      return value.replace(/\{\{([\w-]+)\}\}/g, (whole, name: string) =>
         Object.hasOwn(params, name) ? (params[name] ?? '') : whole,
       );
     }

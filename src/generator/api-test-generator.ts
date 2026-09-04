@@ -28,6 +28,7 @@ import { z } from 'zod';
 
 import type { ProjectGraph, ProjectNode } from '../context/types.js';
 import { hasAssertion } from '../engine/runner.js';
+import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
 import type { Flow, FlowStep } from '../engine/runner.js';
 import type { Defect, DefectCategory, DefectSeverity } from '../engine/proof-bundle.js';
 import {
@@ -185,6 +186,22 @@ meant to test.
 
 - Leave unused fields as empty strings.
 ${POLICY_RULES[policy]}
+
+${DETERMINISM_RULES}
+
+${procedure('HOW TO BUILD THE SUITE', [
+  'Walk the inventory in the order given. For each operation the policy allows, decide its ONE functional case; then, still in inventory order, the edge cases the policy allows; usability cases only for a contract problem the inventory positively shows. Stop at the case limit — earlier operations win.',
+  'Name each case "<kind>: <METHOD /path> <what it proves>", the method and path verbatim from the inventory.',
+  'For a case that needs an id: the first step lists or creates and saves it as {{id}}; never a literal id.',
+  'Every request is followed by an expectStatus, and every functional case additionally by an expectJson on a field the inventory documents.',
+])}
+
+${selfCheck([
+  'Every method+path used appears in the inventory exactly as written.',
+  'Every case has at least one expect* step, and every request has an expectStatus after it.',
+  'No literal id is invented; ids come from a saved response.',
+  'The policy\'s limits hold: no writes under read-only, only invalid payloads under forms, never DELETE.',
+])}
 
 **defects** — problems visible in the spec itself, with no run required: an
 operation with no documented error responses, a required parameter with no

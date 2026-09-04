@@ -119,6 +119,30 @@ function requestedEndpoints(flow: Flow): string[] {
   return [...calls];
 }
 
+/**
+ * Tables the flow's DB steps verify — the schema-side counterpart of
+ * `requestedEndpoints`, readable for the same our-own-format reason.
+ */
+function checkedTables(flow: Flow): string[] {
+  const tables = new Set<string>();
+  const collect = (steps: FlowStep[] | undefined): void => {
+    for (const step of steps ?? []) {
+      if (
+        step.action === 'expectDbRow' ||
+        step.action === 'expectDbDelta'
+      ) {
+        tables.add(step.table);
+      } else if (step.action === 'dbSnapshot' || step.action === 'expectDbUnchanged') {
+        for (const table of step.tables) tables.add(table);
+      }
+    }
+  };
+  collect(flow.setup);
+  collect(flow.steps);
+  collect(flow.teardown);
+  return [...tables];
+}
+
 function flowNode(file: string, id: string, flow: Flow, nameOverride?: string): ProjectNode {
   return {
     id,
@@ -134,6 +158,7 @@ function flowNode(file: string, id: string, flow: Flow, nameOverride?: string): 
       // mis-split, which is why both are only ever read back by our own
       // linking pass and never treated as authoritative.
       calls: requestedEndpoints(flow).join(','),
+      checks: checkedTables(flow).join(','),
     },
   };
 }

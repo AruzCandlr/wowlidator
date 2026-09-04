@@ -2,7 +2,7 @@
 
 Derived from the same code survey as `docs/sequence-testing-spec.md`. The request this answers: *given a database schema, test whether the database is called or modified as planned.* Those are two different questions with two different verdicts, and conflating them is how a tool ends up claiming things it never observed.
 
-> **Status: proposed.** Nothing in this document is implemented. There is no database driver anywhere in the dependency tree today (verified: `package.json` has 13 runtime deps, none DB-related; a repo-wide grep for `postgres|mysql|sqlite|prisma|knex|sequelize|typeorm` over `src/` returns zero hits).
+> **Status: implemented** (branch `backend-quest-for-the-grail`) — D1–D9 landed; D10 (OTel trace ingestion, the causal "called as planned" tier) is deferred and still open, as is the `db-seed` policy tier this spec already kept out of v1. There is still no database driver in the dependency tree: `pg` is a lazy optional import behind a local declaration file, exactly as specified. Two places the implementation sharpened the spec: at run time the schema is always live introspection through the client (a DDL/Prisma file feeds *planning and authoring* via the ingester; the runtime grounding gate never trusts a file over the database it is about to query), and an **injected** `DbClient` is not closed by the run — ownership follows the runner's own only-close-what-you-opened rule. Covered by `tests/db.test.ts` (stub tier always; real-Postgres tier gated on `WOWLIDATOR_DB_TESTS=1`) and `tests/schema-ingester.test.ts`.
 
 ## Verdict
 
@@ -150,3 +150,21 @@ DB findings file under category **`backend`** with detail naming the table — a
 5. **D10** — traces: "called as planned", causal tier; unlocks the sequence spec's remaining lanes in the same release.
 
 **Acceptance:** with `WOWLIDATOR_DB_URL` set and a schema indexed, a checkout flow that clicks through the UI, saves `{{orderId}}` from the API's response, and asserts `expectDbRow orders where id={{orderId}} values status=pending` goes green with the matched row (redacted) in the report and `users` proven count-unchanged; the same flow with the driver uninstalled reports **blocked** with the install command, exit 3, filing nothing against the application; and a deliberately broken backend that returns 201 without writing turns exactly one check red — the DB row — with the failure filed as `backend`, worded "while this flow ran", and the API's 201 still recorded as passing, because which side is broken is the question this whole tier exists to answer.
+
+---
+
+## Addendum: the database baseline (2026-09-02)
+
+A layer above the per-step DB checks, asked for directly: own the *fixture*, not
+just the assertion. `src/db/baseline.ts` detects the tables a run is about,
+snapshots them before the first case, records on every backend step what the run
+did to them (against that snapshot, not the previous step — `ProofStep.dbChanges`),
+and restores them after. Detection is deterministic (DB-step tables, grounded
+prose matches, one FK hop, operator override); the snapshot keeps real values in
+a local file and a server-side content hash; the restore is the only writer in
+`src/db/`, fenced behind a separate `WOWLIDATOR_DB_RESTORE_URL` write credential,
+a per-baseline table allowlist, statement logging, transactional child-first
+delete / parent-first insert, and hash verification through the read-only client
+(a mismatch is environment, never an app defect). `--db-baseline
+off|snapshot|restore|auto`; a resume reuses the original snapshot; `wowlidator db
+restore` puts a paused/killed run's tables back. See `src/api/CLAUDE.md`.
