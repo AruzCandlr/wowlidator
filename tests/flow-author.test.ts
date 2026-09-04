@@ -62,6 +62,9 @@ import {
   settleViolations,
   settleExclusivity,
   settleSelectorRole,
+  settleScriptDemand,
+  settleWorkflowGoal,
+  scriptDemand,
   GENERATED_STEP_MARKER,
   type AuthorRequest,
   type AuthorResult,
@@ -4070,5 +4073,114 @@ describe('the last word is a rewrite, not a refusal (multirole HIR-EC-001, 2026-
     // No tree lists "Migration": no role is evidence for a count.
     const bare = { steps: [{ action: 'expectVisible', selector: 'text="New Hire"' }] as FlowStep[], cases: undefined as undefined };
     assert.equal(settleExclusivity(bare, claim, text, 'option "New Hire"\noption "Replacement"'), null);
+  });
+});
+
+// ---------------------------------------------------------------- multirole ML_01_04 (2026-09-04)
+
+describe('a script step is performed, never read as a noun, and the last word performs it (multirole ML_01_04, 2026-09-04)', () => {
+  // multirole.csv ML_01_04, the Steps column verbatim, as `describeCase` renders it.
+  const caseText = [
+    'ML_01_04: ลาป่วย ขั้นต่ำ 30 นาที - Manager approve request',
+    'Test data:',
+    '  ลา = 31 นาที',
+    'Steps:',
+    '  1. Login web humi',
+    '  2. กดเมนู ME และตรวจสอบ',
+    '  3. กดเมนู Time & Attendance',
+    '  4. กดเมนู Leave request',
+    '  5. เลือก Leave type = Sick Leave',
+    '  6. เลือกวันที่ลา',
+    '  7. เลือกเป็น Hourly แล้วเลือกเวลาที่ต้องการ',
+    '  8. กดปุ่ม Submit',
+    '  9. Manager กดปุ่ม approve request leave',
+    'Expected output:',
+    '  5.1 ระบบแสดง Leave Type',
+    '  7.1 ระบบแสดงเลือก Hourly และแสดงเป็น 0h 31m',
+  ].join('\n');
+  const legs: FlowStep[] = [
+    { action: 'click', selector: 'role=tab[name="Me" i]', intent: 'Step 2: กดเมนู ME' },
+    { action: 'click', selector: 'role=link[name="Leave request" i]', intent: 'Step 4: กดเมนู Leave request' },
+    { action: 'workflow', goal: 'Step 5: On the Leave request form, choose Leave Type = Sick Leave, then Step 6: pick today as the leave date' },
+    { action: 'expectVisible', selector: 'text="Sick Leave"', intent: '5.1 ระบบแสดง Leave Type' },
+    { action: 'workflow', goal: 'Step 7: choose Hourly and a 31-minute window' },
+    { action: 'expectVisible', selector: 'text="0h 31m"', intent: '7.1 แสดงเป็น 0h 31m' },
+    { action: 'click', selector: 'role=button[name="Submit" i]', intent: 'Step 8: กดปุ่ม Submit' },
+    { action: 'signIn', as: 'MANAGER_ACCOUNT', intent: 'Step 9: Manager เข้าระบบ' },
+    { action: 'workflow', goal: 'Step 9: as the manager, approve the pending Sick Leave request' },
+    { action: 'expectVisible', selector: 'text="Approved"', intent: '9.4 Status Approved' },
+  ];
+
+  it('"type" as the head of a "Leave type = Sick Leave" pair is a field name, not the typing verb', () => {
+    assert.equal(scriptDemand(/\btype\b/i, '5. เลือก Leave type = Sick Leave'), null);
+    assert.equal(scriptDemand(/\btype\b/i, '5. type the reason\n6. Leave type = Sick'), 'type');
+    assert.equal(skipsAuthoredScript(caseText, [])?.tier, 'choosing', 'the sheet asks to CHOOSE, nothing to type');
+  });
+
+  it('a workflow leg performs the choosing (and typing) its script asks for; the ML_01_04 body passes', () => {
+    assert.equal(skipsAuthoredScript(caseText, legs), null);
+    const typed = caseText.replace('5. เลือก Leave type = Sick Leave', '5. กรอก เหตุผล = ป่วย');
+    assert.equal(skipsAuthoredScript(typed, [{ action: 'workflow', goal: 'Step 5: กรอก เหตุผล' }, { action: 'expectVisible', selector: 'text=x' }]), null);
+    assert.equal(skipsAuthoredScript(typed, [{ action: 'expectVisible', selector: 'text=x' }])?.tier, 'typing');
+  });
+
+  it('a declared word inside a longer capitalised name in the goal is not the control named', () => {
+    const repo = 'labels: "Type", "Leave", "Leave Type", "Make Correction"';
+    const goal = (g: string): FlowStep[] => [{ action: 'workflow', goal: g }];
+    assert.deepEqual(workflowOverDeclaredControls(goal('choose Leave Type = Sick Leave'), repo)?.declared, ['Leave Type']);
+    assert.equal(workflowOverDeclaredControls(goal('choose Sick Leave'), repo), null, '"Leave" in "Sick Leave" names Sick Leave');
+    assert.deepEqual(workflowOverDeclaredControls(goal('click Make Correction'), repo)?.declared, ['Make Correction']);
+    assert.deepEqual(workflowOverDeclaredControls(goal('click make correction, then type'), repo)?.declared, ['Type', 'Make Correction'], 'a lower-case goal keeps the plain match');
+  });
+
+  it('settleScriptDemand performs an uncited script line from the tree, and hands an ungroundable one to an agent leg in the sheet\'s words', () => {
+    const flow = {
+      steps: [
+        { action: 'click', selector: 'role=link[name="Leave request" i]', intent: 'Step 4: กดเมนู Leave request' },
+        { action: 'expectVisible', selector: 'text="Sick Leave"', intent: '5.1 ระบบแสดง Leave Type' },
+      ] as FlowStep[],
+      cases: [{ name: 'c', steps: [] as FlowStep[] }],
+    };
+    flow.cases[0]!.steps = flow.steps;
+    const tree = 'main\n  button "Leave Type"\n  button "Submit"';
+    const note = settleScriptDemand(flow, caseText, 'choosing', tree);
+    assert.match(note ?? '', /step 5 \(1 control\(s\) from the tree\) as deterministic steps/);
+    assert.match(note ?? '', /step 6, step 7 as agent leg\(s\) in the sheet's words/);
+    const chosen = flow.steps[1] as FlowStep & { selector: string; value: string; intent: string };
+    assert.equal(chosen.action, 'selectOption');
+    assert.equal(chosen.selector, 'role=button[name="Leave Type" i]');
+    assert.equal(chosen.value, 'Sick Leave');
+    assert.match(chosen.intent, /^Step 5: เลือก Leave type = Sick Leave \[generated: performs the script's "เลือก" on button "Leave Type"/);
+    const leg = flow.steps[2] as FlowStep & { goal: string };
+    assert.equal(leg.action, 'workflow');
+    assert.equal(leg.goal, 'Step 6: เลือกวันที่ลา');
+    assert.equal(flow.cases[0]!.steps.length, flow.steps.length, 'the case sees the same insertions');
+    assert.equal(skipsAuthoredScript(caseText, flow.steps), null);
+  });
+
+  it('settleWorkflowGoal splits the goal\'s "Field = value" pair out when the tree names the field, and annotates the leg', () => {
+    const leg: FlowStep = { action: 'workflow', goal: 'On the Leave request form, choose Leave Type = Sick Leave and pick today' };
+    const flow = { steps: [leg] as FlowStep[], cases: undefined as undefined };
+    assert.equal(settleWorkflowGoal(flow, leg, 'main\n  button "Submit"'), null, 'no tree line, no split');
+    const note = settleWorkflowGoal(flow, leg, 'main\n  button "Leave Type"');
+    assert.match(note ?? '', /button "Leave Type" = "Sick Leave" performed deterministically before the leg/);
+    assert.equal(flow.steps[0]!.action, 'selectOption');
+    assert.equal(flow.steps[1], leg);
+    assert.match((leg as { intent?: string }).intent ?? '', /\[generated: 1 control\(s\) the tree names were split out/);
+  });
+
+  it('the pipeline ships the ML_01_04 shape on attempt 1 of 1: the workflow legs perform the script, the weak declared-controls note settles into a split', async () => {
+    const log: string[] = [];
+    const author = new FlowAuthor({
+      model: stubModel({ name: 'ML_01_04 ลาป่วย 31 นาที (Hourly)', steps: legs.map((s) => ({ ...s })) }),
+      projectContext: 'labels: "Type", "Leave", "Leave Type"',
+      journeyTree: 'ANOTHER PAGE IN THIS JOURNEY — http://app.test/en/timeoff\n\nmain\n  tab "Me"\n  link "Leave request"\n  button "Leave Type"\n  button "Submit"\n  text "Sick Leave"\n  text "0h 31m"\n  text "Approved"',
+      attempts: 1,
+      onLog: (l) => log.push(l),
+    });
+    const authored = await author.author(caseText, undefined, { caseText });
+    assert.equal(authored.flow.steps.filter((s) => s.action === 'workflow').length, 3);
+    assert.match(authored.notes, /button "Leave Type" = "Sick Leave" performed deterministically before the leg/);
+    assert.ok(log.some((l) => /weak claim, accepted with a note/.test(l)), 'accepted on the first ask, nothing refused');
   });
 });

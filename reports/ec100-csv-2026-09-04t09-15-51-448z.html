@@ -1,0 +1,395 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><meta http-equiv="refresh" content="60"/><title>wowlidator catalog — EC100.csv</title><style>
+:root {
+  color-scheme: light dark;
+
+  /* surface — QA Command Center */
+  --bg: #F7F7F4;
+  --panel: #FFFFFF;
+  --panel-2: #FAFAF8;
+  --line: #E5E7E3;
+  --line-strong: #D3D6D0;
+
+  /* ink */
+  --ink: #1C2126;
+  --muted: #5C6873;
+  --faint: #98A2AC;
+
+  /* accent — teal is "active system telemetry" */
+  --accent: #0E8A9E;
+  --accent-soft: #E4F3F5;
+  --accent-line: #BCDFE6;
+  /*
+   * Three accents, because one is not enough to stay legible.
+   *
+   * --accent is for hairlines, icons and large type. It is NOT safe as a
+   * background behind white text: #0E8A9E/white is 4.08:1, under the 4.5 AA
+   * needs for body-sized text, and the cyan it becomes in dark mode is 2.43:1,
+   * which is unreadable. Measured in a browser, not estimated.
+   *
+   *   --accent-strong  a solid fill that can carry --on-accent
+   *   --on-accent      the only colour allowed on top of --accent-strong
+   *   --accent-ink     accent-coloured *text*, legible on --accent-soft
+   */
+  --accent-strong: #0A6B7A;
+  --on-accent: #FFFFFF;
+  --accent-ink: #0A6B7A;
+
+  /* semantics: green verified, amber review/gap, red no-go, blue running */
+  --ok: #1B7F4B;        --ok-bg: #E7F4EC;
+  --warn: #B45309;      --warn-bg: #FBF0E1;
+  --bad: #B91C1C;       --bad-bg: #FBE9E9;
+  --info: #2563EB;      --info-bg: #E8EEFC;
+  /* the one derived value: the QA palette has no violet, the orchestrator's is
+     tuned for a black canvas, so this is that hue brought down for paper */
+  --violet: #6D28D9;    --violet-bg: #F1EAF9;
+
+  /* type — IBM Plex when present, platform UI when not. No network. */
+  --sans: "IBM Plex Sans Thai", "IBM Plex Sans", -apple-system, BlinkMacSystemFont,
+          "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --fs-cap: 11px;
+  --fs-xs: 12.5px;
+  --fs-sm: 13.5px;
+  --fs-md: 14px;
+  --fs-lg: 17px;
+  --fs-xl: 23px;
+  --fs-mono: 11.5px;
+
+  /* space */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 20px; --s6: 24px; --s7: 32px;
+
+  /* radius — GRIM clips rather than rounds; nothing here is pill-shaped by default */
+  --r-xs: 4px; --r-sm: 8px; --r-lg: 14px; --r-pill: 999px;
+  --radius: 8px;
+
+  /* elevation — restrained; the border does most of the work */
+  --shadow: 0 1px 2px rgba(28,33,38,.03), 0 2px 6px -2px rgba(28,33,38,.04);
+  --shadow-over: 0 18px 44px -16px rgba(28,33,38,.28), 0 2px 8px -2px rgba(28,33,38,.08);
+  --code-bg: #F2F3F0;
+}
+
+@media (prefers-color-scheme: dark) {
+:root:not([data-theme="light"]) {
+  /* surface — Orchestrator 3 Stream */
+  --bg: #0a0a0a;
+  --panel: #1a1a1a;
+  --panel-2: #1e1e1e;
+  --line: #333333;
+  --line-strong: #404040;
+
+  /* ink */
+  --ink: #ffffff;
+  --muted: #b0b0b0;
+  --faint: #6b7280;
+
+  /* accent — cyan telemetry */
+  --accent: #06b6d4;
+  --accent-soft: #0c2b33;
+  --accent-line: #14505c;
+  /* Cyan is too light to sit under white text, so a solid cyan action takes
+     near-black instead — which is also how the orchestrator's telemetry reads. */
+  --accent-strong: #06b6d4;
+  --on-accent: #06232a;
+  --accent-ink: #22c9e4;
+
+  --ok: #10b981;        --ok-bg: #0c2a1f;
+  --warn: #f59e0b;      --warn-bg: #33260c;
+  --bad: #ef4444;       --bad-bg: #331616;
+  --info: #3b82f6;      --info-bg: #12203a;
+  --violet: #a855f7;    --violet-bg: #251435;
+
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  --shadow-over: 0 18px 44px -16px rgba(0,0,0,.7), 0 2px 8px -2px rgba(0,0,0,.5);
+  --code-bg: #16181c;
+}
+}
+:root[data-theme="dark"] {
+  /* surface — Orchestrator 3 Stream */
+  --bg: #0a0a0a;
+  --panel: #1a1a1a;
+  --panel-2: #1e1e1e;
+  --line: #333333;
+  --line-strong: #404040;
+
+  /* ink */
+  --ink: #ffffff;
+  --muted: #b0b0b0;
+  --faint: #6b7280;
+
+  /* accent — cyan telemetry */
+  --accent: #06b6d4;
+  --accent-soft: #0c2b33;
+  --accent-line: #14505c;
+  /* Cyan is too light to sit under white text, so a solid cyan action takes
+     near-black instead — which is also how the orchestrator's telemetry reads. */
+  --accent-strong: #06b6d4;
+  --on-accent: #06232a;
+  --accent-ink: #22c9e4;
+
+  --ok: #10b981;        --ok-bg: #0c2a1f;
+  --warn: #f59e0b;      --warn-bg: #33260c;
+  --bad: #ef4444;       --bad-bg: #331616;
+  --info: #3b82f6;      --info-bg: #12203a;
+  --violet: #a855f7;    --violet-bg: #251435;
+
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  --shadow-over: 0 18px 44px -16px rgba(0,0,0,.7), 0 2px 8px -2px rgba(0,0,0,.5);
+  --code-bg: #16181c;
+}
+
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: var(--fs-md);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+code, pre, .mono, .num, .time { font-family: var(--mono); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+/* Visible focus is not optional — the QA app's stated AA target, kept. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+
+/* panel: a tonal surface with a hairline border. The border does the work. */
+.g-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow);
+}
+
+/* micro-label: uppercase, tracked, for scanability. Never for prose. */
+.g-cap {
+  font-size: var(--fs-cap);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* chip: a status word with a dot. The dot is what makes a wall of them scan. */
+.g-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-cap);
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.g-chip::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+.g-chip.pass    { background: var(--ok-bg);     color: var(--ok); }
+.g-chip.fail    { background: var(--bad-bg);    color: var(--bad); }
+.g-chip.warn    { background: var(--warn-bg);   color: var(--warn); }
+.g-chip.info    { background: var(--info-bg);   color: var(--info); }
+.g-chip.active  { background: var(--accent-soft); color: var(--accent-ink); }
+.g-chip.idle    { background: var(--panel-2);   color: var(--faint); }
+
+/* a bare verdict word, for inside a dense table where a chip would be noise */
+.g-verdict { font-weight: 700; font-size: var(--fs-xs); letter-spacing: .04em; }
+.g-verdict::before {
+  content: "";
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  margin-right: 6px;
+  background: currentColor;
+}
+.g-verdict.pass { color: var(--ok); }
+.g-verdict.fail { color: var(--bad); }
+.g-verdict.warn { color: var(--warn); }
+.g-verdict.idle { color: var(--faint); }
+
+/* anything a reader might re-run belongs in mono, on its own tone */
+.g-cmd {
+  font-family: var(--mono);
+  font-size: var(--fs-mono);
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  padding: 1px 6px;
+  overflow-wrap: anywhere;
+}
+
+/* dense data table: hairlines, uppercase head, mono figures */
+.g-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.g-table th {
+  text-align: left;
+  font-size: var(--fs-cap);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--line-strong);
+  white-space: nowrap;
+}
+.g-table td {
+  padding: var(--s3);
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.g-table tr:last-child td { border-bottom: 0; }
+.g-table td.num { font-family: var(--mono); font-size: var(--fs-mono); color: var(--muted); white-space: nowrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style><style>
+body { max-width: 1200px; margin: 0 auto; padding: 24px; font: 14px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.meta { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+.tally { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0 22px; font-size: 13px; }
+.scenario { margin: 22px 0 8px; }
+.scenario > .shead { font-weight: 600; font-size: 15px; padding: 6px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; }
+.scenario > .shead .scount { color: var(--muted); font-weight: 400; font-size: 12px; }
+.chip { font-size: 11px; border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+.chip.pass { background: color-mix(in srgb, var(--pass, #2e7d32) 15%, transparent); color: var(--pass, #2e7d32); }
+.chip.fail { background: color-mix(in srgb, #c0392b 14%, transparent); color: #c0392b; }
+.chip.error { background: color-mix(in srgb, #b8860b 16%, transparent); color: #b8860b; }
+.chip.review { background: color-mix(in srgb, #6a5acd 14%, transparent); color: #6a5acd; }
+/* Recorded only: its own colour — not the violet of a wording near-miss, and
+   never green. The case claimed nothing; a person reads its captures. */
+.chip.record { background: color-mix(in srgb, #1f7a8c 14%, transparent); color: #1f7a8c; border: 1px dashed #1f7a8c; }
+.chip.never { background: color-mix(in srgb, var(--muted) 18%, transparent); color: var(--muted); }
+.sid { font-size: 11px; color: var(--muted); margin-left: 8px; font-family: ui-monospace, monospace; }
+.ctag { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; margin-left: 8px; }
+.captures { background: color-mix(in srgb, #1f7a8c 8%, transparent); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+.captures .kv code { color: #1f7a8c; }
+.observed em, .turns em { color: var(--muted); font-style: normal; font-size: 11px; }
+details.case { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; background: var(--panel, transparent); }
+details.case > summary { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; list-style: none; }
+details.case > summary .cname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+details.case > summary .cms { color: var(--muted); font-variant-numeric: tabular-nums; }
+.btn { font: inherit; font-size: 12px; border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 7px; padding: 3px 10px; cursor: pointer; text-decoration: none; }
+.btn[disabled] { opacity: .45; cursor: not-allowed; }
+.meta.live { color: var(--warn, #b8860b); }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 18px; padding: 4px 14px 16px; }
+@media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+.cap { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 10px 0 6px; }
+details.step { border-left: 3px solid var(--line); margin: 4px 0; }
+details.step.no { border-left-color: #c0392b; }
+details.step.ok .dot { background: var(--pass, #2e7d32); }
+details.step.no .dot { background: #c0392b; }
+details.step > summary { display: flex; gap: 8px; align-items: baseline; padding: 4px 8px; cursor: pointer; list-style: none; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
+.sname { font-weight: 600; white-space: nowrap; }
+.ssub { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
+.sms { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+.sbody { padding: 6px 10px 10px 22px; }
+.kv { display: flex; gap: 10px; font-size: 12px; margin: 3px 0; }
+.kv > span:first-child { color: var(--muted); flex: none; width: 82px; }
+.kv code { word-break: break-all; white-space: pre-wrap; }
+.kv.err code { color: #c0392b; }
+.kv.heal code { color: #b8860b; }
+.muted { color: var(--muted); }
+.shot img { max-width: 100%; border: 1px solid var(--line); border-radius: 6px; margin-top: 6px; }
+.history { background: color-mix(in srgb, var(--muted) 7%, transparent); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+.hline { font-size: 12px; margin: 3px 0; }
+.turns { font-size: 12px; margin: 4px 0 0 14px; padding: 0; }
+.turns li.no { color: #c0392b; }
+.time-pane { border-left: 1px solid var(--line); padding-left: 16px; }
+.trow { display: grid; grid-template-columns: 110px 1fr 52px; gap: 8px; align-items: center; margin: 3px 0; font-size: 11px; }
+.tname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+.tbar { height: 8px; border-radius: 4px; background: var(--pass, #2e7d32); opacity: .75; min-width: 2px; }
+.tbar.slow { background: #b8860b; }
+.tbar.broke { background: #c0392b; }
+.tms { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+.tms.slow { color: #b8860b; }
+.tfoot { font-size: 11px; color: var(--muted); margin-top: 10px; }
+body.single .split { grid-template-columns: minmax(0, 1fr) 340px; }
+.rec { margin: 0 0 14px; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.rec figcaption { display: flex; gap: 10px; align-items: baseline; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted); margin-bottom: 8px; }
+.rec figcaption .hint { text-transform: none; letter-spacing: 0; margin-left: auto; }
+.rec video { display: block; width: 100%; height: auto; max-height: 60vh; border-radius: 4px; background: #000; }
+.seek { font: inherit; font-size: 11px; cursor: pointer; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--line); background: transparent; color: var(--muted); white-space: nowrap; margin-left: 8px; }
+.seek:hover { border-color: var(--fg); color: var(--fg); }
+</style></head><body><h1>wowlidator catalog — EC100.csv</h1><div class="meta">ec100-csv@2026-09-04T09:15:51.448Z · 52 case(s) <button class="btn" onclick="exportCatalog()">Export catalog</button> <a class="btn" download href="ec100-csv-2026-09-04t09-15-51-448z-passed.xlsx" title="Written beside this report: passed cases only, one step per row, photos embedded, video linked under every step">Passed cases (Excel)</a></div><div class="meta live">▶ in progress — 0 of 52 case(s) finished · this page refreshes itself every 60s</div><div class="tally"><span>never ran: <b>52</b></span></div><section class="scenario"><div class="shead">ungrouped<span class="scount">0 of 51 passed · 51 never ran</span></div><details class="case" id="case-hir-ec-023" data-name="HIR-EC-023"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-023</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-026" data-name="HIR-EC-026"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-026</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-035" data-name="HIR-EC-035"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-035</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-070" data-name="HIR-EC-070"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-070</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-071-r1" data-name="HIR-EC-071#r1"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-071#r1</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-071-r2" data-name="HIR-EC-071#r2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-071#r2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-075" data-name="HIR-EC-075"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-075</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-076" data-name="HIR-EC-076"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-076</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-077" data-name="HIR-EC-077"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-077</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-080-r1" data-name="HIR-EC-080#r1"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-080#r1</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-080-r2" data-name="HIR-EC-080#r2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-080#r2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-081" data-name="HIR-EC-081"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-081</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-082" data-name="HIR-EC-082"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-082</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-084" data-name="HIR-EC-084"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-084</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-099" data-name="HIR-EC-099"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-099</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-106-r1" data-name="HIR-EC-106#r1"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-106#r1</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-106-r2" data-name="HIR-EC-106#r2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-106#r2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-111" data-name="HIR-EC-111"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-111</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-112" data-name="HIR-EC-112"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-112</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-131" data-name="HIR-EC-131"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-131</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-132" data-name="HIR-EC-132"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-132</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-133" data-name="HIR-EC-133"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-133</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-134" data-name="HIR-EC-134"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-134</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-135" data-name="HIR-EC-135"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-135</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-136" data-name="HIR-EC-136"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-136</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-137" data-name="HIR-EC-137"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-137</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-138" data-name="HIR-EC-138"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-138</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-139" data-name="HIR-EC-139"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-139</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-023-2" data-name="HIR-EC-023#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-023#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-026-2" data-name="HIR-EC-026#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-026#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-035-2" data-name="HIR-EC-035#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-035#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-070-2" data-name="HIR-EC-070#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-070#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-071-2-r1" data-name="HIR-EC-071#2#r1"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-071#2#r1</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-071-2-r2" data-name="HIR-EC-071#2#r2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-071#2#r2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-075-2" data-name="HIR-EC-075#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-075#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-076-2" data-name="HIR-EC-076#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-076#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-077-2" data-name="HIR-EC-077#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-077#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-080-2-r1" data-name="HIR-EC-080#2#r1"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-080#2#r1</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-080-2-r2" data-name="HIR-EC-080#2#r2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-080#2#r2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-081-2" data-name="HIR-EC-081#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-081#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-082-2" data-name="HIR-EC-082#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-082#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-084-2" data-name="HIR-EC-084#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-084#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-099-2" data-name="HIR-EC-099#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-099#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-100-2" data-name="HIR-EC-100#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-100#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-106-2-r1" data-name="HIR-EC-106#2#r1"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-106#2#r1</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-106-2-r2" data-name="HIR-EC-106#2#r2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-106#2#r2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-111-2" data-name="HIR-EC-111#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-111#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-112-2" data-name="HIR-EC-112#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-112#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-131-2" data-name="HIR-EC-131#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-131#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-132-2" data-name="HIR-EC-132#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-132#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details><details class="case" id="case-hir-ec-133-2" data-name="HIR-EC-133#2"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-133#2</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details></section><section class="scenario"><div class="shead">E2E-101<span class="scount">0 of 1 passed · 1 never ran</span></div><details class="case" id="case-hir-ec-100" data-name="HIR-EC-100"><summary><span class="chip never">never ran</span><span class="cname">HIR-EC-100</span><button class="btn export-case" type="button" disabled title="Only a proved case exports — this one never ran, so there is no proof to hand over">Export (Excel)</button></summary><div class="split"><div class="steps-pane"><div class="muted">No steps were recorded.</div></div><div class="time-pane"><div class="muted">no timing — the case never ran</div></div></div></details></section><script>var WOW_PLAYER = "\nfunction wowHydrateVideo(v) {\n  if (!v || v.dataset.wowReady) return;\n  var b64 = v.getAttribute('data-webm') || '';\n  if (!b64) return;\n  v.dataset.wowReady = '1';\n  var bin = atob(b64);\n  var bytes = new Uint8Array(bin.length);\n  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);\n  v.src = URL.createObjectURL(new Blob([bytes], { type: 'video/webm' }));\n  /* data-webm deliberately STAYS. A hydrated player's src is a Blob URL, which\n     means nothing in another document — and every export here is another\n     document. Leaving the bytes on the attribute is what makes an exported\n     case playable whether or not it had been opened first. */\n  /* On a case that broke, the player opens ON the failure: the recording is\n     kept because a step failed, and that is the frame worth showing first. */\n  var at = parseFloat(v.getAttribute('data-failure-offset') || '');\n  if (!isNaN(at)) {\n    v.addEventListener('loadedmetadata', function () {\n      if (at < (v.duration || Infinity)) v.currentTime = at;\n    });\n  }\n}\n/* Decoded when the case is opened, never at load: a catalog holds dozens of\n   recordings and building every Blob on first paint would stall the page to\n   make players nobody opened. */\nfunction wowWireCase(node) {\n  node.addEventListener('toggle', function () {\n    if (node.open) node.querySelectorAll('video[data-webm]').forEach(wowHydrateVideo);\n  });\n}\ndocument.addEventListener('click', function (e) {\n  var b = e.target.closest && e.target.closest('.seek');\n  if (!b) return;\n  e.preventDefault();\n  var scope = b.closest('.case') || document;\n  var v = scope.querySelector('video');\n  if (!v) return;\n  wowHydrateVideo(v);\n  v.currentTime = parseFloat(b.getAttribute('data-seek') || '0') || 0;\n  v.play();\n  v.scrollIntoView({ block: 'nearest' });\n});\ndocument.querySelectorAll('details.case').forEach(wowWireCase);\n/* An exported single case is already open, so its toggle never fires. */\ndocument.querySelectorAll('body.single video[data-webm]').forEach(wowHydrateVideo);\n";</script><script>
+function download(name, html) {
+  var blob = new Blob([html], { type: 'text/html' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+}
+/* A Blob URL is scoped to THIS document, so it must never be written into an
+   exported one; the base64 on data-webm is what travels. */
+function wowStripBlobs(root) {
+  root.querySelectorAll('video').forEach(function (v) {
+    v.removeAttribute('src');
+    delete v.dataset.wowReady;
+  });
+}
+function exportCatalog() {
+  var doc = document.documentElement.cloneNode(true);
+  wowStripBlobs(doc);
+  download((document.title || 'catalog-report') + '.html', '<!doctype html>' + doc.outerHTML);
+}
+</script><script>
+function wowHydrateVideo(v) {
+  if (!v || v.dataset.wowReady) return;
+  var b64 = v.getAttribute('data-webm') || '';
+  if (!b64) return;
+  v.dataset.wowReady = '1';
+  var bin = atob(b64);
+  var bytes = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  v.src = URL.createObjectURL(new Blob([bytes], { type: 'video/webm' }));
+  /* data-webm deliberately STAYS. A hydrated player's src is a Blob URL, which
+     means nothing in another document — and every export here is another
+     document. Leaving the bytes on the attribute is what makes an exported
+     case playable whether or not it had been opened first. */
+  /* On a case that broke, the player opens ON the failure: the recording is
+     kept because a step failed, and that is the frame worth showing first. */
+  var at = parseFloat(v.getAttribute('data-failure-offset') || '');
+  if (!isNaN(at)) {
+    v.addEventListener('loadedmetadata', function () {
+      if (at < (v.duration || Infinity)) v.currentTime = at;
+    });
+  }
+}
+/* Decoded when the case is opened, never at load: a catalog holds dozens of
+   recordings and building every Blob on first paint would stall the page to
+   make players nobody opened. */
+function wowWireCase(node) {
+  node.addEventListener('toggle', function () {
+    if (node.open) node.querySelectorAll('video[data-webm]').forEach(wowHydrateVideo);
+  });
+}
+document.addEventListener('click', function (e) {
+  var b = e.target.closest && e.target.closest('.seek');
+  if (!b) return;
+  e.preventDefault();
+  var scope = b.closest('.case') || document;
+  var v = scope.querySelector('video');
+  if (!v) return;
+  wowHydrateVideo(v);
+  v.currentTime = parseFloat(b.getAttribute('data-seek') || '0') || 0;
+  v.play();
+  v.scrollIntoView({ block: 'nearest' });
+});
+document.querySelectorAll('details.case').forEach(wowWireCase);
+/* An exported single case is already open, so its toggle never fires. */
+document.querySelectorAll('body.single video[data-webm]').forEach(wowHydrateVideo);
+</script></body></html>

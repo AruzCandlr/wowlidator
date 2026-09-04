@@ -134,6 +134,22 @@ const AUTHOR_ATTEMPTS_FIELD: Field = {
   advanced: true,
 };
 
+/**
+ * `--sheet-order`: keep the suite's own case order. It disables two
+ * reorderings the CLI does by default — readers before writers, and the
+ * fastest scenario first. The launcher's "Run sequentially" radio sends it
+ * together with `concurrency: 1`, which is what "one after another, in the
+ * order the sheet lists them" actually means to the CLI; on its own it is an
+ * advanced switch like the rest.
+ */
+const SHEET_ORDER_FIELD: Field = {
+  name: 'sheet-order',
+  label: 'Keep the sheet’s order',
+  type: 'boolean',
+  help: 'Run cases in the order the document lists them. Off, readers run before writers and the fastest scenario is queued first so verdicts arrive soonest.',
+  advanced: true,
+};
+
 const CONCURRENCY_FIELD: Field = {
   name: 'concurrency',
   label: 'Cases at a time',
@@ -944,6 +960,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       AUTHOR_CONCURRENCY_FIELD,
       AUTHOR_ATTEMPTS_FIELD,
       CONCURRENCY_FIELD,
+      SHEET_ORDER_FIELD,
       AUTOHEAL_FIELD,
       {
         name: 'flow',

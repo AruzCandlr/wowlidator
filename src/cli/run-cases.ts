@@ -42,6 +42,7 @@ import {
   governorMode,
   validateGovernorRead,
   validateGovernorWrite,
+  type GovernorCaseFact,
   type GovernorObservation,
 } from '../orchestrator/queue-governor.js';
 import { raiseSessionCapFor } from '../providers/claude-cli-session.js';
@@ -106,10 +107,13 @@ import {
   PIPELINED_CONCURRENCY_AFTER_AUTHORING,
   PIPELINED_CONCURRENCY_WHILE_AUTHORING,
   caseWrites,
+  dependencyStanding,
+  dependsBackOn,
   orderDependentsAfterSources,
   readersFirst,
   runQueue,
   withWorkflowScripts,
+  type DependencyStanding,
 } from './case-plan.js';
 import {
   hasGroundTruth,
@@ -715,53 +719,46 @@ export async function runCases(
     [...heldCases].some((id) => name === id || name.startsWith(`${id} `) || name.startsWith(id));
 
   /**
-   * Where a case's sources stand (CG-12). `ready` — every source passed;
-   * `wait` — a source is queued ahead of it and not finished yet (the
-   * dispatch is held; the loop re-asks as lanes finish); `blocked` — a source
-   * failed, was blocked, awaits review, is not in this run, or is queued
-   * BEHIND the dependent (which the loop's index order could never reach
-   * first — the producer and `orderDependentsAfterSources` rule it out, and
-   * this is the honest answer if one slips through rather than a deadlock).
-   * A resume reads the earlier pass's verdicts for sources it did not re-run.
+   * Where a case's sources stand (CG-12) — `dependencyStanding` in
+   * `case-plan.ts` owns the answer; this only supplies the lookups. The gate
+   * lives in the deterministic scheduler, never the governor: a dependent's
+   * verdict is correctness, and the governor is an optimiser that may be
+   * absent, off, or out of budget without changing any verdict.
    */
-  const dependencyStatus = (
-    testCase: SuiteCase,
-    index: number,
-  ): { kind: 'ready' } | { kind: 'wait'; on: string } | { kind: 'blocked'; reason: string } => {
-    for (const id of testCase.dependsOn ?? []) {
-      if (id === caseIdOf(testCase.name)) continue;
-      const at = queue.items.findIndex((c) => caseIdOf(c.name) === id);
-      const done = at >= 0 ? collected[at] : undefined;
-      const prior = inherited?.[id];
-      const verdict = done?.verdict ?? (at === -1 ? prior?.verdict : undefined);
-      if (verdict === 'passed') continue;
-      if (verdict === undefined) {
-        if (at >= 0 && at < index) return { kind: 'wait', on: id };
-        if (at >= 0) return { kind: 'blocked', reason: `depends on ${id}, which is queued after it — order the sheet so ${id} comes first` };
-        if (!queue.closed && (where.ledger?.planned ?? []).includes(id)) return { kind: 'wait', on: id };
-        return { kind: 'blocked', reason: `depends on ${id}, which is not in this run` };
-      }
-      const why = verdict === 'review' ? 'awaits review' : verdict === 'blocked' ? 'never ran' : 'did not pass';
-      return { kind: 'blocked', reason: `depends on ${id} which ${why}${done?.reason ?? prior?.reason ? ` (${(done?.reason ?? prior?.reason ?? '').split('\n')[0]})` : ''}` };
-    }
-    return { kind: 'ready' };
-  };
+  const dependencyStatus = (testCase: SuiteCase, index: number): DependencyStanding =>
+    dependencyStanding(caseIdOf(testCase.name), testCase.dependsOn ?? [], index, {
+      indexOf: (id) => queue.items.findIndex((c) => caseIdOf(c.name) === id),
+      outcomeAt: (at) => collected[at],
+      inherited: (id) => inherited?.[id],
+      queueOpen: !queue.closed,
+      planned: where.ledger?.planned ?? [],
+      dependsBack: (id) => dependsBackOn(queue.items, (c) => caseIdOf(c.name), (c) => c.dependsOn ?? [], id, caseIdOf(testCase.name)),
+    });
   const dependencyWaitLogged = new Set<number>();
 
   const canRunWith = (
     testCase: SuiteCase,
     index: number,
     inflight: readonly { item: SuiteCase; index: number }[],
-  ): boolean => {
+  ): boolean | 'defer' => {
     // A dependent waits for its source's verdict before anything else is
-    // asked; the source is queued ahead, so it is in flight or done.
+    // asked; the source is queued ahead, so it is in flight or done. The
+    // answer is `'defer'`, not `false`: the loop parks the dependent and
+    // goes on dispatching the cases behind it (2026-09-04 — `false` held the
+    // head of the queue, and a ten-lane pool drained to the one lane running
+    // the prerequisite). The wait still counts toward the governor's
+    // queue-blocked event, so a long one is explained, not mistaken for a
+    // scheduler fault — see `waitingOn` on the observation.
     const dependency = dependencyStatus(testCase, index);
     if (dependency.kind === 'wait') {
       if (!dependencyWaitLogged.has(index)) {
         dependencyWaitLogged.add(index);
         process.stdout.write(`  [c${index + 1}]      waits for ${dependency.on} — ${testCase.name} continues from it\n`);
       }
-      return false;
+      const polls = (blockedPolls.get(index) ?? 0) + 1;
+      blockedPolls.set(index, polls);
+      if (polls === 25 && governorRef !== null) void governorRef.onEvent(observe('queue-blocked'));
+      return 'defer';
     }
     const held = heldBlocks(testCase.name);
     // Under data locks the only thing that can refuse a dispatch is an
@@ -858,10 +855,17 @@ export async function runCases(
   const observe = (event: GovernorObservation['event']): GovernorObservation => {
     const now = Date.now();
     const pending: string[] = [];
+    /** The prerequisite a pending case is parked on, if any — the observation's, not a guess. */
+    const waitingOn = (c: SuiteCase, i: number): string | undefined => {
+      if (c.dependsOn === undefined || c.dependsOn.length === 0) return undefined;
+      const standing = dependencyStatus(c, i);
+      return standing.kind === 'wait' ? standing.on : undefined;
+    };
     queue.items.forEach((c, i) => {
       if (collected[i] !== undefined || inFlightMeta.has(i)) return;
       const m = metaOf(c, i);
-      pending.push(`${c.name.slice(0, 60)} [${m.writes ? 'writer' : 'reader'}${m.deletes ? ' deletes' : ''} ${m.sections.join(' ') || 'no-sections'}]${heldBlocks(c.name) ? ' HELD' : ''}`);
+      const on = waitingOn(c, i);
+      pending.push(`${c.name.slice(0, 60)} [${m.writes ? 'writer' : 'reader'}${m.deletes ? ' deletes' : ''} ${m.sections.join(' ') || 'no-sections'}]${heldBlocks(c.name) ? ' HELD' : ''}${on === undefined ? '' : ` waits-for:${on}`}`);
     });
     const lanes = [...inFlightMeta.values()].map(
       (l) => `${l.name.slice(0, 60)} [${l.meta.writes ? 'writer' : 'reader'} ${l.meta.sections.join(' ') || 'no-sections'}] ${Math.round((now - l.startedMs) / 1000)}s`,
@@ -869,16 +873,17 @@ export async function runCases(
     const done = collected.filter((c) => c !== undefined);
     const tally = `passed ${done.filter((c) => c!.verdict === 'passed').length} · failed ${done.filter((c) => c!.verdict === 'failed').length} · blocked ${done.filter((c) => c!.verdict === 'blocked').length} · left ${queue.items.length - done.length}`;
     const interfered = [...windows.values()].filter((w) => w.name.includes('interference')).length;
-    const fact = (name: string, meta: CaseScheduleMeta): { name: string; writes: boolean; sections: readonly string[] } => ({
+    const fact = (name: string, meta: CaseScheduleMeta, on?: string): GovernorCaseFact => ({
       name,
       writes: meta.writes,
       sections: meta.sections,
+      ...(on === undefined ? {} : { waitingOn: on }),
     });
     const pendingFacts = queue.items
       .map((c, i) => ({ c, i }))
       .filter(({ i }) => collected[i] === undefined && !inFlightMeta.has(i))
       .slice(0, 30)
-      .map(({ c, i }) => fact(c.name, metaOf(c, i)));
+      .map(({ c, i }) => fact(c.name, metaOf(c, i), waitingOn(c, i)));
     const flyingFacts = [...inFlightMeta.values()].map((l) => fact(l.name, l.meta));
     return {
       event,

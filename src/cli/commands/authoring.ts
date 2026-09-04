@@ -136,7 +136,7 @@ import {
   writeLedger,
 } from '../suite-progress.js';
 import { substantiveAssertions, vacuousFlow } from '../../generator/vacuous.js';
-import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, mapPool, orderDependentsAfterSources, orderScenariosFastestFirst } from '../case-plan.js';
+import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, dependencyCycles, mapPool, orderDependentsAfterSources, orderScenariosFastestFirst, unresolvedReferences } from '../case-plan.js';
 import { healHintsFrom } from '../../context/heal-hints.js';
 import { lookupPersona, personaEmails, personaLabelOf, type CliOptions } from '../options.js';
 import { pauseRequested } from '../pause.js';
@@ -3128,6 +3128,25 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   // row that continues from it is written against the page, and the run loop
   // only ever waits on a source queued AHEAD of the dependent.
   rows = orderDependentsAfterSources(rows, (row) => row.caseId, (row) => row.dependsOn ?? []);
+  // **What the plan cannot resolve, said once** (CG-12, 2026-09-04). A cycle
+  // is named as one, here, before either side is blocked on the other at run
+  // time; a case the rows need and this catalog does not hold is listed once
+  // with the rows that need it — the per-row refusal below (`sheetGate`)
+  // stays the row's own record, this is the plan's. Only a reference no
+  // context document names is unresolved: a document that records what the
+  // earlier cycle created stands in for the case (the `registry`).
+  for (const cycle of dependencyCycles(rows, (row) => row.caseId, (row) => row.dependsOn ?? [])) {
+    log?.(`dependency cycle: ${cycle.join(' → ')} → ${cycle[0]} — neither can run first; break the cycle in the sheet`);
+  }
+  const unresolved = unresolvedReferences(rows, contextDocs.map((doc) => doc.text));
+  if (unresolved.length > 0) {
+    log?.(
+      `${unresolved.length} case(s) the rows continue from are not in this catalog — ` +
+        `${unresolved.reduce((n, ref) => n + ref.rows.length, 0)} row(s) will be skipped, not run ` +
+        '(pass a --context-doc that records what each created, or add its sheet to the catalog):',
+    );
+    for (const ref of unresolved) log?.(`  ${ref.id} ← ${ref.rows.join(', ')}`);
+  }
 
   // Announced once, at initialisation: this is the name under which the run —
   // and any later resume of it — appears in the record's run list.

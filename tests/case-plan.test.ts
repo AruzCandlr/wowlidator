@@ -11,7 +11,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { CaseQueue, DEFAULT_AUTHOR_CONCURRENCY, ScenarioGate, authorWorkers, caseWrites, mapPool, orderScenariosFastestFirst, planCases, readersFirst, runQueue, runWithConcurrency, withWorkflowScripts } from '../src/cli/case-plan.js';
+import { CaseQueue, DEFAULT_AUTHOR_CONCURRENCY, ScenarioGate, authorWorkers, caseWrites, dependencyCycles, dependencyStanding, dependsBackOn, mapPool, orderScenariosFastestFirst, planCases, readersFirst, runQueue, runWithConcurrency, unresolvedReferences, withWorkflowScripts, type DependencyLookup, type DependencyOutcome } from '../src/cli/case-plan.js';
 import { signsInItself, type Flow } from '../src/engine/runner.js';
 
 const flow = (steps: Flow['steps'], setup?: Flow['setup']): Flow =>
@@ -717,5 +717,236 @@ describe('orderScenariosFastestFirst', () => {
     const { rows: ordered, order } = orderScenariosFastestFirst(rows);
     assert.equal(ordered.length, 3);
     assert.deepEqual(order.map((o) => o.scenario), ['B', 'A', 'ungrouped']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dependencies in the queue (CG-12, 2026-09-04). Built from the EC catalog
+// run of 2026-09-04: a dependent is decided only after its prerequisite
+// ENDED, quoting that outcome; while the prerequisite is in flight the
+// dependent is parked — not the head of the queue blocking every case behind
+// it; a cycle and a case the catalog does not hold are said once, at plan
+// time. All pure or promise bookkeeping — $0.
+// ---------------------------------------------------------------------------
+
+describe('runQueue parks a deferred item instead of blocking the queue behind it', () => {
+  const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 5));
+  type Item = { id: string; needs?: string };
+  const gated = (): {
+    started: string[];
+    ended: Set<string>;
+    release: (id: string) => Promise<void>;
+    run: (item: Item) => Promise<void>;
+    canRunWith: (item: Item) => boolean | 'defer';
+  } => {
+    const started: string[] = [];
+    const ended = new Set<string>();
+    const gates = new Map<string, () => void>();
+    return {
+      started,
+      ended,
+      release: async (id) => {
+        gates.get(id)!();
+        await tick();
+      },
+      run: async (item) => {
+        started.push(item.id);
+        await new Promise<void>((r) => gates.set(item.id, r));
+        ended.add(item.id);
+      },
+      // The dependency gate's shape: wait (defer) while the prerequisite has
+      // not ended; dispatch once it has (the run then reads its verdict).
+      canRunWith: (item) => (item.needs !== undefined && !ended.has(item.needs) ? 'defer' : true),
+    };
+  };
+
+  it('a dependent waits while its prerequisite is in flight, and the cases behind it still dispatch', async () => {
+    const queue = new CaseQueue<Item>();
+    [{ id: 'src' }, { id: 'dep', needs: 'src' }, { id: 'c' }, { id: 'd' }].forEach((x) => queue.push(x));
+    queue.close();
+    const g = gated();
+    const done = runQueue(queue, 4, () => false, g.run, undefined, g.canRunWith);
+    await tick();
+    assert.deepEqual(g.started, ['src', 'c', 'd'], 'the dependent is parked; nothing behind it waited');
+    await g.release('src');
+    assert.deepEqual(g.started, ['src', 'c', 'd', 'dep'], 'the dependent runs once its prerequisite ended');
+    await g.release('c');
+    await g.release('d');
+    await g.release('dep');
+    await done;
+  });
+
+  it('a parked item is re-offered when a lane ends while the queue waits for its next arrival', async () => {
+    // The pipelined catalog: the loop is inside take() for as long as the
+    // next row authors. The prerequisite ending in that gap must release
+    // the dependent then, not when the next row arrives.
+    const queue = new CaseQueue<Item>();
+    queue.push({ id: 'src' });
+    queue.push({ id: 'dep', needs: 'src' });
+    const g = gated();
+    const done = runQueue(queue, 4, () => false, g.run, undefined, g.canRunWith);
+    await tick();
+    assert.deepEqual(g.started, ['src']);
+    await g.release('src');
+    assert.deepEqual(g.started, ['src', 'dep'], 'released by the lane ending, with the queue still open');
+    queue.push({ id: 'late' });
+    await tick();
+    assert.deepEqual(g.started, ['src', 'dep', 'late']);
+    await g.release('dep');
+    await g.release('late');
+    queue.close();
+    await done;
+  });
+
+  it('a chain of dependents drains in order after the queue closes', async () => {
+    const queue = new CaseQueue<Item>();
+    [{ id: 'a' }, { id: 'b', needs: 'a' }, { id: 'c', needs: 'b' }].forEach((x) => queue.push(x));
+    queue.close();
+    const g = gated();
+    const done = runQueue(queue, 4, () => false, g.run, undefined, g.canRunWith);
+    await tick();
+    assert.deepEqual(g.started, ['a']);
+    await g.release('a');
+    assert.deepEqual(g.started, ['a', 'b']);
+    await g.release('b');
+    assert.deepEqual(g.started, ['a', 'b', 'c']);
+    await g.release('c');
+    await done;
+  });
+
+  it('an exclusive dependent is parked too, then runs alone after its prerequisite', async () => {
+    const queue = new CaseQueue<Item>();
+    [{ id: 'src' }, { id: 'w', needs: 'src' }, { id: 'r' }].forEach((x) => queue.push(x));
+    queue.close();
+    const g = gated();
+    let inFlight = 0;
+    const peaks: Record<string, number> = {};
+    const run = async (item: Item): Promise<void> => {
+      inFlight += 1;
+      peaks[item.id] = inFlight;
+      await g.run(item);
+      inFlight -= 1;
+    };
+    const done = runQueue(queue, 4, (i) => i.id === 'w', run, undefined, g.canRunWith);
+    await tick();
+    assert.deepEqual(g.started, ['src', 'r'], 'the exclusive dependent did not drain the pool to wait');
+    await g.release('src');
+    await g.release('r');
+    assert.deepEqual(g.started, ['src', 'r', 'w']);
+    assert.equal(peaks['w'], 1, 'and ran with nothing beside it');
+    await g.release('w');
+    await done;
+  });
+
+  it('a pause leaves a parked item un-run, so a resume picks it up', async () => {
+    const queue = new CaseQueue<Item>();
+    [{ id: 'src' }, { id: 'dep', needs: 'src' }].forEach((x) => queue.push(x));
+    queue.close();
+    const g = gated();
+    let paused = false;
+    const done = runQueue(queue, 4, () => false, g.run, () => paused, g.canRunWith);
+    await tick();
+    paused = true;
+    await g.release('src');
+    await done;
+    assert.deepEqual(g.started, ['src'], 'the dependent earned no outcome');
+  });
+
+  it('a suite that never answers defer takes the old path exactly', async () => {
+    const queue = new CaseQueue<string>();
+    ['a', 'b', 'c'].forEach((x) => queue.push(x));
+    queue.close();
+    const seen: [string, number][] = [];
+    await runQueue(queue, 2, () => false, async (item, i) => { seen.push([item, i]); }, undefined, () => true);
+    assert.deepEqual(seen, [['a', 0], ['b', 1], ['c', 2]]);
+  });
+});
+
+describe('dependencyStanding — the gate that decides a dependent, from lookups alone', () => {
+  const lookup = (
+    queue: readonly string[],
+    outcomes: Record<string, DependencyOutcome> = {},
+    extra: Partial<DependencyLookup> = {},
+  ): DependencyLookup => ({
+    indexOf: (id) => queue.indexOf(id),
+    outcomeAt: (at) => outcomes[queue[at]!],
+    inherited: () => undefined,
+    queueOpen: false,
+    planned: [],
+    dependsBack: () => false,
+    ...extra,
+  });
+
+  it('waits while the prerequisite queued ahead has not ended', () => {
+    assert.deepEqual(dependencyStanding('B', ['A'], 1, lookup(['A', 'B'])), { kind: 'wait', on: 'A' });
+  });
+
+  it('is ready once every prerequisite passed', () => {
+    assert.deepEqual(dependencyStanding('C', ['A', 'B'], 2, lookup(['A', 'B', 'C'], { A: { verdict: 'passed' }, B: { verdict: 'passed', reason: '' } })), { kind: 'ready' });
+  });
+
+  it('is decided after a failed prerequisite, quoting the first line of its outcome', () => {
+    const standing = dependencyStanding('B', ['A'], 1, lookup(['A', 'B'], { A: { verdict: 'failed', reason: 'expected "Active"\nsecond line' } }));
+    assert.deepEqual(standing, { kind: 'blocked', reason: 'depends on A which did not pass (expected "Active")' });
+  });
+
+  it('a prerequisite the harness ended is "could not run", a plain blocked one "never ran", a review "awaits review"', () => {
+    const error = dependencyStanding('B', ['A'], 1, lookup(['A', 'B'], { A: { verdict: 'blocked', reason: 'runtime error — the harness ended this case, not the application: signIn did not take' } }));
+    assert.equal(error.kind, 'blocked');
+    assert.match((error as { reason: string }).reason, /^depends on A which could not run \(runtime error — the harness ended this case/);
+    const refused = dependencyStanding('B', ['A'], 1, lookup(['A', 'B'], { A: { verdict: 'blocked', reason: 'authoring refused (attempt 1): x' } }));
+    assert.match((refused as { reason: string }).reason, /which never ran \(authoring refused/);
+    const review = dependencyStanding('B', ['A'], 1, lookup(['A', 'B'], { A: { verdict: 'review' } }));
+    assert.deepEqual(review, { kind: 'blocked', reason: 'depends on A which awaits review' });
+  });
+
+  it('a prerequisite queued behind it is blocked with the ordering advice — or named a cycle when it depends back', () => {
+    assert.deepEqual(dependencyStanding('A', ['B'], 0, lookup(['A', 'B'])), {
+      kind: 'blocked',
+      reason: 'depends on B, which is queued after it — order the sheet so B comes first',
+    });
+    assert.deepEqual(dependencyStanding('A', ['B'], 0, lookup(['A', 'B'], {}, { dependsBack: (id) => id === 'B' })), {
+      kind: 'blocked',
+      reason: 'depends on B, which depends back on A — a cycle the sheet must break; neither can run first',
+    });
+  });
+
+  it('a prerequisite not in the run is blocked — unless the queue is still open and it is planned, which waits', () => {
+    assert.deepEqual(dependencyStanding('B', ['A'], 0, lookup(['B'])), { kind: 'blocked', reason: 'depends on A, which is not in this run' });
+    assert.deepEqual(dependencyStanding('B', ['A'], 0, lookup(['B'], {}, { queueOpen: true, planned: ['A', 'B'] })), { kind: 'wait', on: 'A' });
+  });
+
+  it('a resume reads the earlier pass for a prerequisite it did not re-run; a self-reference is ignored', () => {
+    const inherited = (id: string): DependencyOutcome | undefined => (id === 'A' ? { verdict: 'passed' } : undefined);
+    assert.deepEqual(dependencyStanding('B', ['B', 'A'], 0, lookup(['B'], {}, { inherited })), { kind: 'ready' });
+  });
+});
+
+describe('dependencyCycles / dependsBackOn / unresolvedReferences — the plan says it once', () => {
+  type R = { caseId: string; dependsOn?: string[]; externalRefs?: string[] };
+  const r = (caseId: string, dependsOn?: string[], externalRefs?: string[]): R => ({ caseId, ...(dependsOn ? { dependsOn } : {}), ...(externalRefs ? { externalRefs } : {}) });
+  const id = (x: R): string => x.caseId;
+  const deps = (x: R): readonly string[] => x.dependsOn ?? [];
+
+  it('finds each cycle once, from its earliest-listed member, and ignores self and external references', () => {
+    const rows = [r('A', ['B', 'A', 'E2E-118']), r('B', ['C']), r('C', ['A']), r('D', ['A']), r('E', ['F']), r('F', ['E'])];
+    assert.deepEqual(dependencyCycles(rows, id, deps), [['A', 'B', 'C'], ['E', 'F']]);
+    assert.deepEqual(dependencyCycles([r('A', ['B']), r('B')], id, deps), []);
+  });
+
+  it('dependsBackOn walks the edges transitively', () => {
+    const rows = [r('A', ['B']), r('B', ['C']), r('C', ['A']), r('D')];
+    assert.equal(dependsBackOn(rows, id, deps, 'B', 'A'), true);
+    assert.equal(dependsBackOn(rows, id, deps, 'D', 'A'), false);
+    assert.equal(dependsBackOn(rows, id, deps, 'A', 'D'), false);
+  });
+
+  it('lists a missing case once with every row that needs it, and a context document that names it resolves it', () => {
+    const rows = [r('P1', undefined, ['E2E-04']), r('P2', undefined, ['E2E-04', 'E2E-45']), r('P3', undefined, ['E2E-45']), r('P4')];
+    assert.deepEqual(unresolvedReferences(rows), [
+      { id: 'E2E-04', rows: ['P1', 'P2'] },
+      { id: 'E2E-45', rows: ['P2', 'P3'] },
+    ]);
+    assert.deepEqual(unresolvedReferences(rows, ['E2E-04 created employee EM0001']), [{ id: 'E2E-45', rows: ['P2', 'P3'] }]);
   });
 });

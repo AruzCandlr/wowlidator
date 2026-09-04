@@ -5216,6 +5216,7 @@ function openLauncher() {
     // Describe
     describe: '',
     scope: 'unit',     /* unit | e2e — see --scope; e2e is enforced, not hinted */
+    order: 'fastest',  /* fastest | sequential — how a catalog's cases are scheduled, see the radio */
     // shared
     focus: '',
     url: '',
@@ -5915,6 +5916,33 @@ function launcherBox(M) {
     box.appendChild(formField('How far should it reach?', false, scopes));
   }
 
+  if (M.mode === 'catalog') {
+    /* Radios for the same reason as the scope above: the two orders change
+       what the run DOES. "Fastest first" is the CLI's own default — cases run
+       as they are authored, the cheapest scenario queued first, several at a
+       time. "Sequentially" sends --concurrency 1 --sheet-order: author every
+       row first, then run one case at a time in the document's own order —
+       the A/B for a parallel result that looks wrong. */
+    var orders = el('div', {});
+    [['fastest', 'Fastest first', 'Cases run as soon as they are authored, several at a time, cheapest scenario first. Verdicts arrive soonest.'],
+     ['sequential', 'Sequentially', 'Author every row first, then run one case at a time in the order the document lists them.']
+    ].forEach(function (choice) {
+      var input = el('input', {
+        type: 'radio', name: 'launch-order', value: choice[0],
+        checked: M.order === choice[0],
+        onchange: function () { M.order = choice[0]; renderLauncher(); }
+      });
+      orders.appendChild(el('label', { style: 'display:flex;gap:8px;align-items:flex-start;margin-top:6px;font-weight:400' }, [
+        input,
+        el('span', {}, [
+          el('span', { text: choice[1] }),
+          el('span', { class: 'mono', style: 'display:block;opacity:.75', text: choice[2] })
+        ])
+      ]));
+    });
+    box.appendChild(formField('How should the cases run?', false, orders));
+  }
+
   if (M.mode !== 'context') {
     var focus = el('textarea', { rows: '2', placeholder: 'the filter controls',
       oninput: function (e) { M.focus = e.target.value; } });
@@ -6160,6 +6188,10 @@ function submitLauncher() {
     };
     if (M.url.trim()) values.url = M.url.trim();
     if (M.policy !== 'mutations') values.policy = M.policy;
+    /* Fastest first is the CLI's default and sends nothing, as scope does.
+       Sequential is the two flags together: one case at a time AND the
+       sheet's order — concurrency 1 alone would still put readers first. */
+    if (M.order === 'sequential') { values.concurrency = 1; values['sheet-order'] = true; }
     // The personas field is already declared on this command, so nothing new
     // is offered here — only a value shape the server already accepts. It is a
     // secret field, so it travels by env overlay and never becomes argv.

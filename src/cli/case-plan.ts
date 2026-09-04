@@ -401,6 +401,199 @@ export function orderDependentsAfterSources<T>(
 }
 
 /**
+ * The dependency cycles among `items` (CG-12, 2026-09-04): each as the ids
+ * along it, starting at the earliest-listed member, once per cycle. Pure and
+ * total. An id the list does not hold is never part of a cycle (it is an
+ * external reference), and a self-reference is not one either — the parser
+ * already drops it and `orderDependentsAfterSources` ignores it. Reported
+ * once at plan time so the sheet's author sees "A → B → A" instead of two
+ * rows each blocked on the other at run time.
+ */
+export function dependencyCycles<T>(
+  items: readonly T[],
+  idOf: (item: T) => string,
+  depsOf: (item: T) => readonly string[],
+): string[][] {
+  const order = new Map<string, number>();
+  const deps = new Map<string, readonly string[]>();
+  items.forEach((item, at) => {
+    const id = idOf(item);
+    if (order.has(id)) return;
+    order.set(id, at);
+    deps.set(id, depsOf(item).filter((dep) => dep !== id));
+  });
+  const cycles: string[][] = [];
+  const seen = new Set<string>();
+  const state = new Map<string, 'open' | 'done'>();
+  const path: string[] = [];
+  const visit = (id: string): void => {
+    state.set(id, 'open');
+    path.push(id);
+    for (const dep of deps.get(id) ?? []) {
+      if (!order.has(dep)) continue;
+      const mark = state.get(dep);
+      if (mark === 'done') continue;
+      if (mark === 'open') {
+        const loop = path.slice(path.indexOf(dep));
+        // Rotate to the earliest-listed member so the same cycle found from
+        // two entry points reads — and deduplicates — the same.
+        let first = 0;
+        loop.forEach((member, at) => {
+          if ((order.get(member) ?? Infinity) < (order.get(loop[first]!) ?? Infinity)) first = at;
+        });
+        const canonical = [...loop.slice(first), ...loop.slice(0, first)];
+        const key = canonical.join('\u0000');
+        if (!seen.has(key)) {
+          seen.add(key);
+          cycles.push(canonical);
+        }
+        continue;
+      }
+      visit(dep);
+    }
+    path.pop();
+    state.set(id, 'done');
+  };
+  for (const id of order.keys()) if (!state.has(id)) visit(id);
+  return cycles;
+}
+
+/**
+ * Whether `from` transitively depends on `to` among `items` — the run-time
+ * half of `dependencyCycles`, asked of one edge: a source queued BEHIND its
+ * dependent that also names the dependent is a cycle, and the blocked reason
+ * should say so rather than "order the sheet".
+ */
+export function dependsBackOn<T>(
+  items: readonly T[],
+  idOf: (item: T) => string,
+  depsOf: (item: T) => readonly string[],
+  from: string,
+  to: string,
+): boolean {
+  const byId = new Map<string, T>();
+  for (const item of items) if (!byId.has(idOf(item))) byId.set(idOf(item), item);
+  const seen = new Set<string>();
+  const stack = [from];
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const item = byId.get(id);
+    if (item === undefined) continue;
+    for (const dep of depsOf(item)) {
+      if (dep === to) return true;
+      stack.push(dep);
+    }
+  }
+  return false;
+}
+
+/**
+ * The references a plan cannot resolve, once each (CG-12, 2026-09-04): every
+ * id the rows cite as a case they NEED (`externalRefs`, from
+ * `linkDependencies`) that no row of this catalog holds and no context
+ * document names, with the rows that need it in their given order. The
+ * per-row refusal (`sheetGate`) stays the row's own record; this is the
+ * plan's — one line per missing case instead of one per dependent (the
+ * EC catalog's twelve missing scenarios were fourteen identical rows of
+ * "which is not in this catalog" before a person could see the list).
+ */
+export function unresolvedReferences(
+  rows: readonly { caseId: string; externalRefs?: readonly string[] | undefined }[],
+  registry: readonly string[] = [],
+): { id: string; rows: string[] }[] {
+  const out = new Map<string, string[]>();
+  for (const row of rows) {
+    for (const id of row.externalRefs ?? []) {
+      if (registry.some((text) => text.includes(id))) continue;
+      const list = out.get(id) ?? [];
+      if (!list.includes(row.caseId)) list.push(row.caseId);
+      out.set(id, list);
+    }
+  }
+  return [...out].map(([id, list]) => ({ id, rows: list }));
+}
+
+/** A finished case as the dependency gate reads it: its verdict and the first line of why. */
+export interface DependencyOutcome {
+  verdict: string;
+  reason?: string | null | undefined;
+}
+
+/** What the dependency gate asks of the run — every answer a plain lookup. */
+export interface DependencyLookup {
+  /** Queue index of the case with this id; -1 when it has not been queued. */
+  indexOf(id: string): number;
+  /** The recorded outcome of the case at a queue index, undefined while unfinished. */
+  outcomeAt(index: number): DependencyOutcome | undefined;
+  /** An earlier pass's outcome for an id this run did not queue (a resume). */
+  inherited(id: string): DependencyOutcome | undefined;
+  /** Whether the queue may still grow (a streaming catalog), and what it is planned to hold. */
+  queueOpen: boolean;
+  planned: readonly string[];
+  /** Whether the queued case `id` transitively depends on the asking case (a cycle). */
+  dependsBack(id: string): boolean;
+}
+
+export type DependencyStanding = { kind: 'ready' } | { kind: 'wait'; on: string } | { kind: 'blocked'; reason: string };
+
+/**
+ * Where a case's sources stand (CG-12) — the gate that decides whether a
+ * dependent runs, waits, or is recorded blocked, as a pure function so it is
+ * testable at $0 and so the loop that dispatches owns no reasoning of its
+ * own. `ready` — every source passed. `wait` — a source queued ahead of it
+ * has not finished (the dispatch is deferred; asked again as lanes end), or,
+ * on an open queue, is planned and not yet queued. `blocked` — a source
+ * failed, was blocked, awaits review, is not in this run, or is queued BEHIND
+ * the dependent (the producer and `orderDependentsAfterSources` rule that
+ * out; a cycle is named as one). A verdict is quoted with its reason's first
+ * line, so the dependent's record says what the source's did. A resume reads
+ * the earlier pass's verdict for a source it did not re-run.
+ *
+ * The prerequisite's outcome is never guessed: a dependent is decided only
+ * after the source actually ended — the EC catalog's PRB-EC row blocked on
+ * a HIR-EC row whose sign-in failed was decided 22 s after that failure,
+ * quoting it, not before.
+ */
+export function dependencyStanding(
+  selfId: string,
+  dependsOn: readonly string[],
+  index: number,
+  lookup: DependencyLookup,
+): DependencyStanding {
+  for (const id of dependsOn) {
+    if (id === selfId) continue;
+    const at = lookup.indexOf(id);
+    const done = at >= 0 ? lookup.outcomeAt(at) : undefined;
+    const prior = at === -1 ? lookup.inherited(id) : undefined;
+    const outcome = done ?? prior;
+    if (outcome?.verdict === 'passed') continue;
+    if (outcome === undefined) {
+      if (at >= 0 && at < index) return { kind: 'wait', on: id };
+      if (at >= 0) {
+        return lookup.dependsBack(id)
+          ? { kind: 'blocked', reason: `depends on ${id}, which depends back on ${selfId} — a cycle the sheet must break; neither can run first` }
+          : { kind: 'blocked', reason: `depends on ${id}, which is queued after it — order the sheet so ${id} comes first` };
+      }
+      if (lookup.queueOpen && lookup.planned.includes(id)) return { kind: 'wait', on: id };
+      return { kind: 'blocked', reason: `depends on ${id}, which is not in this run` };
+    }
+    const line = (outcome.reason ?? '').split('\n')[0] ?? '';
+    const why =
+      outcome.verdict === 'review'
+        ? 'awaits review'
+        : outcome.verdict === 'blocked'
+          ? /^runtime error/i.test(line)
+            ? 'could not run'
+            : 'never ran'
+          : 'did not pass';
+    return { kind: 'blocked', reason: `depends on ${id} which ${why}${line === '' ? '' : ` (${line})`}` };
+  }
+  return { kind: 'ready' };
+}
+
+/**
  * How many rows to author at once: what was asked for, else the default —
  * unless the generator role sits on a provider that answers one call at a
  * time, where the only honest default is 1. An explicit `--author-concurrency`
@@ -553,8 +746,18 @@ export async function runQueue<T>(
    * NON-exclusive item against everything currently in flight: false holds
    * the dispatch until a lane finishes and the answer is asked again. Absent
    * = the old rule (any two non-exclusive items share).
+   *
+   * `'defer'` (2026-09-04, CG-12) parks the item instead of holding the
+   * head of the queue: the loop moves on to the next index and re-offers
+   * every parked item before each take, whenever a lane ends while the
+   * queue waits for its next arrival, and after the queue closes until none
+   * is left. What a dependent answers while its prerequisite is still in
+   * flight — `false` there was head-of-line blocking (a ten-lane pool
+   * drained to the one lane running the prerequisite while every case
+   * queued behind the dependent waited on nothing). A suite that never
+   * answers `'defer'` takes exactly the path it always did.
    */
-  canRunWith?: (item: T, index: number, inflight: readonly { item: T; index: number }[]) => boolean,
+  canRunWith?: (item: T, index: number, inflight: readonly { item: T; index: number }[]) => boolean | 'defer',
   /**
    * A soft hold: while true, nothing new is dispatched but in-flight lanes
    * finish normally and the loop resumes when it clears. What the
@@ -569,6 +772,8 @@ export async function runQueue<T>(
       : (): number => Math.max(1, Math.floor(concurrency));
   const inFlight = new Set<Promise<void>>();
   const inFlightItems = new Map<Promise<void>, { item: T; index: number }>();
+  /** Items parked on `'defer'`, in arrival order; re-offered as lanes end. */
+  const deferred: { item: T; index: number }[] = [];
 
   const start = (item: T, index: number): void => {
     const promise = run(item, index).finally(() => {
@@ -584,27 +789,28 @@ export async function runQueue<T>(
     // A held loop with an empty pool must not spin hot.
     else await new Promise((resolve) => setTimeout(resolve, 200));
   };
+  const flying = (): { item: T; index: number }[] => [...inFlightItems.values()];
 
-  for (let index = 0; ; index += 1) {
-    if (shouldPause?.()) break;
-    const item = await queue.take(index);
-    if (item === null) break;
-    // Checked again AFTER the take: a streaming queue can hold the loop in
-    // take() for minutes while a row authors, and a pause raised in that gap
-    // must not start the case that finally arrives. The un-run item simply
-    // earns no outcome, which is exactly what a resume reads as still-to-run.
-    if (shouldPause?.()) break;
+  /**
+   * Dispatch one item: started (or, for an exclusive one, run to the end),
+   * deferred because `canRunWith` said so, or abandoned by a pause. The
+   * body the loop below always had, with the one new answer threaded in.
+   */
+  const dispatch = async (item: T, index: number): Promise<'started' | 'deferred' | 'paused'> => {
     while (waitWhile?.() === true) {
-      if (shouldPause?.()) break;
+      if (shouldPause?.()) return 'paused';
       await drainOne();
     }
-    if (shouldPause?.()) break;
+    if (shouldPause?.()) return 'paused';
     if (isExclusive(item, index) || limitOf() === 1) {
+      // An exclusive dependent still waits for its prerequisite: draining the
+      // pool would not finish a source that is itself parked behind another.
+      if (canRunWith?.(item, index, flying()) === 'defer') return 'deferred';
       if (inFlight.size > 0) await Promise.all([...inFlight]);
       while (waitWhile?.() === true && !shouldPause?.()) await drainOne();
-      if (shouldPause?.()) break;
+      if (shouldPause?.()) return 'paused';
       await run(item, index);
-      continue;
+      return 'started';
     }
     // Re-read after every completion, not once: the limit may have grown
     // while this dispatch waited for a slot — and the section check is asked
@@ -614,15 +820,70 @@ export async function runQueue<T>(
         await Promise.race([...inFlight]);
         continue;
       }
-      if (canRunWith !== undefined && !canRunWith(item, index, [...inFlightItems.values()])) {
-        if (shouldPause?.()) break;
+      const answer = canRunWith === undefined ? true : canRunWith(item, index, flying());
+      if (answer === 'defer') return 'deferred';
+      if (answer === false) {
+        if (shouldPause?.()) return 'paused';
         await drainOne();
         continue;
       }
       break;
     }
-    if (shouldPause?.()) break;
+    if (shouldPause?.()) return 'paused';
     start(item, index);
+    return 'started';
+  };
+
+  /** Re-offer every parked item, in arrival order; one that still defers stays parked. */
+  const offerDeferred = async (): Promise<void> => {
+    for (const entry of [...deferred]) {
+      if (shouldPause?.()) return;
+      if (canRunWith?.(entry.item, entry.index, flying()) === 'defer') continue;
+      deferred.splice(deferred.indexOf(entry), 1);
+      const result = await dispatch(entry.item, entry.index);
+      if (result === 'deferred') deferred.push(entry);
+      if (result === 'paused') return;
+    }
+  };
+
+  outer: for (let index = 0; ; index += 1) {
+    let item: T | null;
+    for (;;) {
+      if (deferred.length > 0) await offerDeferred();
+      if (shouldPause?.()) break outer;
+      // A streaming queue can hold `take` for minutes while a row authors; a
+      // parked item whose prerequisite ends in that gap must not idle until
+      // the next arrival, so the take races the lanes while anything is
+      // parked (the losing take is abandoned — the queue wakes the newest).
+      if (deferred.length === 0 || inFlight.size === 0) {
+        item = await queue.take(index);
+        break;
+      }
+      const laneEnded = Symbol('lane ended');
+      const winner = await Promise.race([queue.take(index), Promise.race([...inFlight]).then(() => laneEnded)]);
+      if (winner !== laneEnded) {
+        item = winner as T | null;
+        break;
+      }
+    }
+    if (item === null) break;
+    // Checked again AFTER the take: a streaming queue can hold the loop in
+    // take() for minutes while a row authors, and a pause raised in that gap
+    // must not start the case that finally arrives. The un-run item simply
+    // earns no outcome, which is exactly what a resume reads as still-to-run.
+    if (shouldPause?.()) break;
+    const result = await dispatch(item, index);
+    if (result === 'paused') break;
+    if (result === 'deferred') deferred.push({ item, index });
+  }
+
+  // The queue is closed (or the loop paused): whatever is still parked is
+  // re-offered as lanes end. A parked item's prerequisite is always ahead of
+  // it and already taken — in flight, parked behind its own prerequisite, or
+  // finished — so this drains; a pause leaves the rest un-run, as above.
+  while (deferred.length > 0 && !shouldPause?.()) {
+    await offerDeferred();
+    if (deferred.length > 0 && !shouldPause?.()) await drainOne();
   }
 
   await Promise.all([...inFlight]);

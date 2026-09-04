@@ -117,6 +117,69 @@ timeout-shaped failures in 5 minutes (never below 2). `WOWLIDATOR_GOVERNOR=
 model` restores the LLM governor — its remaining unique power is judging and
 seeding a starved fixture (`db-write`); `off` disables both.
 
+## A dependency wait is the scheduler's; the governor explains it (2026-09-04, EC catalog run `ec-runtest-csv@…09-33-38`)
+
+Read from the panel's job-16 log and its ledger (39 cases, 10 lanes). Two shapes
+of "depends on" refusal, neither the governor's:
+
+- **PRB-EC-021 ← HIR-EC-064.** HIR-EC-064 ran in `[c31]`, its sign-in did not
+  take (a runtime error, 22 s), and it was recorded `blocked`; PRB-EC-021
+  (`[c34]`) was decided AFTER that, quoting it. The gate behaved: a dependent is
+  never decided before its prerequisite ended. What was wrong upstream is the
+  sign-in, not the queue. The wording "which never ran" for a case the harness
+  ended is now "which could not run (runtime error — …)"; a refused/never-
+  started case keeps "never ran".
+- **Twelve E2E-nn references, fourteen rows.** `E2E-04`, `-11`, `-18`, `-42`,
+  `-45`, `-46`, `-105`, `-115`, `-118`, `-119`, `-125`, `-128` are scenarios of
+  another sheet ("Sheet E2E All Module", which the rows' own notes name); the
+  CSV holds one sheet, and none of them is a Scenario ID in it. Scenario-id
+  resolution (`linkDependencies`, 2026-09-04) is correct — these are external.
+  They were fourteen identical per-row lines; the plan now says each ONCE,
+  with the rows that need it (`unresolvedReferences`, `case-plan.ts`, printed
+  by `cmdCatalog` right after `orderDependentsAfterSources`). A cycle is
+  printed there too (`dependencyCycles`), before either side is blocked on the
+  other at run time.
+
+**Where the gate lives, and why.** `dependencyStanding` (`src/cli/case-plan.ts`,
+pure) is the whole rule — wait while a prerequisite queued ahead is unfinished,
+ready when every one passed, blocked with the prerequisite's own outcome line
+otherwise (failed / review / never ran / could not run / not in this run /
+queued after it / a cycle) — and `runCases` only supplies its lookups. It is
+in the deterministic scheduler and not here because a dependent's verdict is
+correctness, and this module's governor is an optimiser that may be absent,
+off, erroring or out of budget without any verdict changing (the containment
+rule at the top of the governor section). The governor OBSERVES the gate:
+`GovernorCaseFact.waitingOn` carries the prerequisite a pending case is
+parked on (set from `dependencyStanding`, never inferred here), the WAITING
+prose line shows ` waits-for:X`, and the rules governor's queue-blocked rule
+says `"B" is waiting on prerequisite A, in flight in lane N` (or "queued
+ahead of it and not yet started" / "not yet queued") once per pair, keeps
+such cases out of the "looks compatible yet has not dispatched" diagnosis —
+which had misread every parked dependent as a scheduler fault — and answers
+idle when the whole queue is parked on prerequisites.
+
+**The queue defect this found.** `runQueue` dispatches in index order, and a
+dependent's `false` from `canRunWith` held the HEAD of the queue: a ten-lane
+pool drained to the one lane running the prerequisite while every case behind
+the dependent waited on nothing. `canRunWith` may now answer `'defer'` (what
+a dependency wait answers): the item is parked, the loop goes on, and parked
+items are re-offered before each take, whenever a lane ends while a streaming
+queue waits for its next authored row (the take races the lanes), and after
+close until none is left; an exclusive dependent is parked the same way
+instead of draining the pool to wait. A suite that never answers `'defer'`
+takes exactly the path it always did — pinned by `tests/case-plan.test.ts`
+("a suite that never answers defer takes the old path exactly"). The wait
+still counts toward the queue-blocked event (25 polls), so a long one reaches
+the governor and is explained rather than silent.
+
+Tests: `tests/case-plan.test.ts` (`runQueue parks a deferred item…`,
+`dependencyStanding…`, `dependencyCycles / dependsBackOn /
+unresolvedReferences…`), `tests/queue-governor.test.ts` (`the rules governor
+explains a dependency wait`). Live before/after on the EC catalog still to be
+recorded: the 09:33 run never hit the wait (HIR-EC-064 ended before PRB-EC-021
+was authored), so the number to watch on the next run is lanes in flight while
+a `waits for` line is open — previously 1, expected the pool size.
+
 ## A readOnly run's finish is the answer, never a claim to refuse (2026-08-31)
 
 The observed-state finish settlement (`goalOutcome`/`outcomeShown`) is skipped

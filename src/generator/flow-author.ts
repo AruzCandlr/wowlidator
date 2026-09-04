@@ -2221,7 +2221,8 @@ export function settleViolations(violations: readonly Violation[]): { notes: str
   const unsettled: Violation[] = [];
   for (const violation of violations) {
     if (violation.severity === 'weak') {
-      notes.push(violation.note);
+      // A thin claim's own grounded rewrite, when it has one; its note otherwise.
+      notes.push(violation.settle?.() ?? violation.note);
       continue;
     }
     const note = violation.settle?.() ?? null;
@@ -3167,6 +3168,19 @@ export class FlowAuthor {
               "steps in order, with the Test data's own values, then assert the Expected output on the " +
               'result. If a step truly cannot be performed here, say so in the step intent rather than ' +
               'dropping it.',
+            {
+              // The last word: the unperformed script lines of that tier are
+              // performed from the tree, or handed to an agent leg in the
+              // sheet's own words — never left silently unperformed.
+              settle: () =>
+                settleScriptDemand(
+                  result,
+                  extra.caseText ?? trimmed,
+                  skipped.tier,
+                  [evidenceTree, interactions].filter((t): t is string => typeof t === 'string').join('\n'),
+                  extra.testDataPairs ?? testDataPairsOfCaseText(extra.caseText ?? trimmed),
+                ),
+            },
           );
         }
 
@@ -3843,6 +3857,14 @@ export class FlowAuthor {
                 `step ${delegated.index} delegates ${delegated.declared
                   .map((d) => JSON.stringify(d))
                   .join(', ')} to a workflow goal — declared controls the flow could have driven directly`,
+              // On acceptance: the goal's own `Field = value` pairs that a
+              // captured tree names are split out as deterministic steps.
+              settle: () => {
+                const step = result.steps[delegated.index];
+                return step === undefined
+                  ? null
+                  : settleWorkflowGoal(result, step, [evidenceTree, interactions].filter((t): t is string => typeof t === 'string').join('\n'));
+              },
             },
           );
         }
@@ -3913,7 +3935,7 @@ export class FlowAuthor {
             }
             throw refusal;
           }
-          const note = violations.map((v) => v.note).join('; ');
+          const note = settleViolations(violations).notes.join('; ');
           result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
           this.#onLog?.(`weak claim, accepted with a note: ${note}`);
         }
@@ -4569,14 +4591,33 @@ function withoutRouteLabels(script: string): string {
 
 export type ScriptDemandTier = 'typing' | 'choosing' | 'acting';
 
+/**
+ * The first demand word of a tier in the script that is used as a VERB, or
+ * null. A demand word that is the head of a `Field = value` pair — the token
+ * right before the `=` — is the field's NAME, not an instruction: multirole
+ * ML_01_04's "5. เลือก Leave type = Sick Leave" was read as "type" (typing
+ * tier) and refused a flow that chose everything through agent legs. The
+ * pair grammar is the sheet's own (CG-02), so the rule is structural: the
+ * match is followed by `=` / `:`, whatever the word.
+ */
+export function scriptDemand(tier: RegExp, script: string): string | null {
+  const every = new RegExp(tier.source, tier.flags.includes('g') ? tier.flags : `${tier.flags}g`);
+  for (const m of script.matchAll(every)) {
+    const after = script.slice(m.index + m[0].length);
+    if (/^\s*[=:：]/.test(after)) continue;
+    return m[0].trim();
+  }
+  return null;
+}
+
 /** What performs each tier — the sentence the refusal prints, kept beside the code that judges it. */
 export function describeScriptDemand(tier: ScriptDemandTier): string {
   switch (tier) {
     case 'typing':
-      return 'a fill, fillRetry, type, setValue, upload, selectOption, check or uncheck in the body';
+      return 'a fill, fillRetry, type, setValue, upload, selectOption, check or uncheck in the body, or a workflow leg whose goal performs it';
     case 'choosing':
       return (
-        'a selectOption, check, uncheck, setValue or fill in the body, or a click whose selector role is a ' +
+        'a selectOption, check, uncheck, setValue or fill in the body, a workflow leg whose goal performs it, or a click whose selector role is a ' +
         `choice (${[...CHOICE_ROLES].join(', ')}), or a click that another body step follows`
       );
     case 'acting':
@@ -4592,15 +4633,21 @@ export function skipsAuthoredScript(
   // sheet):` and `Test data:`, so a Note saying "กด Submit" counted as script.
   const script = withoutRouteLabels(sectionOf(caseText, 'steps') ?? '');
   if (script.trim() === '') return null;
-  const demandedTyping = SCRIPT_DEMANDS.typing.exec(script);
+  // An agent leg performs a script step too (2026-09-04, multirole ML_01_04):
+  // the prompt allows a `workflow` leg exactly where no tree declares the
+  // control, and whether its claim is then settled is `unsettledWorkflowClaim`
+  // / `unassertedExpectedItems`' question, not this lint's.
+  const demandedTyping = scriptDemand(SCRIPT_DEMANDS.typing, script);
   if (demandedTyping !== null) {
-    const performed = bodySteps.filter((step) => INPUT_ACTIONS.has(step.action)).length;
-    if (performed === 0) return { demanded: demandedTyping[0].trim(), tier: 'typing', performed };
+    const performed = bodySteps.filter((step) => INPUT_ACTIONS.has(step.action) || step.action === 'workflow').length;
+    if (performed === 0) return { demanded: demandedTyping, tier: 'typing', performed };
   }
-  const demandedChoice = SCRIPT_DEMANDS.choosing.exec(script);
+  const demandedChoice = scriptDemand(SCRIPT_DEMANDS.choosing, script);
   if (demandedChoice !== null) {
-    const performed = bodySteps.filter((step, i) => INPUT_ACTIONS.has(step.action) || clickChooses(bodySteps, i)).length;
-    if (performed === 0) return { demanded: demandedChoice[0].trim(), tier: 'choosing', performed };
+    const performed = bodySteps.filter(
+      (step, i) => INPUT_ACTIONS.has(step.action) || step.action === 'workflow' || clickChooses(bodySteps, i),
+    ).length;
+    if (performed === 0) return { demanded: demandedChoice, tier: 'choosing', performed };
   }
   // No typing or choosing asked for, but the script still asks the tester to
   // ACT: a body of nothing but assertions has not performed it either.
@@ -5467,6 +5514,25 @@ export function declaredControlStrings(codeContext: string | undefined): string[
  * whole-word, case-insensitive, appearing in the goal's own text — so a goal
  * about genuinely undeclared territory never trips it.
  */
+/**
+ * The run of adjacent Capitalised words (single spaces between) that covers
+ * `[at, at+length)` of `text`, lower-cased, or null when the span itself is
+ * not capitalised. "choose Leave Type = Sick" at "Type" → "leave type".
+ */
+function capitalisedRunAround(text: string, at: number, length: number): string | null {
+  const isCap = (word: string): boolean => /^\p{Lu}/u.test(word);
+  const words: { start: number; end: number; word: string }[] = [];
+  for (const m of text.matchAll(/[\p{L}\p{N}][\p{L}\p{N}'-]*/gu)) words.push({ start: m.index, end: m.index + m[0].length, word: m[0] });
+  const first = words.findIndex((w) => w.start === at);
+  if (first === -1 || !isCap(words[first]!.word)) return null;
+  let lo = first;
+  let hi = first;
+  while (lo > 0 && isCap(words[lo - 1]!.word) && text.slice(words[lo - 1]!.end, words[lo]!.start) === ' ') lo -= 1;
+  while (hi < words.length - 1 && isCap(words[hi + 1]!.word) && text.slice(words[hi]!.end, words[hi + 1]!.start) === ' ') hi += 1;
+  const run = text.slice(words[lo]!.start, words[hi]!.end).toLowerCase();
+  return run.length >= length ? run : null;
+}
+
 export function workflowOverDeclaredControls(
   steps: readonly FlowStep[],
   codeContext: string | undefined,
@@ -5481,11 +5547,24 @@ export function workflowOverDeclaredControls(
       ...new Set(
         declared.filter((v) => {
           const needle = v.toLowerCase();
-          const at = goal.indexOf(needle);
-          if (at === -1) return false;
-          const before = at === 0 ? ' ' : goal[at - 1]!;
-          const after = at + needle.length >= goal.length ? ' ' : goal[at + needle.length]!;
-          return !/[\p{L}\p{N}]/u.test(before) && !/[\p{L}\p{N}]/u.test(after);
+          // Every occurrence: the first may sit inside a longer name and a
+          // later one stand alone.
+          for (let at = goal.indexOf(needle); at !== -1; at = goal.indexOf(needle, at + 1)) {
+            const before = at === 0 ? ' ' : goal[at - 1]!;
+            const after = at + needle.length >= goal.length ? ' ' : goal[at + needle.length]!;
+            if (/[\p{L}\p{N}]/u.test(before) || /[\p{L}\p{N}]/u.test(after)) continue;
+            // A declared word inside a longer CAPITALISED name in the goal
+            // ("Type" in "Leave Type", "Leave" in "Sick Leave") names that
+            // longer thing, not this control (2026-09-04, multirole
+            // ML_01_04: "Type" and "Leave" from a message catalog matched
+            // every leave-request goal). When the longer name is declared
+            // too, IT is the control named, and it matches on its own turn.
+            // Read from the goal's own casing; a lower-case goal keeps the
+            // plain match.
+            const compound = capitalisedRunAround(step.goal, at, needle.length);
+            if (compound === null || compound === needle) return true;
+          }
+          return false;
         }),
       ),
     ];
@@ -5702,11 +5781,16 @@ export function removeStep(flow: SettleableFlow, step: FlowStep): void {
   for (const one of flow.cases ?? []) one.steps = one.steps.filter((s) => s !== step);
 }
 
-/** Splice a step before an anchor, in the body and in the case holding the anchor. */
+/**
+ * Splice a step before an anchor, in the body and in the case holding the
+ * anchor. A folded single case SHARES the body's array (`result.cases =
+ * [{ steps: result.steps }]`), and is spliced once, not twice.
+ */
 export function insertStepBefore(flow: SettleableFlow, anchor: FlowStep, step: FlowStep): void {
   const at = flow.steps.indexOf(anchor);
   if (at >= 0) flow.steps.splice(at, 0, step);
   for (const one of flow.cases ?? []) {
+    if (one.steps === flow.steps) continue;
     const i = one.steps.indexOf(anchor);
     if (i >= 0) one.steps.splice(i, 0, step);
   }
@@ -5794,6 +5878,194 @@ export function settleSelectorRole(
   (step as { selector: string }).selector = repointed;
   annotateStep(step, `role ${JSON.stringify(found.role)} repointed to ${JSON.stringify(treeRole)}, the role the tree shows for ${JSON.stringify(found.name)}`);
   return `role=${found.role} for ${JSON.stringify(found.name)} repointed to role=${treeRole} from the tree's own line (marked [generated: …])`;
+}
+
+/** `Field = value` pairs written on one line of prose — the sheet's own pair grammar (CG-02), read structurally. */
+function pairsOnLine(line: string): { key: string; value: string }[] {
+  const out: { key: string; value: string }[] = [];
+  for (const m of line.matchAll(/([\p{L}\p{N}][^=\n:：]*?)\s*[=：]\s*([^=\n]+?)(?=\s+[\p{L}\p{N}][^=\n]*?\s*[=：]\s|\s*$)/gu)) {
+    const key = (m[1] ?? '').trim().split(/\s+/).slice(-4).join(' ');
+    const value = valueHeadOf((m[2] ?? '').trim());
+    if (key !== '' && value !== '') out.push({ key, value });
+  }
+  return out;
+}
+
+/**
+ * The value at the head of prose after `=`: up to a clause mark (`,` `;`
+ * `.` `(`), and — read from casing, never a word list — up to the first
+ * lower-case Latin word after the first token ("Sick Leave and pick today"
+ * → "Sick Leave"; "31 นาที" and a Thai value run to the clause mark).
+ */
+function valueHeadOf(text: string): string {
+  const clause = text.split(/[,;(]|\.\s|\s[—–-]\s/)[0] ?? '';
+  const tokens = clause.trim().split(/\s+/);
+  const kept: string[] = [];
+  for (const [i, token] of tokens.entries()) {
+    if (i > 0 && /^\p{Ll}/u.test(token)) break;
+    kept.push(token);
+  }
+  return kept.join(' ').trim();
+}
+
+/** The tree line naming a field, as `{ role, name }`, or null — every captured tree and the probe report. */
+function treeControlNamed(field: string, evidence: string | undefined): { role: string; name: string } | null {
+  const needle = squash(field);
+  if (needle === '') return null;
+  for (const raw of (evidence ?? '').split('\n')) {
+    const m = /^\s*([a-z]+)\s+"((?:[^"\\]|\\.)*)"/i.exec(raw);
+    if (m === null) continue;
+    const name = (m[2] ?? '').replace(/\\(.)/g, '$1').trim();
+    const have = squash(name);
+    if (have !== '' && (have === needle || have.includes(needle) || needle.includes(have))) return { role: (m[1] ?? '').toLowerCase(), name };
+  }
+  return null;
+}
+
+/** The deterministic step that enters `value` into a control of `role`, by the role the tree shows — or null for a role nothing enters. */
+function entryStepFor(control: { role: string; name: string }, value: string, intent: string): FlowStep | null {
+  const selector = `role=${control.role}[name=${JSON.stringify(control.name)} i]`;
+  switch (control.role) {
+    case 'textbox':
+    case 'searchbox':
+    case 'spinbutton':
+      return { action: 'fill', selector, value, intent };
+    case 'button':
+    case 'combobox':
+    case 'listbox':
+      return { action: 'selectOption', selector, value, intent };
+    case 'checkbox':
+    case 'switch':
+      return { action: 'check', selector, intent };
+    case 'radio':
+    case 'option':
+    case 'tab':
+    case 'menuitem':
+    case 'menuitemradio':
+    case 'menuitemcheckbox':
+      return { action: 'click', selector, intent };
+    default:
+      return null;
+  }
+}
+
+/** The script step numbers a flow's intents and goals cite (the same carriers `unperformedScriptSteps` reads). */
+function citedScriptSteps(steps: readonly FlowStep[]): Set<number> {
+  const cited = new Set<number>();
+  for (const step of steps) {
+    for (const text of [(step as { intent?: unknown }).intent, step.action === 'workflow' ? step.goal : undefined]) {
+      if (typeof text !== 'string') continue;
+      for (const m of text.matchAll(AUTHORING.script.citation)) if (m[1] === undefined) cited.add(Number(m[2]));
+    }
+  }
+  return cited;
+}
+
+/** Where a script step's inserted steps belong: before the first body step citing a LATER script step, else before the first assertion, else the end. */
+function insertionAnchorFor(flow: SettleableFlow, scriptStep: number): FlowStep | null {
+  const later = flow.steps.find((step) => [...citedScriptSteps([step])].some((n) => n > scriptStep));
+  if (later !== undefined) return later;
+  return flow.steps.find((step) => /^(expect|save)/.test(step.action)) ?? null;
+}
+
+function appendOrInsert(flow: SettleableFlow, anchor: FlowStep | null, step: FlowStep): void {
+  if (anchor !== null) {
+    insertStepBefore(flow, anchor, step);
+    return;
+  }
+  flow.steps.push(step);
+  const last = flow.cases?.[flow.cases.length - 1];
+  if (last !== undefined && last.steps !== flow.steps) last.steps.push(step);
+}
+
+/**
+ * Perform the script steps of a demanded tier that the flow left unperformed
+ * (the fallback for `skipsAuthoredScript`, 2026-09-04). For each numbered
+ * script line carrying a demand verb of the tier and not cited by any body
+ * step: every `Field = value` pair on the line (or the Test data pair whose
+ * key the line names) whose field a captured tree names becomes the entry
+ * step the tree's role dictates — fill for a textbox, selectOption for a
+ * button/combobox, check for a checkbox, click for a radio/option — in
+ * script order, cited `Step N:` and marked `[generated: …]`. A line the
+ * evidence cannot ground at all becomes a `workflow` leg whose goal is the
+ * sheet's own line, marked the same way: the agent performs it, and the
+ * flow's own later assertions settle it. Returns the note, or null when the
+ * script carries no line of the tier (nothing to perform).
+ */
+export function settleScriptDemand(
+  flow: SettleableFlow,
+  caseText: string,
+  tier: ScriptDemandTier,
+  evidence: string | undefined,
+  testData: readonly TestDataPair[] = [],
+): string | null {
+  const script = withoutRouteLabels(sectionOf(caseText, 'steps') ?? '');
+  const verb = tier === 'typing' ? SCRIPT_DEMANDS.typing : tier === 'choosing' ? SCRIPT_DEMANDS.choosing : SCRIPT_DEMANDS.acting;
+  const cited = citedScriptSteps(flow.steps);
+  const performed: string[] = [];
+  const delegated: string[] = [];
+  let current = 0;
+  for (const raw of script.split('\n')) {
+    const numbered = /^\s*(\d{1,2})[.)]\s*(.*)$/.exec(raw);
+    if (numbered !== null) current = Number(numbered[1]);
+    const text = (numbered?.[2] ?? raw).replace(/^\s*[-•*]\s*/, '').trim();
+    if (text === '' || scriptDemand(verb, text) === null || cited.has(current)) continue;
+    const label = current > 0 ? `Step ${current}: ${text}` : text;
+    const pairs = pairsOnLine(text);
+    const fromData = pairs.length > 0 ? pairs : testData.filter((p) => squash(p.key) !== '' && squash(text).includes(squash(p.key))).map((p) => ({ key: p.key, value: p.value }));
+    const anchor = insertionAnchorFor(flow, current);
+    let grounded = 0;
+    for (const pair of fromData) {
+      if (unconfirmedValue(pair.value)) continue;
+      const control = treeControlNamed(pair.key, evidence);
+      if (control === null) continue;
+      const step = entryStepFor(control, pair.value, markGenerated(label, `performs the script's "${scriptDemand(verb, text)}" on ${control.role} ${JSON.stringify(control.name)} from the tree with the sheet's value ${JSON.stringify(pair.value)}`));
+      if (step === null) continue;
+      appendOrInsert(flow, anchor, step);
+      grounded += 1;
+    }
+    if (grounded > 0) {
+      performed.push(`${current > 0 ? `step ${current}` : text.slice(0, 40)} (${grounded} control(s) from the tree)`);
+      continue;
+    }
+    appendOrInsert(flow, anchor, {
+      action: 'workflow',
+      goal: label,
+      intent: markGenerated(label, 'no captured tree names its control — an agent leg performs the sheet\'s own line; the later assertions settle it'),
+    } as FlowStep);
+    delegated.push(current > 0 ? `step ${current}` : text.slice(0, 40));
+  }
+  if (performed.length === 0 && delegated.length === 0) return null;
+  return (
+    `script ${tier} the flow left unperformed was inserted by the harness (marked [generated: …]): ` +
+    [performed.length > 0 ? `${performed.join(', ')} as deterministic steps` : '', delegated.length > 0 ? `${delegated.join(', ')} as agent leg(s) in the sheet's words` : '']
+      .filter(Boolean)
+      .join('; ')
+  );
+}
+
+/**
+ * Split a workflow goal's `Field = value` pairs into deterministic entry
+ * steps where a captured tree names the field (the fallback for
+ * `workflowOverDeclaredControls`): each grounded pair becomes the entry step
+ * the tree's role dictates, inserted before the leg, and the leg keeps its
+ * goal (annotated) — the agent finds the field already set. Nothing
+ * grounded, null: the weak note stands.
+ */
+export function settleWorkflowGoal(flow: SettleableFlow, step: FlowStep, evidence: string | undefined): string | null {
+  if (step.action !== 'workflow') return null;
+  const done: string[] = [];
+  for (const pair of pairsOnLine(step.goal)) {
+    const control = treeControlNamed(pair.key, evidence);
+    if (control === null) continue;
+    const entry = entryStepFor(control, pair.value, markGenerated(`${pair.key} = ${pair.value}`, `split out of the workflow goal: ${control.role} ${JSON.stringify(control.name)} is in the tree`));
+    if (entry === null) continue;
+    insertStepBefore(flow, step, entry);
+    done.push(`${control.role} ${JSON.stringify(control.name)} = ${JSON.stringify(pair.value)}`);
+  }
+  if (done.length === 0) return null;
+  annotateStep(step, `${done.length} control(s) the tree names were split out before this leg: ${done.join(', ')}`);
+  return `workflow goal ${JSON.stringify(step.goal.slice(0, 60))}: ${done.join(', ')} performed deterministically before the leg (marked [generated: …])`;
 }
 
 /**

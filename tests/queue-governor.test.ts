@@ -315,3 +315,88 @@ describe('the rules governor holds a shared fixture', () => {
     assert.equal(governorHoldsConsumed({ WOWLIDATOR_GOVERNOR_HOLD_CONSUMED: '1' }), true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// A dependency wait is the scheduler's, and the governor explains it as such
+// (CG-12, 2026-09-04). The gate that parks a dependent lives in the run loop
+// (`dependencyStanding`); the observation carries the prerequisite on
+// `waitingOn`, and the rules governor names it — never "a compatible case
+// that has not dispatched", which is what it read before.
+// ---------------------------------------------------------------------------
+
+describe('the rules governor explains a dependency wait', () => {
+  it('names the prerequisite and the lane it is in flight in, once per pair', async () => {
+    const gov = new RuleGovernorModel();
+    const obs: GovernorObservation = {
+      ...observation(),
+      event: 'queue-blocked',
+      flyingFacts: [
+        { name: 'X other', writes: false, sections: ['route:home'] },
+        { name: 'HIR-1 hire the employee', writes: true, sections: ['table:employee'] },
+      ],
+      pendingFacts: [{ name: 'PRB-1 probation of that employee', writes: true, sections: ['table:probation'], waitingOn: 'HIR-1' }],
+    };
+    const first = await gov.decide(obs, null);
+    assert.equal(first.kind, 'note');
+    assert.match(first.reason, /"PRB-1 probation of that employee" is waiting on prerequisite HIR-1, in flight in lane 2/);
+    assert.match(first.reason, /dependency gate, not starvation/);
+    const second = await gov.decide(obs, null);
+    assert.equal(second.kind, 'idle', 'said once');
+    assert.doesNotMatch(second.reason, /looks compatible/, 'a parked dependent is never misread as a stuck compatible case');
+  });
+
+  it('a prerequisite parked ahead in the queue, or not yet queued, is said as such', async () => {
+    const gov = new RuleGovernorModel();
+    const ahead = await gov.decide({
+      ...observation(),
+      event: 'queue-blocked',
+      flyingFacts: [{ name: 'A', writes: true, sections: ['table:plan'] }],
+      pendingFacts: [
+        { name: 'B', writes: false, sections: ['route:x'], waitingOn: 'A' },
+        { name: 'C', writes: false, sections: ['route:y'], waitingOn: 'B' },
+      ],
+    }, null);
+    assert.equal(ahead.kind, 'note');
+    assert.match(ahead.reason, /"B" is waiting on prerequisite A, in flight in lane 1/);
+    const next = await gov.decide({
+      ...observation(),
+      event: 'queue-blocked',
+      flyingFacts: [{ name: 'A', writes: true, sections: ['table:plan'] }],
+      pendingFacts: [
+        { name: 'B', writes: false, sections: ['route:x'], waitingOn: 'A' },
+        { name: 'C', writes: false, sections: ['route:y'], waitingOn: 'B' },
+      ],
+    }, null);
+    assert.match(next.reason, /"C" is waiting on prerequisite B, queued ahead of it and not yet started/);
+    const gov2 = new RuleGovernorModel();
+    const unqueued = await gov2.decide({
+      ...observation(),
+      event: 'queue-blocked',
+      flyingFacts: [{ name: 'A', writes: true, sections: ['table:plan'] }],
+      pendingFacts: [{ name: 'D', writes: false, sections: ['route:x'], waitingOn: 'Z' }],
+    }, null);
+    assert.match(unqueued.reason, /waiting on prerequisite Z, not yet queued/);
+  });
+
+  it('a queue that is entirely parked on prerequisites is idle, and one with a real conflict beside a parked case still names the conflict', async () => {
+    const gov = new RuleGovernorModel();
+    const parked: GovernorObservation = {
+      ...observation(),
+      event: 'queue-blocked',
+      flyingFacts: [{ name: 'A', writes: true, sections: ['table:plan'] }],
+      pendingFacts: [{ name: 'B', writes: false, sections: ['route:x'], waitingOn: 'A' }],
+    };
+    await gov.decide(parked, null); // the once-only note
+    const again = await gov.decide(parked, null);
+    assert.deepEqual(again, { kind: 'idle', reason: 'every waiting case is parked on a prerequisite — nothing to change' });
+    const mixed = await gov.decide({
+      ...parked,
+      pendingFacts: [
+        { name: 'B', writes: false, sections: ['route:x'], waitingOn: 'A' },
+        { name: 'W', writes: true, sections: ['table:plan'] },
+      ],
+    }, null);
+    assert.equal(mixed.kind, 'note');
+    assert.match(mixed.reason, /correctly serialising a real data conflict/);
+  });
+});

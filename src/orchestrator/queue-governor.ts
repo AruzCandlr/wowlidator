@@ -92,6 +92,15 @@ export interface GovernorCaseFact {
    * sections differ, because the data locks serialise by TABLE, not record.
    */
   fixtures?: readonly string[] | undefined;
+  /**
+   * The prerequisite case this pending case is parked on (CG-12, 2026-09-04):
+   * the scheduler's own dependency gate said `wait`, because that case is
+   * queued ahead and has not ended. Set by the run's observation, never
+   * inferred here. A case carrying it is waiting by design, and the rules
+   * governor explains it as such rather than reporting a compatible case that
+   * "has not dispatched" — the gate is the scheduler's; the governor observes.
+   */
+  waitingOn?: string | undefined;
 }
 
 /**
@@ -510,7 +519,32 @@ export class RuleGovernorModel implements GovernorModel {
     }
     if (observation.event === 'queue-blocked') {
       const flying = observation.flyingFacts ?? [];
-      const pending = observation.pendingFacts ?? [];
+      // Rule 1a — a dependency wait is the scheduler honouring the sheet, not
+      // a blockage: say which prerequisite, and where it is (in a lane, or
+      // parked ahead in the queue behind its own), once per pair; and keep
+      // such cases out of the "compatible yet not dispatching" diagnosis,
+      // which would otherwise misread every dependent as a scheduler fault.
+      const waiting = (observation.pendingFacts ?? []).filter((c) => c.waitingOn !== undefined);
+      for (const c of waiting) {
+        const key = `waiting:${c.name}:${c.waitingOn}`;
+        if (this.#saidKeys.has(key)) continue;
+        this.#saidKeys.add(key);
+        const lane = flying.findIndex((f) => f.name === c.waitingOn || f.name.startsWith(`${c.waitingOn} `));
+        const where =
+          lane >= 0
+            ? `in flight in lane ${lane + 1}${flying[lane]!.detail ? ` (${flying[lane]!.detail})` : ''}`
+            : (observation.pendingFacts ?? []).some((p) => p.name === c.waitingOn || p.name.startsWith(`${c.waitingOn} `))
+              ? 'queued ahead of it and not yet started'
+              : 'not yet queued';
+        return {
+          kind: 'note',
+          reason: `"${c.name}" is waiting on prerequisite ${c.waitingOn}, ${where} — the scheduler's dependency gate, not starvation`,
+        };
+      }
+      const pending = (observation.pendingFacts ?? []).filter((c) => c.waitingOn === undefined);
+      if (pending.length === 0 && waiting.length > 0) {
+        return { kind: 'idle', reason: 'every waiting case is parked on a prerequisite — nothing to change' };
+      }
       const conflicts = (c: GovernorCaseFact): boolean =>
         flying.some((f) => {
           const a = { writes: c.writes, sections: c.sections, deletes: false };

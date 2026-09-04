@@ -589,11 +589,37 @@ describe('the wowUI page', () => {
     assert.match(html, /type: 'radio', name: 'launch-scope'/);
     assert.match(html, /End-to-end/);
   });
+
+  it('asks how a catalog should run, fastest first or sequentially, with real radios', () => {
+    // Two orders that change what the run DOES: fastest first is the CLI's
+    // default and sends nothing; sequential is --concurrency 1 --sheet-order,
+    // because concurrency 1 alone would still put readers before writers.
+    assert.match(html, /How should the cases run\?/);
+    assert.match(html, /type: 'radio', name: 'launch-order'/);
+    assert.match(html, /Fastest first/);
+    assert.match(html, /Sequentially/);
+    assert.match(html, /order: 'fastest'/);
+    assert.match(html, /if \(M\.order === 'sequential'\) \{ values\.concurrency = 1; values\['sheet-order'\] = true; \}/);
+  });
 });
 
 describe('the command whitelist', () => {
   const claims = commandById('catalog-claims')!;
   const run = commandById('catalog-run')!;
+
+  it('declares the order the launcher offers, so the server accepts it', () => {
+    // The sequential radio sends concurrency 1 and sheet-order together; both
+    // must be declared on catalog-run or the server refuses the submission.
+    for (const name of ['concurrency', 'sheet-order']) {
+      assert.ok(run.fields.find((one) => one.name === name), `catalog-run must declare ${name}`);
+    }
+    const argv = buildArgv(run, { catalog: 'cases.xlsx', claims: 'c.json', run: true, concurrency: 1, 'sheet-order': true });
+    assert.ok(argv.includes('--sheet-order'));
+    assert.deepEqual(argv.slice(argv.indexOf('--concurrency'), argv.indexOf('--concurrency') + 2), ['--concurrency', '1']);
+    // Fastest first sends neither: the CLI's default IS fastest first.
+    const plain = buildArgv(run, { catalog: 'cases.xlsx', claims: 'c.json', run: true });
+    assert.ok(!plain.includes('--sheet-order') && !plain.includes('--concurrency'));
+  });
 
   it('declares the scope the launcher offers, so the server accepts it', () => {
     // The radio in the Describe launcher sends `scope`, and a value this file

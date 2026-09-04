@@ -847,3 +847,15 @@ re-pinned), `tests/flow-author.test.ts` ("the last word is a rewrite, not a
 refusal": `settleViolations`, the step-7-of-8 hand-over, the identical
 refusal settled on attempt 2, a token still refused, the ungrounded text
 annotated, `settleSelectorRole`, `settleExclusivity`).
+
+### Addendum, same day: ML_01_04 — a noun read as a verb, and what the last word could not settle
+
+The panel's job-6 (`--author-attempts 1`, so attempt 1 IS the last word) blocked ML_01_04 on `skipsAuthoredScript` (fatal, no `settle`) plus the weak `workflowOverDeclaredControls`; the rebuilt dist was in use (job started 08:54Z, dist 15:46 local = 08:46Z). What stopped the settle was simply that the fatal lint had none — and it should not have fired: the script says `5. เลือก Leave type = Sick Leave`, and the typing tier matched the NOUN "type" (the head of a `Field = value` pair). Fixes, all structural:
+
+- **`scriptDemand`**: a demand word immediately followed by `=` / `:` is a field name (the sheet's own pair grammar), never the verb. A `workflow` leg performs the typing and choosing tiers as it already performed the acting tier — whether its claim is settled is `unsettledWorkflowClaim`'s question. ML_01_04's body (choosing through agent legs) now passes the lint outright.
+- **`workflowOverDeclaredControls`**: a declared word inside a longer CAPITALISED run in the goal ("Type" in "Leave Type", "Leave" in "Sick Leave") names that longer thing; a declared compound matches on its own turn; every occurrence is judged; a lower-case goal keeps the plain match (`capitalisedRunAround`, read from casing, no word list).
+- **`settleScriptDemand`** (the fallback for `skipsAuthoredScript`): each uncited script line of the demanded tier is performed — every `Field = value` pair on the line (or the Test data pair the line names) whose field a tree/probe line names becomes the entry step the tree's ROLE dictates (`entryStepFor`: textbox → fill, button/combobox → selectOption, checkbox → check, radio/option → click), cited `Step N:` and marked; a line nothing grounds becomes a `workflow` leg whose goal is the sheet's own line, marked the same way. Placed before the first body step citing a later script step, else before the first assertion.
+- **`settleWorkflowGoal`** (for the weak lint, applied on acceptance — `settleViolations` now lets a weak complaint run its own settle before falling back to its note): the goal's `Field = value` pairs a tree names are split out as entry steps before the leg, and the leg is annotated. Values in prose are cut by casing (`valueHeadOf`: "Sick Leave and pick today" → "Sick Leave").
+- `insertStepBefore` / `appendOrInsert` skip a case whose `steps` IS the body's array (the folded single case shares it) — found by the test, it would have inserted twice.
+
+Tests: `tests/flow-author.test.ts` ("a script step is performed, never read as a noun, and the last word performs it (multirole ML_01_04)"): the noun rule, the workflow-leg rule, the compound rule, `settleScriptDemand` from the tree and to an agent leg, `settleWorkflowGoal`, and the pipeline shipping the ML_01_04 shape on attempt 1 of 1.

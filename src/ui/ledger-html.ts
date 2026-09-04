@@ -1183,7 +1183,7 @@ var POSITIVE = {
 };
 var ADV_GROUPS = [
   ['Recording', ['video', 'screenshots', 'capture-delay', 'step-delay', 'no-target-highlight']],
-  ['Behaviour', ['no-heal', 'no-agent', 'no-agent-early-stop', 'no-reconstruct', 'no-network', 'no-history', 'quarantine-flaky', 'update-baselines', 'no-author-review', 'no-agent-capture', 'no-value-resolution', 'concurrency', 'author-concurrency', 'author-attempts', 'db-baseline']],
+  ['Behaviour', ['no-heal', 'no-agent', 'no-agent-early-stop', 'no-reconstruct', 'no-network', 'no-history', 'quarantine-flaky', 'update-baselines', 'no-author-review', 'no-agent-capture', 'no-value-resolution', 'concurrency', 'author-concurrency', 'author-attempts', 'sheet-order', 'db-baseline']],
   ['Chrome', ['headless', 'browsers', 'no-ensure-chrome', 'stop-chrome', 'wait-for', 'cdp']],
   ['Output', ['report', 'no-report', 'junit', 'ctrf', 'suite', 'flow', 'catalog-out', 'claims-out', 'context-out', 'cache', 'out']]
 ];
