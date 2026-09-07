@@ -46,8 +46,11 @@ console.log(`runKey        : ${led.runKey ?? '(none)'}`);
 // `ended: null` means either "still running" or "stopped short"; the only way to
 // tell them apart from the file alone is how recently it was written.
 const ageMin = led.updatedAt ? (Date.now() - Date.parse(led.updatedAt)) / 60000 : Infinity;
-const endedLabel = led.ended
-  ? led.ended
+const endedText = typeof led.ended === 'object' && led.ended !== null
+  ? JSON.stringify(led.ended)
+  : led.ended;
+const endedLabel = endedText
+  ? endedText
   : ageMin < 5
     ? `null  — written ${ageMin.toFixed(1)} min ago, so probably STILL RUNNING`
     : `null  — it STOPPED, it did not finish (last written ${ageMin.toFixed(0)} min ago)`;
