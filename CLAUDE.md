@@ -158,7 +158,9 @@ same authority as this file, just paid for only when relevant:
 
 ## Repo-local tooling for Claude Code
 
-- `.claude/skills/wowlidate` — `/wowlidate`: starts a catalog run end to end — gathers the catalog, URL, credentials and lanes, then predicts persona coverage with `preflight.mjs` before a browser is spent. The prediction is the point: on 2026-09-07, 308 of 309 EC cases were refused before any model was called because no persona credentials were supplied.
+- `.claude/skills/wowlidate` — `/wowlidate`: starts a catalog run end to end — gathers the catalog, URL, credentials and lanes, then predicts persona coverage with `preflight.mjs` before a browser is spent. The prediction is the point: on 2026-09-07, 308 of 309 EC cases were refused before any model was called because no persona credentials were supplied. Its `monitor/` is a view-only live
+page (plain HTML/CSS/JS, no server, no network) that `watch.mjs` feeds from the
+run's own ledger and log.
 - `.claude/skills/catalog-triage` — `/catalog-triage`: the other half — re-enters a run that stopped. Its `ledger.mjs` reads `<slug>.claims.progress.json` and prints the run key, the verdict tally, never-ran versus blocked, and whether the authored flows still resolve. Knows the two quiet ways a re-entry loses results: a changed run key orphans the old verdicts, and `--rerun-*` resets sealed ones.
 - `.claude/skills/monitor` — `/monitor`: dumps the panel's job log and attributes a slow run to authoring, agent legs or the ladder. Its `joblog.mjs` is the fastest way to read timings.
 - `.claude/skills/rebuild-beplan-db` — resets the local HRCenter-DEV `benefit_plan` table to the be100 QA baseline before a catalog run.

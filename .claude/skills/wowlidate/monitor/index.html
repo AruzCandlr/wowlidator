@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>wowlidator — run monitor</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg:#F7F7F4; --panel:#FFFFFF; --panel-2:#FAFAF8;
+    --line:#E5E7E3; --line-strong:#D3D6D0;
+    --ink:#1C2126; --muted:#5C6873; --faint:#98A2AC;
+    --accent-soft:#E4F3F5; --accent-ink:#0A6B7A;
+    --ok:#1B7F4B;   --ok-bg:#E7F4EC;
+    --warn:#B45309; --warn-bg:#FBF0E1;
+    --bad:#B91C1C;  --bad-bg:#FBE9E9;
+    --info:#2563EB; --info-bg:#E8EEFC;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --shadow:0 1px 2px rgba(28,33,38,.03),0 2px 6px -2px rgba(28,33,38,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0a0a0a; --panel:#1a1a1a; --panel-2:#1e1e1e;
+      --line:#333; --line-strong:#404040;
+      --ink:#fff; --muted:#b0b0b0; --faint:#6b7280;
+      --accent-soft:#0c2b33; --accent-ink:#22c9e4;
+      --ok:#10b981;   --ok-bg:#0c2a1f;
+      --warn:#f59e0b; --warn-bg:#33260c;
+      --bad:#ef4444;  --bad-bg:#331616;
+      --info:#3b82f6; --info-bg:#12203a;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0a0a0a; --panel:#1a1a1a; --panel-2:#1e1e1e;
+    --line:#333; --line-strong:#404040;
+    --ink:#fff; --muted:#b0b0b0; --faint:#6b7280;
+    --accent-soft:#0c2b33; --accent-ink:#22c9e4;
+    --ok:#10b981;   --ok-bg:#0c2a1f;
+    --warn:#f59e0b; --warn-bg:#33260c;
+    --bad:#ef4444;  --bad-bg:#331616;
+    --info:#3b82f6; --info-bg:#12203a;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing:border-box; }
+  body { margin:0; padding:28px; background:var(--bg); color:var(--ink);
+         font-family:var(--sans); font-size:14px; line-height:1.45; }
+  .wrap { max-width:1180px; margin:0 auto; display:flex; flex-direction:column; gap:18px; }
+
+  .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.09em;
+             text-transform:uppercase; color:var(--faint); overflow-wrap:anywhere; }
+  h1 { font-size:23px; font-weight:600; letter-spacing:-.01em; margin:2px 0 0; }
+
+  header.top { display:flex; justify-content:space-between; align-items:flex-start;
+               gap:16px; flex-wrap:wrap; }
+  .top-meta { display:flex; flex-direction:column; gap:10px; align-items:flex-end; }
+  .chip-row { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+
+  .chip { display:inline-flex; align-items:center; gap:6px; font-family:var(--mono);
+          font-size:11.5px; letter-spacing:.03em; padding:4px 10px; border-radius:999px;
+          border:1px solid var(--line-strong); background:var(--panel-2);
+          color:var(--muted); white-space:nowrap; }
+  .chip .dot { width:6px; height:6px; border-radius:50%; background:currentColor; flex:none; }
+  .chip.ok{color:var(--ok);background:var(--ok-bg);border-color:transparent}
+  .chip.warn{color:var(--warn);background:var(--warn-bg);border-color:transparent}
+  .chip.bad{color:var(--bad);background:var(--bad-bg);border-color:transparent}
+  .chip.info{color:var(--info);background:var(--info-bg);border-color:transparent}
+  .chip.accent{color:var(--accent-ink);background:var(--accent-soft);border-color:transparent}
+  .chip .dot.pulse { animation:pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  @media (prefers-reduced-motion: reduce) { .chip .dot.pulse{animation:none} }
+
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:14px; box-shadow:var(--shadow); }
+
+  .notice { padding:12px 16px; border-radius:12px; border:1px solid var(--line-strong);
+            background:var(--panel-2); color:var(--muted); font-size:12.5px; }
+  .notice.bad{color:var(--bad);background:var(--bad-bg);border-color:transparent}
+  .notice.warn{color:var(--warn);background:var(--warn-bg);border-color:transparent}
+  .notice b{color:inherit;font-weight:600}
+
+  .progress-panel { padding:20px 22px; display:flex; flex-direction:column; gap:14px; }
+  .progress-head { display:flex; justify-content:space-between; align-items:baseline;
+                   gap:12px; flex-wrap:wrap; }
+  .progress-head .label { font-family:var(--mono); font-size:11px; letter-spacing:.08em;
+                          text-transform:uppercase; color:var(--faint); }
+  .progress-head .frac { font-family:var(--mono); font-size:13.5px; color:var(--muted); }
+  .progress-head .frac b { color:var(--ink); font-weight:600; }
+  .bar-track { height:10px; border-radius:999px; background:var(--panel-2);
+               border:1px solid var(--line); overflow:hidden; display:flex; }
+  .bar-track > span { height:100%; display:block; transition:width .5s ease; }
+  .b-pass{background:var(--ok)} .b-fail{background:var(--bad)}
+  .b-review{background:var(--info)} .b-blocked{background:var(--faint)}
+
+  .tiles { display:grid; grid-template-columns:repeat(6,1fr); gap:1px; background:var(--line);
+           border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  @media (max-width:720px){ .tiles{grid-template-columns:repeat(3,1fr)} }
+  .tile { background:var(--panel); padding:14px 16px; display:flex; flex-direction:column; gap:4px; }
+  .tile .n { font-family:var(--mono); font-size:26px; font-weight:600;
+             font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+  .tile .lbl { font-size:11px; font-family:var(--mono); text-transform:uppercase;
+               letter-spacing:.07em; color:var(--faint); }
+  .tile.pass .n{color:var(--ok)} .tile.fail .n{color:var(--bad)}
+  .tile.review .n{color:var(--info)} .tile.blocked .n{color:var(--muted)}
+  .tile.total .n{color:var(--ink)} .tile.reached .n{color:var(--accent-ink)}
+
+  .cols { display:grid; grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);
+          gap:18px; align-items:start; }
+  @media (max-width:860px){ .cols{grid-template-columns:minmax(0,1fr)} }
+
+  .panel-h { display:flex; justify-content:space-between; align-items:center; gap:10px;
+             padding:14px 18px; border-bottom:1px solid var(--line); }
+  .panel-h .t { font-size:13px; font-weight:600; white-space:nowrap; }
+  .panel-h .n { font-family:var(--mono); font-size:11.5px; color:var(--faint);
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  .feed { max-height:520px; overflow-y:auto; }
+  .feed-row { display:grid; grid-template-columns:92px minmax(0,1fr); gap:10px; padding:9px 18px;
+              border-bottom:1px solid var(--line); align-items:baseline; }
+  .feed-row:last-child{border-bottom:none}
+  .feed-row .case { font-family:var(--mono); font-size:11px; color:var(--accent-ink);
+                    background:var(--accent-soft); border-radius:5px; padding:1px 6px;
+                    white-space:nowrap; justify-self:start; overflow:hidden;
+                    text-overflow:ellipsis; max-width:100%; }
+  .feed-row .msg { font-size:12.5px; color:var(--muted); overflow-wrap:anywhere;
+                   font-family:var(--mono); min-width:0; }
+  .feed-row.new { animation:rowIn .5s ease; }
+  @keyframes rowIn { from{background:var(--accent-soft)} to{background:transparent} }
+  @media (prefers-reduced-motion: reduce){ .feed-row.new{animation:none} }
+
+  .outcomes { max-height:520px; overflow-y:auto; }
+  .out-row { display:flex; align-items:center; gap:10px; padding:10px 18px;
+             border-bottom:1px solid var(--line); }
+  .out-row:last-child{border-bottom:none}
+  .verdict-pill { font-family:var(--mono); font-size:10.5px; font-weight:600;
+                  text-transform:uppercase; letter-spacing:.04em; padding:2px 8px;
+                  border-radius:999px; flex:none; }
+  .verdict-pill.passed{color:var(--ok);background:var(--ok-bg)}
+  .verdict-pill.failed{color:var(--bad);background:var(--bad-bg)}
+  .verdict-pill.review{color:var(--info);background:var(--info-bg)}
+  .verdict-pill.blocked{color:var(--muted);background:var(--panel-2)}
+  .out-row .name { font-size:12.5px; flex:1; min-width:0; overflow:hidden;
+                   text-overflow:ellipsis; white-space:nowrap; font-family:var(--mono); }
+  .out-row .t { font-family:var(--mono); font-size:10.5px; color:var(--faint); flex:none; }
+  .out-row .name small { display:block; color:var(--faint); font-size:10.5px;
+                         overflow:hidden; text-overflow:ellipsis; }
+
+  .empty { padding:32px 18px; text-align:center; color:var(--faint); font-size:12.5px; }
+
+  footer { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap;
+           font-family:var(--mono); font-size:10.5px; color:var(--faint); padding:4px 4px 0; }
+  footer span { overflow-wrap:anywhere; }
+
+  ::-webkit-scrollbar { width:8px; }
+  ::-webkit-scrollbar-thumb { background:var(--line-strong); border-radius:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <div class="eyebrow" id="eyebrow">waiting for a run&hellip;</div>
+      <h1>Catalog run monitor</h1>
+    </div>
+    <div class="top-meta">
+      <div class="chip-row" id="statusChips"></div>
+      <div class="chip" id="updatedChip"><span class="dot"></span><span id="updatedText">connecting&hellip;</span></div>
+    </div>
+  </header>
+
+  <div class="notice" id="notice" hidden></div>
+
+  <div class="panel progress-panel">
+    <div class="progress-head">
+      <span class="label">Cases proved</span>
+      <span class="frac" id="fracText"><b>&mdash;</b> / &mdash;</span>
+    </div>
+    <div class="bar-track" id="barTrack">
+      <span class="b-pass" style="width:0%"></span><span class="b-fail" style="width:0%"></span><span class="b-review" style="width:0%"></span><span class="b-blocked" style="width:0%"></span>
+    </div>
+    <div class="tiles" id="tiles"></div>
+  </div>
+
+  <div class="cols">
+    <div class="panel">
+      <div class="panel-h"><span class="t">Live activity</span><span class="n" id="feedCount">&mdash;</span></div>
+      <div class="feed" id="feed"><div class="empty">Waiting for the run to write its first line&hellip;</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-h"><span class="t">Recent outcomes</span><span class="n" id="outcomeCount">&mdash;</span></div>
+      <div class="outcomes" id="outcomes"><div class="empty">No case has a verdict yet.</div></div>
+    </div>
+  </div>
+
+  <footer>
+    <span id="runKeyText">run key: &mdash;</span>
+    <span id="logPathText"></span>
+    <span>view only &middot; reads the run's own ledger and log</span>
+  </footer>
+</div>
+
+<script>
+// This page only ever reads. Nothing here starts, stops or changes a run —
+// there is no control to press, on purpose: a monitor that can also act is a
+// monitor you hesitate to leave open.
+//
+// Opened from the filesystem, fetch() of a sibling file is blocked but a
+// <script src> is not. So watch.mjs writes run-state.js as an assignment and
+// this re-injects the tag on a timer. That is the entire transport.
+(function () {
+  var POLL_MS = 3000;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function num(v) { return typeof v === 'number' && isFinite(v) ? v : 0; }
+  function relTime(iso) {
+    if (!iso) return '—';
+    var ms = Date.now() - new Date(iso).getTime();
+    if (ms < 0) return 'just now';
+    var s = Math.floor(ms / 1000);
+    if (s < 5) return 'just now';
+    if (s < 60) return s + 's ago';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ago';
+    return Math.floor(m / 60) + 'h ' + (m % 60) + 'm ago';
+  }
+  function showNotice(html, cls) {
+    var el = $('notice');
+    if (!html) { el.hidden = true; return; }
+    el.className = 'notice' + (cls ? ' ' + cls : '');
+    el.innerHTML = html;
+    el.hidden = false;
+  }
+
+  var lastSig = null;
+
+  function render(s) {
+    if (!s) return;
+    var c = s.counts || {};
+    var passed = num(c.passed), failed = num(c.failed),
+        review = num(c.review), blocked = num(c.blocked), planned = num(c.planned);
+    var reached = passed + failed + review + blocked;
+
+    var eyebrow = [];
+    if (s.launch && s.launch.catalog) eyebrow.push(s.launch.catalog);
+    if (s.launch && s.launch.url) eyebrow.push(s.launch.url);
+    if (!eyebrow.length && s.title) eyebrow.push(s.title);
+    $('eyebrow').textContent = eyebrow.join('  ·  ') || 'waiting for a run…';
+
+    $('fracText').innerHTML = '<b>' + reached + '</b> / ' + planned;
+    var pct = function (n) { return planned > 0 ? (n / planned) * 100 : 0; };
+    var track = $('barTrack').children;
+    track[0].style.width = pct(passed) + '%';
+    track[1].style.width = pct(failed) + '%';
+    track[2].style.width = pct(review) + '%';
+    track[3].style.width = pct(blocked) + '%';
+
+    $('tiles').innerHTML = [
+      ['pass', passed, 'Passed'], ['fail', failed, 'Failed'],
+      ['review', review, 'Review'], ['blocked', blocked, 'Blocked'],
+      ['reached', reached, 'Reached'], ['total', planned, 'Planned']
+    ].map(function (t) {
+      return '<div class="tile ' + t[0] + '"><span class="n">' + t[1] +
+             '</span><span class="lbl">' + t[2] + '</span></div>';
+    }).join('');
+
+    var chips = [];
+    if (s.ended) {
+      chips.push('<span class="chip ' + (s.ended.complete ? 'ok' : 'bad') + '"><span class="dot"></span>' +
+        (s.ended.complete ? 'finished' : 'stopped: ' + esc(s.ended.cause || 'unknown')) + '</span>');
+    } else {
+      var cls = s.phase === 'running' ? 'accent' : 'info';
+      chips.push('<span class="chip ' + cls + '"><span class="dot' +
+        (s.phase === 'running' ? ' pulse' : '') + '"></span>' + esc(s.phase || 'starting') + '</span>');
+    }
+    if (num(s.chromeAlive) > 0) chips.push('<span class="chip">chrome ' + num(s.chromeAlive) + '</span>');
+    if (num(s.authored) > 0) chips.push('<span class="chip">' + num(s.authored) + ' authored</span>');
+    $('statusChips').innerHTML = chips.join('');
+
+    // Two clocks, and conflating them is how a dead run looks alive: logMtime is
+    // when the run last wrote, updatedAt is when the watcher last read it. A
+    // reading is only ever as fresh as the watcher that took it.
+    $('updatedText').textContent = 'log wrote ' + relTime(s.logMtime) + ' · read ' + relTime(s.updatedAt);
+    var readAge = s.updatedAt ? Date.now() - new Date(s.updatedAt).getTime() : Infinity;
+    var logAge = s.logMtime ? Date.now() - new Date(s.logMtime).getTime() : Infinity;
+    var readStale = readAge > 20000;
+    $('updatedChip').className = 'chip ' + (readStale ? 'bad' : s.ended ? '' : logAge > 120000 ? 'warn' : 'ok');
+
+    if (readStale) {
+      showNotice('No fresh reading for <b>' + relTime(s.updatedAt) +
+        '</b> — the watcher is not running, so these numbers are frozen. Restart it with ' +
+        '<b>node .claude/skills/wowlidate/monitor/watch.mjs</b>.', 'bad');
+    } else if (s.note) {
+      showNotice(esc(s.note), 'warn');
+    } else if (!s.ended && logAge > 120000 && s.phase !== 'waiting') {
+      showNotice('The run has written nothing for <b>' + relTime(s.logMtime) +
+        '</b>. It may be on a long model call, or it may be wedged.', 'warn');
+    } else if (s.ended && !s.ended.complete) {
+      showNotice('This run <b>stopped short</b>: ' + esc(s.ended.cause || 'cause not recorded') +
+        '. Sealed verdicts are kept; a plain <b>--resume</b> continues under the same run key.', 'bad');
+    } else {
+      showNotice(null);
+    }
+
+    var feed = $('feed');
+    var ev = Array.isArray(s.recentActivity) ? s.recentActivity : [];
+    var sig = ev.length ? ev[0].caseId + '|' + ev[0].text : '';
+    if (!ev.length) {
+      feed.innerHTML = '<div class="empty">Waiting for the run to write its first line&hellip;</div>';
+    } else {
+      feed.innerHTML = ev.map(function (e, i) {
+        return '<div class="feed-row' + (i === 0 && sig !== lastSig ? ' new' : '') + '">' +
+          '<span class="case">' + esc(e.caseId) + '</span>' +
+          '<span class="msg">' + esc(e.text) + '</span></div>';
+      }).join('');
+    }
+    lastSig = sig;
+    $('feedCount').textContent = num(s.requestsSeenThisWindow) + ' llm req in window';
+
+    var out = $('outcomes');
+    var os = Array.isArray(s.recentOutcomes) ? s.recentOutcomes : [];
+    if (!os.length) {
+      out.innerHTML = '<div class="empty">No case has a verdict yet.</div>';
+    } else {
+      out.innerHTML = os.map(function (o) {
+        return '<div class="out-row">' +
+          '<span class="verdict-pill ' + esc(o.verdict) + '">' + esc(o.verdict) + '</span>' +
+          '<span class="name" title="' + esc(o.reason) + '">' + esc(o.name || o.id) +
+            (o.reason ? '<small>' + esc(o.reason) + '</small>' : '') + '</span>' +
+          '<span class="t">' + relTime(o.at) + '</span></div>';
+      }).join('');
+    }
+    $('outcomeCount').textContent = reached + ' of ' + planned;
+
+    $('runKeyText').textContent = 'run key: ' + (s.runKey || '—');
+    $('logPathText').textContent = s.logFile || s.ledgerFile || '';
+  }
+
+  function load() {
+    var el = document.createElement('script');
+    el.src = 'run-state.js?t=' + Date.now(); // cache-bust, or the browser serves the first read forever
+    el.onload = function () {
+      el.remove();
+      render(window.__WOW_STATE__);
+    };
+    el.onerror = function () {
+      el.remove();
+      $('updatedChip').className = 'chip bad';
+      $('updatedText').textContent = 'no run-state.js';
+      showNotice('No <b>run-state.js</b> beside this page. Start the watcher: ' +
+        '<b>node .claude/skills/wowlidate/monitor/watch.mjs</b>', 'bad');
+    };
+    document.head.appendChild(el);
+  }
+
+  load();
+  setInterval(load, POLL_MS);
+  // Re-tick the relative times even when no new reading lands, so "3s ago"
+  // never sits there lying while the watcher is dead.
+  setInterval(function () { if (window.__WOW_STATE__) render(window.__WOW_STATE__); }, 5000);
+})();
+</script>
+</body>
+</html>

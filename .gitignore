@@ -20,3 +20,4 @@ supervisor.hold
 .lavish/
 scripts-scratch/
 CLAUDE.local.md
+.claude/skills/wowlidate/monitor/run-state.js

@@ -128,6 +128,26 @@ npm run cli -- catalog "$CATALOG" --url "$APP_URL" --run --resume \
 Run it in the background and tell the user the log path. A catalog run outlives
 any single command, and holding the foreground blocks the conversation for hours.
 
+Then open the monitor, so the run has a face while it works:
+
+```bash
+node .claude/skills/wowlidate/monitor/watch.mjs &   # projects ledger + log every 3s
+open .claude/skills/wowlidate/monitor/index.html    # macOS; xdg-open elsewhere
+```
+
+`watch.mjs` finds the newest ledger and log itself — resolving
+`WOWLIDATOR_REPORT_DIR` the way the CLI does, so it looks where the run actually
+writes — or takes `--ledger` / `--log` explicitly. It writes `run-state.js`
+beside the page, and the page re-injects that script every three seconds. A
+`file://` page cannot `fetch` a sibling file, but it can load one as a script;
+that is the whole reason the state is JS rather than JSON, and it is what makes
+the page live with no server behind it. Kill the watcher when the run ends.
+
+**The page is view-only, deliberately.** There is no control on it that can
+touch the run. That is what makes it safe to leave open on a second screen for
+five hours: a monitor that can also act is a monitor you hesitate to leave
+open.
+
 **`--resume` belongs on essentially every launch.** It skips anything that
 already holds a verdict, and reusing authored flows is nearly free next to
 writing them (a real re-entry reused 188 of 284). The `--rerun-*` family is the
@@ -138,7 +158,15 @@ when the run will finish, and say so when you do.
 
 ## 5. Watch it
 
-Poll every few minutes; never with a foreground `sleep` alone. The suite prints
+The monitor from §4 answers "is it alive, and what has it proved" at a glance:
+the split progress bar, the six counts, the live log feed and the newest
+verdicts with their reasons. It shows **two clocks** on purpose — when the run
+last *wrote*, and when the watcher last *read* — because a dead watcher in front
+of a healthy run looks exactly like a live watcher in front of a wedged run, and
+only the pair tells them apart.
+
+For anything the page does not answer, poll every few minutes; never with a
+foreground `sleep` alone. The suite prints
 a running tally (`passed N · failed N · blocked N · left N`), and the ledger
 beside the claims file is the durable record:
 
