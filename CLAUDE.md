@@ -92,7 +92,7 @@ Skips are printed with the reason, so a green run that skipped the browser tier 
 | `data` (`data/data-model.ts`) | Groq | a `fillRetry` step's kind is `custom` | `DataModel.generate()` |
 | `governor` (`orchestrator/queue-governor.ts`) | Groq | a handful of event-driven turns per *suite* | see `src/orchestrator/CLAUDE.md` |
 
-Each role is matched to a tier's strength, not to a favourite vendor: repair is small and latency-sensitive (Groq is fastest), generation sends the biggest prompt in the system (Gemini has the largest free context), navigation is one small structured decision per turn (Groq again — the loop, not the model, owns the reasoning; OpenRouter remains the natural re-point for a stronger agent model), data regeneration is another small latency-sensitive call (Groq again). Every role is re-pointable with two env vars — see `.env.example`. `PROVIDERS` in `src/config.ts` is the live list (thirteen as of 2026-09, including the `claude-cli`/`claude-tty`/`claude-cloud` family that shells out to Claude Code rather than calling an HTTP API); `LLM_ROLES` is the live role list.
+Each role is matched to a tier's strength, not to a favourite vendor: repair is small and latency-sensitive (Groq is fastest), generation sends the biggest prompt in the system (Gemini has the largest free context), navigation is one small structured decision per turn (Groq again — the loop, not the model, owns the reasoning; OpenRouter remains the natural re-point for a stronger agent model), data regeneration is another small latency-sensitive call (Groq again). Every role is re-pointable with two env vars — see `.env.example`. `PROVIDERS` in `src/config.ts` is the live list (fifteen as of 2026-09-07, including the `claude-cli`/`claude-tty`/`claude-cloud` family that shells out to Claude Code rather than calling an HTTP API); `LLM_ROLES` is the live role list.
 
 `data`'s deterministic kinds (`email`, `username`, `name`, `phone`, `text`) never actually touch a model — see `src/data/mock-data.ts`. Only `kind: 'custom'` reaches `data-model.ts`, which is why the role exists so escalation is *possible*, not so it's *routine*.
 
@@ -158,6 +158,8 @@ same authority as this file, just paid for only when relevant:
 
 ## Repo-local tooling for Claude Code
 
+- `.claude/skills/wowlidate` — `/wowlidate`: starts a catalog run end to end — gathers the catalog, URL, credentials and lanes, then predicts persona coverage with `preflight.mjs` before a browser is spent. The prediction is the point: on 2026-09-07, 308 of 309 EC cases were refused before any model was called because no persona credentials were supplied.
+- `.claude/skills/catalog-triage` — `/catalog-triage`: the other half — re-enters a run that stopped. Its `ledger.mjs` reads `<slug>.claims.progress.json` and prints the run key, the verdict tally, never-ran versus blocked, and whether the authored flows still resolve. Knows the two quiet ways a re-entry loses results: a changed run key orphans the old verdicts, and `--rerun-*` resets sealed ones.
 - `.claude/skills/monitor` — `/monitor`: dumps the panel's job log and attributes a slow run to authoring, agent legs or the ladder. Its `joblog.mjs` is the fastest way to read timings.
 - `.claude/skills/rebuild-beplan-db` — resets the local HRCenter-DEV `benefit_plan` table to the be100 QA baseline before a catalog run.
 - `.claude/output-styles/asd-ste100.md` — an output style that holds every user-facing sentence to ASD-STE100 Simplified Technical English; code blocks are exempt.
