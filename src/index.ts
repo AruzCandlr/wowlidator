@@ -545,6 +545,7 @@ export {
   quoteIdent,
   type DbActionsOptions,
   type DbCheckRecord,
+  type DbStatementRecord,
   type FlowDbCalledSpec,
   type FlowDbDeltaSpec,
   type FlowDbRowSpec,

@@ -71,6 +71,24 @@ export function dialogIsIntendedContext(lastAction: string | null | undefined): 
 }
 
 /**
+ * The intended-context exemption, WITH the evidence it was missing
+ * (be-sit-high-fixed-20260910-141440, PL_08_01). "Opened by the previous
+ * <action>" is only true when that dialog was ALREADY OPEN when this step's
+ * resolution began: the previous step's click opens the modal, this step
+ * begins, and the modal is there. A dialog that appears only DURING the
+ * ladder — the JIT probe's own click, the agent — was not opened by the
+ * previous step whatever the last action was, so it is a blocker and
+ * dismissed as before. The second exemption ("holding the very control this
+ * step is aimed at") is unchanged and lives at the call site.
+ */
+export function dialogIsIntendedContextGiven(
+  lastAction: string | null | undefined,
+  openAtStart: boolean,
+): boolean {
+  return openAtStart && dialogIsIntendedContext(lastAction);
+}
+
+/**
  * Does the failing selector name something INSIDE the open dialog? A step
  * aimed at the dialog's own field must never close it, whatever came before.
  * Hidden elements count (the field may be in a collapsed section of the

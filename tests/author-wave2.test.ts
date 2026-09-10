@@ -253,7 +253,13 @@ describe('CG-05 — personas reach the model by label and email, never by passwo
 
   it('refuses a sign-in typed for an account the run does not hold, naming the labels', async () => {
     const author = new FlowAuthor({
-      model: stubModel({ steps: [...loginAs('employee2@cnext.test', 'Password123!'), { action: 'expectVisible', selector: 'text="Consent"', intent: '1.1' }] }),
+      model: stubModel({
+        steps: [
+          ...loginAs('employee2@cnext.test', 'Password123!'),
+          { action: 'goto', url: 'http://x.test/en/consent' },
+          { action: 'expectVisible', selector: 'text="Consent"', intent: '1.1' },
+        ],
+      }),
       personas: PERSONAS,
       attempts: 1,
     });

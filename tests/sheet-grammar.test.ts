@@ -18,6 +18,7 @@ import {
   dbTablesNamed,
   describeCase,
   destinationOf,
+  statedDestinationUrl,
   expectedLines,
   linkDependencies,
   menuPathOf,
@@ -540,5 +541,56 @@ describe('The sheet\'s status as a gate and as ground truth (CG-01)', () => {
     assert.equal(rows[0]!.note, 'Blocker group: Environment\nBlocker detail: GPS mock ยังไม่พร้อม');
     assert.equal(rows[1]!.note, '');
     assert.match(describeCase(rows[0]!), /Note \(from the sheet\):\n {2}Blocker group: Environment\n {2}Blocker detail: GPS mock ยังไม่พร้อม$/);
+  });
+});
+
+describe('a sign-in URL is never a destination (be-high-sonnet, 2026-09-09)', () => {
+  // The live sheet opens EVERY row's Steps column with the same preamble
+  // naming the login page, and states the case's real page as a bare path.
+  // Taking the first URL made the login page the destination of all 429 rows:
+  // 14 of ~30 authoring complaints on the High slice were `ignoresMenuPath`
+  // reporting that the flow never navigates to the sign-in page, with a remedy
+  // no correct flow can perform.
+  const row = (over: Record<string, string>): any => ({
+    steps: '',
+    menu: '',
+    testData: '',
+    preconditions: '',
+    note: '',
+    expected: '',
+    ...over,
+  });
+
+  it('ignores the "begin here" login URL and falls through to the menu path', () => {
+    const one = row({
+      steps:
+        'QA default locale = en; เริ่มที่ https://humi-sit-int.central.co.th/humi/en/login ' +
+        'และใช้ /humi/en/ สำหรับทุก route\n0. Route อ้างอิง /humi/en/admin/benefits/plans',
+      menu: '1. HR\n2. Benefits Admin\n3. Benefit Plans',
+    });
+    assert.equal(statedDestinationUrl(one), null);
+    const dest = destinationOf(one);
+    assert.equal(dest?.url, null);
+    assert.deepEqual(dest?.path, ['HR', 'Benefits Admin', 'Benefit Plans']);
+  });
+
+  it('takes a real page over a login URL wherever in the cell it appears', () => {
+    const one = row({ steps: 'start at https://app.test/en/login then open https://app.test/en/admin/plans' });
+    assert.equal(statedDestinationUrl(one), 'https://app.test/en/admin/plans');
+  });
+
+  it('answers null when every URL the row names is a sign-in surface', () => {
+    // Not a loss: signing in is what setup does, and `ignoresMenuPath` judges
+    // the body alone, so a login destination can only ever be a false complaint.
+    assert.equal(statedDestinationUrl(row({ steps: 'Navigate to https://app.test/en/login and sign in' })), null);
+  });
+
+  it('does not mistake a page whose path merely contains sso for a sign-in surface', () => {
+    // PY-1 TC_SSO_001_001: /admin/config/sso is a payroll app's Social Security
+    // Office page. `LOGIN_URL_PATTERN` already knows; this pins that we use it.
+    assert.equal(
+      statedDestinationUrl(row({ steps: 'open https://app.test/en/admin/config/sso' })),
+      'https://app.test/en/admin/config/sso',
+    );
   });
 });

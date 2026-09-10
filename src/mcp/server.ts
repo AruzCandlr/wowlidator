@@ -218,6 +218,14 @@ const flowStepSchema = z.discriminatedUnion('action', [
     method: z.string().describe('GET, POST, PUT, PATCH, DELETE, …'),
     url: z.string().describe('Absolute, or relative to the flow baseUrl. May contain {{vars}}.'),
     headers: z.record(z.string(), z.string()).optional(),
+    inheritHeaders: z
+      .boolean()
+      .optional()
+      .describe(
+        'Default true: the call inherits the headers the page itself was observed sending to ' +
+          'this origin (an authored header always wins). Set false to send only what is ' +
+          'authored — the spelling for a deliberately malformed-request test.',
+      ),
     body: z
       .unknown()
       .optional()

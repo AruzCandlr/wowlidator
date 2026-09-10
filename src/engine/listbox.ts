@@ -64,13 +64,37 @@ export interface ListboxSelection {
   via: 'option' | 'checkbox';
   /** What was typed into the search box, when one was used. */
   typed?: string | undefined;
-  /** Which candidate found the option: the whole value, its code half, or its label half. */
-  matchedBy: 'whole' | 'code' | 'label';
+  /**
+   * Which candidate found the option: the whole value, its code half, its
+   * label half — or `prefix`, the one option in the list that starts with
+   * the value when nothing matched whole ("Thai" → "Thailand - Thailand").
+   */
+  matchedBy: 'whole' | 'code' | 'label' | 'prefix';
   /** What the trigger showed afterwards, and whether that holds the pick. */
   readBack: string | null;
   confirmed: boolean;
   /** How long the list took to hold anything after opening. */
   waitedMs: number;
+}
+
+/**
+ * The one option name that begins with `value` (case-folded, whitespace
+ * collapsed, a code-half `X - ` prefix on the option tolerated), or null when
+ * none or several do. Pure; the pick rung's last resort before a miss.
+ */
+export function uniquePrefixMatch(options: readonly string[], value: string): string | null {
+  const fold = (text: string): string => text.normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim();
+  const wanted = fold(value);
+  if (wanted.length < 2) return null;
+  const hits = options.filter((option) => {
+    const name = fold(option);
+    if (name === wanted) return false; // a whole match belongs to the rung above
+    if (name.startsWith(wanted)) return true;
+    // "TH - Thailand": the label half after a code dash may carry the prefix.
+    const dash = name.indexOf(' - ');
+    return dash > 0 && name.slice(dash + 3).startsWith(wanted);
+  });
+  return hits.length === 1 ? hits[0]! : null;
 }
 
 /** The list opened but never held the option — closed again; wording is a parsed contract. */
@@ -90,6 +114,8 @@ export class ListboxOptionMissingError extends Error {
    * null when no search was typed or every head returned options.
    */
   readonly searchedEmpty: string | null;
+  /** The trigger's own label when the list opened — the page's name for the control, in its language. */
+  readonly trigger: string;
   constructor(
     trigger: string,
     value: string,
@@ -106,6 +132,7 @@ export class ListboxOptionMissingError extends Error {
     this.shown = shown;
     this.filtered = evidence.filtered ?? false;
     this.searchedEmpty = evidence.searchedEmpty ?? null;
+    this.trigger = trigger;
   }
 }
 
@@ -316,10 +343,44 @@ export async function selectFromListbox(
   const settleMs = options.settleMs ?? 250;
   const triggerName = (await readTrigger(trigger, 250)) ?? 'the trigger';
 
+  // A search box on the page before the trigger was even touched is not
+  // evidence of anything the click did; counted here so the fallback below
+  // can tell "the click revealed one" from "one was already sitting there".
+  const searchBoxesBefore = await page.locator(SEARCH_INPUT).filter({ visible: true }).count().catch(() => 0);
+
   const expanded = await attr(trigger, 'aria-expanded', 250);
   if (expanded !== 'true') await trigger.first().click({ timeout });
 
-  const opened = await openList(page, trigger, timeout);
+  let opened = await openList(page, trigger, timeout);
+  if (opened === null && options.typeToFilter !== false) {
+    // Some triggers (`aria-haspopup="listbox"` and nothing else — the
+    // `HumiSearchableSelect` shape this module's header already names) open
+    // onto a bare search box with no role=listbox/option anywhere yet: the
+    // list is created only once the search is narrowed, so `openList` above
+    // had nothing to find and timed out looking for it. A search-shaped
+    // input that appeared as a RESULT of the click — never one already on
+    // the page, which searching page-wide could grab by coincidence — is
+    // worth one probe keystroke before giving up, the way a person facing an
+    // apparently-empty dropdown starts typing rather than assuming it is
+    // broken. The probe need not be the exact match: it only has to cause
+    // the real list to render; the per-part loop below re-types the correct
+    // head into it regardless, once a container exists to scope that search
+    // to. A short retry budget — the list rendering in response to a
+    // keystroke is a re-render, not the network fetch `waitForListToFill`
+    // is patient for.
+    const revealed = page.locator(SEARCH_INPUT).filter({ visible: true });
+    const revealedCount = await revealed.count().catch(() => 0);
+    if (revealedCount > searchBoxesBefore) {
+      const firstPart = splitMultiValue(value)[0] ?? value;
+      const probe = codeAndLabelOf(firstPart)?.code ?? firstPart;
+      await revealed
+        .nth(revealedCount - 1)
+        .fill(probe, { timeout })
+        .catch(() => undefined);
+      await page.waitForTimeout(settleMs);
+      opened = await openList(page, trigger, Math.min(timeout, 1_500));
+    }
+  }
   if (opened === null) {
     await page.keyboard.press('Escape').catch(() => undefined);
     throw new ListboxOptionMissingError(triggerName, value, [], `no listbox or menu became visible within ${timeout} ms of opening`);
@@ -332,7 +393,7 @@ export async function selectFromListbox(
 
   const picked: string[] = [];
   let typed: string | undefined;
-  let matchedBy: 'whole' | 'code' | 'label' = 'whole';
+  let matchedBy: 'whole' | 'code' | 'label' | 'prefix' = 'whole';
   for (const part of parts) {
     const candidates = optionCandidates(part);
     // 3. Type-to-filter, the stable head first.
@@ -377,6 +438,24 @@ export async function selectFromListbox(
       if (hit !== null && !hit.disabled) {
         matchedBy = candidate.by;
         break;
+      }
+    }
+    // Last resort before a miss: the ONE option that starts with the value.
+    // Never a substring ("Male" is not "Female") and never one of several
+    // ("New Hire" is not every "New Hire — …"): exactly one option, or
+    // nothing. The read-back below records what the control shows, so a
+    // wrong guess is visible in the proof rather than silent. Measured live
+    // (humi, 2026-09-05): "Thai" against a list whose only match was
+    // "Thailand - Thailand" cost the agent a miss, a settle, and a turn.
+    if (hit === null || hit.disabled) {
+      const unique = uniquePrefixMatch(state.options, part);
+      if (unique !== null) {
+        const [exact] = optionNamePatterns(unique);
+        const byPrefix = (await findOption(container, exact)) ?? (await findOption(page.locator('body'), exact));
+        if (byPrefix !== null && !byPrefix.disabled) {
+          hit = byPrefix;
+          matchedBy = 'prefix';
+        }
       }
     }
     if (hit === null) {

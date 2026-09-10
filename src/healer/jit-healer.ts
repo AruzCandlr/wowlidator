@@ -16,6 +16,7 @@ import { CacheManager, type HealedSelectorEntry } from '../cache/cache-manager.j
 import type { RejectedHeal } from '../engine/proof-bundle.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
 import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
+import { fence, sanitizeInline } from '../providers/model-fence.js';
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
 import type { HealHints, HealHintsProvider } from '../context/heal-hints.js';
 import { focusTreeText } from '../context/retriever.js';
@@ -278,7 +279,13 @@ ${selfCheck([
  * is entirely in the *second* ask, which is the first one that knows what did
  * not work.
  */
-const HEAL_ATTEMPTS = 3;
+/**
+ * Repair asks per failed selector. The value is entirely in the SECOND ask —
+ * the first one that knows what did not work (`HealRequest.rejected`). One was
+ * too few for the failure that actually happens; exported so
+ * `tests/healer-economy.test.ts` can pin the budget rather than trust it.
+ */
+export const HEAL_ATTEMPTS = 3;
 
 /**
  * The healer could not repair the selector, and here is everything it tried.
@@ -351,15 +358,28 @@ function sameSelector(a: string, b: string): boolean {
 }
 
 export function buildUserPrompt(request: HealRequest, hints?: HealHints): string {
+  // FENCED at assembly, never at the source: the tree, the repository hints
+  // and the background slices are all third-party text, and the one thing a
+  // repair must not do is propose a selector out of a rewritten tree. Only
+  // the prompt string is sanitised — `focusTreeText` below, `selectorGrounded`
+  // and the cache all keep reading the tree as the page wrote it. The failed
+  // selector and the action are the harness's own and go in as they are.
   const lines = [
-    `Page URL: ${request.url}`,
+    `Page URL: ${sanitizeInline(request.url)}`,
     `Attempted action: ${request.action}`,
     `Failed selector: ${request.failedSelector}`,
   ];
-  if (request.failureReason) lines.push(`Why it failed: ${request.failureReason}`);
-  if (request.intent) lines.push(`Author intent: ${request.intent}`);
+  if (request.failureReason) lines.push(`Why it failed: ${sanitizeInline(request.failureReason)}`);
+  if (request.intent) lines.push(`Author intent: ${sanitizeInline(request.intent)}`);
   if (request.caseContext) {
-    lines.push(`The test case this step serves (context, not the thing to repair): ${request.caseContext}`);
+    // A block, not a folded line: this is the same `Flow.caseContext` card the
+    // agent is shown, it runs to many lines, and an inline bound would cut a
+    // long one silently. Same source label as the agent gives it, so the
+    // fencing is one thing across the roles rather than per-prompt taste.
+    lines.push(
+      'The test case this step serves (context, not the thing to repair):',
+      fence('catalog', request.caseContext),
+    );
   }
   // Advisory context, before the tree so every re-ask of this heal keeps a
   // byte-identical prefix (`rejected` alone grows between attempts). Framing
@@ -368,14 +388,14 @@ export function buildUserPrompt(request: HealRequest, hints?: HealHints): string
     lines.push(
       '',
       'What the repository declares about this page (advisory — the accessibility tree below is the page as it stands, and your candidate must come from it):',
-      hints.repoHints,
+      fence('repository', hints.repoHints),
     );
   }
   if (hints?.background) {
     lines.push(
       '',
       'Background documents matching this step (context for intent, never candidate material):',
-      hints.background,
+      fence('repository', hints.background),
     );
   }
   if (request.action === 'expectCount') {
@@ -405,9 +425,9 @@ export function buildUserPrompt(request: HealRequest, hints?: HealHints): string
     focusQuery === ''
       ? request.axTree
       : focusTreeText(request.axTree, focusQuery, HEAL_TREE_MAX_LINES).text;
-  lines.push('', 'Accessibility tree:', tree);
+  lines.push('', 'Accessibility tree:', fence('page', tree));
   if (request.interactions) {
-    lines.push('', 'Controls revealed by opening disclosures on page:', request.interactions);
+    lines.push('', 'Controls revealed by opening disclosures on page:', fence('page', request.interactions));
   }
   // The rejected list is the only part that grows between attempts; keeping it
   // after the tree leaves attempts 1-3 sharing a byte-identical prefix, which a
@@ -416,7 +436,7 @@ export function buildUserPrompt(request: HealRequest, hints?: HealHints): string
     lines.push(
       '',
       'Already tried and rejected — do NOT propose any of these again:',
-      ...request.rejected.map((entry) => `  - ${entry}`),
+      ...request.rejected.map((entry) => `  - ${sanitizeInline(entry)}`),
     );
   }
   return lines.join('\n');
@@ -447,26 +467,39 @@ export interface LlmHealerModelOptions {
  * right fit for the fastest free tier rather than the smartest one.
  */
 export class LlmHealerModel implements HealerModel {
-  readonly id: string;
-
   readonly #source: ModelSource;
   readonly #maxOutputTokens: number;
   readonly #maxRetries: number;
   readonly #hints: HealHintsProvider | undefined;
+  readonly #givenId: string | undefined;
 
   constructor(options: LlmHealerModelOptions = {}) {
     this.#hints = options.hints;
     if (options.model) {
       this.#source = { model: options.model };
-      this.id = options.id ?? 'custom:healer';
+      this.#givenId = options.id ?? 'custom:healer';
       this.#maxRetries = options.maxRetries ?? 2;
     } else {
       const factory = options.factory ?? new LlmFactory();
       this.#source = { factory, role: 'healer' };
-      this.id = options.id ?? factory.forRole('healer').id;
+      this.#givenId = options.id;
       this.#maxRetries = options.maxRetries ?? factory.maxRetries;
     }
     this.#maxOutputTokens = options.maxOutputTokens ?? 1024;
+  }
+
+  /**
+   * The model's label, and never a key demand. The CLI builds a healer for
+   * every run and the bundle records `healerModel` before the first step;
+   * resolving the role here demanded the healer's key on a flow that never
+   * healed — `wowlidator needs a Groq key to run the "healer" role` on a
+   * passing flow, exit 1. "A run that never heals never demands a key" is
+   * the factory's contract; the key is asked for by `suggest`, when a heal
+   * actually happens.
+   */
+  get id(): string {
+    if (this.#givenId !== undefined) return this.#givenId;
+    return 'factory' in this.#source ? this.#source.factory.labelFor('healer') : 'custom:healer';
   }
 
   async suggest(request: HealRequest): Promise<HealSuggestion> {
@@ -768,6 +801,13 @@ export interface HealOutcome {
   entry: HealedSelectorEntry;
   /** Wall-clock time of the whole repair, including AX capture and verification. */
   latencyMs: number;
+  /**
+   * What the pre-heal disclosure probe could not put back or could not do —
+   * a popover it opened and had to close with a click rather than Escape, or
+   * one it left open. Surfaced so a run can say the page state a heal ran on
+   * was the probe's doing, not the flow's.
+   */
+  probeWarnings?: string[] | undefined;
 }
 
 export interface HealInput {
@@ -814,10 +854,19 @@ export class JitHealer {
     // trigger is clicked. The model cannot pick a selector for something it
     // cannot see. Failures are swallowed (a probe must never abort a repair).
     let interactions: string | undefined;
+    const probeWarnings: string[] = [];
     try {
       const report = await probeInteractions(input.page);
       const formatted = formatProbeReport(report);
       if (formatted) interactions = formatted;
+      probeWarnings.push(...report.warnings);
+      for (const probe of report.probes) {
+        // A disclosure that needed a click to close is a fact about the page
+        // worth recording: Escape is the gesture every later rung reaches for.
+        if (probe.closedVia !== undefined && probe.closedVia !== 'escape') {
+          probeWarnings.push(`"${probe.trigger}" ignored Escape and was closed by ${probe.closedVia}`);
+        }
+      }
     } catch {
       // Safe to ignore — disclosure probing is a best-effort enrichment.
     }
@@ -945,7 +994,13 @@ export class JitHealer {
       model: this.model.id,
     });
 
-    return { selector: candidate, suggestion, entry, latencyMs: Date.now() - startedMs };
+    return {
+      selector: candidate,
+      suggestion,
+      entry,
+      latencyMs: Date.now() - startedMs,
+      ...(probeWarnings.length > 0 ? { probeWarnings } : {}),
+    };
   }
 
   /**

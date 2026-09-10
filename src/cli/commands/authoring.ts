@@ -98,10 +98,12 @@ import {
   caseFlows,
   type AuthoredFlow,
 } from '../../generator/flow-author.js';
+import { declaredStringsOf, type DeclaredString } from '../../generator/step-evidence.js';
 import { LlmGeneratorModel, TestGenerator } from '../../generator/test-generator.js';
 import type { GeneratedSuite } from '../../generator/test-generator.js';
 import { captureAxNodes, captureAxTree, type AxNode } from '../../healer/jit-healer.js';
-import { performSignIn, acceptConsentGate } from '../../engine/sign-in.js';
+import { performSignIn } from '../../engine/sign-in.js';
+import { acceptConsentGate } from '../../engine/consent-gate.js';
 import { probeInteractions } from '../../context/page-probe.js';
 import { formatTrend } from '../../history/run-history.js';
 import {
@@ -124,6 +126,7 @@ import {
 import { EXIT, exitCodeFor, suiteExit, type CaseOutcome } from '../exit.js';
 import {
   AUTHORING_REFUSAL_CAP,
+  forgetAuthored,
   isErrorOutcome,
   isFailedOutcome,
   ledgerPathFor,
@@ -132,14 +135,18 @@ import {
   readLedger,
   recordOutcome,
   remaining,
+  resumeAuthored,
   summariseLedger,
   writeLedger,
+  type LedgerAuthored,
+  type SuiteLedger,
 } from '../suite-progress.js';
 import { substantiveAssertions, vacuousFlow } from '../../generator/vacuous.js';
 import { CaseQueue, DEFAULT_CONCURRENCY, ScenarioGate, authorWorkers, dependencyCycles, mapPool, orderDependentsAfterSources, orderScenariosFastestFirst, unresolvedReferences } from '../case-plan.js';
 import { healHintsFrom } from '../../context/heal-hints.js';
 import { lookupPersona, personaEmails, personaLabelOf, type CliOptions } from '../options.js';
 import { pauseRequested } from '../pause.js';
+import { awaitQuotaRelease, ensureQuotaHold } from '../quota-hold.js';
 import {
   assertRolesResolvable,
   buildAgent,
@@ -155,7 +162,7 @@ import {
   stepLogger,
   buildRiskModel,
 } from '../runtime.js';
-import { runCases, type SuiteCase } from '../run-cases.js';
+import { runCases, type LedgerHooks, type SuiteCase } from '../run-cases.js';
 
 export async function cmdGenerate(url: string | undefined, options: CliOptions): Promise<number> {
   // `--api` reads the indexed spec rather than a page, so it needs no url.
@@ -831,28 +838,102 @@ export function sliceRows(
 const OPENING_NAME = /^(?:create|add|new|next|continue|insert|open|edit|make correction|\+|สร้าง|เพิ่ม|ถัดไป|เปิด|แก้ไข|ทำรายการ)/iu;
 const NOT_AN_OPENING = /delete|remove|ลบ|save|submit|บันทึก|confirm|ยืนยัน|approve|อนุมัติ|reject|ปฏิเสธ|sign|log ?out|ออกจากระบบ/iu;
 
+/** A step line's own number, as sheets write them ("2." / "2)"). */
+const NUMBERED_STEP = /^\s*(\d{1,2})[.)]\s*/;
+
+/** How far into a row's own script the opening click is looked for. */
+const OPENING_STEP_LINES = 3;
+
 /**
- * The first control a row's Steps click to reach its fields (CG-18, the
- * reduced form): `กดปุ่ม "Create Plan"`, `Click Add`, `กด ถัดไป`, `+`. Only
- * an OPENING name qualifies — the capture may open a dialog or a wizard step
- * on its own tab, never save, submit or delete anything — and only from the
- * first three steps: a control clicked later is past fields the author has
- * to fill first. Null when the row names none.
+ * The row's first steps, counted as the sheet NUMBERS them rather than as
+ * lines, with the numbering stripped.
+ *
+ * Measured (2026-09-09, be-high RU_06_12): a generated catalog prefixes every
+ * row with a locale/route preamble and a `0.` reference line, so the row's own
+ * opening click — `2. กดไอคอน Edit (Make Correction) …` — was the fourth
+ * line and never looked at. The capture then read the list page only, the
+ * popup the case is about was never opened, and the author wrote its
+ * assertion out of the sheet's vocabulary instead of the application's.
+ * The first three LINES stay in the pool as well, so a script with no
+ * numbering at all reads exactly as it did before.
  */
-export function openingControlOf(steps: string): string | null {
-  const lines = steps
-    .split('\n')
-    .map((line) => line.replace(/^\s*\d{1,2}[.)]\s*/, '').trim())
-    .filter((line) => line !== '')
-    .slice(0, 3);
-  for (const line of lines) {
-    const quoted = /(?:กด(?:ปุ่ม)?|click|press|เลือก|select)\s*(?:the\s+)?(?:button\s+)?["“]([^"”\n]{1,40})["”]/iu.exec(line);
-    const bare = /(?:กด(?:ปุ่ม)?|click|press)\s+(?:the\s+)?(?:button\s+)?(\+|[A-Z][A-Za-z0-9&/-]*(?:\s+[A-Z][A-Za-z0-9&/-]*){0,3}|ถัดไป|สร้าง[\p{L}\p{M}]*|เพิ่ม[\p{L}\p{M}]*)/iu.exec(line);
-    const name = (quoted?.[1] ?? bare?.[1] ?? '').trim();
-    if (name === '') continue;
-    if (OPENING_NAME.test(name) && !NOT_AN_OPENING.test(name)) return name;
+function firstScriptLines(steps: string): string[] {
+  const raw = steps.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+  // By the sheet's OWN numbers, not by how many numbered lines came first: a
+  // `0.` reference line is a convention for "read this before you start", and
+  // counting it as a step spent one of the three on nothing (measured: it hid
+  // step 3, the row's only click, on four rows of the failing run).
+  const numbered = raw.filter((line) => {
+    const number = NUMBERED_STEP.exec(line)?.[1];
+    return number !== undefined && Number(number) <= OPENING_STEP_LINES;
+  });
+  const pool = new Set([...raw.slice(0, OPENING_STEP_LINES), ...numbered]);
+  return raw.filter((line) => pool.has(line)).map((line) => line.replace(NUMBERED_STEP, '').trim());
+}
+
+/**
+ * The alias a step line puts in brackets straight after the control it names
+ * — `Edit (Make Correction)`, `ปุ่ม บันทึก (Save)`. The sheet's word for a
+ * control and the application's word for it are frequently not the same, and
+ * a row that writes both is handing over both: the second one is tried when
+ * nothing on the page carries the first. Null when what follows is not a
+ * bracketed word.
+ */
+function bracketedAliasAfter(line: string, from: number): string | null {
+  const match = /^\s*[([]([^)\]\n]{1,40})[)\]]/u.exec(line.slice(from));
+  const alias = (match?.[1] ?? '').trim();
+  return alias === '' || !/\p{L}/u.test(alias) ? null : alias;
+}
+
+/**
+ * Every name the row's first steps give the control that OPENS what the case
+ * is about, best first (CG-18, the reduced form): `กดปุ่ม "Create Plan"`,
+ * `Click Add`, `กด ถัดไป`, `กดไอคอน Edit (Make Correction)`, `+`. Only an
+ * OPENING name qualifies — the capture may open a dialog or a wizard step on
+ * its own tab, never save, submit or delete anything, and that rule holds for
+ * a bracketed alias too — and only from the first three steps: a control
+ * clicked later is past fields the author has to fill first. Empty when the
+ * row names none.
+ */
+export function openingControlNamesOf(steps: string): string[] {
+  for (const line of firstScriptLines(steps)) {
+    const quoted = /(?:กด(?:ปุ่ม|ไอคอน)?|click|press|เลือก|select)\s*(?:the\s+)?(?:button\s+|icon\s+)?["“]([^"”\n]{1,40})["”]/iu.exec(line);
+    // The verb may carry the noun with it — `กดไอคอน Edit`, `click icon Edit`
+    // — which the old `กด(?:ปุ่ม)?\s+` could not read at all: 61 of the 1,286
+    // rows in the measured workbook name their opening control that way, and
+    // every one of them captured the page in front of the dialog.
+    const bare = /(?:กด(?:ปุ่ม|ไอคอน)?|click|press)\s*(?:the\s+)?(?:button\s+|icon\s+)?(\+|[A-Z][A-Za-z0-9&/-]*(?:\s+[A-Z][A-Za-z0-9&/-]*){0,3}|ถัดไป|สร้าง[\p{L}\p{M}]*|เพิ่ม[\p{L}\p{M}]*)/iu.exec(line);
+    // A click on a control the row DESCRIBES rather than names — "กดไอคอน
+    // ดินสอ (Make correction)", "กดไอคอน Layers (Insert)" — puts the
+    // application's own word for it in the brackets, and that gloss is the
+    // only name on the line a page can carry.
+    const glossed = /(?:กด(?:ปุ่ม|ไอคอน)?|click|press)[^\n(（"“]{0,30}[(（]([^)）\n]{1,40})[)）]/iu.exec(line);
+    const found = [quoted, bare, glossed].filter((match): match is RegExpExecArray => match !== null);
+    const names = found.map((match) => (match[1] ?? '').trim());
+    if (names.every((name) => name === '')) continue;
+    // One veto for the whole line: if ANY word this line clicks is a save, a
+    // submit or a delete, nothing on it is opened on someone's application —
+    // the gloss of a destructive control is not a way in.
+    if (names.some((name) => NOT_AN_OPENING.test(name))) continue;
+    const index = names.findIndex((name) => name !== '' && OPENING_NAME.test(name));
+    if (index < 0) continue;
+    const primary = found[index] as RegExpExecArray;
+    const opening = [names[index] as string];
+    // The row's other word for the same control, when it wrote one in
+    // brackets straight after: the sheet's word first, the application's
+    // second, and the capture takes whichever the page actually carries.
+    const alias = bracketedAliasAfter(line, primary.index + primary[0].length);
+    if (alias !== null && alias.toLowerCase() !== (opening[0] as string).toLowerCase() && !NOT_AN_OPENING.test(alias)) {
+      opening.push(alias);
+    }
+    return opening;
   }
-  return null;
+  return [];
+}
+
+/** The one name the row gives its opening control, for callers that want a single word. */
+export function openingControlOf(steps: string): string | null {
+  return openingControlNamesOf(steps)[0] ?? null;
 }
 
 export function caseCard(row: TestCaseRow): string | undefined {
@@ -989,6 +1070,10 @@ async function authorEachRow(
   // judge). The warm claude pool must fit them, or worker N+1 falls to a
   // cold one-shot at full price — the run-pool already does this for lanes.
   raiseSessionCapFor(workers);
+  // Authoring spends the same session window the lanes do — arm the hold
+  // here too, because on the pipelined path the first row is authored before
+  // the run loop exists. Idempotent with the runner's own call.
+  ensureQuotaHold(options.config, (line) => process.stderr.write(`${line}\n`));
   if (workers === 1 && options.authorConcurrency === undefined && rows.length > 1) {
     context.log?.(
       `authoring rows one at a time: the generator role is on ${options.config.roles.generator.provider}, ` +
@@ -1083,6 +1168,10 @@ async function authorEachRow(
       await context.gate.waitFor(scenarioKey, () => pauseRequested());
       if (pauseRequested()) return;
     }
+    // The account's session window is nearly spent: a row authored now would
+    // be refused mid-answer and recorded as never ran. Wait for the window.
+    await awaitQuotaRelease(() => pauseRequested());
+    if (pauseRequested()) return;
     // Per row, not once for the loop. Every row is authored in its own call
     // against the same open page, so whole context documents were multiplied
     // by the row count — a twelve-row sheet with one 120,000-character spec
@@ -1182,8 +1271,10 @@ async function authorEachRow(
           credentials: resolved.first,
           // The row's first opening click (CG-18, reduced): the fields of
           // ~400 rows live behind "Create Plan" / "Add" / "ถัดไป", and a
-          // tree read before that click shows none of them.
-          opening: openingControlOf(row.steps),
+          // tree read before that click shows none of them. Every name the
+          // row gives it — its own word first, a bracketed alias after —
+          // because the sheet's word and the application's are often two.
+          opening: openingControlNamesOf(row.steps),
           // **Not behind a flag on this path.** A sheet row names a
           // destination that is almost never the start url, and authoring it
           // from the sign-in tree alone is the failure this capture exists
@@ -1283,6 +1374,7 @@ async function authorEachRow(
             documents: selected.documents.map((d) => ({ name: d.name, text: d.text })),
             repository: rowProjectContext,
             declaredRoutes: declaredPageRoutes(context.graph ?? null),
+            deploymentUrl: options.url,
             backend: options.backend,
             // The sheet's own Actual Result: a row the tester already saw
             // fail is the strongest expected-fail evidence there is.
@@ -1298,7 +1390,14 @@ async function authorEachRow(
           // reasons as feedback; the better flow wins. be100: "the search
           // box starts disabled" (0.78), "no Start-date filter exists"
           // (0.88) — each right, each spent on a full dead-ended run.
-          if (risk.verdict === 'fail-fast' && risk.reasons.length > 0 && !riskRetried.has(row.caseId)) {
+          // Only the DEAD-END dimension is worth a re-ask: a flow can be
+          // rewritten around a control that does not exist, but not around a
+          // sheet that already says the case fails — an expected-fail verdict
+          // is a fact about the application, and re-authoring cannot author
+          // it away. Measured live (2026-09-05): 29 of 59 risk re-asks were
+          // expected-fail, each a full authoring call that changed nothing.
+          const deadEndTripped = risk.likelihood > risk.threshold;
+          if (risk.verdict === 'fail-fast' && deadEndTripped && risk.reasons.length > 0 && !riskRetried.has(row.caseId)) {
             riskRetried.add(row.caseId);
             log?.(`  ${row.caseId}: re-authoring once against the risk judge's ${risk.reasons.length} reason(s)…`);
             try {
@@ -1315,6 +1414,7 @@ async function authorEachRow(
                   caseName: testCase.name, caseText: `${row.testCase}\n${described}`, flow: again.flow,
                   documents: selected.documents.map((d) => ({ name: d.name, text: d.text })), repository: rowProjectContext,
                   declaredRoutes: declaredPageRoutes(context.graph ?? null), backend: options.backend,
+                  deploymentUrl: options.url,
                   ...(humanVerdict === undefined ? {} : { knownResult: humanVerdict })
                 },
                 { model: context.risk, log: (line) => process.stderr.write(`${line}\n`) },
@@ -1570,6 +1670,20 @@ function declaredPageRoutes(graph: ProjectGraph | null): readonly string[] {
   return (graph?.nodes ?? [])
     .filter((node) => node.kind === 'route' && node.meta?.['type'] !== 'api')
     .map((node) => node.name);
+}
+
+/**
+ * Every string the index declares the application RENDERS, for the author's
+ * step-level evidence lookup (`src/generator/step-evidence.ts`).
+ *
+ * The prompt's repository slice is ranked against the row's words and capped
+ * at `DEFAULT_CONTEXT_MAX_NODES`, so it is chosen before anyone knows which
+ * controls the model will name; this is the same index, unranked, searched per
+ * authored control name and never sent to a model. Built once per run — the
+ * whole graph is already in memory.
+ */
+function declaredRenderings(graph: ProjectGraph | null): readonly DeclaredString[] {
+  return graph === null ? [] : declaredStringsOf(graph.nodes);
 }
 
 async function loadRepoGraph(
@@ -2016,12 +2130,13 @@ async function captureJourneyTree(
     /** The account the capture signs in as — the row's first persona (CG-05); `--as` otherwise. */
     credentials?: { email: string; password: string } | undefined;
     /**
-     * The row's first opening control (CG-18, reduced): clicked ONCE on the
-     * capture tab after the landing tree is read, and the page after it
-     * captured as a second, labelled tree. Only a name `openingControlOf`
-     * passed — never a save, submit or delete.
+     * The row's opening control, every name it gives it, best first (CG-18,
+     * reduced): clicked ONCE on the capture tab after the landing tree is
+     * read, and the page after it captured as a second, labelled tree. Only
+     * names `openingControlNamesOf` passed — never a save, submit or delete
+     * — and the first that a control on the page actually carries wins.
      */
-    opening?: string | null | undefined;
+    opening?: readonly string[] | null | undefined;
   } = {},
 ): Promise<string | undefined> {
   // `--scope e2e` turns this on by itself. An end-to-end test whose
@@ -2250,16 +2365,24 @@ async function captureJourneyTree(
     // behind it is evidence for a form the row never opens. No tree is
     // better than that tree: the author then declines the fields or hands the
     // leg to a workflow goal, both of which the run can settle honestly.
-    let opened: Awaited<ReturnType<typeof captureAfterOpening>> = null;
+    const wanted = hints.opening ?? [];
+    let opened: OpeningCapture['opened'] = null;
+    // The names the click was tried under and did not find, so the section
+    // can say that whatever they open is NOT in the trees below — a silent
+    // miss reads to the author exactly like a page with nothing behind it.
+    let openingMissed: readonly string[] = [];
     if (tabWanted !== null && tabSelected === null) {
-      if (hints.opening) {
+      if (wanted.length > 0) {
         log?.(
-          `journey capture: the row's first click "${hints.opening}" is scripted after selecting the tab ` +
+          `journey capture: the row's first click ${quotedNames(wanted)} is scripted after selecting the tab ` +
           `"${tabWanted}", which this page does not name — not clicked, so no control of another tab is read as the row's`,
         );
+        openingMissed = wanted;
       }
     } else {
-      opened = await captureAfterOpening(extra, hints.opening ?? null, log);
+      const attempt = await captureAfterOpening(extra, wanted, log);
+      opened = attempt.opened;
+      openingMissed = attempt.missed;
     }
     const landing =
       landingAfterSignIn === undefined ||
@@ -2270,8 +2393,8 @@ async function captureJourneyTree(
         ` — and passing the consent gate, when one appeared — the application landed on ${landingAfterSignIn}. ` +
         'This is the ONLY landing path you may expectUrl, and only for that same account; any ' +
         'other persona\'s landing is unknown, so its proof of sign-in is expectHidden of the ' +
-        'submit control (see SIGNING IN), never a path inferred from a route or role name.\n\n';
-    return landing + journeyTreeSection({ landed, tree, tabWanted, tabSelected, opened });
+        'submit control (see SIGNING IN), never a path inferred from a route or role name.';
+    return journeyTreeSection({ landed, tree, tabWanted, tabSelected, opened, openingMissed, landing });
   } catch (error) {
     // Diagnostic, and swallowed: authoring without this section is exactly
     // what authoring did before it existed.
@@ -2317,20 +2440,72 @@ export function controlNamedIn(
 }
 
 /**
+ * Was this tree cut short by the node budget? `captureAxTree` writes the
+ * notice; this reads it back, so the section's own header can carry the fact
+ * to the author. It matters because the header is the ONE line the per-row
+ * narrowing keeps verbatim — a notice inside the tree body can be ranked
+ * away, and a tree silently missing the page's second half is the evidence
+ * gap the author fills from the test sheet's wording.
+ */
+export function treeWasCut(tree: string): boolean {
+  return /\[TREE (?:TRUNCATED|NARROWED):/.test(tree);
+}
+
+/** Tab names printed in a captured tree, in document order, deduplicated. */
+export function unreadPanelsIn(tree: string, max = 8): string[] {
+  const names: string[] = [];
+  for (const line of tree.split('\n')) {
+    const match = /^tab ("(?:[^"\\]|\\.)*")/.exec(line.trim());
+    if (match === null) continue;
+    let name: string;
+    try {
+      name = JSON.parse(match[1] as string) as string;
+    } catch {
+      continue;
+    }
+    if (name.trim() === '' || names.includes(name)) continue;
+    names.push(name);
+    if (names.length >= max) break;
+  }
+  return names;
+}
+
+/**
  * The journey-tree section as the author reads it. Pure, so a test can hold
  * it to its wording: a tree read with the row's tab selected says so and
  * says the flow must click that tab first; a tab the capture could not select
  * is announced as such, so a control the script names that is absent below
  * is read as "not captured", never "not on the page".
+ *
+ * **Every reason this capture may not cover the page rides on the FIRST
+ * line** (2026-09-09, be-high RU_06_12): a cut tree, a tab strip whose other
+ * panels were never rendered, and an opening click that matched nothing. The
+ * author's own words for that row were "menu path submenu items are not
+ * present in the captured tree (truncated)" — and it then asserted a string
+ * only the test sheet uses, on a feature the application renders under
+ * another name. Absence of evidence is not evidence of absence, and the
+ * sheet's vocabulary is not evidence of anything the application renders.
  */
 export function journeyTreeSection(parts: {
   landed: string;
   tree: string;
   tabWanted: string | null;
   tabSelected: { name: string; selector: string } | null;
-  opened: { name: string; selector: string; url: string; tree: string } | null;
+  opened: { name: string; selector: string; url: string; tree: string; navigated: boolean } | null;
+  /** Names the row's opening click was tried under and no control carried. */
+  openingMissed?: readonly string[] | undefined;
+  /**
+   * The observed sign-in landing sentence, when the capture signed in. It
+   * rides INSIDE the section rather than in front of it: the per-row
+   * narrowing keeps the first line verbatim as "the label line — which page
+   * this tree describes", and a paragraph prepended to the section made the
+   * landing sentence that line instead, leaving the label and every
+   * not-captured caveat rankable like an ordinary tree row.
+   */
+  landing?: string | undefined;
 }): string {
   const { landed, tree, tabWanted, tabSelected, opened } = parts;
+  const missed = parts.openingMissed ?? [];
   const tabNote =
     tabSelected !== null
       ? ` This tree was read WITH the tab "${tabSelected.name}" selected (${tabSelected.selector}), as the row's script ` +
@@ -2342,16 +2517,59 @@ export function journeyTreeSection(parts: {
           'is not listed below as NOT CAPTURED rather than absent — a workflow goal in the script\'s own words is the honest ' +
           'shape for that leg, never a control of another panel that merely resembles the name.'
         : '';
+  // A tree the budget cut is still evidence for what IS listed — and evidence
+  // for nothing at all about what is not. Said on the header line because
+  // that is the line that survives the per-row narrowing.
+  const cutNote =
+    treeWasCut(tree) || (opened !== null && treeWasCut(opened.tree))
+      ? ' This capture was CUT SHORT by its node budget (the tree says so where it was cut): what is not listed was NOT ' +
+        'CAPTURED, and that is not the same as absent. The test case\'s own wording is never evidence that the application ' +
+        'renders that string — for a leg whose control this tree does not show, write a workflow goal in the script\'s own ' +
+        'words rather than an assertion on a name nothing here shows.'
+      : '';
+  // One panel renders at a time. The row that started this: its feature lives
+  // on a tab of the dialog, under the application's own name for it, and the
+  // sheet calls it something else entirely.
+  const panels = [...unreadPanelsIn(tree), ...(opened === null ? [] : unreadPanelsIn(opened.tree))].filter(
+    (name, index, all) => all.indexOf(name) === index && name !== tabSelected?.name,
+  );
+  const panelNote =
+    panels.length === 0
+      ? ''
+      : ` One panel renders at a time here: the tabs ${panels.map((name) => `"${name}"`).join(', ')} are listed, but only the ` +
+        'panel showing when this was read is below. A control the script names that is not listed is behind one of those tabs ' +
+        '— NOT CAPTURED, not absent — so write the click on the tab, and take the tab\'s name from this list, which is the ' +
+        'application\'s word for it, never the sheet\'s word for the same thing.';
+  const missedNote =
+    missed.length === 0
+      ? ''
+      : ` The row's first click ${missed.map((name) => `"${name}"`).join(' / ')} matched no control here, so whatever it opens ` +
+        '— dialog, wizard step, panel — is NOT in the tree(s) below: its fields and its wording were never captured. Write ' +
+        'that click, then a workflow goal in the script\'s own words for what happens behind it; do not assert a name the ' +
+        'sheet supplies and no tree here shows.';
   return (
     `ANOTHER PAGE IN THIS JOURNEY — the accessibility tree of ${landed}, which the request ` +
     'describes. It is NOT the page this run starts on: a selector taken from here resolves ' +
     'only after the flow has navigated to that page, so write the goto or the click that ' +
-    `reaches it first.${tabNote}\n\n${tree}` +
+    `reaches it first.${tabNote}${cutNote}${panelNote}${missedNote}` +
+    (parts.landing === undefined || parts.landing.trim() === '' ? '' : `\n\n${parts.landing.trim()}`) +
+    `\n\n${tree}` +
     (opened === null
       ? ''
       : `\n\nAFTER CLICKING "${opened.name}" ON ${landed}${tabSelected === null ? '' : ` (with the tab "${tabSelected.name}" selected)`} — the accessibility tree once that control ` +
-      `(${opened.selector}) was clicked, now at ${opened.url}: the dialog, form or wizard step the row's ` +
-      'fields live in. Write that click FIRST; every selector below resolves only after it, and none of ' +
+      `(${opened.selector}) was clicked, now at ${opened.url}: ` +
+      // **Which surface it opened is observed, never guessed** (2026-09-10,
+      // be-sit-high RU_06_01). This sentence used to read "the dialog, form
+      // or wizard step the row's fields live in" whatever happened — so a
+      // row whose sheet says "แสดงป็อปอัพ" (shows a popup) was authored
+      // `expectModal` against an application that had just navigated to a
+      // page, and the step could only fail. The capture already compared the
+      // URL before and after the click; it says which it saw.
+      (opened.navigated
+        ? "the click NAVIGATED: this is a PAGE, not a dialog, whatever the row's own wording calls it. Do not assert a modal " +
+          'or a dialog role for it — prove it with this page\'s own heading, badge or URL. '
+        : 'the click opened this in place — no navigation — so it is a dialog, panel or wizard step on the same page. ') +
+      'The row\'s fields live here. Write that click FIRST; every selector below resolves only after it, and none of ' +
       `them is on the page above.\n\n${opened.tree}`)
   );
 }
@@ -2386,24 +2604,49 @@ async function selectNamedTab(
   }
 }
 
+/** What one opening click amounted to: the tree behind it, or the names nothing on the page carried. */
+interface OpeningCapture {
+  opened: { name: string; selector: string; url: string; tree: string; navigated: boolean } | null;
+  /** The names tried and not found — empty when one landed, or when the row named none. */
+  missed: readonly string[];
+}
+
+/** A list of names as a person reads it: `"Edit" / "Make Correction"`. */
+function quotedNames(names: readonly string[]): string {
+  return names.map((name) => `"${name}"`).join(' / ');
+}
+
 /**
- * Click the named opening control on the capture tab and read the page after
- * it. Deterministic and $0: the control is matched by accessible name
+ * Click the row's opening control on the capture tab and read the page after
+ * it. Deterministic and $0: the names are matched by accessible name
  * (`controlNamedIn`) in the tree as it stands — after the row's tab, when it
- * names one. Null — with the reason logged — when nothing matches or the
- * click does not land; the capture then stands as it was.
+ * names one — and the FIRST name a control on this page actually carries
+ * wins, so a row that writes the sheet's word with the application's in
+ * brackets ("Edit (Make Correction)") opens the dialog under whichever of the
+ * two the page renders. `missed` — with the reason logged — when nothing
+ * matches or the click does not land; the capture then stands as it was, and
+ * the section says the fields behind that click were not captured.
  */
 async function captureAfterOpening(
   tab: Page,
-  opening: string | null,
+  opening: readonly string[],
   log?: ((line: string) => void) | undefined,
-): Promise<{ name: string; selector: string; url: string; tree: string } | null> {
-  if (opening === null) return null;
+): Promise<OpeningCapture> {
+  if (opening.length === 0) return { opened: null, missed: [] };
   try {
-    const hit = controlNamedIn(await captureAxNodes(tab, 600), opening);
+    const nodes = await captureAxNodes(tab, 600);
+    let hit: ReturnType<typeof controlNamedIn> = null;
+    let asked = opening[0] as string;
+    for (const candidate of opening) {
+      hit = controlNamedIn(nodes, candidate);
+      if (hit !== null) {
+        asked = candidate;
+        break;
+      }
+    }
     if (hit === null) {
-      log?.(`journey capture: the row's first click "${opening}" names no button or link on this page — the fields behind it are not captured`);
-      return null;
+      log?.(`journey capture: the row's first click ${quotedNames(opening)} names no button or link on this page — the fields behind it are not captured`);
+      return { opened: null, missed: opening };
     }
     const { selector } = hit;
     const before = tab.url();
@@ -2413,13 +2656,14 @@ async function captureAfterOpening(
     const tree = await captureAxTree(tab, DEFAULT_AUTHOR_MAX_NODES);
     if (tree.trim() === '') {
       log?.(`journey capture: after clicking "${hit.name}" the tree was empty — not captured`);
-      return null;
+      return { opened: null, missed: opening };
     }
-    log?.(`journey capture: clicked "${hit.name}" (${selector}) and read the page after it${tab.url() === before ? '' : ` — now at ${tab.url()}`}`);
-    return { name: hit.name, selector, url: tab.url(), tree };
+    const alias = asked.toLowerCase() === hit.name.toLowerCase() ? '' : ` — the row calls it "${asked}"`;
+    log?.(`journey capture: clicked "${hit.name}" (${selector})${alias} and read the page after it${tab.url() === before ? '' : ` — now at ${tab.url()}`}`);
+    return { opened: { name: hit.name, selector, url: tab.url(), tree, navigated: tab.url() !== before }, missed: [] };
   } catch (error) {
-    log?.(`journey capture: clicking "${opening}" did not land (${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}) — the landing tree stands`);
-    return null;
+    log?.(`journey capture: clicking ${quotedNames(opening)} did not land (${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}) — the landing tree stands`);
+    return { opened: null, missed: opening };
   }
 }
 
@@ -2864,6 +3108,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   const reviewer = buildFlowReviewer(options);
   const valueResolution = buildValueResolution(options, contextDocs);
   const retryModel = buildAuthorRetryModel(options);
+  const declaredStrings = declaredRenderings(repoContextGraph);
   const author = new FlowAuthor({
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     ...(retryModel === null ? {} : { retryModel }),
@@ -2874,6 +3119,10 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     ...(valueResolution === undefined ? {} : { valueResolution }),
     ...(tables.length > 0 ? { tables } : {}),
     ...(projectContext !== '' ? { projectContext } : {}),
+    // What the index says the application renders, unranked: the step-level
+    // evidence lookup searches it for the control names the model actually
+    // wrote, which the ranked slice above could not know in advance.
+    ...(declaredStrings.length === 0 ? {} : { declaredStrings }),
     // The third grounding source for expectUrl. A route the application
     // declares is evidence as good as the tree's own url= attributes.
     declaredRoutes: (repoContextGraph?.nodes ?? [])
@@ -2962,6 +3211,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           ...(options.sheets.length === 0 ? {} : { sheets: [...options.sheets] }),
           ...(options.categories.length === 0 ? {} : { categories: [...options.categories] }),
           ...(options.includeBlocked ? { includeBlocked: true } : {}),
+          reportLang: options.reportLang,
         },
       };
   let rows = allRows;
@@ -2970,8 +3220,12 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   const refusedBefore = new Map<string, number>();
   /** Refused rows for the non-pipelined path, appended to the run so they are recorded. */
   let refusedForSerialRun: SuiteCase[] = [];
+  // The prior ledger as this resume leaves it after every rerun marking —
+  // what the pipelined path reads its reusable authored flows from.
+  let priorLedger: SuiteLedger | null = null;
   if (options.resume) {
     const prior = ledgerSpec === undefined ? null : await readLedger(ledgerSpec.path);
+    priorLedger = prior;
     for (const [id, outcome] of Object.entries(prior?.outcomes ?? {})) {
       if (outcome.authoringRefused !== undefined && outcome.authoringRefused > 0) refusedBefore.set(id, outcome.authoringRefused);
     }
@@ -2997,6 +3251,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           return null;
         }
       });
+      // Marked for re-authoring: the vacuous flow is not what a resume replays.
+      forgetAuthored(prior, marked);
       await writeLedger(ledgerSpec.path, prior);
       log?.(
         marked.length === 0
@@ -3027,6 +3283,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       }
       const tail = new Set(prior.planned.slice(start));
       const marked = markForRerun(prior, (_o, id) => tail.has(id), `resume-from ${prior.planned[start]}`);
+      // "Under the current config" means authored again, not replayed.
+      forgetAuthored(prior, marked);
       await writeLedger(ledgerSpec.path, prior);
       log?.(
         `--resume-from: rerunning from ${prior.planned[start]} — ${marked.length} recorded case(s) rerun, ` +
@@ -3052,12 +3310,17 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         (_o, id) => wanted.has(id) || [...wanted].some((w) => id.startsWith(w)),
         'rerun requested by case id — re-authored from the sheet row',
       );
+      // The sheet row is the source of truth: the recorded flow is not reused.
+      forgetAuthored(prior, marked);
       await writeLedger(ledgerSpec.path, prior);
       log?.(`--rerun-case: ${marked.length} case(s) re-authored from their sheet rows and re-run: ${marked.join(', ')}`);
     }
     if (prior !== null && ledgerSpec !== undefined && (options.rerunErrors || options.rerunFailed)) {
       const errors = options.rerunErrors ? markForRerun(prior, isErrorOutcome, 'rerun after error') : [];
       const failed = options.rerunFailed ? markForRerun(prior, isFailedOutcome, 'heal: re-run with autoheal') : [];
+      // An explicit rerun authors again, as it always has; only a row the
+      // last pass queued and never ran replays its recorded flow.
+      forgetAuthored(prior, [...errors, ...failed]);
       await writeLedger(ledgerSpec.path, prior);
       if (options.rerunErrors) log?.(errors.length === 0 ? '--rerun-errors: no recorded case ended in error' : `--rerun-errors: ${errors.length} case(s) the harness ended will run again: ${errors.join(', ')}`);
       if (options.rerunFailed) log?.(failed.length === 0 ? '--rerun-failed: no recorded case failed' : `--rerun-failed: ${failed.length} failed case(s) will run again with autoheal: ${failed.join(', ')}`);
@@ -3173,6 +3436,14 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
     const g = first.sourceUrl === undefined ? undefined : reportGroupForUrl(first.sourceUrl);
     return { group: g, dir: g === undefined ? resolve(options.reportDir) : pageDir(options, g) };
   };
+  // The same rule for a flow a resume replays from disk: its provenance
+  // recorded the page the author read (an ungrounded pass wrote the catalog's
+  // name there instead, which is no page and lands, as it did, ungrouped).
+  const placeForReused = (flow: Flow): { group: string | undefined; dir: string } => {
+    const source = flow.authoredBy?.sourceUrl;
+    const g = source !== undefined && /^https?:\/\//i.test(source) ? reportGroupForUrl(source) : undefined;
+    return { group: g, dir: g === undefined ? resolve(options.reportDir) : pageDir(options, g) };
+  };
   try {
     if (rows.length > 0) {
       // Say which kind of test these rows become. A 'Test Script / Steps'
@@ -3247,7 +3518,25 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       if (riskModel === null && riskEnabled()) {
         log?.('pre-run dead-end risk is not judged: the generator role does not resolve — every case runs with every retry path');
       }
+      // **A resume runs the flows the stopped pass authored; it does not
+      // author them again** (2026-09-05). The ledger records each flow's
+      // path the moment its case is queued (`SuiteLedger.authored`, through
+      // the runner's `noteAuthored` hook below); a row still without a
+      // verdict, never refused and never judged vacuous, is read back
+      // through the zod seam and pushed straight into the queue. A file that
+      // is missing or fails the schema, or a persona this resume has no
+      // credentials for, falls back to authoring with the reason logged.
+      const hooks: { value: LedgerHooks | null } = { value: null };
+      let authorRows: TestCaseRow[] = rows;
+      let reused: { row: TestCaseRow; entry: LedgerAuthored; flow: Flow }[] = [];
+      if (queue !== null && priorLedger !== null) {
+        const split = await resumeAuthored(priorLedger, rows, { log });
+        authorRows = split.author;
+        reused = split.reuse;
+      }
       const queuedPaths: string[] = [];
+      /** Flows a resume replayed from disk, in the order they were queued. */
+      const reusedPaths: string[] = [];
       // Rows authoring refused: each becomes a flow-less case the runner
       // records as blocked, with the reason and the refusal count — that is
       // how the refusal reaches the ledger, the report and the next resume
@@ -3312,8 +3601,92 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         queue.push(refusedCase);
         void releaseDependents(refusedCase.name);
       };
+      // The consumer, started once — by the first authored flow, or by the
+      // first reused one, whichever is queued first. The report folder is
+      // fixed by that first case: nothing is queued before there is somewhere
+      // for its report to go.
+      const startRunner = (place: { group: string | undefined; dir: string }): { group: string | undefined; dir: string } => {
+        placed.value ??= place;
+        const { group, dir } = placed.value;
+        if (queue !== null) {
+          drain.value ??= runCases(queue, options, {
+            dir,
+            group,
+            indexTitle: `wowlidator catalog — ${document.name}`,
+            declaredRoutes: declaredPageRoutes(repoContextGraph),
+            graphFacts: graphFactsOf(repoContextGraph),
+            ledger:
+              ledgerSpec === undefined
+                ? undefined
+                : {
+                  ...ledgerSpec,
+                  hooks: (given) => {
+                    hooks.value = given;
+                  },
+                },
+            healHints: suiteHealHints,
+            // The sheet's words for every planned row: what the
+            // database baseline detects its tables from, so it can
+            // snapshot before the first case instead of waiting for
+            // the whole pass to author (which would disable the
+            // pipelining this path exists for).
+            planRows: rows.map(planRowText),
+            onCaseDone: (finished) => {
+              if (finished.scenarioId !== undefined) gate?.ran(finished.scenarioId);
+            },
+          });
+          // Refusals that arrived before the runner existed join its queue now.
+          for (const refusedCase of pendingRefused.splice(0)) enqueueRefused(refusedCase);
+        }
+        return placed.value;
+      };
+      let authoredRows: { first: AuthoredFlow; cases: TableCase[] } | null = null;
       try {
-        const authoredRows = await authorEachRow(rows, author, options, {
+        // The reused flows first: they are ready now, and the browser would
+        // otherwise idle through the first row's authoring.
+        const fellBack = new Set<string>();
+        for (const { row, entry, flow } of reused) {
+          const scenarioId = row.scenarioId || 'ungrouped';
+          const resolved = resolveRowPersonas(personasOf(row), options);
+          if (resolved.missing.length > 0) {
+            log?.(`resume: ${row.caseId} — persona ${resolved.missing.join(', ')} has no credentials in this resume; authoring it again`);
+            fellBack.add(row.caseId);
+            continue;
+          }
+          const { group } = startRunner(placeForReused(flow));
+          // Its authoring is done as far as the scenario gate is concerned.
+          gate?.authored(scenarioId);
+          const known = sheetVerdict(row.actual);
+          const reusedCase: SuiteCase = {
+            name: `${row.caseId} ${row.testCase}`,
+            flow,
+            flowPath: entry.flowPath,
+            kind: 'catalog',
+            scenarioId,
+            ...(group === undefined ? {} : { group: `${group}/${slugify(scenarioId)}` }),
+            ...(flow.authoredBy === undefined ? {} : { generatedBy: flow.authoredBy }),
+            ...(entry.risk === undefined ? {} : { risk: entry.risk }),
+            ...suiteFactsOf({
+              ...(row.dependsOn === undefined ? {} : { dependsOn: row.dependsOn }),
+              ...(known === undefined ? {} : { knownResult: known }),
+              ...(observeOnlyCase(row) ? { recordOnly: true } : {}),
+              ...(Object.keys(resolved.personas).length === 0 ? {} : { personas: resolved.personas }),
+            }),
+          };
+          reusedPaths.push(entry.flowPath);
+          await offer(row.caseId, row.dependsOn, async () => {
+            log?.(`  queued ${reusedCase.name} → ${entry.flowPath} (reused, not authored again)`);
+            queue!.push(reusedCase);
+            gate?.queued(scenarioId);
+            // Already on the ledger under this run key: nothing is re-noted,
+            // nothing re-substituted.
+          });
+        }
+        if (fellBack.size > 0) {
+          const back = new Set([...authorRows.map((row) => row.caseId), ...fellBack]);
+          authorRows = rows.filter((row) => back.has(row.caseId));
+        }
+        authoredRows = authorRows.length === 0 ? null : await authorEachRow(authorRows, author, options, {
           summary: claimsFile.summary,
           context: contextDocs,
           log,
@@ -3332,31 +3705,9 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
             queue === null
               ? undefined
               : async (testCase, first) => {
-                // The report folder is known from the first authored flow,
-                // and the consumer starts then: nothing is queued before
-                // there is somewhere for its report to go.
-                placed.value ??= placeFor(first);
-                const { group, dir } = placed.value;
-                drain.value ??= runCases(queue, options, {
-                  dir,
-                  group,
-                  indexTitle: `wowlidator catalog — ${document.name}`,
-                  declaredRoutes: declaredPageRoutes(repoContextGraph),
-                  graphFacts: graphFactsOf(repoContextGraph),
-                  ledger: ledgerSpec,
-                  healHints: suiteHealHints,
-                  // The sheet's words for every planned row: what the
-                  // database baseline detects its tables from, so it can
-                  // snapshot before the first case instead of waiting for
-                  // the whole pass to author (which would disable the
-                  // pipelining this path exists for).
-                  planRows: rows.map(planRowText),
-                  onCaseDone: (finished) => {
-                    if (finished.scenarioId !== undefined) gate?.ran(finished.scenarioId);
-                  },
-                });
-                // Refusals that arrived before the runner existed join its queue now.
-                for (const refusedCase of pendingRefused.splice(0)) enqueueRefused(refusedCase);
+                // The report folder is known from the first queued flow —
+                // this one, unless a resume replayed one before it.
+                const { group, dir } = startRunner(placeFor(first));
                 // Same stamp and same file the non-pipelined path writes
                 // below — built here because the run needs both now.
                 testCase.flow.authoredBy = stampProvenance(provenanceOf(first), testCase);
@@ -3373,7 +3724,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
                 const caseId = caseIdOfName(testCase.name);
                 await offer(caseId, testCase.dependsOn, async () => {
                   log?.(`  queued ${testCase.name} → ${flowPath}`);
-                  queue.push({
+                  const queued: SuiteCase = {
                     name: testCase.name,
                     flow: testCase.flow,
                     flowPath,
@@ -3383,25 +3734,35 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
                     generatedBy: testCase.flow.authoredBy,
                     ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
                     ...suiteFactsOf(testCase),
-                  });
+                  };
+                  queue.push(queued);
                   gate?.queued(testCase.scenarioId);
+                  // On the ledger the moment it is queued — the file is
+                  // already on disk — so a stop before it runs costs the
+                  // next resume nothing.
+                  await hooks.value?.noteAuthored(queued);
                 });
               },
         });
-        authored = authoredRows.first;
-        tableCases = authoredRows.cases;
       } catch (error) {
-        // Authoring broke; the cases already queued are still running and
-        // still owed their reports. Let them finish before the error lands,
-        // or they are abandoned mid-run with their proofs half-written.
-        await flushHeld().catch(() => undefined);
-        queue?.close();
-        if (drain.value !== null) await drain.value.catch(() => undefined);
-        // Nothing ran, so no runner wrote the ledger: the refusals go there
-        // directly, or the next resume re-authors the same rows for the same
-        // answer — the loop this exists to end.
-        if (pendingRefused.length > 0 && ledgerSpec !== undefined) await persistRefusals(ledgerSpec.path, pendingRefused);
-        throw error;
+        if (error instanceof AuthoringError && reusedPaths.length > 0 && drain.value !== null) {
+          // Every row left to author was refused — each is on the queue
+          // already, blocked with its reason — while the reused flows run.
+          // Their refusals are rows of this run, not a reason to abandon it.
+          log?.(`authoring: ${error.message.split('\n')[0] ?? error.message} — the ${reusedPaths.length} reused flow(s) still run`);
+        } else {
+          // Authoring broke; the cases already queued are still running and
+          // still owed their reports. Let them finish before the error lands,
+          // or they are abandoned mid-run with their proofs half-written.
+          await flushHeld().catch(() => undefined);
+          queue?.close();
+          if (drain.value !== null) await drain.value.catch(() => undefined);
+          // Nothing ran, so no runner wrote the ledger: the refusals go there
+          // directly, or the next resume re-authors the same rows for the same
+          // answer — the loop this exists to end.
+          if (pendingRefused.length > 0 && ledgerSpec !== undefined) await persistRefusals(ledgerSpec.path, pendingRefused);
+          throw error;
+        }
       } finally {
         // A dependent whose source never arrived is pushed now — recorded
         // blocked with the reason, never abandoned — before the queue closes.
@@ -3409,10 +3770,24 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
         queue?.close();
       }
       if (drain.value !== null && placed.value !== null) {
-        printAuthored(authored, tableCases, queuedPaths, approved.length, placed.value.group, placed.value.dir);
+        if (authoredRows !== null) {
+          printAuthored(authoredRows.first, authoredRows.cases, queuedPaths, approved.length, placed.value.group, placed.value.dir);
+        }
+        if (reusedPaths.length > 0) {
+          process.stdout.write(`reused ${reusedPaths.length} flow(s) authored before this resume:\n`);
+          for (const path of reusedPaths) process.stdout.write(`    flow     ${path}\n`);
+        }
         const outcomes = await drain.value;
         return suiteExit(outcomes);
       }
+      if (authoredRows === null) {
+        // Only the pipelined path reuses flows, and it returned above once
+        // its runner drained; a list that authored nothing and started no
+        // runner is a contradiction, said rather than swallowed.
+        throw new Error('wowlidator catalog: no row was authored and no run was started');
+      }
+      authored = authoredRows.first;
+      tableCases = authoredRows.cases;
       refusedForSerialRun = pendingRefused;
     } else {
       const approvedText = approvedClaims(claimsFile)
@@ -3574,6 +3949,7 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
   const reviewer = buildFlowReviewer(options);
   const valueResolution = buildValueResolution(options);
   const retryModel = buildAuthorRetryModel(options);
+  const declaredStrings = declaredRenderings(repoContextGraph);
   const authorOptions = {
     model: new LlmFlowAuthorModel({ factory: options.factory }),
     ...(retryModel === null ? {} : { retryModel }),
@@ -3584,6 +3960,9 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
     ...(valueResolution === undefined ? {} : { valueResolution }),
     ...(tables.length > 0 ? { tables } : {}),
     ...(projectContext !== '' ? { projectContext } : {}),
+    // What the index says the application renders, unranked — the step-level
+    // evidence lookup's source, same as the catalog path above.
+    ...(declaredStrings.length === 0 ? {} : { declaredStrings }),
     // The third grounding source for expectUrl. A route the application
     // declares is evidence as good as the tree's own url= attributes.
     declaredRoutes: (repoContextGraph?.nodes ?? [])

@@ -161,6 +161,99 @@ async function settleRendering(page: Page): Promise<void> {
   }
 }
 
+/** Attribute the capture-bounds marker carries — how it is found and removed. */
+export const CAPTURE_BOUNDS_ATTR = 'data-wowlidator-capture-bounds';
+
+/**
+ * Grow the document's scrollable size to cover any `position: fixed` content
+ * that renders past its edge, so the fullPage shutter below does not clip it.
+ *
+ * Chrome sizes a fullPage capture from `document.documentElement`'s (and
+ * `body`'s) `scrollWidth`/`scrollHeight` alone (Playwright's own
+ * `_fullPageSize` in `screenshotter.js`) — and a `position: fixed` element is,
+ * by definition, positioned against the viewport rather than flowed inside
+ * its parent, so it never contributes to that number. Nearly every modal,
+ * tooltip and popup library uses `position: fixed` for exactly that reason
+ * (it must track the viewport, not the document). The result: an overlay
+ * taller or wider than the viewport is not merely out of frame in the
+ * capture, it is not in the buffer at all — the same fact `target.ts`'s
+ * highlight box already had to design around, read the other way round, for
+ * content the page renders rather than content wowlidator draws.
+ *
+ * The fix is the same trick in reverse: a `position: absolute` element DOES
+ * count toward its containing block's scrollable overflow, so placing a 1px
+ * marker at the fixed content's own furthest corner — read from
+ * `getBoundingClientRect()`, already in the same coordinate space the capture
+ * pins fixed elements to — grows `scrollWidth`/`scrollHeight` to include it
+ * before the shutter opens. An overlay that never rendered past the edge
+ * moves nothing; this only ever grows the capture to match what is already
+ * on screen, never invents margin around a control that is simply
+ * mispositioned.
+ */
+async function expandCaptureBounds(page: Page): Promise<boolean> {
+  try {
+    return await page.evaluate((attr: string): boolean => {
+      interface Rect {
+        width: number;
+        height: number;
+        right: number;
+        bottom: number;
+      }
+      interface BoundsNode {
+        setAttribute(name: string, value: string): void;
+        style: { cssText: string };
+      }
+      const g = globalThis as unknown as {
+        getComputedStyle(el: unknown): { position: string };
+        document: {
+          documentElement: {
+            scrollWidth: number;
+            scrollHeight: number;
+            appendChild(node: BoundsNode): void;
+            createElement(tag: string): BoundsNode;
+          };
+          querySelectorAll(selector: string): ArrayLike<{ getBoundingClientRect(): Rect }>;
+        };
+      };
+      let right = g.document.documentElement.scrollWidth;
+      let bottom = g.document.documentElement.scrollHeight;
+      const nodes = g.document.querySelectorAll('*');
+      for (let i = 0; i < nodes.length; i += 1) {
+        const node = nodes[i];
+        if (!node || g.getComputedStyle(node).position !== 'fixed') continue;
+        const r = node.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        if (r.right > right) right = r.right;
+        if (r.bottom > bottom) bottom = r.bottom;
+      }
+      if (right <= g.document.documentElement.scrollWidth && bottom <= g.document.documentElement.scrollHeight) {
+        return false;
+      }
+      const marker = g.document.documentElement.createElement('div');
+      marker.setAttribute(attr, '');
+      marker.setAttribute('aria-hidden', 'true');
+      marker.style.cssText = `position:absolute;left:${Math.ceil(right)}px;top:${Math.ceil(bottom)}px;width:1px;height:1px;pointer-events:none;`;
+      g.document.documentElement.appendChild(marker);
+      return true;
+    }, CAPTURE_BOUNDS_ATTR);
+  } catch {
+    return false;
+  }
+}
+
+/** Remove the capture-bounds marker. Idempotent; never throws. */
+async function removeCaptureBoundsMarker(page: Page): Promise<void> {
+  try {
+    await page.evaluate((attr: string) => {
+      const g = globalThis as unknown as { document: { querySelectorAll(s: string): ArrayLike<{ remove(): void }> } };
+      const nodes = g.document.querySelectorAll(`[${attr}]`);
+      for (let i = nodes.length - 1; i >= 0; i -= 1) nodes[i]?.remove();
+    }, CAPTURE_BOUNDS_ATTR);
+  } catch {
+    // The page may be gone — then so is the marker.
+  }
+}
+
 function wantsEvidence(mode: ScreenshotMode, kind: EvidenceKind): boolean {
   switch (mode) {
     case 'all':
@@ -214,6 +307,7 @@ export async function captureEvidence(
 ): Promise<string | undefined> {
   if (!wantsEvidence(mode, kind)) return undefined;
   let highlighted = false;
+  let boundsExpanded = false;
   try {
     // Ordered by what each one waits for: the document's own resources, then
     // whatever the app fetched once it was running, then the frame it drew.
@@ -239,6 +333,7 @@ export async function captureEvidence(
       await highlight.scrollIntoViewIfNeeded({ timeout: SCROLL_INTO_VIEW_MS }).catch(() => undefined);
       highlighted = await drawTargetHighlight(highlight);
     }
+    boundsExpanded = await expandCaptureBounds(page);
 
     const buffer = await page.screenshot({
       type: 'jpeg',
@@ -252,5 +347,6 @@ export async function captureEvidence(
     return undefined;
   } finally {
     if (highlighted) await removeTargetHighlight(page);
+    if (boundsExpanded) await removeCaptureBoundsMarker(page);
   }
 }

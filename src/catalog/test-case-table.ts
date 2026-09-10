@@ -39,7 +39,7 @@ import { parseDelimited, sniffDelimiter } from './extract.js';
 import type { CatalogClaim } from './catalog.js';
 // The words the gates read a Note with are data — a leaf module that imports
 // nothing of the parser, so the dependency still runs one way (2026-09-04).
-import { AUTHORING } from '../generator/value-rules.js';
+import { AUTHORING, LOGIN_URL_PATTERN } from '../generator/value-rules.js';
 
 /**
  * The header, exactly as the format has it — including the leading space in
@@ -973,13 +973,53 @@ export interface CaseDestination {
 const URL_RE = /https?:\/\/[^\s)"'<>]+/i;
 const TAB_RE = /(?:เลือก|กด|เปิด)?\s*(?:แท็บ|tab)\s*["“]([^"”]+)["”]/iu;
 
+const URL_ALL_RE = /https?:\/\/[^\s)"'<>]+/gi;
+
+/**
+ * The URL the row means as its DESTINATION — which is not always the first one
+ * it writes.
+ *
+ * A sheet may open every row's Steps column with the same "begin here"
+ * preamble naming the sign-in page (`QA default locale = en; เริ่มที่
+ * https://…/humi/en/login และใช้ /humi/en/ สำหรับทุก route`), and taking the
+ * first URL made the login page the stated destination of **every row in the
+ * workbook**. Measured on be-high-sonnet (2026-09-09): 14 of ~30 authoring
+ * complaints were `ignoresMenuPath` reporting, truly and uselessly, that the
+ * flow never navigates to the sign-in page — with a remedy ("after the
+ * sign-in, goto that URL") that no correct flow can perform. It also induced
+ * the seven `loginProofAssertsLoginPage` refusals beside it: told the
+ * destination was `/humi/en/login`, the model proved its login by expecting
+ * the URL to contain `/humi/en`, which the login page already satisfies.
+ *
+ * **So a sign-in URL is never a destination**, and not merely deprioritised.
+ * Signing in is what setup does, and `ignoresMenuPath` judges the BODY alone —
+ * so a row whose stated destination is the login page draws the false
+ * complaint even when the row really is about signing in, because no body ever
+ * navigates back there. There is nothing a flow could do to satisfy it.
+ *
+ * Returning null is not a loss: `CaseDestination` still carries the tab and the
+ * menu path, `describeCase` renders `Destination: (the menu path above)`, and
+ * `ignoresMenuPath` judges the flow against the crumbs — which is what these
+ * sheets intend, since they also say *ไม่เปิด URL ข้าม assertion* (do not open a
+ * URL to skip the assertion). A row that names a real page anywhere in Steps
+ * or Menu still gets it, wherever in the cell it appears.
+ */
+export function statedDestinationUrl(row: TestCaseRow): string | null {
+  for (const cell of [row.steps, row.menu]) {
+    const urls = [...String(cell ?? '').matchAll(URL_ALL_RE)].map((m) => m[0]);
+    const page = urls.find((one) => !LOGIN_URL_PATTERN.test(one));
+    if (page !== undefined) return page;
+  }
+  return null;
+}
+
 /**
  * Where the case starts: the literal URL in Steps (`Navigate ไปที่ https://…`)
  * or Menu, the tab it selects, and the menu path. Null when the row says
  * nothing usable about any of the three.
  */
 export function destinationOf(row: TestCaseRow): CaseDestination | null {
-  const url = URL_RE.exec(row.steps)?.[0] ?? URL_RE.exec(row.menu)?.[0] ?? null;
+  const url = statedDestinationUrl(row);
   const tab = TAB_RE.exec(row.steps)?.[1]?.trim() ?? null;
   const path = menuPathOf(row);
   if (url === null && tab === null && path.length === 0) return null;

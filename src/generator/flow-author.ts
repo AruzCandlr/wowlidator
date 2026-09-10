@@ -22,7 +22,7 @@
 
 import type { LanguageModel } from 'ai';
 import { formatElapsed, wrapText } from '../log-format.js';
-import { CONSENT_ACCEPT_NAME } from '../engine/sign-in.js';
+import { CONSENT_ACCEPT_NAME } from '../engine/consent-gate.js';
 import type { Page } from 'playwright';
 import { z } from 'zod';
 
@@ -33,7 +33,8 @@ import { BACKEND_TIER_ACTIONS } from '../engine/proof-bundle.js';
 
 import { SELECTOR_SYNTAX_RULES, captureAxTree } from '../healer/jit-healer.js';
 import { DETERMINISM_RULES, procedure } from '../providers/prompt-discipline.js';
-import { withQualifiedRole, withRelaxedRoleName, withStableGreeting } from '../engine/selector.js';
+import { fence, sanitizeInline } from '../providers/model-fence.js';
+import { fromTreeLine, withQualifiedRole, withRelaxedRoleName, withStableGreeting } from '../engine/selector.js';
 import {
   PLACEHOLDER_TOKEN,
   fieldLabelOf,
@@ -48,9 +49,12 @@ import {
   type ValueResolutionContext,
   type ValueResolverModel,
 } from './value-resolution.js';
-import { fieldNamesIn } from '../engine/runner.js';
+import { fieldNamesIn, hasAssertion, type ConsentPolicy } from '../engine/runner.js';
 import { matchesRoutePattern } from '../context/context-engine.js';
 import { nearestRoutes, pathnameOf, routeIsDeclared } from '../context/route-match.js';
+import { concretiseRoute, type ConcreteEvidence } from './concretise.js';
+import { LOGIN_URL_PATTERN } from './value-rules.js';
+export { LOGIN_URL_PATTERN };
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
 import { focusTreeText } from '../context/retriever.js';
 import {
@@ -58,8 +62,20 @@ import {
   generateStructuredForModel,
   type ModelSource,
 } from '../providers/llm-factory.js';
-import { hasAssertion } from '../engine/runner.js';
-import { observationSteps, vacuousClaim } from './vacuous.js';
+import { observationSteps, substantiveAssertions, vacuousClaim } from './vacuous.js';
+// The step-level evidence lookup (2026-09-08) and the two pure readers it is
+// built on — one definition of "every selector a step carries" and one of
+// "what the code declares the application renders", shared with the lookup and
+// re-exported below so every caller and test keeps its import.
+import {
+  declaredControlStrings,
+  describeStepEvidence,
+  resolveStepEvidence,
+  selectorsOf,
+  type DeclaredString,
+  type StepEvidenceContext,
+  type StepEvidenceOutcome,
+} from './step-evidence.js';
 import { describeUnprovedExclusivity, optionSetsIn, unprovedExclusivity } from './exclusivity.js';
 // The words the lints read a row with are DATA (`value-rules.ts`, 2026-09-04):
 // every list bilingual, every list replaceable from `.wowlidator/value-rules.json`.
@@ -77,6 +93,8 @@ import { goalOutcomes } from '../orchestrator/goal-evidence.js';
 import type { Flow, FlowStep, StepValueSource } from '../engine/runner.js';
 import { DEFAULT_MUTATION_POLICY, type MutationPolicy } from './test-generator.js';
 import type { FlowReviewer, ReviewRecord } from './flow-review.js';
+
+export { declaredControlStrings, selectorsOf };
 
 /** Same budget as the generator: the AX tree dominates the prompt either way. */
 export const DEFAULT_AUTHOR_MAX_NODES = 200;
@@ -729,6 +747,11 @@ The author has already decided what to test. Express their intent faithfully as
 steps: do not redesign the test, broaden it, or add cases they did not ask for.
 If the request is narrow, the flow is narrow. Deliver the whole case, through its
 last scripted step; a flow that stops early has tested a form, not the claim.
+
+The evidence you need is in this prompt: the request, its documents, the trees
+and the repository excerpts. If a context-search tool is offered, use it at most
+twice, only for a route, table or label the evidence does not give; never to
+re-read what is already here.
 </role>
 
 ${DETERMINISM_RULES}
@@ -748,6 +771,7 @@ ${procedure('How to build the flow', [
   'For each case: the fewest steps that reach the claim, then the assertion(s) that would fail if the claim were false. Every numbered Expected line (6.1, 6.2, …) gets its own assertion on the very element the line names, with the intent citing the line. The sign-in proof and an expectUrl are preparation, never the claim; a backend check may corroborate a line about an on-screen value, never replace it. See <claims> for how each kind of line is asserted.',
   'Pick the control the label points at, with the role the tree shows. A textbox named by a placeholder ("Select date", "เลือกวันที่", "Search…") is usually a read-only display over the real input: fill the textbox named by the field\'s label instead. A date input takes YYYY-MM-DD (2027-09-01). A dropdown the tree lists as a button (aria-haspopup) is a button: selectOption on role=button[name="Event Reason" i], never role=combobox.',
   'Every selector comes from a tree, in canonical form (see the selector rules). A control in no tree but named by what the repository declares is written deterministically against that string. Only when neither a tree nor the repository declares the control may the leg be a workflow step (see <workflow_goals>): deterministic steps cost nothing; an agent leg costs a model call per turn.',
+  'Say WHICH one, when the tree shows several. A control the tree lists more than once under the same name is one per row of a repeated list, and Playwright refuses such a selector outright (strict mode violation) — the step then resolves nothing on every run and reads as the control being missing. Scope it to the row the case is about (role=row[name="…the record…"] >> role=button[name="Edit" i]), or filter/search the list down to that record first. Only where the case names no particular row is ">> nth=0" the right answer, and then say so in the intent.',
 ])}
 </procedure>
 
@@ -804,6 +828,16 @@ clicked still existing.
   page-wide expectText passes when the message sits under the wrong field.
   "ทุกช่องที่ปล่อยว่าง" is one expectFieldError per field, each in its own
   case.
+- Tooltip / hover ("แสดง Tooltip ข้อความ "X" เมื่อนำเมาส์ไปวาง", "hovering the
+  icon shows "X""): a tooltip is in NO tree — nothing hovers while the page is
+  read — so role=tooltip names a role that can never resolve. On the page at
+  rest the tooltip's words are the accessible NAME of the control that shows
+  it: assert that control by the role and name the tree gives it
+  (expectVisible role=button[name="X" i]), citing the Expected line. Where the
+  application carries the text in an attribute, expectAttribute on that same
+  control with "name": "title" (else "aria-label") and "value" the text quoted
+  from the case is the stronger form. Never a bare text="X": it matches a
+  breadcrumb or a heading holding the same words and passes without a tooltip.
 - Open question (an id after the sheet's "= ?", e.g. "= ? OQ-HIR-140"): nobody knows the value yet.
   Never assert the id or invent the answer; assert the fact around it the case
   does state (the field is there, the notice appears, the record was created).
@@ -817,6 +851,16 @@ clicked still existing.
 - A record this flow creates is identified by a value this flow typed: put a
   distinctive string in a free-text field and assert that in the list
   afterwards. "A row appeared" and "my row appeared" are different claims.
+- A record the case NAMES is opened by that name, and its identity is proved
+  before its fields are. Reach it by scoping the row to the value that
+  identifies it, or by searching the list for it — never by position. Then, on
+  the surface that opened, assert the identifying field's own VALUE
+  (expectValue role=textbox[name="<the id field>" i] = "<the id the case
+  names>") before the lines about the record's other fields, citing that
+  Expected line. That one assertion is what ties every
+  later line to the right record: without it, a wrong record makes every field
+  line fail and the report blames the application for showing a different
+  record correctly.
 - A status is asserted in the application's own words, taken from the tree
   ("In review"), never from the state name or the requirement's wording.
 - Never pin a live count inside a selector ("Status (3)"); match the stable
@@ -870,14 +914,20 @@ No personas section: sign in explicitly and completely.
    when adjacent. If a consent / terms / PDPA gate can appear, the next step is
    clickIfVisible on its accept control (name exactly as given), never click
    and never workflow.
-4. Then prove the login: expectHidden of the submit control you clicked
-   (role=button[name="Sign in" i]). Use expectUrl only with a path the evidence
-   states outright (a SIGN-IN LANDING line or a url= in a tree), never one
-   inferred from a route name or persona.
-5. goto the page under test and assert who is signed in with the display name,
-   role label or user id the chrome renders, quoted from a tree. Never assert
-   that a credential the flow typed is displayed. When no tree shows the
-   signed-in chrome, the expectHidden proof already carries the sign-in.
+4. Assert nothing about the sign-in page after the click. Never assert that the
+   sign-in button is hidden, and never assert that the URL left the sign-in
+   page: an application may return to its own sign-in page after creating the
+   session, and both claims are then false on a successful login. A SIGN-IN
+   LANDING line says where the application put the user; it is evidence for a
+   goto, not a claim to assert.
+5. goto the page under test and prove the sign-in there, with a control only a
+   signed-in page shows — the account menu, the greeting, the page heading —
+   quoted from a tree with the role the tree gives it; then assert who is
+   signed in with the display name, role label or user id the chrome renders,
+   when a tree shows it. Never assert that a credential the flow typed is
+   displayed. The engine stops a run whose goto bounces to the sign-in page,
+   so a session that never took is caught there, not by a claim on the
+   sign-in page.
 
 Credentials, in order: the request's own "Login / persona" line, verbatim;
 otherwise the SIGN IN AS section, exactly as given; otherwise an obvious
@@ -1071,7 +1121,8 @@ the flow satisfy them rather than explain a miss:
 - Every workflow step is followed by evidence independent of the agent.
 - With a personas section, every sign-in is a signIn by label and no step fills
   an email or password; without one, nothing sits between the credential fills
-  and the submit click, and the login proof follows the click.
+  and the submit click, nothing on the sign-in page is asserted after it, and
+  the page the flow goes to next proves the sign-in.
 - Every selector token appears in a tree in canonical form; every expectUrl
   fragment appears in a tree's url=, one of this flow's gotos, or the request.
 </final_check>
@@ -1082,8 +1133,17 @@ Keep "notes", "rationale" and each "intent" to one or two sentences.
 
 
 export function buildUserPrompt(request: AuthorRequest): string {
-  const lines = [`Test request: ${request.prompt}`];
-  if (request.url) lines.push(`Page URL: ${request.url}`);
+  // FENCED at assembly (`src/providers/model-fence.ts`). Everything the model
+  // is shown here is third-party — a workbook row, an accessibility tree, a
+  // static index of somebody's repository — and this is the prompt that WRITES
+  // the tests, so a forged instruction inside a sheet cell would be obeyed
+  // most cheaply of all. Two things deliberately stay outside the fence: the
+  // supplied credentials and the persona lines below, whose whole contract is
+  // "use these characters exactly", and the request objects the harness itself
+  // composed. And nothing here mutates a source: the trees, the case text and
+  // the resolved values keep their own bytes everywhere else in this file.
+  const lines = ['Test request:', fence('catalog', request.prompt)];
+  if (request.url) lines.push(`Page URL: ${sanitizeInline(request.url)}`);
   // One line, next to the request it qualifies. The rules for each scope are
   // in the system prompt; this is only which of them applies to THIS test.
   if (request.scope) {
@@ -1116,7 +1176,7 @@ export function buildUserPrompt(request: AuthorRequest): string {
     lines.push(
       '',
       'DECLARED DATABASE TABLES (from the indexed schema — DB checks may use these and no others):',
-      ...request.tables.map((table) => `  ${table.name} (${table.summary})`),
+      ...request.tables.map((table) => `  ${sanitizeInline(table.name)} (${sanitizeInline(table.summary)})`),
     );
   }
   // Also its own labelled section, and the caveat is part of the label: a
@@ -1126,7 +1186,7 @@ export function buildUserPrompt(request: AuthorRequest): string {
     lines.push(
       '',
       'WHAT THE REPOSITORY DECLARES (a static index of the application code — routes, endpoints, coverage. It may lag the live page; where they disagree, the accessibility tree wins):',
-      request.projectContext,
+      fence('repository', request.projectContext),
     );
   }
   // Its own labelled section for the same reason as the two above: what the
@@ -1164,13 +1224,13 @@ export function buildUserPrompt(request: AuthorRequest): string {
         'one verdict: the sheet counts this row as one test, and so does the report.',
     );
   }
-  if (request.axTree) lines.push('', 'Accessibility tree:', request.axTree);
-  if (request.interactions) lines.push('', request.interactions);
+  if (request.axTree) lines.push('', 'Accessibility tree:', fence('page', request.axTree));
+  if (request.interactions) lines.push('', fence('page', request.interactions));
   // Last, and under a label that says which page it is. The order matters as
   // much as the label: the start page's tree is what the flow's early steps
   // are written against, and burying it under a second tree invites the model
   // to write step 1 for a page it has not navigated to yet.
-  if (request.journeyTree) lines.push('', request.journeyTree);
+  if (request.journeyTree) lines.push('', fence('page', request.journeyTree));
   // Refusal feedback goes LAST, after every byte the retry shares with the
   // first attempt: the trees and context above are then an identical prefix
   // across all three authoring attempts, which is what lets a provider's
@@ -1184,14 +1244,14 @@ export function buildUserPrompt(request: AuthorRequest): string {
       '',
       'MISTAKES ALREADY REFUSED ON OTHER ROWS OF THIS SUITE. They are not about this flow — ' +
         'they are the rules this catalog keeps breaking. Do not make them here:',
-      ...request.commonRefusals.map((entry) => `  - ${entry}`),
+      ...request.commonRefusals.map((entry) => `  - ${sanitizeInline(entry)}`),
     );
   }
   if (request.feedback?.length) {
     lines.push(
       '',
       'Your previous attempt at this flow was REFUSED. Fix exactly this — do not repeat it:',
-      ...request.feedback.map((entry) => `  - ${entry}`),
+      ...request.feedback.map((entry) => `  - ${sanitizeInline(entry)}`),
     );
   }
   if (request.feedback?.length && request.priorCases?.length) {
@@ -1497,6 +1557,11 @@ export function fromTreeNotation(selector: string): string {
   const Q = `(?:"([^"]+)"|'([^']+)')`;
   const pick = (m: RegExpExecArray, i: number): string => m[i] ?? m[i + 1] ?? '';
   const rewritten = ((): string | null => {
+    // The tree's plainest form — `dialog "Title"` — has no bracket for the
+    // shapes below to catch, and is the one that filed a false defect against
+    // a dialog that was on the screen (PL_08_01, 2026-09-09).
+    const treeLine = fromTreeLine(head);
+    if (treeLine !== null) return treeLine;
     const staticText = new RegExp(`^StaticText\\s*\\[text=${Q}\\]$`).exec(head);
     if (staticText !== null) return `text="${pick(staticText, 1)}"`;
     const linkUrl = new RegExp(`^role=link\\s*\\[url(\\*?)=${Q}\\]$`).exec(head);
@@ -2201,6 +2266,24 @@ export interface Violation {
    * then stands). A lint without one refuses to the end, as it always did.
    */
   settle?: (() => string | null) | undefined;
+  /**
+   * A WEAK complaint's sharpening, applied before the flow is accepted.
+   *
+   * Where `settle` is a fatal complaint's last-resort fallback, this is a thin
+   * one's chance to stop being vague. It is handed `ConcreteEvidence` — the
+   * repository's declared routes and the database's live rows — which is
+   * evidence the model never saw, and is the reason this is not the blind
+   * re-ask that was removed for buying nothing.
+   *
+   * **It may make an existing claim concrete; it may never add one.** See
+   * `concretise.ts` for the full contract: navigation and scoping only, never
+   * a new `expect*`, because an assertion the sheet did not write is an
+   * expected result nobody specified.
+   *
+   * Returns the note the flow carries instead of the vague one, or null when
+   * the evidence allows no rewrite (the original note then stands).
+   */
+  concretise?: ((evidence: ConcreteEvidence) => string | null) | undefined;
 }
 
 /**
@@ -2415,6 +2498,16 @@ export interface FlowAuthorOptions {
         documents?: readonly import('../catalog/extract.js').ExtractedDocument[] | undefined;
       }
     | undefined;
+  /**
+   * Everything the indexed repository declares the application RENDERS — one
+   * entry per quoted string of a message namespace or a component's own words,
+   * with the file that declares it (`declaredStringsOf`). The step-level
+   * evidence lookup searches this per authored control name; the row's ranked
+   * `projectContext` slice is chosen before the flow exists and cannot know
+   * which controls the model will name. Absent, the lookup falls back to that
+   * slice alone — byte-for-byte the grounding this had before.
+   */
+  declaredStrings?: readonly DeclaredString[] | undefined;
   /** Called at each authoring lifecycle event — for live progress output. */
   onLog?: ((line: string) => void) | undefined;
 }
@@ -2440,6 +2533,8 @@ export class FlowAuthor {
   readonly #backend: boolean;
   readonly #reviewer: FlowReviewer | undefined;
   readonly #valueResolution: FlowAuthorOptions['valueResolution'];
+  /** The whole index's declared renderings — see `FlowAuthorOptions.declaredStrings`. */
+  readonly #declaredStrings: readonly DeclaredString[] | undefined;
   readonly #attempts: number;
   /**
    * Refusals this AUTHOR has already seen, across every row it has written —
@@ -2473,6 +2568,7 @@ export class FlowAuthor {
     this.#backend = options.backend ?? true;
     this.#reviewer = options.reviewer;
     this.#valueResolution = options.valueResolution;
+    this.#declaredStrings = options.declaredStrings;
     this.#onLog = options.onLog;
   }
 
@@ -2693,7 +2789,7 @@ export class FlowAuthor {
     // alternative to handing one of these over is handing over nothing, and
     // nothing is the worse answer whenever the refusal was about weakness
     // rather than falsehood.
-    let weak: { result: typeof result; note: string } | null = null;
+    let weak: { result: typeof result; note: string; evidence: StepEvidenceOutcome | undefined } | null = null;
     let accepted = false;
     let lastRefusal: AuthoringError | null = null;
     // The fatal refusal shapes of the previous attempt — see the guard in
@@ -2704,6 +2800,11 @@ export class FlowAuthor {
     let priorCases: AuthoredCase[] | undefined;
     const authoringStartedMs = Date.now();
     let acceptedOnAttempt = 0;
+    // What the step-evidence lookup found for the attempt whose flow is
+    // handed back — declared beside `weak` because a weak flow kept from an
+    // earlier attempt must travel with the evidence THAT attempt found, not
+    // with a later attempt's.
+    let stepEvidence: StepEvidenceOutcome | undefined;
     for (let attempt = 1; attempt <= this.#attempts; attempt += 1) {
       const retry = attempt > 1;
       const model = retry && this.#retryModel !== undefined ? this.#retryModel : this.model;
@@ -2989,6 +3090,44 @@ export class FlowAuthor {
         }
       }
 
+      // **Step evidence before the lints** (2026-09-08), sited exactly as
+      // value resolution is and for the same reason: a step the captured trees
+      // do not account for is looked up in the repository's own declared
+      // renderings — and a fixture it asserts as already present in the
+      // database — so the grounding checks below judge a claim with all the
+      // evidence there is, not only with the evidence the ranked slice
+      // happened to carry. It can only make a claim MORE grounded: what it
+      // finds is handed to the checks that read declared strings as GROUNDING
+      // (`ungroundedTextExpectation`, the review's audit), never to
+      // `workflowOverDeclaredControls`, which reads them as a prohibition.
+      // Never fatal: a lookup that throws leaves every claim exactly as
+      // authored, and the refusal that follows is the one this had before.
+      try {
+        const ctx: StepEvidenceContext = {
+          trees: [evidenceTree, interactions].filter((t): t is string => typeof t === 'string' && t !== '').join('\n'),
+          caseText: extra.caseText ?? trimmed,
+          fixtures: fixtureFacts(trimmed),
+          ...((extra.projectContext ?? this.#projectContext) === undefined
+            ? {}
+            : { projectContext: extra.projectContext ?? this.#projectContext }),
+          ...(this.#declaredStrings === undefined ? {} : { declared: this.#declaredStrings }),
+          // The database tier reuses the value resolver's own client and its
+          // table-choosing question; with value resolution off, no lookup and
+          // no model call.
+          ...(this.#valueResolution?.db === undefined ? {} : { db: this.#valueResolution.db }),
+          ...(this.#valueResolution?.model == null ? {} : { model: this.#valueResolution.model }),
+          onLog: (line) => this.#onLog?.(line),
+        };
+        stepEvidence = await resolveStepEvidence(result.setup ?? [], result.steps, ctx);
+        const summary = describeStepEvidence(stepEvidence);
+        if (summary !== null) {
+          result.notes = result.notes === '' ? summary : `${result.notes}; ${summary}`;
+        }
+      } catch (error) {
+        this.#onLog?.(`step evidence lookup did not run: ${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}`);
+        stepEvidence = undefined;
+      }
+
       try {
         // Every lint runs and every complaint is collected before anything is
         // thrown. Stopping at the first one cost a whole attempt per problem
@@ -3000,6 +3139,7 @@ export class FlowAuthor {
             severity?: AuthoringErrorSeverity | undefined;
             note?: string | undefined;
             settle?: (() => string | null) | undefined;
+            concretise?: ((evidence: ConcreteEvidence) => string | null) | undefined;
           } = {},
         ): void => {
           violations.push({
@@ -3007,9 +3147,26 @@ export class FlowAuthor {
             severity: options.severity ?? 'fatal',
             note: options.note ?? message,
             ...(options.settle === undefined ? {} : { settle: options.settle }),
+            ...(options.concretise === undefined ? {} : { concretise: options.concretise }),
           });
         };
         violations.push(...skippedStepComplaints);
+
+        // The repository section this row was authored against, and the same
+        // section plus what the step-evidence lookup found about THIS flow's
+        // own control names — written in the section's own shape, so
+        // `declaredControlStrings` reads it exactly as it reads the slice.
+        // Only the checks that treat a declared string as GROUNDING are given
+        // the enlarged text (`ungroundedTextExpectation`,
+        // `wordingClaimAssertsDataValue`): more evidence may excuse a claim,
+        // never accuse one, so `workflowOverDeclaredControls` — which reads a
+        // declared string as a PROHIBITION on an agent leg — keeps the row's
+        // own slice.
+        const codeEvidence = extra.projectContext ?? this.#projectContext;
+        const groundingEvidence =
+          stepEvidence === undefined || stepEvidence.declaredLines.length === 0
+            ? codeEvidence
+            : `${codeEvidence ?? ''}\n${stepEvidence.declaredLines.join('\n')}`;
 
         // Same bar the generator holds itself to: a flow that asserts nothing
         // passes whether or not the feature works. Refusing is the point —
@@ -3025,17 +3182,21 @@ export class FlowAuthor {
         // checked, so the observations ARE the answer, and a manufactured
         // assertion would be a claim about a value nobody knows.
         const observed = observeOnly ? observationSteps(result.steps).length : 0;
-        if (observeOnly && observed > 0 && claimsNothing(result.steps)) {
-          const note = `record-only case — the sheet has no oracle; ${observed} observation(s) saved for a person's review`;
-          result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
-          this.#onLog?.(note);
-        } else if (!hasAssertion(result.steps)) {
-          refuse(
-            `the authored flow "${result.name}" contains no assertion, so it would pass ` +
+        const recordOnly = observeOnly && observed > 0 && claimsNothing(result.steps);
+        // The rail, as one predicate, because two passes ask it: here, on the
+        // flow as the model wrote it, and again after `groundLoginProof` has
+        // dropped whatever "proof" of the sign-in was no proof — a drop must
+        // never leave a flow that asserts nothing to sail through as if it
+        // had been judged.
+        const provesNothing = (): string | null => {
+          if (recordOnly) return null;
+          if (!hasAssertion(result.steps)) {
+            return (
+              `the authored flow "${result.name}" contains no assertion, so it would pass ` +
               'without proving anything. Restate the request in terms of what should be ' +
-              'TRUE afterwards (e.g. "...and the row count shows 8").',
-          );
-        } else {
+              'TRUE afterwards (e.g. "...and the row count shows 8").'
+            );
+          }
           // **A flow whose only assertions are the sign-in proof and a URL is
           // refused as if it asserted nothing** — measured on be100, that
           // exact shape was 20 of 22 `pass**` cases, each green about a row
@@ -3043,16 +3204,23 @@ export class FlowAuthor {
           // attempt the case is blocked (and re-authored on a resume), never
           // handed over as a test that passes whatever the application does.
           const vacuous = vacuousClaim([...(result.setup ?? []), ...result.steps]);
-          if (vacuous !== null) {
-            refuse(
-              `the authored flow "${result.name}" proves nothing about its claim: ${vacuous}. ` +
-                'Assert at least one line of the Expected output in the page\'s own terms — ' +
-                'the options a dropdown lists, the exact error message, the count the page ' +
-                'shows — after the step that reaches it. If that page is in no tree you were ' +
-                'given, reach it with a precisely-goaled workflow step and assert what it then ' +
-                'shows; if the assertion is impossible, say so in notes rather than omitting it.',
-            );
-          }
+          if (vacuous === null) return null;
+          return (
+            `the authored flow "${result.name}" proves nothing about its claim: ${vacuous}. ` +
+            'Assert at least one line of the Expected output in the page\'s own terms — ' +
+            'the options a dropdown lists, the exact error message, the count the page ' +
+            'shows — after the step that reaches it. If that page is in no tree you were ' +
+            'given, reach it with a precisely-goaled workflow step and assert what it then ' +
+            'shows; if the assertion is impossible, say so in notes rather than omitting it.'
+          );
+        };
+        const provedNothingAsWritten = recordOnly ? null : provesNothing();
+        if (recordOnly) {
+          const note = `record-only case — the sheet has no oracle; ${observed} observation(s) saved for a person's review`;
+          result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
+          this.#onLog?.(note);
+        } else if (provedNothingAsWritten !== null) {
+          refuse(provedNothingAsWritten);
         }
         // Steps the model wrote that could not run ride along as a weak
         // complaint: alone they are a note; beside a refusal they are the
@@ -3139,7 +3307,7 @@ export class FlowAuthor {
           trimmed,
           [...(result.setup ?? []), ...result.steps],
           evidenceTree ?? '',
-          extra.projectContext ?? this.#projectContext,
+          groundingEvidence,
           extra.caseText,
         );
         if (wordingOnData !== null) {
@@ -3223,12 +3391,21 @@ export class FlowAuthor {
               'step, citing it in the intent ("Step 5: …"); a step that truly cannot be performed here gets a ' +
               'step whose intent says "skipped step N: <why>", so the gap is visible.',
             {
-              // The last word: the covered steps run, and the uncovered script
-              // steps are named as NOT COVERED on the flow — a partial script
-              // proved is more than no run, and the note keeps it honest.
+              // The last word: the missing numbered steps are PERFORMED from
+              // the evidence — the tree's own control for a `Field = value`
+              // pair, else one agent leg carrying the sheet's own line — and
+              // whatever could not be performed is still named as NOT COVERED
+              // on the flow. A partial script proved is more than no run, and
+              // a settlement that inserts nothing returns exactly the note this
+              // used to return.
               settle: () =>
-                `not covered: script step(s) ${unperformed.missing.map((m) => `${m.n} (${m.text.slice(0, 60)})`).join(', ')} — ` +
-                `no authored step performs them; the flow performs the script through step ${unperformed.performedThrough} of ${unperformed.total}`,
+                settleUnperformedScript(
+                  result,
+                  extra.caseText ?? trimmed,
+                  unperformed,
+                  [evidenceTree, interactions].filter((t): t is string => typeof t === 'string').join('\n'),
+                  extra.testDataPairs ?? testDataPairsOfCaseText(extra.caseText ?? trimmed),
+                ),
             },
           );
         }
@@ -3295,10 +3472,18 @@ export class FlowAuthor {
           );
         }
 
+        const foreignHost = foreignAuthoredHost(
+          [...(result.setup ?? []), ...result.steps],
+          url,
+        );
+        if (foreignHost !== null) {
+          refuse(foreignHostRefusal(result.name, foreignHost));
+        }
+
         const invented = ungroundedGoto(
           [...(result.setup ?? []), ...result.steps],
           this.#declaredRoutes,
-          url === undefined ? undefined : new URL(url).origin,
+          url,
         );
         if (invented !== null) {
           refuse(
@@ -3317,8 +3502,9 @@ export class FlowAuthor {
           refuse(
             `the authored flow "${result.name}" tries to prove the login took effect by ` +
               `expecting the URL to contain a sign-in path (step ${loginProof}) — an assertion ` +
-              'that holds precisely when the login did NOT happen. Expect a non-login path, or ' +
-              'expectVisible something only a signed-in page shows.',
+              'that holds precisely when the login did NOT happen. Assert nothing about the ' +
+              'sign-in page after the submit; prove the sign-in on the page the flow goes to ' +
+              'next, with a control only a signed-in page shows.',
           );
         }
 
@@ -3326,11 +3512,13 @@ export class FlowAuthor {
         // move: the vacuous login proof (`expectUrl "/en/"` after a sign-in
         // from /en/login) was refused on nearly every row of every measured
         // run, and every refusal cost a full authoring call to learn what a
-        // string replacement knows. The submit control the flow itself just
-        // clicked is the honest witness: still on the page, the sign-in did
-        // not take (a native GET resubmit leaves the form standing); gone, it
-        // did — on the landing page and on a consent gate alike, and the goto
-        // plus who-is-signed-in assertion that follow settle the rest.
+        // string comparison knows. Nothing is written in its place: the
+        // sign-in is proved by the flow's own assertions on the page it goes
+        // to next, and the engine stops a run whose goto bounces to the
+        // sign-in page. An `expectHidden` of the submit control is dropped the
+        // same way — an application may return to its sign-in page after
+        // creating the session (HUMI SIT, 2026-09-10), so that claim is false
+        // on a successful login.
         const grounded = groundLoginProof(
           result.setup ?? [],
           result.steps,
@@ -3339,6 +3527,14 @@ export class FlowAuthor {
         if (grounded !== null) {
           this.#onLog?.(`login proof grounded: ${grounded}`);
           result.notes = result.notes === '' ? grounded : `${result.notes}; ${grounded}`;
+          // A drop must not leave a flow that proves nothing: the ordinary
+          // rail fires on what is left, never an invented assertion. Once,
+          // not twice — a flow already refused as written is not refused
+          // again for the same emptiness.
+          if (provedNothingAsWritten === null) {
+            const nothing = provesNothing();
+            if (nothing !== null) refuse(nothing);
+          }
         }
 
         // A check generated out of the scope of the test is re-judged for
@@ -3402,20 +3598,21 @@ export class FlowAuthor {
               `contain "${weakProof.expected}" (step ${weakProof.index}) — but it signed in from ` +
               `"${weakProof.loginUrl}", which already contains that. expectUrl asserts CONTAINS, ` +
               'so this assertion holds just as well when the sign-in was rejected and the page ' +
-              'never moved. Expect a path the login page does not contain (the landing route ' +
-              'itself), or expectVisible something only a signed-in page shows.',
+              'never moved. Assert nothing about the sign-in page after the submit; prove the ' +
+              'sign-in on the page the flow goes to next, with a control only a signed-in page shows.',
           );
         }
 
         const unsynchronized = unsynchronizedLoginSubmit([...(result.setup ?? []), ...result.steps]);
         if (unsynchronized !== null) {
           refuse(
-            `the authored flow "${result.name}" clicks a sign-in submit (step ${unsynchronized}) ` +
-              'and navigates away on the very next step, with nothing checking the login took ' +
-              'effect. A click can land before the application hydrates — the form then submits ' +
-              'natively and no session exists. Between the submit click and the next goto, add ' +
-              'an expectUrl of a non-login path or an expectVisible of something only a ' +
-              'signed-in page shows.',
+            `the authored flow "${result.name}" clicks a sign-in submit (step ${unsynchronized}), ` +
+              'navigates away on the very next step, and asserts nothing on the page it goes to — ' +
+              'the sign-in is proved nowhere. Prove it on that next page with an expectVisible of ' +
+              'a control only a signed-in page shows (the account menu, the greeting, the page ' +
+              'heading), quoted from a tree. Never assert that the sign-in button is hidden or ' +
+              'that the URL left the sign-in page: the application may return to its sign-in ' +
+              'page after creating the session.',
           );
         }
 
@@ -3566,8 +3763,54 @@ export class FlowAuthor {
           }
         }
 
-        const codeEvidence = extra.projectContext ?? this.#projectContext;
-        const unrendered = ungroundedTextExpectation(result.steps, evidenceTree, codeEvidence, trimmed);
+        // **A truncated tree does not license the sheet's vocabulary**
+        // (2026-09-09, RU_06_12). Judged before the complete-tree lint below,
+        // because the two are mutually exclusive by construction: this one
+        // requires the truncation marker, that one declines on it.
+        const unrevealed = ungroundedOnTruncatedTree(result.steps, evidenceTree, groundingEvidence);
+        if (unrevealed !== null) {
+          refuse(
+            `the authored flow "${result.name}" asserts the text ${JSON.stringify(unrevealed.text)} ` +
+              `(step ${unrevealed.index}) on a page whose tree was TRUNCATED — the captured part renders ` +
+              'no such text, so this is the sheet\'s word for the thing rather than the page\'s. The run ' +
+              'cannot know which. Reach it with a workflow leg in the case\'s own words and let the ' +
+              'assertions that follow carry the claim.',
+            {
+              severity: 'weak',
+              note:
+                `step ${unrevealed.index} rests on ${JSON.stringify(unrevealed.text)}, which the truncated ` +
+                'tree does not render — handed to an agent leg so the live page, not the sheet, names it',
+              settle: () => {
+                const step = result.steps[unrevealed.index];
+                if (step === undefined) return null;
+                // The step's own intent is the sheet's words, already written
+                // on it by the author — so the goal needs no vocabulary of
+                // ours, and `unperformedScriptSteps` still reads its citation.
+                const goal =
+                  ('intent' in step ? (step.intent ?? '') : '').trim() ||
+                  `reach the ${unrevealed.text} the case names`;
+                result.steps[unrevealed.index] = {
+                  action: 'workflow',
+                  goal,
+                  intent:
+                    `${goal} [generated: the captured tree was truncated and renders no ` +
+                    `${JSON.stringify(unrevealed.text)}; the live page names it, not the sheet]`,
+                } as FlowStep;
+                for (const one of result.cases ?? []) {
+                  if (one.steps === result.steps) continue;
+                  const at = one.steps.indexOf(step);
+                  if (at >= 0) one.steps[at] = result.steps[unrevealed.index]!;
+                }
+                return (
+                  `step ${unrevealed.index} (${JSON.stringify(unrevealed.text)}) was handed to an agent leg: ` +
+                  'the tree was truncated, so the page\'s own name for it is unknown here'
+                );
+              },
+            },
+          );
+        }
+
+        const unrendered = ungroundedTextExpectation(result.steps, evidenceTree, groundingEvidence, trimmed);
         if (unrendered !== null) {
           refuse(
             `the authored flow "${result.name}" asserts the text ${JSON.stringify(unrendered.text)} ` +
@@ -3712,7 +3955,29 @@ export class FlowAuthor {
               : `the case gives the route to its page — Menu path: ${route.wanted} — and the authored flow "${result.name}" ` +
                 'neither clicks a crumb of it, navigates, nor hands the leg to a workflow. Reach the page the way the sheet says: ' +
                 'click each crumb in order as the tree names it (a collapsed group by its header first).',
-            { severity: 'weak', note: `the sheet's ${route.kind === 'destination' ? 'Destination' : 'Menu path'} (${route.wanted}) is not followed` },
+            {
+              severity: 'weak',
+              note: `the sheet's ${route.kind === 'destination' ? 'Destination' : 'Menu path'} (${route.wanted}) is not followed`,
+              // The repository knows which of the paths this case names is a
+              // real page; the destination reader only knew which URL came
+              // first, and a sheet whose every row opens with "begin at
+              // <login url>" makes that the sign-in page for all of them.
+              concretise: (evidence) => {
+                const decided = concretiseRoute(extra.caseText ?? trimmed, result.steps, evidence);
+                if (decided === null) return null;
+                if (decided.kind === 'honoured') {
+                  return `the sheet's stated Destination (${route.wanted}) is an entry page; the case's own page ${decided.path} is declared by the repository and this flow reaches it`;
+                }
+                const anchor = result.steps[0];
+                if (anchor === undefined) return null;
+                insertStepBefore(result, anchor, {
+                  action: 'goto',
+                  url: decided.url,
+                  intent: `Open the page this case is about, ${decided.path}, which the repository declares as a route. [generated: the sheet's stated Destination was an entry page and the flow reached no page]`,
+                } as FlowStep);
+                return `navigated to ${decided.path}, the case's own page as the repository declares it — the sheet's stated Destination (${route.wanted}) is an entry page`;
+              },
+            },
           );
         }
 
@@ -3738,7 +4003,22 @@ export class FlowAuthor {
           );
         }
 
-        const fixture = ungroundedFixtureAssertion(result.steps, fixtureFacts(trimmed));
+        // A fixture the DATABASE shows the application already holds is not a
+        // fixture this lint can doubt: its whole reason is that thirteen be100
+        // cases asserted records the database never held. A `count(*) > 0`
+        // against the indexed schema answers exactly that question; a count of
+        // zero — the shape of a `BE-XXX-999` mask the sheet writes for a value
+        // that must NOT exist — leaves the refusal untouched.
+        const proven = new Set(stepEvidence?.existingFixtures ?? []);
+        // The case's own `<control> … "<value>"` claims: what the sheet asks
+        // to be READ off a control, which is never the same question as
+        // whether a record exists in a listing.
+        const statedValues = statedValuesIn(extra.caseText ?? trimmed);
+        const fixture = ungroundedFixtureAssertion(
+          result.steps,
+          fixtureFacts(trimmed).filter((fact) => !proven.has(fact)),
+          statedValues,
+        );
         if (fixture !== null) {
           refuse(
             `the authored flow "${result.name}" ${fixture.action}s on ${JSON.stringify(fixture.fact)} (step ${fixture.index}) as if it ` +
@@ -3746,6 +4026,82 @@ export class FlowAuthor {
               'or creates, not a fact about the app. Nothing earlier in this flow creates it. Either author the creation ' +
               '(the fill/insert steps that put it there) before asserting on it, or assert the SHAPE of the result ' +
               '(a row exists, a count is a number) without naming the fixture value.',
+          );
+        }
+
+        // **An Expected line that states a value, proved by a presence check**
+        // (2026-09-10, be-sit-high PL_07_02): the one assertion that would
+        // have caught a whole case opened on the wrong record was written
+        // `expectVisible` of the field. Fatal — the flow claims to cover the
+        // line and does not — and its last word sharpens the step it already
+        // has rather than blocking the row.
+        const presenceOnly = presenceForStatedValue(result.steps, extra.caseText ?? trimmed);
+        if (presenceOnly !== null) {
+          // Which remedy this shape needs depends on whether the control the
+          // step already names can hold a value at all. A landmark or region
+          // cannot, and telling such a step to "assert the value" would invite
+          // an expectText over a container — the read that passes on the wrong
+          // element. Named here from the one definition the settle uses, so
+          // the two cannot say different things.
+          const citedSelector = (selectorsOf(result.steps[presenceOnly.index] ?? ({} as FlowStep))[0] ?? '').trim();
+          const citedRole = (/^role=([a-z]+)/i.exec(citedSelector)?.[1] ?? '').toLowerCase();
+          const holdsValue = valueAssertionFor(citedSelector) !== null;
+          refuse(
+            `the authored flow "${result.name}" cites Expected line ${presenceOnly.id} on step ${presenceOnly.index} and proves it with a ` +
+              `presence check — but that line STATES a value: ${JSON.stringify(presenceOnly.label)} → ${JSON.stringify(presenceOnly.value)}. ` +
+              'A check that the field is on screen passes whatever the field holds, so it cannot fail when the value is wrong. ' +
+              (holdsValue
+                ? 'Assert the value itself on that same control (expectValue for a textbox, expectText for a trigger the tree lists as a ' +
+                  'button), citing the same line. '
+                : `That step names role "${citedRole}", which holds no value of its own — it is a region, and an expectText on it passes ` +
+                  'whenever the value appears ANYWHERE inside it, including in a breadcrumb or a neighbouring row. Move the assertion onto ' +
+                  'the control the Expected line names: find the textbox, trigger or cell the tree shows for ' +
+                  `${JSON.stringify(presenceOnly.label)} and assert its own value there (expectValue for a textbox, expectText for a ` +
+                  'button/cell), citing the same line — not onto the region that contains it. ') +
+              'Where the value identifies the RECORD the case is about, that assertion is also what ties every later line to the right ' +
+              'record — so make it before them, and reach the record by scoping the row to it (or searching for it) rather than by index.',
+            {
+              // Every line of the class, not only the one reported: a sheet
+              // that states one field's value states its neighbours' too
+              // (PL_07_02 had two), and each rewrite reads the flow's own
+              // selector and the sheet's own value.
+              settle: () => {
+                const notes: string[] = [];
+                for (let pass = 0; pass < MAX_SETTLED_STATED_VALUES; pass += 1) {
+                  const found = pass === 0 ? presenceOnly : presenceForStatedValue(result.steps, extra.caseText ?? trimmed);
+                  if (found === null) break;
+                  const step = result.steps[found.index];
+                  const note = step === undefined ? null : settleStatedValue(step, found);
+                  if (note === null) break;
+                  notes.push(note);
+                }
+                return notes.length === 0 ? null : notes.join('; ');
+              },
+            },
+          );
+        }
+
+        // **A control the tree renders many times, addressed as one**
+        // (2026-09-10, be-sit-high RU_06_12 / RU_06_16): `role=button
+        // [name="Make Correction" i]` against a table of twenty-five rows is
+        // a strict-mode violation, never a step. Positive evidence — the tree
+        // has the lines — so no truncation or workflow guard.
+        const ambiguous = ambiguousRepeatedControl(result.steps, evidenceTree);
+        if (ambiguous !== null) {
+          refuse(
+            `the authored flow "${result.name}" ${result.steps[ambiguous.index]?.action ?? 'acts on'}s ` +
+              `${JSON.stringify(ambiguous.name)} (step ${ambiguous.index}), and the captured tree renders ${ambiguous.count} controls of role ` +
+              `"${ambiguous.role}" under that exact name — one per row of a repeated list. Playwright refuses such a selector outright ` +
+              '(strict mode violation), so the step resolves nothing on every run and reads as the control being missing. Say WHICH one: ' +
+              'scope it to the row the case names (chain the row that carries the record\'s own value, e.g. ' +
+              `role=row[name="…the record…"] >> role=${ambiguous.role}[name=${JSON.stringify(ambiguous.name)} i]), or search/filter the list ` +
+              'down to that record first. Only when the case names no particular row is `>> nth=0` the right answer.',
+            {
+              settle: () => {
+                const step = result.steps[ambiguous.index];
+                return step === undefined ? null : settleRepeatedControl(step, ambiguous);
+              },
+            },
           );
         }
 
@@ -3761,12 +4117,80 @@ export class FlowAuthor {
                 'nothing on every run. ' +
                 (wrongRole.nearest.length > 0
                   ? `The page exposes it as: ${wrongRole.nearest.map((l) => `\`${l}\``).join(', ')} — use that role and name verbatim.`
-                  : 'Take the role and name from a line of the tree, never from what such a control usually is.'),
+                  : 'Take the role and name from a line of the tree, never from what such a control usually is.') +
+                // The one role no capture can ever ground (2026-09-09,
+                // PL_07_01): nothing hovers while a tree is read, so the
+                // remedy is not "find the tooltip in the tree" — it is the
+                // control the tooltip belongs to.
+                (AUTHORING.hoverClaim.test(extra.caseText ?? '')
+                  ? ' A tooltip is in no tree: nothing hovers while the page is read, so on the page at rest the tooltip\'s words are the ' +
+                    'accessible NAME of the control that shows it. Assert that control by the role and name the tree gives it, and cite the ' +
+                    'Expected line; expectAttribute on the same control ("name": "title", else "aria-label") with the text quoted from the case ' +
+                    'is the stronger form where the app carries it there.'
+                  : ''),
             {
               // The last word: the tree's own role for the same name, or nothing.
               settle: () => {
                 const step = result.steps[wrongRole.index];
                 return step === undefined ? null : settleSelectorRole(step, wrongRole);
+              },
+            },
+          );
+        }
+
+        // **Nothing used to act on the author's own confession** (2026-09-09,
+        // be-high-sonnet PL_07_01 / RU_06_01): the model wrote "not confirmed
+        // by any captured tree so this is best-effort" into the step's intent
+        // and the harness shipped it. The claim is FALSE as evidence — it
+        // says so itself — so the refusal is fatal, and its last word marks
+        // the step rather than dropping it.
+        const admitted = admitsUngroundedSelector(result.steps);
+        if (admitted !== null) {
+          refuse(
+            `the authored flow "${result.name}" says in step ${admitted.index}'s own intent that its selector is not grounded ` +
+              `(${JSON.stringify(admitted.admission)}) — and a selector nothing in the evidence supports dead-ends on every run, ` +
+              'then reads as the application missing something. Take the role and the name from a line of a captured tree (or a string ' +
+              'WHAT THE REPOSITORY DECLARES), or, when neither names the control, hand that leg to a workflow goal in the case\'s own ' +
+              'words and let a later assertion settle the claim. Never write an assertion whose intent has to apologise for it.',
+            {
+              // The last word: exactly the step that shipped before this
+              // lint existed, plus the mark and the note that say so.
+              settle: () => {
+                const step = result.steps[admitted.index];
+                if (step === undefined) return null;
+                annotateStep(
+                  step,
+                  `the author's own intent says this selector is not grounded (${admitted.admission}); no captured tree confirms it and the run settles it`,
+                );
+                return (
+                  `step ${admitted.index}'s intent admits its selector is not grounded (${admitted.admission}) — ` +
+                  'handed over marked [generated: …] for the run to prove or dead-end'
+                );
+              },
+            },
+          );
+        }
+
+        // **A hover claim proved by a roleless presence check** (2026-09-09,
+        // RU_06_01): `text="Make Correction"` passed against the breadcrumb
+        // span after the healer narrowed it. The tree's own line for that
+        // name is the anchor, and it is in hand.
+        const unanchored = unanchoredHoverAssertion(result.steps, extra.caseText, evidenceTree);
+        if (unanchored !== null) {
+          refuse(
+            `the authored flow "${result.name}" proves a claim about a tooltip / hover surface with ` +
+              `\`text=${JSON.stringify(unanchored.text)}\` (step ${unanchored.index}), which names no role and so matches ANY node holding ` +
+              'those words — a breadcrumb, a heading, a table cell. Nothing hovers while a tree is read, so a tooltip is in no tree; on the ' +
+              `page at rest its words are the accessible NAME of the control that shows it, and the tree has that line: ` +
+              `${unanchored.nearest.map((l) => `\`${l}\``).join(', ')}. Assert that control by its role and name, citing the Expected line ` +
+              '— or, where the application carries the text in an attribute, expectAttribute on the same control with "name": "title" ' +
+              '(else "aria-label") and the text quoted from the case.',
+            {
+              // The last word: the tree's own role for that name. Strictly
+              // narrower than the selector it replaces, so no claim is lost.
+              settle: () => {
+                const step = result.steps[unanchored.index];
+                return step === undefined ? null : settleHoverAnchor(step, unanchored);
               },
             },
           );
@@ -3935,6 +4359,26 @@ export class FlowAuthor {
             }
             throw refusal;
           }
+          // **A thin claim is looked up before it is merely noted**
+          // (2026-09-09). The blind re-ask was removed for buying nothing —
+          // the model learned no new fact — but the repository's routes and
+          // the database's answer about this row's fixtures are facts already
+          // in hand, and no lint had consulted them. A concretiser reads them
+          // and makes the claim concrete; it may never add an assertion (see
+          // `concretise.ts`), so nothing here can author an expected result
+          // the sheet did not write.
+          const concreteEvidence: ConcreteEvidence = {
+            routes: this.#declaredRoutes,
+            existingFixtures: stepEvidence?.existingFixtures ?? [],
+            startUrl: url ?? '',
+          };
+          for (const violation of violations) {
+            if (violation.concretise === undefined) continue;
+            const sharpened = violation.concretise(concreteEvidence);
+            if (sharpened === null) continue;
+            violation.note = sharpened;
+            this.#onLog?.(`weak claim made concrete from evidence: ${sharpened}`);
+          }
           const note = settleViolations(violations).notes.join('; ');
           result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
           this.#onLog?.(`weak claim, accepted with a note: ${note}`);
@@ -3948,7 +4392,7 @@ export class FlowAuthor {
         if (!(error instanceof AuthoringError)) throw error;
         lastRefusal = error;
         if (error.severity === 'weak' && betterThan(result, weak?.result)) {
-          weak = { result, note: error.note };
+          weak = { result, note: error.note, evidence: stepEvidence };
         }
         // **The same fatal refusal twice is not re-asked** (2026-09-04,
         // HIR-EC-001): the model was told, in full, what was wrong, and came
@@ -3998,6 +4442,7 @@ export class FlowAuthor {
       // what `runCases` scores as blocked rather than failed.
       if (weak === null) throw lastRefusal ?? new AuthoringError('authoring produced no flow');
       result = weak.result;
+      stepEvidence = weak.evidence;
       result.notes = result.notes === '' ? weak.note : `${result.notes}; ${weak.note}`;
       this.#onLog?.(`weak claim: ${weak.note}`);
     }
@@ -4030,6 +4475,18 @@ export class FlowAuthor {
           // answerable at all.
           projectContext: extra.projectContext ?? this.#projectContext,
           declaredRoutes: this.#declaredRoutes,
+          // What the step-evidence lookup verified for this flow's own control
+          // names: the audit treats a selector on one of these as grounded
+          // (the repository declaring the rendered string is the second source
+          // the authoring prompt names), and the lines are in the reviewer's
+          // evidence text so a `keep` can quote one. Found by a string
+          // comparison, so nothing here is a model's word for it.
+          ...(stepEvidence === undefined || stepEvidence.groundedControls.length === 0
+            ? {}
+            : { declaredControls: stepEvidence.groundedControls }),
+          ...(stepEvidence === undefined || stepEvidence.declaredLines.length === 0
+            ? {}
+            : { declaredEvidence: stepEvidence.declaredLines.join('\n') }),
           prompt: trimmed,
         },
         result.cases,
@@ -4045,9 +4502,14 @@ export class FlowAuthor {
       }
     }
 
+    const consentPolicy = consentPolicyForCase(extra.caseText ?? trimmed, [
+      ...result.setup,
+      ...result.steps,
+    ]);
     const flow: Flow = {
       name: result.name,
-      ...(originOf(url) === undefined ? {} : { baseUrl: originOf(url) }),
+      ...(consentPolicy === undefined ? {} : { consentPolicy }),
+      ...(baseUrlOf(url) === undefined ? {} : { baseUrl: baseUrlOf(url) }),
       // A persona-switching flow is an end-to-end journey by construction —
       // the mark travels IN the flow file, like `polarity`, so a re-run or a
       // repair keeps it.
@@ -4080,23 +4542,6 @@ export class FlowAuthor {
     };
   }
 }
-
-/** A URL that reads as a sign-in surface. */
-/**
- * Exported because the journey capture needs exactly this rule: a capture that
- * bounced to a sign-in page must be discarded, not handed to the model under
- * the destination's name. Two spellings of "is this a login URL" would drift.
- */
-export const LOGIN_URL_PATTERN =
-  // "login"/"sign-in" anywhere; "auth"/"sso" only where a sign-in surface
-  // actually lives — as a word in the HOST (auth.corp.com, sso.company.com),
-  // as the FIRST path segment after an optional locale (/auth/callback,
-  // /en/sso, /oauth2/authorize), or as a query flag (?sso=1). A bare
-  // substring match read /admin/config/sso — a payroll app's Social
-  // Security Office page — as a sign-in URL (2026-09-03, PY-1 TC_SSO_001_001):
-  // the journey capture dropped the row's own destination, ranked its way to
-  // the wrong page, and the author wrote against a form the case never opens.
-  /login|sign-?in|signin|(?:^|\/\/)[^/]*\b(?:auth|sso)\b[^/]*(?:\/|$)|(?:^|\/\/[^/]+)\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(?:auth|oauth2?|authn|authorize|authenticat(?:e|ion)|sso)(?:\/|$|\?|#)|[?&](?:sso|auth)=/i;
 
 /**
  * A fill (or key-by-key `type`) that reads as a credential: it names a
@@ -4238,42 +4683,74 @@ export function loginProofCannotFail(
 }
 
 /**
- * Replace a login proof that cannot fail with one that can, in place.
+ * The control a selector names, for "is this the submit control the flow
+ * clicked": the `>> nth=N` tail and the ` i` name flag are dropped, whitespace
+ * and case folded. `role=button[name="Sign in"] >> nth=1` and
+ * `role=button[name="Sign in" i]` are one control for this purpose.
+ */
+function controlKey(selector: string): string {
+  return selector
+    .replace(/\s*>>\s*nth=\d+\s*$/i, '')
+    .replace(/(\[name=(["'])[^"']*\2)\s+i\]/gi, '$1]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Drop every "proof" of a sign-in that is no proof, in place.
  *
- * The shape `loginProofCannotFail` refuses: credentials filled, a submit
- * clicked, then `expectUrl` of a fragment the sign-in URL already contains.
- * The replacement is `expectHidden` of the very control that was clicked —
- * the flow's own selector, so nothing is invented — because a submit that did
- * not take leaves the form standing and one that did removes it. Both arrays
- * are edited in place (setup and body are one sequence for this purpose, and
- * the vacuous step usually sits in setup). Returns the disclosure line, or
- * null when nothing was changed.
+ * Three shapes, one rule: **the disappearance of the sign-in page is never a
+ * login proof.** Live (be-sit-high-20260909-170213, HUMI SIT, 2026-09-10): a
+ * SUCCESSFUL local sign-in lands back on the sign-in page — `POST
+ * /api/auth/local-login` 200 with the session cookie set, `/en` →
+ * `/en/me/home` → the client navigates to `/en/login` and re-mounts the form
+ * with empty fields and the Sign in button showing. The session is valid: the
+ * flow's next `goto` renders signed in. Every flow in that run proved the
+ * sign-in with `expectHidden` of the submit control — authored by the model,
+ * or written here in place of a vacuous `expectUrl` — and four cases failed
+ * on a claim that is false on that application by design, after which the
+ * reconstruction re-clicked Sign in on empty fields.
+ *
+ * - `expectUrl` of a fragment the sign-in URL already contains (the shape
+ *   `loginProofCannotFail` refuses) holds precisely when the login did NOT
+ *   happen. Dropped, never rewritten.
+ * - `expectHidden` of the very control the flow clicked to submit — an app
+ *   may return to its sign-in page after creating the session. Dropped.
+ * - `expectVisible`/`expectText` quoting text found in none of the evidence
+ *   (`text="HRIS ADMIN"`, live, from a sheet that said "HR Admin" and a shell
+ *   rendering "ผู้ดูแลระบบ HR") is a guess dressed as a check. Dropped with
+ *   that reason, as the vacuity lints refuse a claim nothing showed.
+ *
+ * Why dropping cannot reduce what the flow proves: a login proof is a
+ * positive claim about a signed-in surface, and every flow carries one where
+ * it belongs — the assertions after its next `goto` (an account menu, the
+ * greeting, the page heading); the engine, not the flow, judges the session
+ * (a `goto` bounced to a sign-in URL stops the run with the stranded verdict).
+ * A flow left with no assertion at all is the caller's to refuse through the
+ * ordinary no-assertion rail — nothing is invented here.
+ *
+ * Both arrays are edited in place (setup and body are one sequence for this
+ * purpose, and the steps usually sit in setup). Returns the disclosure lines
+ * joined, or null when nothing was changed.
  */
 export function groundLoginProof(
   setup: FlowStep[],
   steps: FlowStep[],
-  /**
-   * Everything the model was shown — the trees and the request. A login proof
-   * that quotes text found in none of it (`expectVisible text="HRIS ADMIN"`,
-   * live, from a sheet that said "HR Admin" and a shell that renders
-   * "ผู้ดูแลระบบ HR") is a guess dressed as a check, and it cost that run ~100
-   * seconds of ladder, patience and reconstruction before the real claims.
-   */
+  /** Everything the model was shown — the trees and the request. */
   evidence = '',
 ): string | null {
   let lastGoto: string | null = null;
   let sawCredentialFill = false;
   let submittedFrom: string | null = null;
   let submitSelector: string | null = null;
+  // Whether a SOUND proof of the sign-in already stands in this block: it
+  // only picks the wording of the disclosure. The scan reaches as far as
+  // `loginProofCannotFail` does (the whole block, to the next `goto`), or a
+  // flow is repaired and refused at once (be-high-sonnet-all, 2026-09-09).
+  let proven = false;
   const haystack = evidence.toLowerCase();
-  const replaceWith = (list: FlowStep[], i: number, why: string): string => {
-    list[i] = {
-      action: 'expectHidden',
-      selector: submitSelector as string,
-      intent: `the sign-in took: the submit control "${submitSelector}" is no longer on the page`,
-    };
-    return `${why} and was replaced with expectHidden of the submit control the flow clicked`;
-  };
+  const changes: string[] = [];
   const sections: FlowStep[][] = [setup, steps];
   for (const list of sections) {
     for (let i = 0; i < list.length; i += 1) {
@@ -4282,6 +4759,7 @@ export function groundLoginProof(
         lastGoto = step.url;
         sawCredentialFill = false;
         submittedFrom = null;
+        proven = false;
         continue;
       }
       if (step.action === 'fill' || step.action === 'type') {
@@ -4301,9 +4779,26 @@ export function groundLoginProof(
       if (step.action === 'expectUrl') {
         const expected = step.value.trim();
         if (expected !== '' && submittedFrom.includes(expected)) {
-          return replaceWith(list, i, `the login proof "expectUrl ${expected}" could not fail (the sign-in URL contains it)`);
+          const why = `the login proof "expectUrl ${expected}" could not fail (the sign-in URL contains it)`;
+          list.splice(i, 1);
+          i -= 1;
+          changes.push(
+            proven
+              ? `${why} and was dropped: the sign-in is already proved by the assertion before it`
+              : `${why} and was dropped: the sign-in is proved by the flow's assertions on the next page`,
+          );
+          continue;
         }
-        submittedFrom = null;
+        proven = true;
+        continue;
+      }
+      if (step.action === 'expectHidden' && controlKey(step.selector) === controlKey(submitSelector)) {
+        list.splice(i, 1);
+        i -= 1;
+        changes.push(
+          `the login proof "expectHidden ${step.selector}" was dropped: the submit control disappearing is not a ` +
+            'login proof — the application may return to its sign-in page after creating the session',
+        );
         continue;
       }
       if (step.action === 'expectVisible' || step.action === 'expectText') {
@@ -4314,20 +4809,24 @@ export function groundLoginProof(
         ];
         const ungrounded = quoted.find((q) => haystack !== '' && !haystack.includes(q.toLowerCase()));
         if (ungrounded !== undefined) {
-          return replaceWith(
-            list,
-            i,
-            `the login proof quotes "${ungrounded}", which appears in no tree given and not in the request`,
+          list.splice(i, 1);
+          i -= 1;
+          changes.push(
+            `the login proof quotes "${ungrounded}", which appears in no tree given and not in the request, ` +
+              'and was dropped',
           );
+          continue;
         }
-        submittedFrom = null;
+        proven = true;
         continue;
       }
-      // Any other assertion after the submit is the proof; leave it.
-      if (step.action.startsWith('expect')) submittedFrom = null;
+      // Any other assertion after the submit is a sound proof — it is left
+      // exactly as written, and the scan goes on looking for a vacuous one
+      // after it. Only the next `goto` ends the block.
+      if (step.action.startsWith('expect')) proven = true;
     }
   }
-  return null;
+  return changes.length === 0 ? null : changes.join('; ');
 }
 
 /**
@@ -5001,21 +5500,70 @@ export function unindexedRequestMethod(
 export function ungroundedGoto(
   steps: readonly FlowStep[],
   declaredRoutes: readonly string[] = [],
-  origin?: string | undefined,
+  deploymentUrl?: string | undefined,
 ): { index: number; url: string; near: string[] } | null {
   if (declaredRoutes.length === 0) return null;
   for (const [index, step] of steps.entries()) {
     if (step.action !== 'goto') continue;
-    const url = step.url;
-    if (url === '') continue;
+    const url = authoredStepUrl(step);
+    if (url === null) continue;
     // Another origin is not this application's routing table's business.
-    if (/^https?:\/\//i.test(url) && origin !== undefined && !url.startsWith(origin)) continue;
+    if (/^https?:\/\//i.test(url) && deploymentUrl !== undefined) {
+      try {
+        if (new URL(url).origin !== new URL(deploymentUrl).origin) continue;
+      } catch {
+        continue;
+      }
+    }
     const path = pathnameOf(url) ?? (url.startsWith('/') ? url : null);
     if (path === null) continue;
-    if (routeIsDeclared(path, declaredRoutes) !== false) continue;
+    if (routeIsDeclared(path, declaredRoutes, deploymentUrl) !== false) continue;
     return { index, url, near: nearestRoutes(path, declaredRoutes).map((one) => one.pattern) };
   }
   return null;
+}
+
+function authoredStepUrl(step: FlowStep): string | null {
+  const url = (step as { url?: unknown }).url;
+  return typeof url === 'string' && url !== '' ? url : null;
+}
+
+export function foreignAuthoredHost(
+  steps: readonly FlowStep[],
+  deploymentUrl: string | undefined,
+): { index: number; action: string; url: string; actualHost: string; expectedHost: string } | null {
+  if (deploymentUrl === undefined) return null;
+  let expectedHost: string;
+  try {
+    expectedHost = new URL(deploymentUrl).host;
+  } catch {
+    return null;
+  }
+  for (const [index, step] of steps.entries()) {
+    const url = authoredStepUrl(step);
+    if (url === null || url.includes('{{')) continue;
+    try {
+      const actualHost = new URL(url).host;
+      if (actualHost !== expectedHost) {
+        return { index, action: step.action, url, actualHost, expectedHost };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+export function foreignHostRefusal(
+  flowName: string,
+  foreign: { action: string; url: string; actualHost: string; expectedHost: string },
+): string {
+  return (
+    `the authored flow "${flowName}" has a ${foreign.action} URL ${JSON.stringify(foreign.url)} on host ` +
+    `"${foreign.actualHost}", but this run's deployment host is "${foreign.expectedHost}". ` +
+    `The run's own host "${foreign.expectedHost}" is the only one this catalog may reach. ` +
+    `Use "${foreign.expectedHost}" for this URL, or make it relative to the deployment URL.`
+  );
 }
 
 export function loginProofAssertsLoginPage(steps: readonly FlowStep[]): number | null {
@@ -5046,6 +5594,19 @@ export function loginProofAssertsLoginPage(steps: readonly FlowStep[]): number |
   return null;
 }
 
+/**
+ * A credential submit that the flow navigates straight away from, and whose
+ * next page nothing then asserts — the sign-in is proved nowhere.
+ *
+ * The proof belongs on the page the flow goes to next (2026-09-10): an
+ * application may return to its own sign-in page after creating the session,
+ * so nothing asserted on the sign-in page after the click can be the proof.
+ * A `goto` right after the submit is therefore the ordinary shape, and it is
+ * satisfied when an assertion follows that goto before the flow navigates
+ * again (a control only a signed-in page shows). A check between the click
+ * and the goto still satisfies it, as before. Returns the click's index or
+ * null.
+ */
 export function unsynchronizedLoginSubmit(steps: readonly FlowStep[]): number | null {
   let sawCredentialFill = false;
   for (const [index, step] of steps.entries()) {
@@ -5056,7 +5617,9 @@ export function unsynchronizedLoginSubmit(steps: readonly FlowStep[]): number | 
     }
     if (step.action === 'click' && sawCredentialFill) {
       const next = steps[index + 1];
-      if (next !== undefined && next.action === 'goto') return index;
+      if (next !== undefined && next.action === 'goto' && !assertsBeforeNextNavigation(steps, index + 2)) {
+        return index;
+      }
       sawCredentialFill = false;
       continue;
     }
@@ -5065,6 +5628,16 @@ export function unsynchronizedLoginSubmit(steps: readonly FlowStep[]): number | 
     if (step.action !== 'click') sawCredentialFill = false;
   }
   return null;
+}
+
+/** Whether an assertion stands at or after `from`, before the next `goto`, `signIn` or `workflow`. */
+function assertsBeforeNextNavigation(steps: readonly FlowStep[], from: number): boolean {
+  for (let i = from; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    if (step.action === 'goto' || step.action === 'signIn' || step.action === 'workflow') return false;
+    if (hasAssertion([step])) return true;
+  }
+  return false;
 }
 
 /**
@@ -5482,24 +6055,6 @@ export function strandedCredentialFill(steps: readonly FlowStep[]): number | nul
  * `ungroundedUrlExpectation`.
  */
 /**
- * Every string the repository-context section declares the application
- * renders: the quoted spans of `renders the … strings [locale, file]: key:
- * "value" · …` lines and of a component's `says: "word" · "word"` detail.
- * One extractor for every consumer, so "declared by the code" cannot mean two
- * different things in two lints.
- */
-export function declaredControlStrings(codeContext: string | undefined): string[] {
-  if (!codeContext) return [];
-  const found: string[] = [];
-  for (const m of codeContext.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
-    const value = (m[1] ?? '').replace(/\\(.)/g, '$1').trim();
-    // A one-character span or a bare number is punctuation, not a label.
-    if (value.length >= 2 && !/^[\d\s.,%]+$/.test(value)) found.push(value);
-  }
-  return found;
-}
-
-/**
  * A `workflow` step whose goal names a control the repository itself declares.
  *
  * The cost this removes: an agent leg pays model calls per turn for a journey
@@ -5573,6 +6128,94 @@ export function workflowOverDeclaredControls(
   return null;
 }
 
+/**
+ * A presence assertion resting on a name the CAPTURED part of a truncated
+ * tree does not render (2026-09-09, RU_06_12 / RU_06_08).
+ *
+ * `ungroundedTextExpectation` declines to judge a truncated tree, and that is
+ * right: past the node budget, absence of evidence is not evidence of
+ * absence, so a refusal would strike claims that are perfectly true. But
+ * declining left the author's guess frozen into a selector, and a guess made
+ * from an incomplete tree has only one place left to come from — the SHEET'S
+ * own vocabulary.
+ *
+ * Measured, be-high-sonnet-fixed: RU_06_12's own authored intent says it —
+ * *"menu path submenu items are not present in the captured tree
+ * (truncated)"* — and the flow then asserts `text=Change Log`, which is the
+ * test sheet's name for a panel the application renders as a History tab.
+ * The words "Change Log" are nowhere in the product. The case dead-ends on a
+ * working feature, and the report blames the application.
+ *
+ * The honest reading of a truncated tree is not "assert it anyway" and not
+ * "refuse it" — it is **"this run does not know, and something that will know
+ * runs later."** The agent sees the live page at run time, whatever the panel
+ * is called there. So the step is handed to a `workflow` leg carrying the
+ * step's OWN intent — the sheet's words, already written on it — and the
+ * claim is left to the assertions that follow.
+ *
+ * Two guards make it unable to weaken a flow, and both are structural:
+ *
+ * - **It never runs on a complete tree.** With the full tree in hand,
+ *   `ungroundedTextExpectation` judges as it always has.
+ * - **It never takes the last proof.** The demotion is offered only where the
+ *   flow still holds a substantive assertion without this step — so the claim
+ *   keeps a witness that is not the agent, which is this system's oldest rule
+ *   (`src/orchestrator/CLAUDE.md`: what the agent claims is never the
+ *   evidence). A flow whose only proof is this assertion keeps it verbatim,
+ *   which is exactly the wording-claim case the sheet-exemption protects.
+ *
+ * Returns the first such step, or null.
+ */
+export function ungroundedOnTruncatedTree(
+  steps: readonly FlowStep[],
+  axTree: string | undefined,
+  codeContext?: string | undefined,
+): { index: number; text: string } | null {
+  if (!axTree || !axTree.includes('TREE TRUNCATED')) return null;
+  const names: string[] = [];
+  for (const line of axTree.split('\n')) {
+    const m = /^\s*[A-Za-z]+\s+"((?:[^"\\]|\\.)*)"/.exec(line);
+    if (m && m[1] !== undefined && m[1] !== '') names.push(m[1]);
+  }
+  if (names.length === 0) return null;
+  names.push(...declaredControlStrings(codeContext));
+  const hay = names.map((n) => n.toLowerCase());
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    // The page after an agent leg was never captured — nothing to ground on.
+    // **Kept as a stop, not a skip** (re-examined 2026-09-09, be-high-sonnet):
+    // journey capture now puts a leg at index 0 of every row whose destination
+    // is not the start page, so this withholds most bodies — but every
+    // judgement this lint makes is one of ABSENCE ("the captured part renders
+    // no such text"), and past the leg the captured part does not describe the
+    // page at all. Judging on anyway demotes true assertions about uncaptured
+    // pages into agent legs, which is the one thing this lint's own
+    // never-the-last-proof guard exists to prevent. Measured on PL_07_01: with
+    // this as `continue`, `expectVisible role=button[name="Cancel" i]` — a
+    // control the after-click capture holds and the narrowing had cut — was
+    // handed to the agent. What DOES speak past a leg is positive evidence:
+    // see `ungroundedSelectorRole`'s contradiction tier.
+    if (step.action === 'workflow') return null;
+    if (step.action !== 'expectVisible' && step.action !== 'expectText') continue;
+    for (const one of selectorsOf(step)) {
+      const head = (one.split('>>')[0] ?? '').trim();
+      const named =
+        /^role=[a-z]+\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/i.exec(head) ??
+        /^text=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(.+))$/s.exec(head);
+      const text = (named?.[1] ?? named?.[2] ?? named?.[3] ?? '').replace(/\\(.)/g, '$1').trim();
+      if (text === '') continue;
+      if (hay.some((n) => n.includes(text.toLowerCase()))) continue;
+      // Never the last proof: the claim must keep a witness the agent did not
+      // choose. `substantiveAssertions` is the vacuity lint's own predicate,
+      // so "what counts as proof" cannot mean two things in this file.
+      const withoutIt = steps.filter((_, j) => j !== i);
+      if (substantiveAssertions(withoutIt).length === 0) continue;
+      return { index: i, text };
+    }
+  }
+  return null;
+}
+
 export function ungroundedTextExpectation(
   steps: readonly FlowStep[],
   axTree: string | undefined,
@@ -5608,6 +6251,10 @@ export function ungroundedTextExpectation(
   for (let i = 0; i < steps.length; i += 1) {
     const step = steps[i]!;
     // The page after an agent leg was never captured — nothing to ground on.
+    // Kept as a stop for the same reason as `ungroundedOnTruncatedTree`'s: a
+    // text judgement has only absence to go on, and there is no contradiction
+    // tier a name can have. What speaks past a leg is a ROLE the evidence
+    // contradicts (`ungroundedSelectorRole`).
     if (step.action === 'workflow') return null;
     if (step.action !== 'expectVisible' && step.action !== 'expectText' && step.action !== 'expectAnyVisible') continue;
     // Every alternative of an either/or step is a presence claim of its own
@@ -5642,6 +6289,19 @@ export function ungroundedTextExpectation(
 }
 
 /**
+ * The accessible name a tree line carries (`button "Make Correction" · 30×30`
+ * → `make correction`), normalised the way a selector's `name="…"` is: folded
+ * case, a trailing colon dropped. Null for a line that names nothing — a
+ * prose line of a section header, a node with no name.
+ */
+export function treeLineName(line: string): string | null {
+  const m = /^[a-z]+\s+"((?:[^"\\]|\\.)*)"/i.exec(line.trim());
+  if (m === null) return null;
+  const name = (m[1] ?? '').replace(/\\(.)/g, '$1').trim().toLowerCase().replace(/\s*:$/, '');
+  return name === '' ? null : name;
+}
+
+/**
  * A selector whose ROLE the tree never exposes, on ANY action — the
  * generalisation of `ungroundedCountRole` (S4 of the 2026-08-28 agent-flaw
  * audit). Sixteen dead-ends on one page: the author wrote `role=combobox`,
@@ -5656,20 +6316,47 @@ export function ungroundedTextExpectation(
  * disabled until a filter is chosen", and six flows filled it first.
  *
  * Only `role=…` / `[role="…"]` / a bare `select` are judged; CSS and text
- * selectors say nothing the tree could contradict. A truncated tree
- * declines, and `expectHidden`/`expectCount 0` are exempt — asserting an
- * absence of a role the page lacks is the honest claim, not a phantom.
+ * selectors say nothing the tree could contradict, and
+ * `expectHidden`/`expectCount 0` are exempt — asserting an absence of a role
+ * the page lacks is the honest claim, not a phantom.
+ *
+ * **Two tiers, because silence and contradiction are different evidence**
+ * (2026-09-09, be-high-sonnet PL_07_01). The flow's step 1 was
+ * `expectVisible role=tooltip[name="Make Correction" i]` after a workflow
+ * leg, on a journey tree the 200-node budget had cut; it dead-ended three
+ * times at 5×5000 ms and the case was filed against the application. Both
+ * guards were in its way — the truncation bail-out on line one and the
+ * `workflow` bail-out at step 0 — and both were reading absence.
+ *
+ * - **Silence** (the role is in no tree line) is judged only on a COMPLETE
+ *   tree with no agent leg before the step. Past the node budget, or on a
+ *   page the leg walked to and nothing captured, a role that is missing from
+ *   the evidence may be perfectly real, and a refusal would strike a true
+ *   claim.
+ * - **Contradiction** (a tree line renders this very accessible NAME under a
+ *   DIFFERENT role) is judged always. That line is positive evidence, in
+ *   hand: it says what the thing named "Make Correction" is on the page the
+ *   capture read — a `button`. Truncation cannot take a line away, and a leg
+ *   does not unwrite one. `settleSelectorRole` then has the tree's own role
+ *   to repoint to, so the last word is a rewrite rather than a blocked row.
  */
 export function ungroundedSelectorRole(
   steps: readonly FlowStep[],
   axTree: string | undefined,
 ): { index: number; role: string; name: string | null; nearest: string[]; disabled: boolean } | null {
-  if (!axTree || axTree.includes('TREE TRUNCATED')) return null;
+  if (!axTree) return null;
+  const truncated = axTree.includes('TREE TRUNCATED');
   const lines = axTree.split('\n').map((l) => l.trim()).filter(Boolean);
   const roles = new Set(lines.map((l) => (/^([a-z]+)\b/i.exec(l)?.[1] ?? '').toLowerCase()).filter(Boolean));
+  let afterLeg = false;
   for (let i = 0; i < steps.length; i += 1) {
     const step = steps[i]!;
-    if (step.action === 'workflow') return null; // the page after a leg was never captured
+    if (step.action === 'workflow') {
+      afterLeg = true; // the page the leg ends on was never captured
+      continue;
+    }
+    // Whether the EVIDENCE'S SILENCE may be read as the page's answer.
+    const silenceIsEvidence = !truncated && !afterLeg;
     if (step.action === 'expectHidden' || (step.action === 'expectCount' && (step as { count?: number }).count === 0)) continue;
     // An either/or step carries several selectors; each alternative is judged
     // as a selector of its own (CG-08) — a phantom role in one branch is a
@@ -5697,7 +6384,10 @@ export function ungroundedSelectorRole(
     const needle = name?.toLowerCase().replace(/\s*:$/, '') ?? null;
     // The role exists on the page: fine unless it is disabled and this step acts on it first.
     if (roles.has(role) || (role === 'select' && roles.has('combobox'))) {
-      if (needle !== null && (step.action === 'fill' || step.action === 'click' || step.action === 'type' || step.action === 'selectOption')) {
+      // The disabled tier keeps its original guards exactly: "disabled at
+      // rest" is a fact about the captured page, and after a leg the flow is
+      // no longer on it.
+      if (silenceIsEvidence && needle !== null && (step.action === 'fill' || step.action === 'click' || step.action === 'type' || step.action === 'selectOption')) {
         const line = lines.find((l) => new RegExp(`^${role}\\s+"[^"]*${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^"]*"`, 'i').test(l));
         if (line !== undefined && /\bdisabled\b/.test(line)) {
           return { index: i, role, name, nearest: [line], disabled: true };
@@ -5705,11 +6395,215 @@ export function ungroundedSelectorRole(
       }
       continue;
     }
-    // The role does not exist: name the lines that carry the same name under another role.
+    // The role does not exist in the evidence. A line whose accessible name
+    // IS this step's name, under another role, is the contradiction — named
+    // first so `settleSelectorRole` (which needs `nearest[0]`'s name to equal
+    // the step's) has the repointing line to hand.
+    const sameName = needle === null ? [] : lines.filter((l) => treeLineName(l) === needle);
     const nearest = needle === null
       ? []
-      : lines.filter((l) => l.toLowerCase().includes(needle)).slice(0, 3);
+      : [...sameName, ...lines.filter((l) => !sameName.includes(l) && l.toLowerCase().includes(needle))].slice(0, 3);
+    if (!silenceIsEvidence && sameName.length === 0) continue;
     return { index: i, role, name, nearest, disabled: false };
+    }
+  }
+  return null;
+}
+
+/**
+ * One capture's worth of tree lines at a time.
+ *
+ * The evidence a lint reads is every tree the model was given, concatenated —
+ * the start page, the journey's landing page, and the page the row's opening
+ * click reached. Counting a name across the whole string would read one
+ * `button "Cancel"` on each of two pages as an ambiguous pair. The harness
+ * writes the boundaries itself (`journeySection` in `cli/commands/authoring.ts`
+ * and `captureAxTree`'s own notice), so they are what is split on — the same
+ * "parse our own output" move `treeLineName` and `fromTreeLine` make.
+ */
+function treeSections(axTree: string): string[][] {
+  const sections: string[][] = [[]];
+  for (const raw of axTree.split('\n')) {
+    const line = raw.trim();
+    if (line === '') continue;
+    if (/the accessibility tree of/i.test(line) || /^AFTER CLICKING\b/i.test(line) || line.startsWith('[')) {
+      sections.push([]);
+      continue;
+    }
+    sections[sections.length - 1]!.push(line);
+  }
+  return sections;
+}
+
+/**
+ * The actions that must resolve exactly ONE element.
+ *
+ * Everything that acts (a click changes what the test exercises if it lands on
+ * an arbitrary row) and everything that reads a value off one control. Left
+ * out deliberately: `expectCount` (counting many is the point),
+ * `expectHidden`/`expectVisible`/`expectAnyVisible`/`expectEnabled`/
+ * `expectDisabled` — "one of these is on the page" is a claim any match
+ * satisfies, and the ladder's own narrowing rungs (1.3/1.35/1.36) exist for
+ * exactly those.
+ */
+const ONE_ELEMENT_ACTIONS: ReadonlySet<string> = new Set([
+  'click', 'clickIfVisible', 'fill', 'type', 'selectOption', 'check', 'uncheck', 'press', 'upload',
+  'expectValue', 'expectText', 'expectAttribute', 'expectFieldError', 'expectFocused', 'saveText',
+]);
+
+/**
+ * A control the captured tree renders MORE THAN ONCE, addressed as if there
+ * were one of it.
+ *
+ * Live (2026-09-09, be-sit-high): one application, one table, one control,
+ * authored two ways across five rows. PL_07_01, PL_07_02 and RU_07_01 wrote
+ * `role=button[name="Make Correction" i] >> nth=0` and resolved; RU_06_12 and
+ * RU_06_16 wrote the same selector with no disambiguator and Playwright
+ * refused it — *strict mode violation: … resolved to 25 elements* — so both
+ * dead-ended and filed three defects each against an application whose table
+ * simply has twenty-five rows. The disambiguator was written when the model
+ * happened to think of it.
+ *
+ * A control that lives in a repeated row is ambiguous BY CONSTRUCTION, and the
+ * tree the author read says so: twenty-five lines, one accessible name. That
+ * is **positive evidence**, so — the rule `ungroundedSelectorRole`'s
+ * contradiction tier established — it is judged on a truncated tree and past a
+ * `workflow` leg alike: narrowing cannot take a line away, and an agent leg
+ * does not unwrite one. Silence is never read here; a name the evidence shows
+ * once is left entirely alone.
+ *
+ * A selector the author already narrowed (`>> nth=0`, `>> visible=true`, a
+ * `:has-text(…)` scope) is not judged: the author has said which one they
+ * mean, and whether the RIGHT one is `presenceForStatedValue`'s question, not
+ * this one's.
+ */
+export function ambiguousRepeatedControl(
+  steps: readonly FlowStep[],
+  axTree: string | undefined,
+): { index: number; role: string; name: string; count: number } | null {
+  if (!axTree) return null;
+  const counts = new Map<string, number>();
+  for (const section of treeSections(axTree)) {
+    const here = new Map<string, number>();
+    for (const line of section) {
+      const name = treeLineName(line);
+      if (name === null) continue;
+      const role = (/^([a-z]+)\b/i.exec(line)?.[1] ?? '').toLowerCase();
+      if (role === '') continue;
+      const key = `${role}|${name}`;
+      here.set(key, (here.get(key) ?? 0) + 1);
+    }
+    // The most any ONE page renders it — never the sum across pages.
+    for (const [key, n] of here) counts.set(key, Math.max(counts.get(key) ?? 0, n));
+  }
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    if (!ONE_ELEMENT_ACTIONS.has(step.action)) continue;
+    for (const one of selectorsOf(step)) {
+      const selector = one.trim();
+      if (selector === '' || selector.includes('>>')) continue;
+      if (/:has-text\(|:has\(|:nth-|\bnth=/i.test(selector)) continue;
+      const engine = /^role=([a-z]+)\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/i.exec(selector);
+      if (engine === null) continue;
+      const role = (engine[1] ?? '').toLowerCase();
+      const name = (engine[2] ?? engine[3] ?? '').replace(/\\(.)/g, '$1').trim();
+      if (name === '') continue;
+      const count = counts.get(`${role}|${name.toLowerCase().replace(/\s*:$/, '')}`) ?? 0;
+      if (count >= 2) return { index: i, role, name, count };
+    }
+  }
+  return null;
+}
+
+/**
+ * A step whose OWN INTENT says its selector rests on nothing.
+ *
+ * Live twice in one run (2026-09-09, be-high-sonnet): *"2.1: assert the
+ * tooltip text 'Make Correction' appears on hover, per the case wording; not
+ * confirmed by any captured tree so this is best-effort."* (PL_07_01, which
+ * then dead-ended three times at 5×5000 ms and was filed against the
+ * application) and *"Expected 3.3: a Create badge is shown at the top of the
+ * popup (not captured in the tree; selector guessed from the case wording)."*
+ * (RU_06_01). The model had already reached this file's own verdict about
+ * its answer, written it down where a person would read it — and the harness
+ * shipped the step anyway, because no rule read the intent.
+ *
+ * A confession is the cheapest evidence there is: no tree, no repository
+ * lookup, no model call. The refusal names the remedy the grounding lints
+ * name — take the role and the name from a tree line, or hand the leg to a
+ * workflow goal — and its last word ANNOTATES rather than deletes, so the
+ * worst case is exactly the flow that shipped before this existed, plus the
+ * `[generated: …]` mark and a line in `notes`.
+ *
+ * Two exclusions, both structural: a `workflow` step (its goal is written in
+ * the sheet's own words on purpose, and it is the shape the other refusals
+ * steer TO), and everything after the `[generated:` marker (the harness's own
+ * settle paths write "no captured tree names its control" as a disclosure of
+ * a rewrite it already made — reading that back as the model's confession
+ * would refuse this file's own honesty).
+ */
+export function admitsUngroundedSelector(
+  steps: readonly FlowStep[],
+): { index: number; admission: string } | null {
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    if (step.action === 'workflow') continue;
+    if (selectorsOf(step).length === 0) continue;
+    const intent = 'intent' in step ? (step.intent ?? '') : '';
+    const own = intent.split(GENERATED_STEP_MARKER)[0] ?? '';
+    const hit = AUTHORING.admission.exec(own);
+    if (hit !== null) return { index: i, admission: hit[0] };
+  }
+  return null;
+}
+
+/**
+ * A hover claim proved by a presence assertion that names no role.
+ *
+ * A tooltip is the one surface a capture can never hold: nothing hovers
+ * while the tree is read, so `role=tooltip` is invented by construction
+ * (`ungroundedSelectorRole`'s contradiction tier refuses it) and the words
+ * of the tooltip are, on the page at rest, the accessible NAME of the
+ * control that carries it. A bare `text="Make Correction"` therefore proves
+ * nothing about the tooltip and can match anything on the page holding those
+ * words — measured (2026-09-09, be-high-sonnet RU_06_01): the step failed,
+ * the healer narrowed it to `>> visible=true >> nth=0`, and it then passed
+ * against `span "Make Correction" · 110×23 at (549,100)` — the BREADCRUMB.
+ * A green about a tooltip nobody hovered. `[c9] text=Create` did the same
+ * against `span "Create Plan"`.
+ *
+ * Fires only where the evidence can steer: the case's own words claim a
+ * hover surface, the assertion's selector head carries no role, and a
+ * captured tree renders that very text as some control's accessible name.
+ * With no such line there is nothing to point at and the step is left alone
+ * — a refusal there would be the sheet's vocabulary judged by absence, which
+ * is `ungroundedTextExpectation`'s business and its exemptions.
+ */
+export function unanchoredHoverAssertion(
+  steps: readonly FlowStep[],
+  caseText: string | undefined,
+  axTree: string | undefined,
+): { index: number; text: string; role: string; nearest: string[] } | null {
+  if (caseText === undefined || axTree === undefined) return null;
+  if (!AUTHORING.hoverClaim.test(caseText)) return null;
+  const lines = axTree.split('\n').map((l) => l.trim()).filter(Boolean);
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    if (step.action !== 'expectVisible' && step.action !== 'expectText') continue;
+    for (const one of selectorsOf(step)) {
+      const head = (one.split('>>')[0] ?? '').trim();
+      // Already anchored on a role — the shape this refusal steers to.
+      if (/^role=/i.test(head) || /\[role="/i.test(head)) continue;
+      const m = /^text=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(.+))$/s.exec(head);
+      const text = (m?.[1] ?? m?.[2] ?? m?.[3] ?? '').replace(/\\(.)/g, '$1').trim();
+      if (text === '') continue;
+      const needle = text.toLowerCase().replace(/\s*:$/, '');
+      const named = lines.filter((l) => treeLineName(l) === needle);
+      const line = named[0];
+      if (line === undefined) continue;
+      const role = (/^([a-z]+)/i.exec(line)?.[1] ?? '').toLowerCase();
+      if (role === '') continue;
+      return { index: i, text, role, nearest: named.slice(0, 3) };
     }
   }
   return null;
@@ -5880,6 +6774,119 @@ export function settleSelectorRole(
   return `role=${found.role} for ${JSON.stringify(found.name)} repointed to role=${treeRole} from the tree's own line (marked [generated: …])`;
 }
 
+/**
+ * Anchor a roleless presence check on the role the tree gives that name (the
+ * fallback for `unanchoredHoverAssertion`). Any `>> …` tail the author wrote
+ * is kept: it narrows, it does not name. The rewrite is never weaker than
+ * what it replaces — `text="X"` matches every node holding those words, the
+ * anchored form only the nodes of that role — so the last word here cannot
+ * cost the flow a claim it had.
+ */
+export function settleHoverAnchor(step: FlowStep, found: { text: string; role: string }): string | null {
+  const selector = (step as { selector?: string }).selector;
+  if (typeof selector !== 'string' || selector.trim() === '') return null;
+  const tail = selector.split('>>').slice(1).map((part) => part.trim()).filter(Boolean);
+  const anchored = `role=${found.role}[name="${found.text.replace(/"/g, '\\"')}" i]`;
+  (step as { selector: string }).selector = [anchored, ...tail].join(' >> ');
+  annotateStep(
+    step,
+    `${JSON.stringify(`text=${found.text}`)} anchored on role=${found.role}, the role the tree shows for that name — ` +
+      'a roleless presence check for a hover claim passes against a breadcrumb or heading holding the same words',
+  );
+  return `${JSON.stringify(`text=${found.text}`)} anchored on role=${found.role} from the tree's own line (marked [generated: …])`;
+}
+
+/**
+ * Say WHICH of the identical controls (the fallback for
+ * `ambiguousRepeatedControl`).
+ *
+ * The refusal's own first remedy — scope the step to the row the case names —
+ * needs a tree line for that row, and by the time the last word runs the model
+ * has been asked for it and could not supply one. `>> nth=0` is what the same
+ * suite's working rows wrote for the same control, and it is the difference
+ * between a step that exercises the feature and a strict-mode violation that
+ * dead-ends and files defects about a table having rows. WHICH row it lands on
+ * remains a separate question, and `presenceForStatedValue` is what asks it —
+ * so the mark says so.
+ */
+export function settleRepeatedControl(step: FlowStep, found: { role: string; name: string; count: number }): string | null {
+  const selector = (step as { selector?: string }).selector;
+  if (typeof selector !== 'string' || selector.trim() === '' || selector.includes('>>')) return null;
+  (step as { selector: string }).selector = `${selector.trim()} >> nth=0`;
+  annotateStep(
+    step,
+    `the tree renders ${found.count} controls named ${JSON.stringify(found.name)}; nth=0 takes the first, since no captured ` +
+      'tree names the row this case is about',
+  );
+  return (
+    `step's ${JSON.stringify(found.name)} is one of ${found.count} identical controls — narrowed to nth=0 (marked ` +
+    '[generated: …]); which row it opens is not established by the flow'
+  );
+}
+
+/**
+ * Assert the value the sheet states, on the control the flow already named
+ * (the fallback for `presenceForStatedValue`).
+ *
+ * The step keeps its selector and its cited line; only the CLAIM sharpens,
+ * from "this field is on screen" to "this field holds what the sheet says".
+ * Which comparison the engine can make is decided by the role the author took
+ * from the tree — a textbox holds a value, a trigger button renders its
+ * choice as text — so the rewrite reads the same evidence `entryStepFor`
+ * does, in the opposite direction. A role neither reads gets no rewrite and
+ * the refusal stands.
+ */
+/**
+ * How many stated-value presence checks one last word sharpens. A bound in
+ * the shape of `MAX_SETTLED_SCRIPT_LEGS`: a sheet listing twenty fields is a
+ * flow the model should have written, not one the fallback should rebuild.
+ */
+export const MAX_SETTLED_STATED_VALUES = 6;
+
+/**
+ * Which comparison the engine can make against a selector's own role, or null
+ * for a role that holds no value of its own.
+ *
+ * One definition, read by the refusal's wording and by the settle, so the
+ * message a model is asked to act on and the rewrite the last word performs
+ * cannot disagree about what is settleable.
+ *
+ * **Deliberately strict, and an any-role `expectText` fallback was considered
+ * and rejected** (2026-09-10): the engine reads `innerText`, so an
+ * `expectText` on a landmark or container passes whenever the value appears
+ * ANYWHERE inside it. That is exactly the shape that produced this run's worst
+ * result — RU_06_01's roleless `text="Make Correction"` healed to
+ * `>> visible=true >> nth=0` and passed green against the BREADCRUMB — and it
+ * would trade a blocked row for a false pass. A refusal with no rewrite earns
+ * the informed re-ask instead, bounded by `AUTHORING_REFUSAL_CAP`.
+ */
+function valueAssertionFor(selector: string): 'expectValue' | 'expectText' | null {
+  const role = (/^role=([a-z]+)/i.exec(selector.trim())?.[1] ?? '').toLowerCase();
+  if (role === 'textbox' || role === 'searchbox' || role === 'spinbutton') return 'expectValue';
+  if (role === 'button' || role === 'combobox' || role === 'listbox' || role === 'link' || role === 'heading' || role === 'cell') {
+    return 'expectText';
+  }
+  return null;
+}
+
+export function settleStatedValue(step: FlowStep, found: { id: string; value: string }): string | null {
+  const selector = (step as { selector?: string }).selector;
+  if (typeof selector !== 'string' || selector.trim() === '') return null;
+  const action = valueAssertionFor(selector);
+  if (action === null) return null;
+  (step as { action: string }).action = action;
+  (step as { value: string }).value = found.value;
+  annotateStep(
+    step,
+    `Expected line ${found.id} states ${JSON.stringify(found.value)}; a presence check on this field passes whatever it holds, ` +
+      `so the step now ${action}s the stated value`,
+  );
+  return (
+    `Expected line ${found.id}'s stated value ${JSON.stringify(found.value)} is now asserted with ${action} instead of a ` +
+    'presence check (marked [generated: …])'
+  );
+}
+
 /** `Field = value` pairs written on one line of prose — the sheet's own pair grammar (CG-02), read structurally. */
 function pairsOnLine(line: string): { key: string; value: string }[] {
   const out: { key: string; value: string }[] = [];
@@ -6041,6 +7048,158 @@ export function settleScriptDemand(
     [performed.length > 0 ? `${performed.join(', ')} as deterministic steps` : '', delegated.length > 0 ? `${delegated.join(', ')} as agent leg(s) in the sheet's words` : '']
       .filter(Boolean)
       .join('; ')
+  );
+}
+
+/**
+ * How many script steps one settlement may hand to the agent.
+ *
+ * An agent leg is the most expensive step there is, and a flow whose whole
+ * second half is legs is the shape this plane refuses everywhere else. The
+ * live rows that needed this (be-cycle1-sit, RU_09_5x / PL_10_5x) each left
+ * one or two numbered steps unperformed, so three covers them and bounds the
+ * worst case; the rest are named as not covered, which is what the refusal's
+ * own note said before this existed.
+ */
+export const MAX_SETTLED_SCRIPT_LEGS = 3;
+
+/**
+ * Perform the numbered script steps the flow never reached — the fallback for
+ * `unperformedScriptSteps` (2026-09-08).
+ *
+ * Measured on be-cycle1-sit (440 rows): eight of the nineteen rows blocked at
+ * authoring were blocked by this lint, every one of them on the same shape —
+ * the sheet's later step acts on a page no capture reached (a bulk-import
+ * wizard behind an upload), so the model cited step 1 and stopped. The lint is
+ * right that the claim is untested; refusing was the wrong remedy, because the
+ * machinery to perform an uncovered script line from evidence already existed
+ * for `skipsAuthoredScript` and was simply not wired to this one, which
+ * settled with a note instead.
+ *
+ * Each missing numbered line, in script order: every `Field = value` pair on
+ * it (or the Test data pair whose key it names) whose field a captured tree
+ * names becomes the entry step that tree line's ROLE dictates; a line nothing
+ * grounds becomes ONE `workflow` leg carrying the sheet's own words as its
+ * goal — the honest shape for a leg no tree covers. Inserted before the first
+ * step citing a later script step, else before the flow's first assertion, so
+ * the action precedes the check it is checked by. Every inserted step is cited
+ * `Step N:` and marked `[generated: …]`.
+ *
+ * **Never returns null.** The note this used to produce — "not covered: script
+ * step(s) N" — is what a settlement that can insert nothing still returns, so
+ * a row that was handed over with a note before is never refused because of
+ * this change.
+ */
+export function settleUnperformedScript(
+  flow: SettleableFlow,
+  caseText: string,
+  unperformed: { performedThrough: number; total: number; missing: readonly { n: number; text: string }[] },
+  evidence: string | undefined,
+  testData: readonly TestDataPair[] = [],
+): string {
+  const notCovered = (which: readonly { n: number; text: string }[]): string =>
+    `not covered: script step(s) ${which.map((m) => `${m.n} (${m.text.slice(0, 60)})`).join(', ')} — ` +
+    `no authored step performs them; the flow performs the script through step ${unperformed.performedThrough} of ${unperformed.total}`;
+
+  // The script's own lines by number, continuations folded in — the lint's
+  // `missing` text is cut at 80 characters for the refusal message, and a
+  // `Field = value` pair can sit past that.
+  const lines = new Map<number, string>();
+  let current = 0;
+  for (const raw of (sectionOf(caseText, 'steps') ?? '').split('\n')) {
+    const numbered = /^\s*(\d{1,2})[.)]\s*(.*)$/.exec(raw);
+    if (numbered !== null) {
+      current = Number(numbered[1]);
+      lines.set(current, (numbered[2] ?? '').trim());
+      continue;
+    }
+    const continuation = raw.replace(/^\s*[-•*]\s*/, '').trim();
+    if (current > 0 && continuation !== '' && lines.has(current)) {
+      lines.set(current, `${lines.get(current)!} ${continuation}`.trim());
+    }
+  }
+
+  const performed: string[] = [];
+  const delegated: string[] = [];
+  const left: { n: number; text: string }[] = [];
+  for (const step of [...unperformed.missing].sort((a, b) => a.n - b.n)) {
+    const text = (lines.get(step.n) ?? step.text).trim();
+    if (text === '') {
+      left.push(step);
+      continue;
+    }
+    // **Only a line that asks the tester to ACT is performed here.** A line
+    // that asks them to LOOK — `8. ตรวจสอบ Employee Profile ใน EC` — is an
+    // assertion the flow omitted, and the sheet's Expected output decides what
+    // this flow asserts; performing it as an agent leg would make the agent
+    // the witness for its own claim, which is the one thing an agent leg may
+    // never be. Such a line is named as not covered, as it was before.
+    const demanded = withoutRouteLabels(text);
+    const demands =
+      scriptDemand(SCRIPT_DEMANDS.typing, demanded) ??
+      scriptDemand(SCRIPT_DEMANDS.choosing, demanded) ??
+      scriptDemand(SCRIPT_DEMANDS.acting, demanded);
+    if (demands === null) {
+      left.push(step);
+      continue;
+    }
+    const label = `Step ${step.n}: ${text.slice(0, 160)}`;
+    const anchor = insertionAnchorFor(flow, step.n);
+    const pairs = pairsOnLine(text);
+    const fromData =
+      pairs.length > 0
+        ? pairs
+        : testData
+            .filter((p) => squash(p.key) !== '' && squash(text).includes(squash(p.key)))
+            .map((p) => ({ key: p.key, value: p.value }));
+    let grounded = 0;
+    for (const pair of fromData) {
+      if (unconfirmedValue(pair.value)) continue;
+      const control = treeControlNamed(pair.key, evidence);
+      if (control === null) continue;
+      const entry = entryStepFor(
+        control,
+        pair.value,
+        markGenerated(
+          label,
+          `performs the script step on ${control.role} ${JSON.stringify(control.name)} from the tree ` +
+            `with the sheet's value ${JSON.stringify(pair.value)}`,
+        ),
+      );
+      if (entry === null) continue;
+      appendOrInsert(flow, anchor, entry);
+      grounded += 1;
+    }
+    if (grounded > 0) {
+      performed.push(`step ${step.n} (${grounded} control(s) from the tree)`);
+      continue;
+    }
+    if (delegated.length >= MAX_SETTLED_SCRIPT_LEGS) {
+      left.push(step);
+      continue;
+    }
+    appendOrInsert(flow, anchor, {
+      action: 'workflow',
+      goal: label,
+      intent: markGenerated(
+        label,
+        "no captured tree names its controls — an agent leg performs the sheet's own line, and the " +
+          "flow's own assertions settle it",
+      ),
+    } as FlowStep);
+    delegated.push(`step ${step.n}`);
+  }
+
+  if (performed.length === 0 && delegated.length === 0) return notCovered(unperformed.missing);
+  return (
+    'script step(s) the flow left unperformed were inserted by the harness (marked [generated: …]): ' +
+    [
+      performed.length > 0 ? `${performed.join(', ')} as deterministic steps` : '',
+      delegated.length > 0 ? `${delegated.join(', ')} as agent leg(s) in the sheet's words` : '',
+    ]
+      .filter(Boolean)
+      .join('; ') +
+    (left.length > 0 ? `; ${notCovered(left)}` : '')
   );
 }
 
@@ -6226,6 +7385,7 @@ export function fixtureFacts(caseText: string): string[] {
 export function ungroundedFixtureAssertion(
   steps: readonly FlowStep[],
   facts: readonly string[],
+  stated: readonly StatedValue[] = [],
 ): { index: number; fact: string; action: string } | null {
   if (facts.length === 0) return null;
   const typedSoFar = new Set<string>();
@@ -6269,6 +7429,37 @@ export function ungroundedFixtureAssertion(
       (step.action === 'expectText' || step.action === 'expectValue') &&
       /^role=(?:textbox|combobox|spinbutton|button|searchbox)\b/i.test(step.selector.trim());
     if (derived) continue;
+    // **Reading a record's identity off the record's own field is the flow's
+    // SCOPE, not a claim that the record exists** (2026-09-10, be-sit-high
+    // PL_07_02). The sheet's Expected line 3.3 is *Benefit Plan ID แสดง
+    // "PL_07_01_02_03_04_05_06"*, and `unassertedExpectedItems` demands an
+    // assertion for it — while this lint refused the only assertion that
+    // makes it. The model resolved the contradiction the way the two rules
+    // left open: `expectVisible` of the field, which passes whatever it
+    // holds, and twelve later assertions then failed against a page showing
+    // a different plan correctly. Exempted, the case fails at line 3.3 with
+    // one true finding: the record on screen is not the one the sheet names.
+    //
+    // Narrow on purpose: only where the CASE ITSELF pairs the value with that
+    // control's own label, and only as a value read off a value-holding
+    // control. A DB where-clause, an exact count, a row click scoped by the
+    // fact and a `text=` presence in a listing are the be100 shapes this lint
+    // was written for and stay judged exactly as before.
+    const identityRead =
+      (step.action === 'expectText' || step.action === 'expectValue') &&
+      /^role=(?:textbox|combobox|spinbutton|button|searchbox|listbox)\b/i.test(step.selector.trim());
+    if (identityRead && stated.length > 0) {
+      const named = /^role=[a-z]+\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/i.exec(step.selector.trim());
+      const controlName = (named?.[1] ?? named?.[2] ?? '').replace(/\\(.)/g, '$1').trim();
+      const pairedFact =
+        controlName !== '' &&
+        facts.some(
+          (fact) =>
+            text.includes(fact) &&
+            stated.some((claim) => claim.value.includes(fact) && labelMatchesControl(claim.label, controlName)),
+        );
+      if (pairedFact) continue;
+    }
     for (const f of facts) {
       if (!text.includes(f) || typedSoFar.has(f)) continue;
       // A click on a row scoped by the fact, or a DB check keyed on it.
@@ -6447,6 +7638,163 @@ export function unassertedExpectedItems(
   return items.filter((id) => !carriers.includes(id));
 }
 
+/** One Expected line's claim that a named control holds a stated value. */
+export interface StatedValue {
+  /** The line's own number, when it has one (`3.3`). */
+  id: string | null;
+  /** The words the line writes before the value — the control it speaks of, as the sheet says it. */
+  label: string;
+  /** The value the sheet quotes. */
+  value: string;
+}
+
+/**
+ * Every `<control> … "<value>"` claim the Expected block makes.
+ *
+ * The sheet's own grammar, read structurally: a QUOTED value, and the words
+ * of its own clause in front of it. Nothing here knows a connective — the
+ * label keeps whatever the line put between the control and the value
+ * (`Benefit Plan ID แสดง`, `Status shows`), and `labelNames` below lets the
+ * TREE decide which of its trailing words is the control's name. Only quoted
+ * values are read: an unquoted tail is prose as often as it is a value, and a
+ * lint that reads prose as a claim refuses true flows.
+ *
+ * `[RECORD ONLY]` lines are skipped — the sheet asked for those to be read,
+ * never asserted (CG-09), which is `assertsRecordOnlyLine`'s rule.
+ */
+export function statedValuesIn(caseText: string): StatedValue[] {
+  const block = sectionOf(caseText, 'expected');
+  if (block === null) return [];
+  const out: StatedValue[] = [];
+  const seen = new Set<string>();
+  for (const raw of block.split('\n')) {
+    if (RECORD_ONLY_MARK.test(raw)) continue;
+    const line = raw.trim().replace(/^[-•*]\s*/, '');
+    const numbered = /^(\d+(?:\.\d+)?)[.)]?\s+/.exec(line);
+    const id = numbered?.[1] ?? null;
+    const body = numbered === null ? line : line.slice(numbered[0].length);
+    let cursor = 0;
+    for (const m of body.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+      const value = (m[1] ?? '').replace(/\\(.)/g, '$1').trim();
+      const before = body.slice(cursor, m.index);
+      cursor = m.index + m[0].length;
+      if (value === '') continue;
+      // An ellipsis inside the quotes is the sheet showing a SHAPE, not a
+      // value — *"Entitlement Amount from ... to ..."* (RU_06_16). Nothing can
+      // assert it verbatim, so it states nothing this lint may demand.
+      if (/\.\.\.|…/.test(value)) continue;
+      // The clause this value belongs to: the sheet writes several pairs on
+      // one line, separated by its own punctuation.
+      const clause = (before.split(/[,;:：]|\s[—–]\s/).pop() ?? '').trim();
+      const label = clause.split(/\s+/).filter(Boolean).slice(-5).join(' ');
+      if (label === '') continue;
+      const key = `${label} ${value}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ id, label, value });
+    }
+  }
+  return out;
+}
+
+/**
+ * The control names a stated value's label could be naming, longest first.
+ *
+ * The sheet writes `<control> <verb> "<value>"` — `3.3 Benefit Plan ID แสดง
+ * "…"`, `3.2 Status shows "…"` — so the control OPENS the clause and whatever
+ * trails it is the verb. Which trailing words those are is a question no word
+ * list should answer, so every PREFIX of the clause is offered and the
+ * evidence (the selector the author already took from a tree) picks. Anchored
+ * at the start on purpose: a window taken from the middle let one shared word
+ * match — RU_06_16's *"…ในกรอบ Entitlement Amount History สอดคล้อง…"* against a
+ * control named "History Sidebar" — which is a claim about neither.
+ */
+function labelNames(label: string): string[] {
+  const words = label.split(/\s+/).filter(Boolean);
+  const out: string[] = [];
+  for (let end = words.length; end > 0; end -= 1) out.push(words.slice(0, end).join(' '));
+  return out;
+}
+
+/**
+ * Does a selector's accessible name answer to the control a label opens with?
+ *
+ * Folded EQUAL, not merely overlapping. `squash` already drops the
+ * punctuation an application decorates a name with (`Country*`, `Benefit Plan
+ * ID :`), which is the whole tolerance this needs — and containment either way
+ * pairs things that share only a family word: `Benefit Plan ID แสดง` matched a
+ * control named "Benefit Name" through the single prefix "Benefit", which
+ * would have exempted the fixture lint on a control the sheet never paired
+ * that value with. A name the application decorates in some other way simply
+ * does not pair, and both lints stay silent — the safe direction.
+ */
+function labelMatchesControl(label: string, controlName: string): boolean {
+  const have = squash(controlName);
+  if (have.length < 3) return false;
+  return labelNames(label).some((candidate) => squash(candidate) === have);
+}
+
+/**
+ * An Expected line that STATES a value, proved by a check that the field
+ * exists.
+ *
+ * The worst single case of the be-sit-high run (PL_07_02, 16 defects filed
+ * against a working application) turned on one step. The sheet's line 3.3 is
+ * *Benefit Plan ID แสดง "PL_07_01_02_03_04_05_06"* — the identity of the
+ * record every other line of the case is about. It was authored
+ * `expectVisible role=textbox[name="Benefit Plan ID" i]`, which passes
+ * whatever the field holds; the flow had opened the plan sitting in row zero
+ * (`>> nth=0`, no search, no row scope), so twelve plan-specific assertions
+ * failed against a page displaying a DIFFERENT plan perfectly correctly. The
+ * one assertion that could have caught it was the one written as a presence.
+ *
+ * Structural and general: a presence assertion (`expectVisible` /
+ * `expectEnabled` / `expectDisabled`) that CITES a numbered Expected line
+ * whose control it names, where the value that line states appears in no step
+ * of the flow. `unassertedExpectedItems` already asks whether a line has an
+ * assertion at all; this asks whether the assertion makes the line's claim.
+ *
+ * Conservative in three ways, each of which stops it refusing a true flow:
+ * the value must be QUOTED by the sheet; the step must cite that line's own
+ * number, so a step about something else is never judged; and a flow that
+ * asserts the value ANYWHERE — as `expectText`, as `text="…"`, in a saved
+ * comparison — is silent, because the claim is then made.
+ */
+export function presenceForStatedValue(
+  steps: readonly FlowStep[],
+  caseText: string | undefined,
+): { index: number; id: string; label: string; value: string } | null {
+  if (caseText === undefined) return null;
+  const stated = statedValuesIn(caseText).filter((s): s is StatedValue & { id: string } => s.id !== null);
+  if (stated.length === 0) return null;
+  // What the flow claims, the fixture lint's own reading: the step's fields
+  // without its intent, so a value merely EXPLAINED to a reader is not a claim.
+  const claimed = steps
+    .map((step) => {
+      const { intent: _intent, ...claim } = step as FlowStep & { intent?: unknown };
+      return JSON.stringify(claim);
+    })
+    .join('\n');
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    if (step.action !== 'expectVisible' && step.action !== 'expectEnabled' && step.action !== 'expectDisabled') continue;
+    const selector = (selectorsOf(step)[0] ?? '').trim();
+    const engine = /^role=[a-z]+\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/i.exec(selector);
+    if (engine === null) continue;
+    const controlName = (engine[1] ?? engine[2] ?? '').replace(/\\(.)/g, '$1').trim();
+    if (controlName === '') continue;
+    const intent = 'intent' in step ? (step.intent ?? '') : '';
+    const cited = new Set([...intent.matchAll(/(?:^|[^\d.])(\d+(?:\.\d+)?)(?![\d.])/g)].map((m) => m[1]!));
+    for (const claim of stated) {
+      if (!cited.has(claim.id)) continue;
+      if (!labelMatchesControl(claim.label, controlName)) continue;
+      if (claimed.includes(claim.value)) continue;
+      return { index: i, id: claim.id, label: claim.label, value: claim.value };
+    }
+  }
+  return null;
+}
+
 /**
  * A selector written against a control's DOM implementation instead of its
  * role.
@@ -6590,6 +7938,21 @@ function isConsentAccept(step: FlowStep): boolean {
   return false;
 }
 
+function isConsentDecline(step: FlowStep): boolean {
+  if (step.action !== 'click') return false;
+  const name = clickTargetName(step.selector);
+  return name !== null && /^(decline|reject|do not accept|ไม่ยอมรับ|ปฏิเสธ)$/i.test(name);
+}
+
+export function consentPolicyForCase(
+  caseText: string,
+  steps: readonly FlowStep[],
+): ConsentPolicy | undefined {
+  if (steps.some(isConsentAccept)) return undefined;
+  if (steps.some(isConsentDecline)) return 'preserve';
+  return /\bCONSENT_REQUIRED\b/i.test(caseText) ? 'preserve' : undefined;
+}
+
 /**
  * F3 of docs/consent-gate-recovery-spec.md: a consent-accept step the model
  * placed AFTER the first post-login navigation or assertion is spliced to
@@ -6695,6 +8058,42 @@ export function groundCredentialFills(
 }
 
 /**
+ * Does this typed sign-in block MEAN to succeed?
+ *
+ * Three grounding moves (`groundCredentialValues`, `groundPersonaSignIns`,
+ * `handTypedPersonaSignIn`) act only on a sign-in the flow means to succeed,
+ * and leave a negative sign-in case — a wrong password typed on purpose, an
+ * error message asserted — exactly as written. They used to read that intent
+ * off the canonical login proof, `expectHidden` of the submit control. That
+ * proof is no longer authored (an application may return to its sign-in page
+ * after creating the session, 2026-09-10), so the intent is read off what the
+ * flow does NEXT: a flow that proceeds as a signed-in user meant the sign-in
+ * to take. One predicate, so the three gates cannot drift apart.
+ *
+ * `segment` is the block from the sign-in's first step to the step before the
+ * next navigation; `next` is the step that ends it (the next `goto`), or
+ * undefined at the end of the flow.
+ */
+export function signInMeansToSucceed(segment: readonly FlowStep[], next: FlowStep | undefined): boolean {
+  // The legacy proof, still honoured for flows on disk: the block asserts the
+  // sign-in page went away.
+  if (segment.some((s) => s.action === 'expectHidden')) return true;
+  // The flow carries on as someone signed in: an agent leg, a link followed
+  // off the sign-in page, a hand-off to another persona, or a navigation to
+  // a page that is not a sign-in page.
+  const travels = (s: FlowStep): boolean =>
+    s.action === 'workflow' ||
+    s.action === 'signIn' ||
+    (s.action === 'click' && LINK_CLICK.test(s.selector)) ||
+    (s.action === 'goto' && !LOGIN_URL_PATTERN.test(s.url));
+  if (segment.some(travels)) return true;
+  return next !== undefined && travels(next);
+}
+
+/** A click on a link: a navigation by construction, never a sign-in control. */
+const LINK_CLICK = /^role=link\b/i;
+
+/**
  * Force the supplied account's password onto the fills that sign in AS that
  * account.
  *
@@ -6709,9 +8108,9 @@ export function groundCredentialFills(
  * Narrow on purpose, two gates both required:
  * - the segment (fills since the last `goto`) types the supplied email, so a
  *   three-persona catalog keeps its other personas untouched; and
- * - the segment's tail carries an `expectHidden` login proof — the flow MEANS
- *   this sign-in to succeed. A negative test that deliberately types a wrong
- *   password asserts an error message instead, and is left exactly as written.
+ * - the flow MEANS this sign-in to succeed (`signInMeansToSucceed`). A
+ *   negative test that deliberately types a wrong password asserts an error
+ *   message instead, and is left exactly as written.
  *
  * Steps are mutated in place (the `applyReview` precedent) so a case list
  * holding the same objects sees the correction without a second pass.
@@ -6739,8 +8138,7 @@ export function groundCredentialValues(
         s.value.trim().toLowerCase() === credentials.email.toLowerCase(),
     );
     if (!typesEmail) continue;
-    const meansToSucceed = segment.some((s) => s.action === 'expectHidden');
-    if (!meansToSucceed) continue;
+    if (!signInMeansToSucceed(segment, steps[to])) continue;
     for (const step of segment) {
       if (step.action !== 'fill' && step.action !== 'type') continue;
       if (!isCredentialFill(step)) continue;
@@ -6912,30 +8310,30 @@ export function caseFlows(authored: AuthoredFlow): { name: string; flow: Flow }[
   }));
 }
 
-function originOf(url: string | undefined): string | undefined {
+/**
+ * The origin plus the deployment's base path — the segments in front of the
+ * locale (`https://h/humi/th/login` → `https://h/humi`). The origin alone
+ * was wrong for a base-pathed app (humi, 2026-09-05): every authored request
+ * step resolved `/api/consent-api/status` against it, hit the gateway's
+ * HTML 404 instead of the application's `/humi/api/...`, and six cases
+ * failed on a path the page itself calls successfully. A URL with no locale
+ * segment keeps the origin, as before.
+ */
+export function baseUrlOf(url: string | undefined): string | undefined {
   if (url === undefined) return undefined;
   try {
-    return new URL(url).origin;
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split('/').filter((p) => p !== '');
+    const LOCALE = /^[a-z]{2}(-[A-Za-z]{2})?$/;
+    const localeAt = parts.findIndex((part) => LOCALE.test(part));
+    const base = localeAt > 0 ? `/${parts.slice(0, localeAt).join('/')}` : '';
+    return `${parsed.origin}${base}`;
   } catch {
     return undefined;
   }
 }
 
 // --- wave 2 (2026-09-03): the sheet's own shapes, authored honestly ---------
-
-/**
- * Every selector a step carries — the one `selector`, or an either/or step's
- * `selectors` (CG-08). The grounding lints read this so an alternative is
- * judged exactly as a single selector would be.
- */
-export function selectorsOf(step: FlowStep): string[] {
-  const one = (step as { selector?: unknown }).selector;
-  const many = (step as { selectors?: unknown }).selectors;
-  const out: string[] = [];
-  if (typeof one === 'string') out.push(one);
-  if (Array.isArray(many)) for (const s of many) if (typeof s === 'string') out.push(s);
-  return out;
-}
 
 /**
  * The Test data pairs as `describeCase` rendered them — one `[phase] Key =
@@ -7088,12 +8486,13 @@ const LOGIN_BLOCK_STEPS: ReadonlySet<string> = new Set(['fill', 'type', 'click',
  * disclosed, rather than paying a re-ask to be told what a lookup knows.
  *
  * A block is the run from a sign-in `goto` (or the first fill of a
- * segment) through the contiguous fills, the Next/Sign in clicks and the
- * login proof (`expectHidden`/`expectUrl`), inside one `goto`-delimited
- * segment; a consent `when` inside it is kept after the signIn, because the
- * gate may still show. The password fill is dropped with the block — the
- * engine types the secret it holds. A block whose email matches no persona
- * is left alone for `handTypedPersonaSignIn` to refuse.
+ * segment) through the contiguous fills, the Next/Sign in clicks and any
+ * legacy login proof (`expectHidden`/`expectUrl`), inside one
+ * `goto`-delimited segment and never past a click on a link (the flow
+ * travelling on); a consent `when` inside it is kept after the signIn,
+ * because the gate may still show. The password fill is dropped with the
+ * block — the engine types the secret it holds. A block whose email matches
+ * no persona is left alone for `handTypedPersonaSignIn` to refuse.
  */
 export function groundPersonaSignIns(
   steps: readonly FlowStep[],
@@ -7114,22 +8513,30 @@ export function groundPersonaSignIns(
       continue;
     }
     let end = step.action === 'goto' ? i + 1 : i;
-    while (end < steps.length && LOGIN_BLOCK_STEPS.has(steps[end]!.action)) end += 1;
+    // A click on a link ends the block: it is the flow travelling on as the
+    // signed-in person, never part of the sign-in itself.
+    while (
+      end < steps.length &&
+      LOGIN_BLOCK_STEPS.has(steps[end]!.action) &&
+      !(steps[end]!.action === 'click' && LINK_CLICK.test((steps[end] as { selector: string }).selector))
+    ) {
+      end += 1;
+    }
     const block = steps.slice(i, end);
     const emailFill = block.find(
       (s) => (s.action === 'fill' || s.action === 'type') && personaOfEmail(s.value, personas) !== null,
     );
     const label = emailFill === undefined ? null : personaOfEmail((emailFill as { value: string }).value, personas);
     // The block must be a sign-in that MEANS TO SUCCEED: a persona's email
-    // typed, a credential fill or a sign-in goto around it, and the canonical
-    // login proof (`expectHidden` of the submit) at its tail — the
-    // `groundCredentialValues` gate. A business form that happens to take the
+    // typed, a credential fill or a sign-in goto around it, and the flow
+    // carrying on as that person afterwards (`signInMeansToSucceed`, the
+    // `groundCredentialValues` gate). A business form that happens to take the
     // manager's email is not a login, and a negative sign-in case (a wrong
     // password, an error asserted) is left exactly as written.
     const isSignIn =
       label !== null &&
       (step.action === 'goto' || block.some((s) => (s.action === 'fill' || s.action === 'type') && isCredentialFill(s))) &&
-      block.some((s) => s.action === 'expectHidden');
+      signInMeansToSucceed(block, steps[end]);
     if (!isSignIn) {
       out.push(step);
       i += 1;
@@ -7163,8 +8570,9 @@ export function handTypedPersonaSignIn(
 ): { index: number; value: string } | null {
   if (Object.keys(personas).length === 0) return null;
   // Segments between gotos, the `switchesPersona` cut: a segment that types
-  // a credential AND carries the login proof means to sign in; one that
-  // asserts an error instead is a negative sign-in case and is the author's.
+  // a credential AND means to succeed (`signInMeansToSucceed`) is a sign-in;
+  // one that asserts an error instead is a negative sign-in case and is the
+  // author's.
   let from = 0;
   const segments: [number, number][] = [];
   for (const [index, step] of steps.entries()) {
@@ -7180,7 +8588,7 @@ export function handTypedPersonaSignIn(
     if (before !== undefined && before !== null && before.action === 'goto') lastGoto = before.url;
     const onSignIn = lastGoto !== null && LOGIN_URL_PATTERN.test(lastGoto);
     const segment = steps.slice(start, end);
-    if (!segment.some((s) => s.action === 'expectHidden')) continue;
+    if (!signInMeansToSucceed(segment, steps[end])) continue;
     for (const [offset, step] of segment.entries()) {
       if (step.action !== 'fill' && step.action !== 'type') continue;
       if (onSignIn || isCredentialFill(step)) return { index: start + offset, value: step.value };

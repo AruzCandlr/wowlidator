@@ -40,6 +40,9 @@ Usage:
                                            (one step per row, photos embedded,
                                            video linked under every step) from
                                            the ledgers on disk — no re-run
+                                           add --narrate to give every step a
+                                           plain-language sentence in the same
+                                           pass (no browser, no re-run)
                                            (default: .wowlidator/catalogs/)
   wowlidator db restore [<baseline.json> | <runKey> | <ledger.progress.json>]
                                            put the tables back to the snapshot a
@@ -48,6 +51,12 @@ Usage:
                                            ran. Needs WOWLIDATOR_DB_RESTORE_URL, a
                                            write credential. Newest baseline if no
                                            argument is given
+  wowlidator data check <catalog> --master-data <file> --url <app> [--as <email>:<pass>] [--json]
+                                           do the codes the sheet's Test Data names
+                                           exist in the application's master, what
+                                           are they called, are they free, and can
+                                           the UI picker reach them? A report, exit
+                                           0 always — see "data check" below
   wowlidator doctor
   wowlidator mcp
 
@@ -266,6 +275,35 @@ catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mm
                        rectangle is drawn around the element each step acted
                        on or checked (its selector, role, name and box are
                        recorded on the step as "target" either way).
+  --narrate            After each case, have the healer-role model write one
+                       plain-language sentence per step onto the proof bundle,
+                       so the report says what each step did in words anyone
+                       can read. One call per case, not one per step; the
+                       sentence is labelled as the model's and can never
+                       change a verdict, a defect or a finding. OFF by default
+                       (WOWLIDATOR_NARRATE=on is the same switch) because it
+                       spends the model window on every case that runs, and is
+                       skipped when the healer role has no key. Also available
+                       on 'wowlidator report' to back-fill finished runs.
+  --report-lang <en|th>
+                       The language of each case's own report page — its
+                       labels and the model-written narrative on it. English
+                       by default (WOWLIDATOR_REPORT_LANG is the same switch).
+                       Recorded on the run's ledger, so 'wowlidator report'
+                       rebuilds in the language the run chose. Application
+                       text is always shown as captured, never translated.
+  --no-case-narrative  Leave the case page to its evidence: skip the one
+                       generator-role call per case that writes its lede,
+                       pre-read summary, ticket wording, verifier note and
+                       open questions onto the bundle. The narrative is
+                       labelled as the model's and can never change a
+                       verdict, a defect or a finding
+                       (WOWLIDATOR_CASE_NARRATIVE=off is the same switch).
+  --case-narrative     On 'wowlidator report': back-fill the case narrative
+                       onto finished runs that have none, in the language the
+                       run recorded (a rebuild cannot change it). One
+                       generator-role call per case; off unless asked, since a
+                       rebuild is otherwise no re-run.
   --no-agent-capture   Capture the page immediately instead of letting the
                        agent steady it first (wait out spinners, dismiss
                        overlays, prime lazy content). The pilot is on by
@@ -318,6 +356,10 @@ Browser lifecycle (wowlidator starts and checks Chrome itself — no wrapper scr
                        asserts on the database — always runs alone. 1 runs
                        them one after another, and is the A/B test for a
                        parallel result that looks wrong.
+  --case-timeout <seconds|off>
+                       Whole-case ceiling for suite/catalog runs (default 1200s;
+                       env WOWLIDATOR_CASE_TIMEOUT_MS is milliseconds). 0 or off
+                       disables it. A cut case is blocked and --resume runs it again.
   --author-concurrency <n>
   --author-attempts <n>  Authoring asks per row including the first (default 3, or the
                        Machinery dial); 1 = no re-ask budget
@@ -435,6 +477,35 @@ author options:
                         i.e. beside the report it produces)
   --run                Execute the authored flow immediately
   --policy <p>         Same three tiers as generate (default forms)
+
+data check:
+  A sheet names entity CODES (a position, a company); the UI picker shows
+  NAMES and may load only the first page of a large master. This rung reads
+  the sheet's Test Data pairs, fetches each declared lookup once per distinct
+  binding, and prints, per code: rows in the sheet, found, label, the declared
+  facts, and reachable (when the declaration gives the picker's page size).
+  Then a summary: codes/rows not found, codes/rows unreachable, consumable
+  codes two or more rows want, and the lookup URLs used. It informs a person;
+  it authors nothing, blocks nothing and changes no data. No model call.
+
+  --master-data <file> The lookup declaration: a JSON array of
+                       { field: ["Position", "Position Code"],   Test Data fields it grounds
+                         url: "/api/positions?company={Company}&page={page}",
+                                                    {Token} bound from the same row's
+                                                    Test Data; {page} is 1-based
+                         rows: "data.rows",         JSON path to the page's row array
+                         next: "data.hasNextPage",  JSON path to a has-more boolean (optional)
+                         code: "positionCode",      JSON path in a row to the code
+                         label: "name.en",          JSON path to the label (a locale key is fine)
+                         facts: ["vacant"],         row paths to report (optional)
+                         consumable: "vacant",      the fact one use consumes (optional)
+                         uiPageSize: 500 }          rows the UI picker loads (optional)
+  --url <app>          The application; lookup paths are resolved against it
+  --as / --persona     Sign in on a tab of its own and send the lookups through
+                       that browser context, so the application's own cookies
+                       are used. Without credentials the lookups go over plain
+                       HTTP and Chrome is never touched.
+  --json               The same report as one JSON document, for tooling
 
 LLM routing (verify with: wowlidator doctor):
   healer     repairs a dead selector      WOWLIDATOR_HEALER_PROVIDER / WOWLIDATOR_HEALER_MODEL

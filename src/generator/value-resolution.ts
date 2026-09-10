@@ -225,6 +225,7 @@ interface CompiledVocabulary {
 function compileVocabulary(v: Vocabulary): CompiledVocabulary {
   const d = v.dates;
   const f = v.formatWords;
+  const dateNoun = `(?:${alternation(d.dateNouns, escape)}\\s*)?`;
   const monthWord = `(${alternation([...d.thisMonth, ...d.nextMonth, ...d.previousMonth], escape)})`;
   const unit = alternation([...d.units.day, ...d.units.week, ...d.units.month, ...d.units.year]);
   const ageOp = alternation([...d.ageUnder, ...d.ageOver, ...d.ageAtLeast, ...d.ageAtMost, ...d.ageExact], symbolOrWord);
@@ -257,6 +258,7 @@ function compileVocabulary(v: Vocabulary): CompiledVocabulary {
       under: new RegExp(alternation(f.under, symbolOrWord), 'iu'),
     },
     date: {
+      // Optional, non-capturing: `(?:วันที่|วัน|date)\s*`
       today: new RegExp(`^${alternation(d.today)}`, 'iu'),
       tomorrow: new RegExp(`^${alternation(d.tomorrow)}`, 'iu'),
       yesterday: new RegExp(`^${alternation(d.yesterday)}`, 'iu'),
@@ -266,8 +268,12 @@ function compileVocabulary(v: Vocabulary): CompiledVocabulary {
       thisMonth: new RegExp(`^${alternation(d.thisMonth, escape)}$`, 'iu'),
       nextMonth: new RegExp(`^${alternation(d.nextMonth, escape)}$`, 'iu'),
       previousMonth: new RegExp(`^${alternation(d.previousMonth, escape)}$`, 'iu'),
-      before: new RegExp(`^${alternation(d.before, relationWord)}\\s*`, 'iu'),
-      after: new RegExp(`^${alternation(d.after, relationWord)}\\s*`, 'iu'),
+      // A relation may be preceded by the word for "date" itself
+      // (`วันที่ก่อน Hire Date` = `วันที่` + `ก่อน`). Optional, and it consumes
+      // nothing on its own: what follows must still be a relation WORD, so
+      // `วันที่ 20` — a bare day — is untouched and parses as it always did.
+      before: new RegExp(`^${dateNoun}${alternation(d.before, relationWord)}\\s*`, 'iu'),
+      after: new RegExp(`^${dateNoun}${alternation(d.after, relationWord)}\\s*`, 'iu'),
       atClause: new RegExp(`(?:^|\\s)${alternation(d.at)}\\s*([\\p{L}\\p{M}\\p{N} /().'*-]+?)(?=\\s*(?:${ageOp}|\\d)|\\s*$)`, 'iu'),
       prefix: new RegExp(`^${alternation(d.prefixes)}\\s*`, 'iu'),
       exactTail: new RegExp(`\\s*${alternation(d.exact)}\\s*$`, 'iu'),
@@ -299,7 +305,7 @@ function compileVocabulary(v: Vocabulary): CompiledVocabulary {
       phraseShapes: [
         new RegExp(`^${alternation([...d.today, ...d.tomorrow, ...d.yesterday, ...d.future, ...d.past])}`, 'iu'),
         new RegExp(`^${alternation(d.prefixes)}`, 'iu'),
-        new RegExp(`^${alternation([...d.before, ...d.after], relationWord)}\\s*\\S`, 'iu'),
+        new RegExp(`^${dateNoun}${alternation([...d.before, ...d.after], relationWord)}\\s*\\S`, 'iu'),
         new RegExp(`^${alternation(d.back)}`, 'iu'),
         new RegExp(`(?:^|\\s)${alternation(d.at)}\\s`, 'iu'),
         /วันนี้|วันถัดไป|วันพรุ่งนี้|พรุ่งนี้|เมื่อวาน|วันที่ปัจจุบัน|ย้อนหลัง|วันก่อน|ล่วงหน้า|ของเดือน|สิ้นเดือน|ต้นเดือน|วันสุดท้าย|วันแรก|ของปี|อายุ/u,
@@ -1164,6 +1170,23 @@ export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 
   const forwardRe = alternation(VOCABULARY.dates.forward);
 
   // --- relation: one day before or after the base
+  //
+  // The amount may be written on either side of the relation word, and the
+  // two orders are the same claim: English fronts it (`2 weeks after Hire
+  // Date`), Thai trails it (`ก่อน Hire Date 1 ปี`). Only the trailing order
+  // parsed, so every fronted phrase resolved to nothing at all. A leading
+  // amount is consumed here only when a relation word actually follows it —
+  // the lookahead leaves that word for the matcher below — so a phrase that
+  // merely starts with a quantity (`3 วันก่อน`, an offset in its own right)
+  // is untouched.
+  const relationAhead = `(?:${alternation(VOCABULARY.dates.dateNouns, escape)}\\s*)?${alternation(
+    [...VOCABULARY.dates.before, ...VOCABULARY.dates.after],
+    relationWord,
+  )}`;
+  let lead: { amount: number; unit: string } | null = null;
+  const led = take(new RegExp(`^(\\d+)\\s*(${unitRe})\\s+(?=${relationAhead})`, 'iu'));
+  if (led) lead = { amount: Number(led[1]), unit: led[2]! };
+
   let relation = 0;
   if (take(R.date.before)) relation = -1;
   else if (take(R.date.after)) relation = 1;
@@ -1242,9 +1265,13 @@ export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 
   // --- offsets, any number, in order
   let date = base;
   let o: RegExpExecArray | null;
-  if (relation !== 0 && (o = take(new RegExp(`^(\\d+)\\s*(${unitRe})(?=\\s|$)`, 'iu')))) {
-    // `วันที่ก่อน Hire Date 1 ปี`, `2 weeks after Today`: the relation names
-    // the direction and the amount follows the base.
+  if (relation !== 0 && lead !== null) {
+    // `2 weeks after Hire Date`: the amount was written before the relation.
+    date = applyOffset(base, relation, lead.amount, lead.unit);
+    notes.push(`${relation < 0 ? 'minus' : 'plus'} ${lead.amount} ${lead.unit}`);
+  } else if (relation !== 0 && (o = take(new RegExp(`^(\\d+)\\s*(${unitRe})(?=\\s|$)`, 'iu')))) {
+    // `วันที่ก่อน Hire Date 1 ปี`: the relation names the direction and the
+    // amount follows the base.
     date = applyOffset(base, relation, Number(o[1]), o[2]!);
     notes.push(`${relation < 0 ? 'minus' : 'plus'} ${o[1]} ${o[2]}`);
   } else if (relation !== 0) {
@@ -1262,7 +1289,18 @@ export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 
       date = applyOffset(date, 1, Number(o[1]), o[2]!);
     } else if (take(/^(?:และ|and)\b/iu)) {
       continue;
-    } else if (gap && text.split(/\s+/).length >= 2 && !/[+\-−]\s*\d/.test(text) && !new RegExp(`^(?:${backRe}|${forwardRe})`, 'iu').test(text)) {
+    } else if (
+      gap &&
+      text.split(/\s+/).length >= 2 &&
+      // An offset's sign stands on its own: it opens the remark or follows a
+      // space. A sign GLUED to a word is part of that word — `E2E-41` is a
+      // case id, and reading its `-41` as "minus 41 days" rejected the whole
+      // phrase, so `14 เมษายน รันคู่กับ E2E-41` resolved to nothing rather
+      // than to 14 April with the remark set aside. Same rule `relationWord`
+      // already applies to `<`, and for the same reason.
+      !/(?:^|\s)[+\-−]\s*\d/.test(text) &&
+      !new RegExp(`^(?:${backRe}|${forwardRe})`, 'iu').test(text)
+    ) {
       // A complete date followed by words that are not an offset — `14 เมษายน
       // รันคู่กับ E2E-41` — is a date with a remark; the remark is set aside.
       // One trailing word (`ถึงสิ้นเดือน`, a range) is not understood, and
@@ -1426,8 +1464,8 @@ export async function fromRepo(need: ValueNeed, ctx: ValueResolutionContext): Pr
   return { need, value, source: { kind: 'repo', detail: `from the documents/repository: ${answer.evidence.slice(0, 120) || value}` } };
 }
 
-/** `schema.table` or `table` → the introspected table, case-insensitively. */
-function tableIn(schema: DbSchema, name: string): DbSchema['tables'][number] | null {
+/** `schema.table` or `table` → the introspected table, case-insensitively. Shared with `step-evidence.ts`. */
+export function tableIn(schema: DbSchema, name: string): DbSchema['tables'][number] | null {
   const want = name.trim().toLowerCase();
   return (
     schema.tables.find((t) => t.name.toLowerCase() === want) ??
@@ -1436,11 +1474,11 @@ function tableIn(schema: DbSchema, name: string): DbSchema['tables'][number] | n
   );
 }
 
-function qualifiedIdent(table: string): string {
+export function qualifiedIdent(table: string): string {
   return table.split('.').map(quoteIdent).join('.');
 }
 
-function schemaSummary(schema: DbSchema): string {
+export function schemaSummary(schema: DbSchema): string {
   return schema.tables
     .slice(0, 80)
     .map((t) => `${t.name}(${t.columns.map((c) => c.name).slice(0, 30).join(', ')})`)

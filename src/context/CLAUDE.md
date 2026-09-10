@@ -86,6 +86,16 @@ Live (be100 PL_03_03, 2026-08-25): the authoring prompt says *"never invent endp
 Now the file-convention router reads its own handler exports (`exportedHttpMethods` — the three shapes Next.js documents, a regex on the same "pragmatic beats wrong" rule as `guessDefaultComponentName`) and emits **one `operation` node per method+path**, in the OpenAPI ingester's own id and `METHOD /path` name shape so every consumer reads one vocabulary whichever source found it. The methods also ride the route node's `meta.methods`. A handler too odd to read contributes no operations and keeps its route node: silence, never a guess. The authoring lint `unindexedRequestMethod` and the runtime's `MethodRefusedError` are the two halves that use it.
 
 
+## Master-data grounding, first rung (`src/context/master-data.ts`, 2026-09-05)
+
+A test-case sheet names entity CODES in its Test Data (`Position = <code>`); the UI picker shows NAMES, and a picker over a large master may load only its first page and search client-side within it. Measured on one application: the picker loaded 500 of 5,364 rows for one company and searched by name, so 29 of the sheet's 100 codes — 151 rows — were unreachable although every one existed and was vacant. A run authored from those rows fails at the picker and reads like a selector problem. This rung answers the question before anything is authored, from the application's own list endpoint.
+
+- **A declared lookup, parsed at the file seam.** `--master-data <file>` is a JSON array of `{ field, url, rows, next?, code, label, facts?, consumable?, uiPageSize? }` read through `MASTER_DATA_DECLARATION_SCHEMA` (zod, exported from the module — the Phase C rule: a persisted artifact is parsed, never asserted). A missing `code` path is refused as `lookups[N].code: …`; an unusable file is a thrown error naming it. `url` is a path template: `{Company}`-style tokens are bound from the same row's Test Data pairs (spacing and case ignored, URL-encoded), `{page}` is 1-based. `rows`/`next`/`code`/`label`/`facts` are JSON paths (`data.rows`, `name.en`, `items[0].code`); a `label` path that stops at a locale object yields its first string.
+- **`groundCodes(lookup, rows, wantedCodes)` is pure.** Per distinct wanted code: `found`, `label`, the declared `facts`, `index` in page-1 order across every fetched page, `reachable = index < uiPageSize` (only when declared — absent means "no claim", never "yes"), `consumable` (the declared fact read as a boolean) and `sharedBy` (how many wanted entries named it; the command passes one per row, so it counts rows). Codes compare as trimmed strings; a numeric code column is printed first.
+- **The fetcher never throws.** `LookupFetcher` takes an injected `fetchJson(url)` (tests stub it; the CLI wires `fetchJsonThrough(transport)` over the HTTP execution plane's `ApiTransport` — `BrowserTransport` on a tab it signed in, so the application's own cookies are used, or `FetchTransport` when no credentials were given). It pages until `next` is not `true`, memoises every bound URL for the life of one command, and turns a thrown, non-2xx, non-JSON or array-less answer into `{ status: 'unknown', reason }`. `MAX_LOOKUP_PAGES` ends a `next` that never turns false. **Unknown is not missing**: an unread lookup's codes are reported as unverified, never as not found. Every fetched page is data — read through paths, compared as strings, never interpreted.
+- **`wowlidator data check <catalog> --master-data <file> --url <app> [--as|--persona] [--json]`** (`src/cli/commands/maintenance.ts`, `cmdData`) reads the catalog's Test Data through `testDataPairs`, plans one fetch per (lookup, bound tokens) (`planLookups`; a row that cannot bind a token lands in an `unbound` group rather than a guessed URL), grounds each (`groundPlan`), and prints a table per lookup — code, rows in the sheet, found, label, facts, reachable — then the summary: codes/rows not found, codes/rows unreachable, consumable codes wanted by two or more rows, unread lookups, and the URLs it used. **Exit 0 always; it is a report.** `--json` writes one document. `describeGroundingFinding(results)` is the same as one paragraph — the suite-level FINDING a later task attaches to the catalog report (`src/reporter/` untouched for now).
+- **No authoring hook, no blocking, no data mutation.** This rung informs a person; it does not change a run. No application literal lives in `src/` — the company, position and cost-centre examples are in `tests/fixtures/master-data-cases.csv` and `tests/fixtures/master-data.lookups.json`. Tests: `tests/master-data.test.ts` (hand-written pages, a stub fetcher that counts calls) and the `data check` block in `tests/cli.test.ts` (the CLI as a subprocess against a fixture HTTP server, no Chrome).
+
 ## What the generator actually knew about a page — measured (2026-08-28)
 
 Asked whether the generator "understands the codebase and documents", the honest answer was: the STRUCTURE, not the TEXT — and for a fifth of the pages, not even the structure. Two measured facts:
@@ -96,3 +106,59 @@ Asked whether the generator "understands the codebase and documents", the honest
 **Built the same day: the message ingester** (`ingesters/message-ingester.ts`, kind `message`). One node per (locale file, top-level namespace) — `messages/en.json › admin_benefits_plans` — with the namespace's strings as `detail` (short labels first, paragraphs cut, `(+N more)` past `MAX_KEYS_SHOWN`), so the prompt slice prints them ("BenefitPlansScreen renders the admin_benefits_plans strings [en, messages/en.json]: title: "Benefit Plan Catalog" · …") and the BM25 corpus indexes them. The component ingester draws the `uses` edge from every component in a file to every locale's node for each namespace the file binds (`useTranslations` / `getTranslations` / `useScopedI18n`, by regex — a hook cannot be tied to one component of a file without scope analysis, so all of them get it); a namespace no catalog declares dangles and is pruned like every other guess. Files are found by convention (`messages/`, `locales/`, `i18n/`, `translations/`, `lang/` + a locale-shaped stem or parent), capped at `MAX_MESSAGE_FILES`. Both locales are linked on purpose: the bilingual `anyOf` needs the Thai rendering beside the English one. Remember the cache rule: `context add … --force` before the new nodes exist on disk.
 
 **And a component's own words** (same day): the modal title the wording case asked about — `title={isTh ? 'สร้างแผนสวัสดิการใหม่' : 'Create Benefit Plan'}` — was a hardcoded JSX attribute in no catalog, so the message ingester alone still missed it. `collectJsxWords` in the component ingester now records each exported component's JSX text and the string values of label-shaped attributes (`title`, `label`, `aria-label`, `placeholder`, `alt`, …), following literals, templates and BOTH branches of a ternary or logical expression, into the node's `detail` (capped at `MAX_WORDS_PER_COMPONENT`, letters required — a number is not a word). The slice prints it as `— says: "Create Benefit Plan" · "Create"` on the `renders`/`uses` line, and the corpus indexes it. Between the two, "the application's words" now means: its catalogs AND what its components hardcode.
+
+## No tree beats a tree of the wrong panel — and a tree that stops short must say where (2026-09-09, be-high RU_06_12)
+
+The row's flow asserted `text=Change Log`. The application renders that feature as a **History** tab and never renders those two words; the case dead-ended on a working feature. The author had already said why, in its own step intent: *"menu path submenu items are not present in the captured tree (truncated); go to the stated Default route … directly."* When the captured evidence does not cover the page a row is about, the author has nothing left to write from except the TEST SHEET's vocabulary — and a sheet's wording is not evidence that the application renders that string. Three gaps, all on the evidence side, all measured on the run's own input (`.wowlidator/slices/be-high-20260909134138.csv`, 15 rows) and on the 1,286-row workbook fixture:
+
+- **The row's opening click was never found, so the popup its case is about was never opened.** `openingControlOf` read the first three LINES of the Steps column; the generated slice prefixes every row with a locale/route preamble and a `0.` reference line, so `2. กดไอคอน Edit (Make Correction) …` was the fourth line. It also read only `กด(ปุ่ม)? <Name>` — not a verb that carries its noun (`กดไอคอน Edit`), not a control the row DESCRIBES with the application's name in brackets (`กดไอคอนดินสอ (Make correction)`, `กดไอคอน Layers (Insert)`). Now: steps are counted **by the sheet's own numbers** (`firstScriptLines`, numbers ≤ 3, with the first three raw lines still in the pool so an unnumbered script reads exactly as before), the verb may carry its noun, a bracketed gloss is a candidate name, and a row that writes both words hands over both — `openingControlNamesOf` returns `["Edit", "Make Correction"]`, and `captureAfterOpening` clicks whichever of them the page actually carries, saying so when the page's word is not the row's. The safety rule is unchanged and now vetoes the whole LINE: if any word it clicks is a save, submit or delete, nothing on that line is opened — a gloss is not a way to smuggle `(Delete)` past it.
+- **A capture that could not cover the page said nothing about it.** `journeyTreeSection` announced only the one case it already knew (a tab the row names and the capture could not select). It now also says, in the same voice, that the tree was **cut short by its node budget** (`treeWasCut`), that the page **renders one panel at a time behind tabs it lists but did not read** (`unreadPanelsIn` — the row that started this has its feature on a tab of the dialog, under the application's own name for it), and that the row's **opening click matched no control**, so whatever it opens is in no tree below. Each note ends in the same rule the tab note already carried: not listed is **NOT CAPTURED, not absent**; write a workflow goal in the script's own words, never an assertion on a name only the sheet uses. A capture with none of these conditions is byte-for-byte the section it was.
+- **The section's own label line was not the line the narrowing keeps.** `FlowAuthor` narrows the per-row journey tree with `focusTreeText(raw, prompt, JOURNEY_TREE_MAX_LINES, 1)`, whose `keepHead = 1` exists to keep the label — "which page this tree describes IS the evidence". The capture prepended the SIGN-IN LANDING paragraph, so line 0 was the landing sentence and the label (with every caveat above) was an ordinary body line, rankable away like any tree row. The landing sentence now rides INSIDE the section, after the label line.
+
+Measured, no browser: opening controls named on the 1,286-row workbook **318 → 383, none lost, none renamed**; on the failing run's own 15-row input **0 → 7** (four of the remainder are rows whose Steps column arrived character-corrupted from the slice that produced the CSV — an upstream defect, not this capture's). Pinned by `tests/cli-wave2.test.ts` ("openingControlNamesOf reads the click past a preamble…", "journeyTreeSection says what was not captured…", "treeWasCut and unreadPanelsIn…"); the wording tests in `tests/flow-author.test.ts` still hold.
+
+**The rule this leaves:** the capture is allowed to reach further into the row's script for the control that opens it, and is never allowed to be quiet about what it did not read. Every reason a capture may not cover the row's page belongs on the section's FIRST line, because that is the only line the per-row narrowing keeps verbatim.
+
+## A probe puts back what it opened, and Escape is only its first gesture (2026-09-10, be-sit-high-fixed PL_08_01 / RU_07_01 / PL_06_05 / RU_06_08)
+
+**Incident.** The JIT healer probes disclosures before every heal. On the
+live application the top bar's To-do trigger (`aria-haspopup="dialog"`) opens a
+popover of the shape every popover library uses: a `position: fixed; inset: 0`,
+`aria-hidden` click-catcher plus the panel, closed by a click on the catcher
+and by nothing else — no Escape handler. The probe pressed Escape, saw the
+popover still open, recorded *"would not close with Escape — stopped
+probing"* and **left it open**. From then on the catcher took every click of
+the case: Playwright names the catcher's ancestor as the interceptor and never
+dispatches a click it sees intercepted, so the ladder's own overlay rung
+(Escape again) could not clear it either, and four lanes filed
+"blocked by div.humi-topbar" against a page whose controls were all on screen.
+Reproduced with `probeInteractions` alone on the live page: closed before,
+open after, catcher at the card's centre.
+
+**Rule.** "The page is left as it was found" is verified, never assumed, and
+Escape is the first of four gestures, not the only one. `closeDisclosure`
+tries, each verified against the baseline tree: Escape; a neutral dismiss
+control inside an open dialog (`findDismissButton`, `automatic` policy — the
+same names the ladder's unrequested-dialog rung is allowed to click); the
+click-catcher itself (`src/engine/click-catcher.ts` — an element that covers
+the viewport, has no name and no text, and so has no action of its own:
+clicking it is the dismiss a person performs and cannot be a Submit or a
+Delete, which have names); and finally the trigger again, a toggle by ARIA
+contract but still a control, so last. `ProbeResult.closedVia` records which
+gesture did it; `leftOpen` is now reached only when all four failed, and
+probing still stops there. A trigger that **navigated** is mislabelled: the
+probe goes back and stops, since a probe that leaves the run on another URL
+has changed the run it was helping. The healer carries the probe's warnings
+and every non-Escape close on `HealOutcome.probeWarnings`, so a run can say
+the page state a heal ran on was the probe's doing.
+
+**Safety, unchanged.** Only ARIA-marked disclosures are ever opened; the
+gestures that close them can only close — a dismiss control by its neutral
+name, a catcher by construction, the trigger by its own contract. The test
+that asserts a destructive button is never clicked still holds.
+
+Tests: `tests/page-probe.test.ts` — a catcher popover with no Escape handler
+is put back via `click-catcher`, a menu that ignores Escape via `trigger`, the
+identity menu still via `escape`, and the sticky dialog (no catcher, no
+dismiss control, non-toggling trigger) is still reported `leftOpen` with all
+four gestures named.

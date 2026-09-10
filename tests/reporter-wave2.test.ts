@@ -16,25 +16,32 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { ProofBundleBuilder, type AgentRecord, type ProofBundle, type ProofStep } from '../src/engine/proof-bundle.js';
+import { ProofBundleBuilder, type AgentRecord, type Defect, type ProofBundle, type ProofStep } from '../src/engine/proof-bundle.js';
 import { GLOSSARY, renderReport } from '../src/reporter/html-reporter.js';
 import { renderCatalogReport, verdictChipOf, type CatalogReportCase } from '../src/reporter/catalog-report.js';
 import { stepProof } from '../src/reporter/excel-export.js';
 import { renderCtrf, renderJUnit } from '../src/reporter/machine-report.js';
 import { renderSuiteIndex } from '../src/reporter/suite-index.js';
 import { escalationTrace } from '../src/reporter/verdict.js';
+import { ASSERTION_ACTIONS } from '../src/engine/runner.js';
 import {
   countVerdicts,
+  dbEvidence,
+  dbProofLines,
   describeAgentAction,
   describeResolution,
   describeVerdictCounts,
   displayCaseId,
+  inconsequentialAgentLeg,
+  inconsequentialBrokenStep,
+  isAssertionStepAction,
   observedEvidence,
   provenanceExtras,
   recordOnlyCase,
   recordedCaptures,
   sheetLabel,
   stepKindFacts,
+  stepNarration,
   stepTarget,
   visibleDetail,
 } from '../src/reporter/step-facts.js';
@@ -89,6 +96,20 @@ function newKindsBundle(over: Partial<ProofBundle> = {}): ProofBundle {
 /* ------------------------------------------------------------ step facts */
 
 describe('step-facts — what a step WAS, from the record', () => {
+  it('renders a skipped tail step as neutral with its reason', () => {
+    const bundle = bundleOf((builder) => {
+      builder.recordSkipped(
+        { action: 'expectVisible', selector: 'text="Order saved"' },
+        'not run: depends on step 2 (submit the order form), which did not reach its goal',
+      );
+    });
+    const html = renderReport(bundle);
+    assert.match(html, /class="step skipped"/);
+    assert.match(html, /Not run/);
+    assert.match(html, /depends on step 2/);
+    assert.equal(bundle.summary.passed, 0);
+    assert.equal(bundle.summary.failed, 0);
+  });
   it('an either/or assertion is aimed at its alternatives, never at nothing', () => {
     const step = { action: 'expectAnyVisible', selector: null, detail: { selectors: ['text=A', 'text=B'] } };
     assert.equal(stepTarget(step), 'text=A | text=B');
@@ -681,5 +702,529 @@ describe('the HTML report folds a superseded attempt under the step that replace
     const failed = renderReport(bundleOf((b) => b.addStep({ action: 'selectOption', ...bare, status: 'failed', error: 'x', selector: 'role=combobox[name="Company Code" i]', agent })));
     assert.match(failed, /<div class="callout agent failed">\s*<div class="callout-title">Workflow agent took over — goal not reached<\/div>/);
     assert.match(failed, /<details open>/);
+  });
+});
+
+/* ---------------------------------------- the agent leg that decided nothing */
+
+/**
+ * An agent leg that neither rescued the step nor broke it is folded behind a
+ * CLOSED disclosure (2026-09-08), on every surface, through one predicate —
+ * `inconsequentialAgentLeg` in `step-facts.ts`, so the per-run report, the
+ * catalog report and the workbook cannot disagree about which legs are noise.
+ *
+ * The rules under test are the ones that keep folding from hiding evidence:
+ * nothing leaves the document (the leg is a full record inside the
+ * disclosure, exactly as a superseded attempt is), a leg on a step that did
+ * NOT pass never folds, a held action never folds, the model's own `fail`
+ * claim never folds, the step neither changes status nor opens on load, and a
+ * bundle with no qualifying step renders the bytes it rendered before this
+ * existed.
+ */
+describe('an agent leg that did not decide its step', () => {
+  const leg = (over: Partial<AgentRecord> = {}): AgentRecord => ({
+    goal: 'open the Company Code picker',
+    model: 'stub',
+    success: false,
+    summary: 'agent found nothing the goal names to act on',
+    turns: 2,
+    maxSteps: null,
+    latencyMs: 5,
+    actions: [{ index: 0, action: 'scroll', selector: '', value: null, url: 'u', reasoning: 'look further down', ok: true, durationMs: 1 }],
+    ...over,
+  });
+
+  const legStep = (over: Partial<ProofStep> = {}, agent: AgentRecord = leg(), bundleOver: Partial<ProofBundle> = {}): ProofBundle =>
+    bundleOf(
+      (b) =>
+        b.addStep({
+          action: 'selectOption',
+          intent: 'set the rule type to Part time',
+          ...bare,
+          selector: 'role=combobox[name="Company Code" i]',
+          resolution: 'agent',
+          agent,
+          ...over,
+        } as Omit<ProofStep, 'index'>),
+      bundleOver,
+    );
+
+  const DID_NOT_DECIDE = "agent leg — did not affect this step&#39;s outcome: the step passed on the flow&#39;s own selector regardless";
+  const LOOKED_ONLY = "agent leg — did not affect this step&#39;s outcome: it never engaged a control the goal names";
+
+  it('(a) a passing step whose agent reported no success folds, and the whole leg is still in the document', () => {
+    const page = renderReport(legStep());
+    assert.match(page, new RegExp(`<details class="aside-leg">\\s*<summary>${DID_NOT_DECIDE}</summary>`));
+    // Folded, never deleted: the callout, the goal, the summary and the
+    // turn-by-turn trace are all still there, one click away.
+    assert.match(page, /<div class="callout agent ">/);
+    assert.match(page, /<span>goal<\/span> open the Company Code picker/);
+    assert.match(page, /What the agent did — 1 action, turn by turn/);
+    // Closed, in the ordinary colour, and the step is still a passed row that
+    // the page script leaves collapsed (it opens failed steps only).
+    assert.doesNotMatch(page, /<details class="aside-leg" open>|<details open>/);
+    assert.doesNotMatch(page, /callout agent failed/);
+    assert.match(page, /<li class="step passed" id="step-0"/);
+  });
+
+  it('(b) a leg that never engaged a control folds, and says so in the words the flag actually means', () => {
+    const page = renderReport(legStep({}, leg({ lookedOnly: true, endedBy: 'no-progress' })));
+    assert.match(page, new RegExp(`<details class="aside-leg">\\s*<summary>${LOOKED_ONLY}</summary>`));
+    // NOT "every action was a scroll or a wait": `WorkflowAgent` also raises
+    // the flag when every interaction MISSED, which is 76 of the 85 real
+    // cases in this workspace's bundles. The sentence has to be true of both.
+    assert.doesNotMatch(page, /every action it took was a scroll or a wait/);
+  });
+
+  it('a leg on a step that did NOT pass is never folded — it is the evidence of the failure', () => {
+    for (const status of ['failed', 'dead-end', 'error'] as const) {
+      const page = renderReport(legStep({ status, error: 'could not resolve' }));
+      assert.doesNotMatch(page, /class="aside-leg"/, `a ${status} step keeps its agent leg open`);
+      assert.match(page, /callout agent failed/);
+    }
+    // The same holds for a leg that only looked and still could not carry the step.
+    const looked = renderReport(legStep({ status: 'failed', error: 'x' }, leg({ lookedOnly: true })));
+    assert.doesNotMatch(looked, /class="aside-leg"/);
+  });
+
+  it('a held action and the model\'s own "fail" claim are never folded', () => {
+    const held = { reason: 'irreversible', rule: 'manifest', message: 'no approval for delete' };
+    assert.doesNotMatch(renderReport(legStep({ blocked: held } as Partial<ProofStep>)), /class="aside-leg"/);
+    assert.doesNotMatch(renderReport(legStep({}, leg({ blocked: held } as Partial<AgentRecord>))), /class="aside-leg"/);
+    assert.doesNotMatch(renderReport(legStep({}, leg({ endedBy: 'fail' }))), /class="aside-leg"/);
+  });
+
+  it('a leg that DID decide the outcome renders untouched', () => {
+    const page = renderReport(legStep({}, leg({ success: true, summary: 'opened the picker' })));
+    assert.doesNotMatch(page, /class="aside-leg"/);
+    assert.match(page, /<div class="callout-title">Workflow agent took over<\/div>/);
+  });
+
+  it('folding adds the disclosure and changes nothing else — and the defect count is untouched', () => {
+    const defect: Defect = {
+      id: 'd1',
+      title: 'the picker did not open on the first click',
+      detail: 'the agent had to prepare the page',
+      severity: 'low',
+      category: 'functional',
+      source: 'runtime',
+      selector: 'role=combobox[name="Company Code" i]',
+      stepIndex: 0,
+    };
+    // ONE bundle, rendered twice, with the single field the predicate reads
+    // and the report renders nowhere flipped in between — the same shape the
+    // narration's byte-identity test uses, and the only way to hold the run
+    // id and the timestamps still.
+    const b = legStep({}, leg(), { defects: [defect] });
+    const folded = renderReport(b);
+    (b.steps[0]!.agent as { endedBy?: string }).endedBy = 'fail';
+    const openLeg = renderReport(b);
+    assert.match(folded, /class="aside-leg"/);
+    assert.doesNotMatch(openLeg, /class="aside-leg"/);
+    const stripped = folded.replace(
+      /\n {4}<details class="aside-leg">\n {6}<summary>[^<]*<\/summary>\n {6}([\s\S]*?)\n {4}<\/details>/,
+      '$1',
+    );
+    assert.equal(stripped, openLeg, 'the fold is a wrapper; every other byte of the report is the same');
+    // Stated separately from the byte comparison, because it is the promise
+    // the drift signal rests on: the report shows the same defects either way.
+    const defectsOf = (page: string): string[] => [...page.matchAll(/<div class="d-title">([\s\S]*?)<\/div>/g)].map((m) => m[1] ?? '');
+    assert.deepEqual(defectsOf(folded), defectsOf(openLeg));
+    assert.deepEqual(defectsOf(folded), ['the picker did not open on the first click'], 'the defect really is on the page');
+  });
+
+  it('the predicate is one function of the record, and every non-shape returns null', () => {
+    const passed = { status: 'passed' };
+    assert.equal(inconsequentialAgentLeg({ ...passed })?.kind, undefined, 'a step with no agent record');
+    assert.equal(inconsequentialAgentLeg({ ...passed, agent: undefined })?.kind, undefined);
+    assert.equal(inconsequentialAgentLeg({ ...passed, agent: 'not an object' })?.kind, undefined);
+    assert.equal(inconsequentialAgentLeg({ ...passed, agent: {} })?.kind, undefined, 'an older record with neither field');
+    assert.equal(inconsequentialAgentLeg({ status: undefined, agent: { success: false } })?.kind, undefined, 'a record with no status');
+    assert.equal(inconsequentialAgentLeg({ ...passed, agent: { success: false } })?.kind, 'did-not-decide');
+    assert.equal(inconsequentialAgentLeg({ ...passed, agent: { success: false, lookedOnly: true } })?.kind, 'looked-only');
+    assert.equal(inconsequentialAgentLeg({ status: 'passed-with-issues', agent: { success: false } })?.kind, 'did-not-decide', 'pass** IS a pass');
+  });
+
+  it('escapes the wording it composes, and carries no captured page text into it', () => {
+    const page = renderReport(legStep({}, leg({ goal: '<script>alert(1)</script>', summary: '<img src=x onerror=1>' })));
+    assert.ok(!page.includes('<script>alert(1)</script>'));
+    assert.ok(!page.includes('<img src=x'));
+    // The summary line is composed from the two constants and nothing the
+    // page said, so no application text — and no credential — can reach it.
+    const summaries = [...page.matchAll(/<details class="aside-leg">\s*<summary>([^<]*)<\/summary>/g)].map((m) => m[1]);
+    assert.deepEqual(summaries, [DID_NOT_DECIDE]);
+  });
+});
+
+/* ------------------------------------------------ the narration on a step */
+
+/**
+ * `ProofStep.narration` (2026-09-07): a model's plain-language reading of the
+ * step's own recorded line, written after the run and stored on the bundle.
+ * The reporter renders it and never produces it, so everything here is a pure
+ * function over a hand-built bundle.
+ *
+ * The rules under test are the ones that make it safe to put a model's prose
+ * beside evidence: it is labelled and attributed where it is read, it comes
+ * after every recorded fact and displaces none, it is escaped and marked
+ * `lang=""` like any other captured text, and a step with no narration
+ * renders EXACTLY the bytes it rendered before this existed.
+ */
+describe('a step narrated in plain language', () => {
+  const NARRATION = {
+    text: 'Looked for a dialog called "Create Plan" and found one titled "สร้างแผนสวัสดิการ" instead.',
+    by: 'groq:llama-3.3-70b-versatile',
+    at: '2026-09-07T00:01:00.000Z',
+  };
+  const failing = {
+    action: 'expectModal',
+    intent: 'the Create Plan dialog is shown',
+    selector: 'role=dialog[name="Create Plan" i]',
+    resolvedSelector: null,
+    resolution: null,
+    status: 'failed' as const,
+    error: 'could not resolve role=dialog[name="Create Plan" i]',
+    detail: { expected: 'Create Plan', actual: 'สร้างแผนสวัสดิการ' },
+    ...base,
+  };
+  const narrated = (over: Partial<ProofStep> = {}): ProofBundle =>
+    bundleOf((b) => b.addStep({ ...failing, narration: NARRATION, ...over } as Omit<ProofStep, 'index'>));
+
+  it('renders as an always-visible line, labelled, explained and signed by the model that wrote it', () => {
+    const page = renderReport(narrated());
+    const line = page.match(/<p class="step-narration">[\s\S]*?<\/p>/)?.[0] ?? '';
+    assert.notEqual(line, '', 'the narration renders');
+    // Outside `.step-body`, so it is read without expanding the step.
+    assert.ok(page.indexOf(line) < page.indexOf('<div class="step-body"'), 'it sits in the always-visible group');
+    assert.match(line, /in plain language/);
+    assert.match(line, /written by groq:llama-3\.3-70b-versatile/, 'attributed where it is read, not on hover');
+    assert.ok(line.includes('Looked for a dialog called'));
+    // The rule that makes it safe to sit here is one greppable wording.
+    assert.match(GLOSSARY['in plain language'] ?? '', /Descriptive only: it sets no status, files no defect, and is no part of the verdict/);
+  });
+
+  it('never displaces the recorded evidence — it is the LAST of the step\'s always-visible lines', () => {
+    const page = renderReport(narrated());
+    const step = page.slice(page.indexOf('<li class="step failed"'), page.indexOf('<div class="step-body"'));
+    const order = ['class="headline"', 'class="step-sub"', 'class="step-compare"', 'class="step-narration"'];
+    const at = order.map((needle) => step.indexOf(needle));
+    assert.ok(at.every((i) => i >= 0), `every line renders: ${JSON.stringify(at)}`);
+    assert.deepEqual([...at].sort((a, b) => a - b), at, 'intent, then the selector, then expected/actual, and only then the reading');
+    // The deterministic lines are untouched by the narration beside them.
+    assert.match(step, /expected <code>Create Plan<\/code>/);
+    assert.match(step, /<code class="target">role=dialog\[name=&quot;Create Plan&quot; i\]<\/code>/);
+  });
+
+  it('escapes the model\'s prose and marks its captured application text, exactly like every other string', () => {
+    const page = renderReport(narrated({ narration: { ...NARRATION, text: '<script>alert("x")</script> found "สร้างแผน" on the page' } } as Partial<ProofStep>));
+    assert.doesNotMatch(page, /<script>alert\("x"\)<\/script>/, 'a script tag in a narration is text, never markup');
+    assert.match(page, /&lt;script&gt;alert\(&quot;x&quot;\)&lt;\/script&gt;/);
+    assert.match(page, /<span class="narr-t"><span lang="" class="captured">/, 'non-Latin narration is marked lang="", never translated and never guessed at');
+    // A model id is our own string, never captured text — it is escaped, not marked.
+    const injected = renderReport(narrated({ narration: { ...NARRATION, by: '<img src=x onerror=1>' } } as Partial<ProofStep>));
+    assert.doesNotMatch(injected, /<img src=x/);
+    assert.match(injected, /written by &lt;img src=x onerror=1&gt;/);
+  });
+
+  it('a step with no narration renders exactly the bytes it did before narration existed', () => {
+    // One bundle, rendered twice — the run id and the timestamps are the same
+    // document, so the only difference the diff can show is the narration.
+    const bundle = narrated();
+    const withNarration = renderReport(bundle);
+    delete (bundle.steps[0] as { narration?: unknown }).narration;
+    const plain = renderReport(bundle);
+    assert.doesNotMatch(plain, /class="step-narration"|in plain language<\/abbr>/, 'nothing about narration reaches an un-narrated report but the unused CSS rule');
+    assert.equal(withNarration.replace(/<p class="step-narration">[\s\S]*?<\/p>/g, ''), plain, 'the narrated page differs by the narration line and by nothing else');
+  });
+
+  it('is nothing at all when the record is empty, half-written or not the shape', () => {
+    assert.equal(stepNarration({}), null);
+    assert.equal(stepNarration({ narration: { text: '   ', by: 'm', at: 'now' } }), null);
+    assert.equal(stepNarration({ narration: 'a bare string' }), null);
+    // Whitespace is folded so a two-line answer is one line on every surface.
+    assert.equal(stepNarration({ narration: { text: ' opened\n  the page ', by: 'm:1', at: 'now' } })?.text, 'opened the page');
+    // Never unattributed: a sentence with no author reads as the harness's own.
+    assert.equal(stepNarration({ narration: { text: 'x', at: 'now' } })?.attribution, 'written by a model');
+  });
+});
+
+/* ------------------------------------- the query a database check ran */
+
+/**
+ * A database validation shows the statement it ran and the rows it got back
+ * (2026-09-08).
+ *
+ * `DbCheckRecord` carried only a redacted `where` summary and a capped row
+ * sample, so a reader could not see WHAT SQL answered the claim, and the
+ * sample rendered as an unlabelled grid of `col = value` cells. The statement
+ * is now captured at its source (`src/db/db-actions.ts`, from identifiers
+ * that already passed the schema gate) and projected once in `step-facts.ts`,
+ * so the per-run report, the catalog report and the workbook cannot describe
+ * one check three ways.
+ *
+ * The rules under test: the SQL and its bound parameters render and are
+ * escaped; a credential-shaped parameter was redacted at the source and
+ * cannot reach the HTML; the rows render as a real table with a header row
+ * and say how many matched and whether the sample was capped; and a bundle
+ * sealed before any of this existed renders its summary exactly as it did,
+ * with no query section and nothing invented.
+ */
+describe('a database check shows the query it ran', () => {
+  const dbStep = (db: Record<string, unknown>): ProofBundle =>
+    bundleOf((b) =>
+      b.addStep({
+        action: 'expectDbRow',
+        intent: 'the plan row is there',
+        ...bare,
+        db: db as never,
+      } as Omit<ProofStep, 'index'>),
+    );
+
+  const RECORD = {
+    kind: 'row',
+    table: 'benefit_plan',
+    where: 'id = 42 AND session_token = [redacted]',
+    expected: 'at least 1 row',
+    observed: '1 row(s)',
+    rows: [{ id: '42', name: '<script>alert(1)</script>' }],
+    rowsMatched: 42,
+    durationMs: 12,
+    statements: [
+      {
+        sql: 'SELECT * FROM "benefit_plan" WHERE "id" = $1 AND "session_token" = $2 LIMIT 25',
+        params: ['42', '[redacted]'],
+        tables: ['benefit_plan'],
+      },
+    ],
+    note: 'read directly from the database while this flow ran',
+  };
+
+  it('renders the SQL, its bound parameters and the rows as a table with a header row', () => {
+    const page = renderReport(dbStep(RECORD));
+    assert.match(page, /<div class="http-part-title">query<\/div>/);
+    assert.match(page, /SELECT \* FROM &quot;benefit_plan&quot; WHERE &quot;id&quot; = \$1/);
+    assert.match(page, /<th colspan="2">parameters<\/th>/);
+    assert.match(page, /<code>\$2<\/code><\/td><td>\[redacted\]/);
+    // A real table: one header row of column names, one <tr> per row.
+    assert.match(page, /<thead><tr><th>id<\/th><th>name<\/th><\/tr><\/thead>/);
+    // The sample says how many matched and that it is capped.
+    assert.match(page, /rows returned — showing 1 of 42 row\(s\) — the sample is capped at 3/);
+    // The summary lines the block always carried are still there.
+    assert.match(page, /<dt>where<\/dt><dd>id = 42 AND session_token = \[redacted\]/);
+    assert.match(page, /<dt>expected<\/dt><dd>at least 1 row/);
+    assert.match(page, /<dt>observed<\/dt><dd>1 row\(s\)/);
+  });
+
+  it('escapes the statement and every cell — application text reaches this block', () => {
+    const page = renderReport(
+      dbStep({
+        ...RECORD,
+        statements: [{ sql: 'SELECT * FROM "t" WHERE "n" = $1 -- <script>alert(2)</script>', params: ['<img src=x onerror=1>'] }],
+      }),
+    );
+    assert.ok(!page.includes('<script>alert(1)</script>'), 'a cell value cannot open a tag');
+    assert.ok(!page.includes('<script>alert(2)</script>'), 'the SQL cannot open a tag');
+    assert.ok(!page.includes('<img src=x'), 'a bound parameter cannot open a tag');
+    assert.match(page, /&lt;script&gt;alert\(2\)&lt;\/script&gt;/);
+  });
+
+  it('a credential-shaped parameter is the redacted one, and the real value is nowhere in the document', () => {
+    // The redaction happens at the source (`redact-row.ts`), so what a bundle
+    // carries is already `[redacted]` — the report renders the record and
+    // never re-derives a value, which is what makes this assertion possible.
+    const page = renderReport(
+      dbStep({
+        ...RECORD,
+        rows: [{ id: '42', password: '[redacted]' }],
+        statements: [{ sql: 'SELECT * FROM "u" WHERE "password" = $1', params: ['[redacted]'] }],
+      }),
+    );
+    assert.ok(!page.includes('hunter2'));
+    assert.match(page, /<th>password<\/th>/);
+    assert.match(page, /<td>\[redacted\]<\/td>/);
+  });
+
+  it('a bundle sealed before the statement existed renders its summary and no query section', () => {
+    const { statements: _dropped, rowsMatched: _also, ...older } = RECORD;
+    const page = renderReport(dbStep(older));
+    assert.doesNotMatch(page, /<div class="http-part-title">query<\/div>/);
+    assert.doesNotMatch(page, /parameters/);
+    // Everything it always showed is still shown, and the sample is honest
+    // about being one row rather than pretending to know a total.
+    assert.match(page, /<dt>where<\/dt><dd>id = 42 AND session_token = \[redacted\]/);
+    assert.match(page, /rows returned — 1 row\(s\)/);
+    assert.match(page, /<dt>duration<\/dt>/);
+  });
+
+  it('a step with no db record renders no block at all', () => {
+    assert.equal(dbEvidence({ db: undefined }), null);
+    assert.equal(dbEvidence({ db: 'not an object' }), null);
+    assert.doesNotMatch(renderReport(bundleOf((b) => b.addStep({ action: 'click', ...bare }))), /callout request/);
+  });
+
+  it('the workbook says the same thing in the Proof column, in the same words', () => {
+    const lines = dbProofLines({ db: RECORD });
+    assert.deepEqual(lines.slice(0, 4), [
+      'db row on benefit_plan',
+      'where id = 42 AND session_token = [redacted]',
+      'expected at least 1 row',
+      'observed 1 row(s)',
+    ]);
+    assert.ok(lines.includes('query: SELECT * FROM "benefit_plan" WHERE "id" = $1 AND "session_token" = $2 LIMIT 25'));
+    assert.ok(lines.includes('parameters: $1 = 42 · $2 = [redacted]'));
+    assert.ok(lines.includes('rows returned — showing 1 of 42 row(s) — the sample is capped at 3'));
+    assert.ok(lines.includes('id | name'));
+    assert.deepEqual(dbProofLines({ db: undefined }), []);
+  });
+
+  it('a called check names what it sampled — statements, not rows of a table', () => {
+    const e = dbEvidence({
+      db: { kind: 'called', durationMs: 3, rows: [{ statement: 'INSERT INTO orders …' }], rowsMatched: undefined },
+    });
+    assert.equal(e?.sample, '1 matching statement(s)');
+    assert.deepEqual(e?.columns, ['statement']);
+  });
+});
+
+/* ------------------------------- a broken step that decided nothing */
+
+/**
+ * A step that broke without deciding the run's outcome is folded, never
+ * dropped (2026-09-08) — `inconsequentialBrokenStep` in `step-facts.ts`, the
+ * sibling of `inconsequentialAgentLeg` and under the same constitution: this
+ * decides only how a step is LAID OUT. It is not a status, not a verdict, not
+ * a defect and not a count.
+ *
+ * The conditions are all structural, and the exclusions are what keep folding
+ * from hiding evidence: an assertion step is never folded (its outcome IS the
+ * claim), an `error` step is never folded (`harnessOnly()` depends on it being
+ * visible), a held step is never folded, and nothing folds on a run whose
+ * claims did not hold.
+ */
+describe('a step that broke without deciding the outcome', () => {
+  const run = (over: Partial<ProofBundle> = {}, broken: Partial<ProofStep> = {}): ProofBundle =>
+    bundleOf(
+      (b) => {
+        b.addStep({ action: 'goto', ...bare } as Omit<ProofStep, 'index'>);
+        b.addStep({
+          action: 'click',
+          intent: 'dismiss the consent gate',
+          ...bare,
+          selector: 'role=button[name="Accept" i]',
+          status: 'failed',
+          error: 'could not resolve role=button[name="Accept" i]',
+          ...broken,
+        } as Omit<ProofStep, 'index'>);
+        b.addStep({
+          action: 'expectText',
+          intent: 'the plan is listed',
+          ...bare,
+          selector: 'text="Part time"',
+          detail: { expected: 'Part time', actual: 'Part time' },
+        } as Omit<ProofStep, 'index'>);
+      },
+      { status: 'passed-with-issues', ...over },
+    );
+
+  const SUMMARY =
+    "failed — did not decide this run&#39;s outcome: it makes no claim, the run carried past it, and every claim the run did make held";
+
+  it('folds the whole row behind a closed disclosure, and the row is still in the document', () => {
+    const page = renderReport(run());
+    assert.match(page, new RegExp(`<details class="aside-step">\\s*<summary>.*${SUMMARY}</summary>`));
+    // Folded, never deleted: the failed row, its status class, its error and
+    // its intent are all one click away.
+    assert.match(page, /<li class="step failed" id="step-1"/);
+    assert.match(page, /could not resolve role=button/);
+    assert.match(page, /dismiss the consent gate/);
+    // Closed, and the sealed status is named on the summary — nothing is
+    // relabelled, it is only laid out differently.
+    assert.doesNotMatch(page, /<details class="aside-step" open>/);
+    assert.match(page, /<summary><span class="idx">1<\/span>/);
+  });
+
+  it('the fold is a wrapper and changes nothing else about the report', () => {
+    // ONE bundle rendered twice, with only the run status flipped in between,
+    // so the run id and the timestamps hold still.
+    const b = run();
+    const folded = renderReport(b);
+    (b as { status: string }).status = 'failed';
+    const plain = renderReport(b);
+    assert.match(folded, /class="aside-step"/);
+    assert.doesNotMatch(plain, /class="aside-step"/);
+    const stripped = folded.replace(
+      /\n {2}<li class="step-aside">\n {4}<details class="aside-step">\n {6}<summary>[\s\S]*?<\/summary>\n {6}<ol class="steps">([\s\S]*?)<\/ol>\n {4}<\/details>\n {2}<\/li>/,
+      '$1',
+    );
+    // The verdict headline differs (the run status is what changed), so the
+    // step list is compared rather than the whole page.
+    const stepsOf = (page: string): string => page.slice(page.indexOf('<li class="step passed" id="step-0"'), page.indexOf('id="step-2"'));
+    assert.ok(stepsOf(plain).includes('could not resolve role=button'), 'the comparison really covers the broken step');
+    assert.equal(stepsOf(stripped), stepsOf(plain), 'the fold adds a wrapper and removes nothing');
+  });
+
+  it('a failed ASSERTION is never folded — its outcome is the claim', () => {
+    const page = renderReport(
+      run({ status: 'passed-with-issues' }, { action: 'expectVisible', status: 'failed', error: 'not visible' }),
+    );
+    assert.doesNotMatch(page, /class="aside-step"/);
+  });
+
+  it('an `error` step and a held step are never folded', () => {
+    assert.doesNotMatch(renderReport(run({}, { status: 'error', error: 'database unavailable' })), /class="aside-step"/);
+    const held = { reason: 'irreversible', rule: 'manifest', message: 'no approval for delete' };
+    assert.doesNotMatch(renderReport(run({}, { blocked: held } as Partial<ProofStep>)), /class="aside-step"/);
+  });
+
+  it('nothing folds on a run whose claims did not hold', () => {
+    for (const status of ['failed', 'dead-end', 'error', 'needs-review']) {
+      assert.doesNotMatch(renderReport(run({ status: status as ProofBundle['status'] })), /class="aside-step"/, status);
+    }
+  });
+
+  it('the predicate is structural, and every other shape returns null', () => {
+    const steps = [
+      { index: 0, action: 'goto', status: 'passed' },
+      { index: 1, action: 'click', status: 'failed' },
+      { index: 2, action: 'expectText', status: 'passed' },
+    ];
+    const bundle = { status: 'passed-with-issues', steps };
+    assert.equal(inconsequentialBrokenStep(steps[1]!, bundle)?.status, 'failed');
+    assert.equal(inconsequentialBrokenStep(steps[1]!, { status: 'passed-with-issues', steps: [] }), null, 'a step the run does not hold');
+    assert.equal(
+      inconsequentialBrokenStep(steps[1]!, { status: 'passed-with-issues', steps: steps.slice(0, 2) }),
+      null,
+      'the last broken thing standing: nothing after it ran',
+    );
+    assert.equal(
+      inconsequentialBrokenStep(steps[1]!, {
+        status: 'passed-with-issues',
+        steps: [steps[0]!, steps[1]!, { index: 2, action: 'expectText', status: 'skipped' }],
+      }),
+      null,
+      'a step the run never reached is downstream evidence it obstructed something',
+    );
+    assert.equal(
+      inconsequentialBrokenStep(steps[1]!, { status: 'passed-with-issues', steps: [steps[0]!, steps[1]!, { index: 2, action: 'click', status: 'passed' }] }),
+      null,
+      'a run that made no claim has nothing this break was beside the point of',
+    );
+    assert.equal(
+      inconsequentialBrokenStep({ index: 1, action: 'click', status: 'failed', superseded: true }, bundle),
+      null,
+      'a superseded attempt is already folded under the step that replaced it',
+    );
+    // `pass**` and `passed` both mean the claims held.
+    assert.equal(inconsequentialBrokenStep(steps[1]!, { status: 'passed', steps })?.status, 'failed');
+    assert.equal(inconsequentialBrokenStep(steps[1]!, { status: undefined, steps }), null);
+  });
+
+  it('the assertion mirror cannot drift from the runner\'s own list', () => {
+    for (const action of ASSERTION_ACTIONS) {
+      assert.equal(isAssertionStepAction(action), true, action);
+    }
+    for (const action of ['click', 'goto', 'workflow', 'fill', 'signIn', 'upload', 'request', 'dbSnapshot', 'saveText', undefined]) {
+      assert.equal(isAssertionStepAction(action), false, String(action));
+    }
   });
 });

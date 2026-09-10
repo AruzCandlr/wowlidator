@@ -6,21 +6,19 @@
  * - **Every planned case of the catalog is on it**, grouped by scenario —
  *   including the ones that never ran (a report of 13 rows for a 108-row
  *   catalog reads as a 13-row catalog).
- * - **It is one file with the evidence inside**: screenshots are embedded as
- *   data URIs, so the file can be mailed or archived whole. Failure stills
- *   are always embedded; routine stills are embedded until a size budget is
- *   spent, then omitted with a note naming where they live (the proof
- *   bundle) — a 200MB report helps nobody.
+ * - **It is one file while the evidence fits**: screenshots are embedded as
+ *   data URIs until the inline budget is spent, then written beside the HTML
+ *   when the artifact writer supplies a spill sink. A sink-less pure render
+ *   keeps the old inline-or-omit behaviour for small runs and tests.
  * - **The film is here too, and it is the evidence a passing case has**
  *   (2026-08-31). The runner's screenshot default is video-aware: while it is
  *   filming, stills are taken only at failures, because the film covers the
  *   rest. Measured on be100-rip, that is exactly what the bundles hold — all
  *   13 non-passing cases carry stills and 18 of 19 passing ones carry none —
  *   so a report that dropped the recording left a reader with no evidence at
- *   all for every case that worked. Every recording is embedded, whatever it
- *   weighs (the 25MB budget was removed 2026-09-03: a report with no film is
- *   worth less than a large one). It is decoded only when its case is opened,
- *   so a heavy catalog costs load time, not the reader's patience.
+ *   all for every case that worked. Recordings embed while their inline
+ *   budget lasts, then become relative `.webm` links beside the report. An
+ *   inline recording is decoded only when its case is opened.
  * - **A case opens into a two-pane view**: LEFT the steps, each expandable
  *   into its full detail (intent, selector, resolution, error, heal, agent
  *   turns, screenshot) plus an explanation drawn from the run history (trend,
@@ -40,6 +38,14 @@
  *   planned case a `never ran` row — before the first case has a verdict,
  *   and each finished case replaces its row in place. A rerun of the same
  *   catalog run (same run key) updates the same file, never a new one.
+ * - **It leads with FINDINGS** (2026-09-05, `findings.ts`): under the tally,
+ *   "N findings account for M of K non-passing cases · U unclustered", one
+ *   `<details>` per root cause listing its member cases (linked to their
+ *   sections) with the statuses AS SEALED, counted and never changed. The
+ *   signature is a pure function of the failing step's typed fields — never
+ *   of a message — so seventy cases that met one 500 read as one finding.
+ *   `never ran` cases fold into ONE list with the count on its summary line
+ *   instead of a full section each; every id is still in the DOM.
  *
  * Pure render (`renderCatalogReport`) + one writer (`writeCatalogReport`), the
  * `html-reporter.ts` split, so `tests/catalog-report.test.ts` runs at the
@@ -53,24 +59,40 @@ import type { ProofBundle, ProofStep } from '../engine/proof-bundle.js';
 import { describeDbChanges, describeTarget, describeValueSource, verdictFamily } from '../engine/proof-bundle.js';
 import { grimTheme } from './theme.js';
 import { slugify } from './html-reporter.js';
+import type { ReportLang } from '../engine/proof-bundle.js';
+import { buildFindingsSummary, findingsHeadline, statusCounts, type Finding, type FindingCase, type FindingsSummary } from './findings.js';
 import {
   countVerdicts,
   describeAgentAction,
   describeResolution,
   describeVerdictCounts,
   displayCaseId,
+  inconsequentialAgentLeg,
+  inconsequentialBrokenStep,
+  dbEvidence,
+  DB_QUERY_LABEL,
+  DB_PARAMS_LABEL,
+  DB_ROWS_LABEL,
   observedEvidence,
   provenanceExtras,
   recordOnlyCase,
   recordedCaptures,
   sheetLabel,
   stepKindFacts,
+  stepNarration,
   stepTarget,
 } from './step-facts.js';
 
 export const CATALOG_REPORT_DIR = 'reports';
 /** Routine screenshots are embedded until this many bytes of base64 are spent. */
 export const SCREENSHOT_BUDGET_BYTES = 15_000_000;
+/** Recordings are the largest single bundle value, so their inline allowance is deliberately small. */
+export const RECORDING_BUDGET_BYTES = 20_000_000;
+/**
+ * Hard cap for inline screenshot base64. 350 MB leaves roughly 160 MB below
+ * V8's ~512 MB maximum string length for the report's markup and recordings.
+ */
+export const REPORT_HTML_CEILING_BYTES = 350_000_000;
 /** A step at or over the fast-path budget is worth a reader's eye. */
 const SLOW_STEP_MS = 2_000;
 
@@ -102,6 +124,14 @@ export interface CatalogReportCase {
   sheetCaseId?: string | undefined;
   sheet?: string | undefined;
   category?: string | undefined;
+  /**
+   * Where the ledger says this case's own report is (`LedgerOutcome.reportPath`),
+   * absolute. For a catalog run that file IS the case page (`case-page.ts`):
+   * it is what the panel's card and the run folder open, so the page is
+   * written there and the index links there. Absent or null: the page lives
+   * in the media folder beside the workbook.
+   */
+  reportPath?: string | null | undefined;
 }
 
 /** The sheet-side identity of a case: the row's own fields first, the bundle's stamp second. */
@@ -121,6 +151,51 @@ export interface CatalogReportInput {
    * says so and reloads itself, since rows are still being filled in.
    */
   live?: boolean | undefined;
+  /**
+   * Where a screenshot goes when the inline budget is spent: it is handed the
+   * case id, the step index and the base64, and returns the href to link, or
+   * null when it cannot take it (then the report says the shot stays in the
+   * proof bundle, exactly as today). Absent means inline-or-omit, the old
+   * behaviour, which is what every small run and every test gets by default.
+   */
+  /**
+   * What the run snapshotted before it began, and how to put it back
+   * (2026-09-09). Summary only, on purpose: the baseline's real values live in
+   * a local file that never enters a report (`src/api/CLAUDE.md`), and a
+   * redacted row would restore the wrong data. The page carries the counts,
+   * the file paths and the command; the rows stay out of anything shareable.
+   */
+  dbBaseline?:
+    | {
+        path: string;
+        tables: readonly string[];
+        takenAt: string;
+        mode: 'snapshot' | 'restore';
+        restoreSql?: string | undefined;
+        restored?: { at: string; ok: boolean; detail: string } | undefined;
+      }
+    | undefined;
+  spillScreenshot?: ((caseId: string, stepIndex: number, base64: string) => string | null) | undefined;
+  /**
+   * The language the per-case pages are written in (`case-page.ts`) — off
+   * the ledger's launch record, so a rebuild speaks the run's language.
+   * English when absent.
+   */
+  lang?: ReportLang | undefined;
+  /**
+   * The href the case's name links to, relative to the catalog report, when
+   * the writer put the page somewhere other than the media folder (the
+   * ledger's own `reportPath`). Null falls back to the media folder; absent
+   * means the media folder for every case — the pure render's default.
+   */
+  casePageHref?: ((c: CatalogReportCase) => string | null) | undefined;
+  /**
+   * Where a recording goes when it is not carried inline: handed the case id
+   * and the base64 webm, returns the href to play from, or null when it
+   * cannot take it (then the report says the recording is in the proof
+   * bundle). Absent means inline, the old behaviour.
+   */
+  spillRecording?: ((caseId: string, base64: string) => string | null) | undefined;
 }
 
 function esc(value: unknown): string {
@@ -156,12 +231,19 @@ export function verdictChipOf(c: CatalogReportCase): { cls: string; label: strin
 
 /* ------------------------------------------------------------ step detail */
 
-interface ShotBudget {
-  left: number;
-  omitted: number;
+interface MediaBudget {
+  screenshotLeft: number;
+  recordingLeft: number;
+  inline: number;
+  screenshotsSpilled: number;
+  screenshotsOmitted: number;
+  recordingsSpilled: number;
+  recordingsOmitted: number;
+  spillScreenshot: CatalogReportInput['spillScreenshot'];
+  spillRecording: CatalogReportInput['spillRecording'];
 }
 
-function stepDetail(step: ProofStep, budget: ShotBudget): string {
+function stepDetail(step: ProofStep, budget: MediaBudget, caseId: string): string {
   const rows: string[] = [];
   const row = (label: string, value: string | null | undefined, mono = true): void => {
     if (value === null || value === undefined || value === '') return;
@@ -185,6 +267,40 @@ function stepDetail(step: ProofStep, budget: ShotBudget): string {
   // is the one a reader must weigh.
   row('value', describeValueSource(step), false);
   row('url', step.url);
+  // The database check this step made: the same projection the per-run report
+  // and the workbook read (`step-facts.ts`), so the three cannot describe one
+  // check three ways. Redacted at the source; a bundle sealed before the
+  // statement was recorded shows the summary it always did and no query.
+  const db = dbEvidence(step);
+  if (db !== null) {
+    row(`db ${db.kind}`, db.target ?? '', false);
+    row('db where', db.where, false);
+    row('db expected', db.expected, false);
+    row('db observed', db.observed, false);
+    for (const statement of db.statements) {
+      row(`db ${DB_QUERY_LABEL}`, statement.sql);
+      if (statement.params.length > 0) {
+        row(
+          `db ${DB_PARAMS_LABEL}`,
+          statement.params.map((p, i) => `$${i + 1} = ${p}`).join(' · '),
+        );
+      }
+    }
+    if (db.rows.length > 0) {
+      rows.push(
+        `<div class="dbrows"><div class="kv"><span>db ${esc(DB_ROWS_LABEL)}</span><span>${esc(db.sample ?? '')}</span></div>` +
+          '<table><thead><tr>' +
+          db.columns.map((c) => `<th>${esc(c)}</th>`).join('') +
+          '</tr></thead><tbody>' +
+          db.rows
+            .map((r) => `<tr>${r.map((cell) => `<td>${esc(cell)}</td>`).join('')}</tr>`)
+            .join('') +
+          '</tbody></table></div>',
+      );
+    }
+    if (db.polledMs !== null) row('db polled', fmtMs(db.polledMs), false);
+    if (db.note !== null) row('db note', db.note, false);
+  }
   for (const line of describeDbChanges(step.dbChanges)) row('db', line, false);
   if (step.dbProbeError) row('db probe', step.dbProbeError, false);
   if (step.error) rows.push(`<div class="kv err"><span>error</span><code>${esc(step.error)}</code></div>`);
@@ -201,14 +317,25 @@ function stepDetail(step: ProofStep, budget: ShotBudget): string {
     const turns = (a.actions ?? [])
       .map((t) => {
         const { target, note } = describeAgentAction(t);
-        return `<li class="${t.ok ? 'ok' : 'no'}">${esc(t.action)} <code>${esc(target)}</code>${note ? ` <em>${esc(note)}</em>` : ''}${t.error ? ` — ${esc(t.error)}` : ''}</li>`;
+        // A held action is a hold, not a miss: the typed outcome says the
+        // harness withheld it (Phase B), and the line says so first.
+        const held = t.outcome?.kind === 'blocked' ? `<em>held · ${esc(t.outcome.reason)}</em> ` : '';
+        return `<li class="${t.ok ? 'ok' : 'no'}">${held}${esc(t.action)} <code>${esc(target)}</code>${note ? ` <em>${esc(note)}</em>` : ''}${t.error ? ` — ${esc(t.error)}` : ''}</li>`;
       })
       .join('');
-    rows.push(
+    const leg =
+      (a.blocked === undefined
+        ? ''
+        : `<div class="kv held"><span>held</span><span>${esc(a.blocked.reason)} · ${esc(a.blocked.rule)} — no verdict about the application</span></div>`) +
       `<div class="agent"><div class="kv"><span>agent</span><span>${esc(a.summary ?? '')} (${a.turns} turn(s))</span></div>` +
-        (turns === '' ? '' : `<ol class="turns">${turns}</ol>`) +
-        '</div>',
-    );
+      (turns === '' ? '' : `<ol class="turns">${turns}</ol>`) +
+      '</div>';
+    // A leg that neither rescued this step nor broke it is folded behind a
+    // closed disclosure, in the ordinary colour — the same treatment and the
+    // same wording the per-run report gives it (`step-facts.ts`). Nothing
+    // leaves the pane: what was tried is evidence, just not the outcome.
+    const aside = inconsequentialAgentLeg(step);
+    rows.push(aside === null ? leg : `<details class="aside-leg"><summary>${esc(aside.summary)}</summary>${leg}</details>`);
   }
   // What the agent READ off the page on an observe-and-record leg — the
   // evidence such a leg has (OA-14), quoted verbatim with where it was read.
@@ -222,17 +349,39 @@ function stepDetail(step: ProofStep, budget: ShotBudget): string {
         '</ul></div>',
     );
   }
+  // Last of the step's text, after every recorded fact and never before one:
+  // a model's reading of the line above it, labelled and signed, the same
+  // wording the per-run report and the workbook use (`step-facts.ts`). Every
+  // run that did not ask for a narration renders exactly what it always did.
+  const narration = stepNarration(step);
+  if (narration !== null) {
+    rows.push(
+      `<div class="narration"><span class="narr-k" title="${esc(narration.note)}">${esc(narration.label)}</span>` +
+        `<span class="narr-t">${esc(narration.text)}</span>` +
+        `<em class="narr-by">— ${esc(narration.attribution)}</em></div>`,
+    );
+  }
   if (step.screenshot) {
-    const isFailure = step.status !== 'passed';
+    const isFailure = step.status !== 'passed' && step.status !== 'skipped';
     const size = step.screenshot.length;
-    if (isFailure || budget.left >= size) {
-      if (!isFailure) budget.left -= size;
+    const withinCeiling = budget.inline + size <= REPORT_HTML_CEILING_BYTES;
+    if (withinCeiling && (isFailure || budget.screenshotLeft >= size)) {
+      if (!isFailure) budget.screenshotLeft -= size;
+      budget.inline += size;
       rows.push(
         `<figure class="shot"><img loading="lazy" alt="step ${step.index} screenshot" src="data:image/jpeg;base64,${step.screenshot}"/></figure>`,
       );
     } else {
-      budget.omitted += 1;
-      rows.push('<div class="kv muted"><span>screenshot</span><span>omitted for size — it stays in the proof bundle</span></div>');
+      const href = budget.spillScreenshot?.(caseId, step.index, step.screenshot) ?? null;
+      if (href === null) {
+        budget.screenshotsOmitted += 1;
+        rows.push('<div class="kv muted"><span>screenshot</span><span>omitted for size — it stays in the proof bundle</span></div>');
+      } else {
+        budget.screenshotsSpilled += 1;
+        rows.push(
+          `<figure class="shot"><img loading="lazy" alt="step ${step.index} screenshot" src="${esc(href)}"/></figure>`,
+        );
+      }
     }
   }
   return rows.join('');
@@ -241,37 +390,65 @@ function stepDetail(step: ProofStep, budget: ShotBudget): string {
 /**
  * The run on film, inside the case that produced it.
  *
- * **The base64 rides on an attribute and becomes a Blob URL in the page**, as
- * it does in `html-reporter.ts`: Chrome's media stack will not load a `data:`
- * video — the element sits at `readyState 0` forever with no error, which
- * reads exactly like a corrupt recording. The same bytes play instantly from a
- * Blob. Keep the indirection.
+ * **Inline base64 rides on an attribute and becomes a Blob URL in the page**,
+ * as it does in `html-reporter.ts`: Chrome's media stack will not load a
+ * `data:` video. A spilled recording is already a real `.webm` file, so its
+ * relative `src` is left alone and needs no Blob indirection.
  *
- * **Hydrated when the case is opened, not at load.** A catalog holds dozens of
- * these; decoding every one into a Blob on first paint would stall the page
- * for seconds to build players nobody opened. The case's own `toggle` is the
- * signal, so a reader still does nothing but click the case.
+ * **Inline recordings hydrate when the case is opened, not at load.** A
+ * catalog holds dozens; decoding every one on first paint would stall the
+ * page to build players nobody opened.
  */
-function videoBlock(c: CatalogReportCase): string {
+function videoBlock(c: CatalogReportCase, budget: MediaBudget): { html: string; playable: boolean } {
   const video = c.bundle?.video;
-  if (!video) return '';
+  if (!video) return { html: '', playable: false };
   if (!video.data) {
-    return `<figure class="rec"><figcaption>Recording</figcaption><div class="muted">${esc(
-      video.omitted ?? 'the recording could not be embedded',
-    )}</div></figure>`;
+    return {
+      html: `<figure class="rec"><figcaption>Recording</figcaption><div class="muted">${esc(
+        video.omitted ?? 'the recording could not be embedded',
+      )}</div></figure>`,
+      playable: false,
+    };
   }
   const steps = c.bundle?.steps ?? [];
-  const failing = steps.find((s) => s.status !== 'passed' && !s.superseded && s.videoOffsetMs !== undefined);
-  return (
+  const failing = steps.find((s) => s.status !== 'passed' && s.status !== 'skipped' && !s.superseded && s.videoOffsetMs !== undefined);
+  const failureOffset = failing?.videoOffsetMs !== undefined
+    ? ` data-failure-offset="${(failing.videoOffsetMs / 1000).toFixed(2)}"`
+    : '';
+  const size = video.data.length;
+  const spillRecording = budget.spillRecording;
+  const inline = spillRecording === undefined || (
+    budget.recordingLeft >= size && budget.inline + size <= REPORT_HTML_CEILING_BYTES
+  );
+  if (inline) {
+    budget.inline += size;
+    if (spillRecording !== undefined) budget.recordingLeft -= size;
+    return {
+      html:
+        `<figure class="rec">` +
+        `<figcaption>Recording — the run as it happened<span class="hint">each step has “play from here”</span></figcaption>` +
+        `<video controls preload="none" width="${esc(video.width)}" height="${esc(video.height)}"` +
+        ` data-webm="${esc(video.data)}"${failureOffset}></video></figure>`,
+      playable: true,
+    };
+  }
+  const href = spillRecording(c.id, video.data);
+  if (href === null) {
+    budget.recordingsOmitted += 1;
+    return {
+      html: '<figure class="rec"><figcaption>Recording</figcaption><div class="muted">the recording could not be embedded — it stays in the proof bundle</div></figure>',
+      playable: false,
+    };
+  }
+  budget.recordingsSpilled += 1;
+  return {
+    html:
     `<figure class="rec">` +
     `<figcaption>Recording — the run as it happened<span class="hint">each step has “play from here”</span></figcaption>` +
     `<video controls preload="none" width="${esc(video.width)}" height="${esc(video.height)}"` +
-    ` data-webm="${esc(video.data)}"` +
-    (failing?.videoOffsetMs !== undefined
-      ? ` data-failure-offset="${(failing.videoOffsetMs / 1000).toFixed(2)}"`
-      : '') +
-    `></video></figure>`
-  );
+    ` src="${esc(href)}"${failureOffset}></video></figure>`,
+    playable: true,
+  };
 }
 
 /**
@@ -311,7 +488,7 @@ function timePane(steps: readonly ProofStep[]): string {
     .map((s) => {
       const width = Math.max(2, Math.round((s.durationMs / max) * 100));
       const slow = s.durationMs >= SLOW_STEP_MS ? ' slow' : '';
-      const failed = s.status !== 'passed' ? ' broke' : '';
+      const failed = s.status !== 'passed' && s.status !== 'skipped' ? ' broke' : '';
       return (
         `<div class="trow" data-step="${s.index}"><span class="tname">${s.index} ${esc(s.action)}</span>` +
         `<span class="tbar${slow}${failed}" style="width:${width}%"></span>` +
@@ -347,30 +524,42 @@ function exportControl(c: CatalogReportCase, input: CatalogReportInput): string 
   );
 }
 
-function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: ShotBudget): string {
+function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: MediaBudget): string {
   const chip = verdictChipOf(c);
-  const anchor = `case-${slugify(c.id)}`;
+  const anchor = caseAnchor(c.id);
   const bundle = c.bundle;
   const steps = bundle?.steps ?? [];
-  const film = videoBlock(c);
+  const video = videoBlock(c, budget);
+  const film = video.html;
   // Seek buttons only where there is something to seek IN: a recording that
   // was never made would give a reader a control that silently does nothing.
-  const hasVideo = typeof bundle?.video?.data === 'string' && bundle.video.data !== '';
+  const hasVideo = video.playable;
   const left =
     steps.length === 0
       ? `<div class="muted">No steps were recorded${c.reason ? ` — ${esc(c.reason)}` : ''}.</div>`
       : steps
           .filter((s) => !s.superseded)
           .map((s) => {
-            const ok = s.status === 'passed';
+            // A broken step that decided nothing is laid out as an aside: the
+            // step is already a closed disclosure here, so folding it means
+            // the ordinary colour and one honest line on the summary naming
+            // the sealed status and why it did not decide. Nothing leaves the
+            // pane; the body is exactly what it was. Same predicate and same
+            // wording as the per-run report and the workbook.
+            const aside = bundle === null || bundle === undefined
+              ? null
+              : inconsequentialBrokenStep(s, bundle);
+            const tone =
+              aside !== null ? 'aside' : s.status === 'passed' ? 'ok' : s.status === 'skipped' ? 'skip' : 'no';
             return (
-              `<details class="step ${ok ? 'ok' : 'no'}"><summary><b class="dot"></b>` +
+              `<details class="step ${tone}"><summary><b class="dot"></b>` +
               `<span class="sname">${s.index} ${esc(s.action)}</span>` +
               `<span class="ssub">${esc(s.intent ?? stepTarget(s) ?? '')}</span>` +
+              (aside === null ? '' : `<span class="saside">${esc(aside.summary)}</span>`) +
               `<span class="sms">${esc(fmtMs(s.durationMs))}</span>` +
               seekControl(s, hasVideo) +
               '</summary>' +
-              `<div class="sbody">${stepDetail(s, budget)}</div></details>`
+              `<div class="sbody">${stepDetail(s, budget, c.id)}</div></details>`
             );
           })
           .join('');
@@ -399,7 +588,20 @@ function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: Sh
   return (
     `<details class="case" id="${anchor}" data-name="${esc(c.name)}">` +
     `<summary><span class="chip ${chip.cls}">${esc(chip.label)}</span>` +
-    `<span class="cname">${esc(c.name)}${sheetChip}${sheetTag}</span>` +
+    // The case's own page (2026-09-10): written beside the workbook for
+    // every case that has a bundle, so the name is the way in. `stopPropagation`
+    // keeps the click from also toggling the row, the same rule as the export
+    // button; a case with no bundle has no page and its name stays plain text.
+    `<span class="cname">${
+      bundle
+        ? `<a class="open-case" href="${esc(input.casePageHref?.(c) ?? `${catalogMediaDirName(input.runKey, input.title)}/${casePageName(c.id)}`)}"${
+            // The absolute path too: served by the panel (`/reports/<file>`), a
+            // relative href into another tree cannot be followed, and the page
+            // script re-points the link at the panel's own `/view?path=` door.
+            typeof c.reportPath === 'string' && c.reportPath !== '' ? ` data-report="${esc(c.reportPath)}"` : ''
+          } onclick="event.stopPropagation()" title="This case's own report page: summary, tickets, the database evidence and the queries behind it, the film and the stills">${esc(c.name)}</a>`
+        : esc(c.name)
+    }${sheetChip}${sheetTag}</span>` +
     (bundle ? `<span class="cms">${esc(fmtMs(bundle.caseDurationMs ?? bundle.durationMs))}</span>` : '') +
     exportControl(c, input) +
     '</summary>' +
@@ -410,25 +612,141 @@ function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: Sh
   );
 }
 
+/* ------------------------------------------------------------- findings */
+
+/** The anchor a case's section carries — what the findings block links to. */
+function caseAnchor(id: string): string {
+  return `case-${slugify(id)}`;
+}
+
+function memberChip(m: FindingCase): string {
+  // The status exactly as the ledger sealed it — `error` reads `error`.
+  const sealed = m.status ?? m.verdict;
+  const via = m.dependsOn === undefined ? '' : ` <em title="listed here because it depends on ${esc(m.dependsOn)}">↳ depends on ${esc(m.dependsOn)}</em>`;
+  return `<span class="fcase"><a href="#${esc(caseAnchor(m.id))}">${esc(m.id)}</a> <code class="sealed">${esc(sealed)}</code>${via}</span>`;
+}
+
+function findingBlock(f: Finding): string {
+  const counts = statusCounts(f.cases)
+    .map((s) => `${esc(s.status)}: ${s.count}`)
+    .join(' · ');
+  const kv = (label: string, value: string | undefined): string =>
+    value === undefined || value === '' ? '' : `<div class="kv"><span>${esc(label)}</span><code>${esc(value)}</code></div>`;
+  return (
+    `<details class="finding" data-key="${esc(f.key)}"><summary>` +
+    `<span class="fkind">${esc(f.kind)}</span><span class="ftitle">${esc(f.title)}</span>` +
+    `<span class="fcount">${f.cases.length} case${f.cases.length === 1 ? '' : 's'} · ${counts}</span></summary>` +
+    `<div class="fbody">` +
+    `<div class="kv"><span>cases</span><span class="fcases">${f.cases.map(memberChip).join('')}</span></div>` +
+    kv('where', f.where) +
+    kv('asked', f.asked) +
+    kv('offered', f.offered) +
+    (f.evidence.length === 0
+      ? ''
+      : `<div class="kv"><span>evidence</span><ul class="turns">${f.evidence.map((e) => `<li><em>${esc(e.label)}</em> <code>${esc(e.value)}</code></li>`).join('')}</ul></div>`) +
+    `</div></details>`
+  );
+}
+
+/**
+ * The block under the tally: the headline, one `<details>` per finding, the
+ * unclustered remainder. Absent only when nothing failed — a run with no
+ * non-passing case has no findings to lead with.
+ */
+function findingsSection(summary: FindingsSummary): string {
+  if (summary.nonPassing === 0) return '';
+  const headline = findingsHeadline(summary);
+  const unclustered =
+    summary.unclustered.length === 0
+      ? ''
+      : `<details class="finding unclustered"><summary><span class="fkind">—</span><span class="ftitle">unclustered — no shared cause in the typed fields; each keeps its own section below</span>` +
+        `<span class="fcount">${summary.unclustered.length} case${summary.unclustered.length === 1 ? '' : 's'}</span></summary>` +
+        `<div class="fbody"><div class="kv"><span>cases</span><span class="fcases">${summary.unclustered.map(memberChip).join('')}</span></div></div></details>`;
+  return (
+    `<section class="findings" id="findings"><div class="shead">Findings<span class="scount">${esc(headline)}</span></div>` +
+    `<div class="fnote">Grouped by the failing step's typed fields — request, URL, control, hold, agent end — never by its message. Statuses are shown as the run sealed them.</div>` +
+    summary.findings.map(findingBlock).join('') +
+    unclustered +
+    '</section>'
+  );
+}
+
+/**
+ * Every `never ran` case in ONE list, the count on the summary line. A
+ * 252-row remainder used to render 252 full sections a reader had to scroll
+ * past; the ids are all still here, each in its own `<span>`.
+ */
+/**
+ * The state this run found, and the way back to it.
+ *
+ * A mutating run against a shared environment leaves it changed, and until now
+ * the only account of that was a line in a log nobody keeps. The snapshot
+ * always knew how to undo itself; what it lacked was a write credential — and
+ * the knowledge and the permission are different things. So the report states
+ * what was captured and names the script that reverses it, whether or not this
+ * run was allowed to run that script itself.
+ *
+ * No row values here. They are in the local baseline and its script, which are
+ * deliberately not report content.
+ */
+function dbBaselineSection(input: CatalogReportInput): string {
+  const b = input.dbBaseline;
+  if (b === undefined) return '';
+  const restored = b.restored;
+  const state =
+    restored !== undefined
+      ? restored.ok
+        ? `<span class="chip pass">restored ${esc(restored.at)}</span>`
+        : `<span class="chip fail">restore failed</span>`
+      : b.mode === 'restore'
+        ? '<span class="chip">restore armed for the end of the run</span>'
+        : '<span class="chip never">snapshot only — the tables were left as this run left them</span>';
+  const script =
+    b.restoreSql === undefined
+      ? '<p>No restore script was written for this run.</p>'
+      : `<p>Put the tables back with:</p><pre><code>psql "$WOWLIDATOR_DB_RESTORE_URL" -v ON_ERROR_STOP=1 -f ${esc(b.restoreSql)}</code></pre>` +
+        '<p class="muted">The script deletes and reinserts every row of the tables above and nothing else — anything this run changed outside them is not undone by it.</p>';
+  return (
+    '<section class="db-baseline"><h2>Database before this run</h2>' +
+    `<p>${state} · captured ${esc(b.takenAt)}</p>` +
+    `<p>Tables: ${b.tables.length === 0 ? '(none)' : b.tables.map((t) => `<code>${esc(t)}</code>`).join(', ')}</p>` +
+    `<p class="muted">Snapshot: <code>${esc(b.path)}</code>${restored !== undefined ? ` · ${esc(restored.detail)}` : ''}</p>` +
+    script +
+    '</section>'
+  );
+}
+
+function neverRanSection(cases: readonly CatalogReportCase[]): string {
+  if (cases.length === 0) return '';
+  return (
+    `<details class="never-ran" id="never-ran"><summary><span class="chip never">never ran</span>` +
+    `<span class="cname">${cases.length} case${cases.length === 1 ? '' : 's'} never ran — listed here, not as a section each</span></summary>` +
+    `<div class="fbody nlist">${cases
+      .map((c) => `<span class="nid" id="${esc(caseAnchor(c.id))}" title="${esc(c.scenario)}${c.reason ? ` — ${esc(c.reason)}` : ''}">${esc(c.id)}</span>`)
+      .join('')}</div></details>`
+  );
+}
+
 /* ------------------------------------------------------------- the page */
 
 /**
  * The player script, shared by this page and by every case exported from it.
  *
- * Kept as its own string precisely so the export can carry it: an exported
- * case is a `<video data-webm="…">` with no `src`, and without this it is a
- * dead player in a file someone was told holds the evidence.
+ * Kept as its own string precisely so an export can carry either an inline
+ * `<video data-webm="…">` or a relative file-backed `<video src="…">`.
  */
 const PLAYER_SCRIPT = `
 function wowHydrateVideo(v) {
   if (!v || v.dataset.wowReady) return;
   var b64 = v.getAttribute('data-webm') || '';
-  if (!b64) return;
+  if (!b64 && !v.hasAttribute('src')) return;
   v.dataset.wowReady = '1';
-  var bin = atob(b64);
-  var bytes = new Uint8Array(bin.length);
-  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  v.src = URL.createObjectURL(new Blob([bytes], { type: 'video/webm' }));
+  if (b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    v.src = URL.createObjectURL(new Blob([bytes], { type: 'video/webm' }));
+  }
   /* data-webm deliberately STAYS. A hydrated player's src is a Blob URL, which
      means nothing in another document — and every export here is another
      document. Leaving the bytes on the attribute is what makes an exported
@@ -447,7 +765,7 @@ function wowHydrateVideo(v) {
    make players nobody opened. */
 function wowWireCase(node) {
   node.addEventListener('toggle', function () {
-    if (node.open) node.querySelectorAll('video[data-webm]').forEach(wowHydrateVideo);
+    if (node.open) node.querySelectorAll('video').forEach(wowHydrateVideo);
   });
 }
 document.addEventListener('click', function (e) {
@@ -464,7 +782,15 @@ document.addEventListener('click', function (e) {
 });
 document.querySelectorAll('details.case').forEach(wowWireCase);
 /* An exported single case is already open, so its toggle never fires. */
-document.querySelectorAll('body.single video[data-webm]').forEach(wowHydrateVideo);
+document.querySelectorAll('body.single video').forEach(wowHydrateVideo);
+/* Under the panel a case page in the run's own folder is reached through /view,
+   the panel's one door to a file outside the reports folder; off the panel the
+   relative href already works. */
+if (location.pathname.indexOf('/reports/') === 0) {
+  document.querySelectorAll('a.open-case[data-report]').forEach(function (a) {
+    a.href = '/view?path=' + encodeURIComponent(a.getAttribute('data-report'));
+  });
+}
 `;
 
 const EXPORT_SCRIPT = `
@@ -476,10 +802,10 @@ function download(name, html) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
 }
-/* A Blob URL is scoped to THIS document, so it must never be written into an
-   exported one; the base64 on data-webm is what travels. */
+/* A Blob URL is scoped to THIS document, so strip it only from inline videos;
+   a relative file-backed src is the portable value and must stay. */
 function wowStripBlobs(root) {
-  root.querySelectorAll('video').forEach(function (v) {
+  root.querySelectorAll('video[data-webm]').forEach(function (v) {
     v.removeAttribute('src');
     delete v.dataset.wowReady;
   });
@@ -509,10 +835,21 @@ h1 { font-size: 20px; margin: 0 0 4px; }
 .chip.record { background: color-mix(in srgb, #1f7a8c 14%, transparent); color: #1f7a8c; border: 1px dashed #1f7a8c; }
 .chip.never { background: color-mix(in srgb, var(--muted) 18%, transparent); color: var(--muted); }
 .sid { font-size: 11px; color: var(--muted); margin-left: 8px; font-family: ui-monospace, monospace; }
+.cname a.open-case { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
+.cname a.open-case:hover { color: var(--fg); border-bottom-style: solid; }
 .ctag { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; margin-left: 8px; }
 .captures { background: color-mix(in srgb, #1f7a8c 8%, transparent); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
 .captures .kv code { color: #1f7a8c; }
 .observed em, .turns em { color: var(--muted); font-style: normal; font-size: 11px; }
+/* A leg that did not decide the step: folded, ordinary colour, never red —
+   the same treatment a superseded attempt gets in the per-run report. */
+.dbrows { margin: 4px 0; }
+.dbrows table { border-collapse: collapse; font-size: 11px; margin-top: 3px; }
+.dbrows th, .dbrows td { border: 1px solid var(--line); padding: 2px 6px; text-align: left; vertical-align: top; }
+.dbrows th { color: var(--muted); font-weight: 600; }
+.step.aside > summary .saside { color: var(--muted); font-size: 11px; }
+details.aside-leg { margin: 4px 0; }
+details.aside-leg > summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 details.case { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; background: var(--panel, transparent); }
 details.case > summary { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; list-style: none; }
 details.case > summary .cname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -525,8 +862,12 @@ details.case > summary .cms { color: var(--muted); font-variant-numeric: tabular
 .cap { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 10px 0 6px; }
 details.step { border-left: 3px solid var(--line); margin: 4px 0; }
 details.step.no { border-left-color: #c0392b; }
+details.step.skip { color: var(--muted); }
 details.step.ok .dot { background: var(--pass, #2e7d32); }
 details.step.no .dot { background: #c0392b; }
+details.step.skip .dot { background: var(--muted); }
+details.step.aside { border-left-style: dashed; }
+details.step.aside .dot { background: var(--muted); }
 details.step > summary { display: flex; gap: 8px; align-items: baseline; padding: 4px 8px; cursor: pointer; list-style: none; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
 .sname { font-weight: 600; white-space: nowrap; }
@@ -538,6 +879,14 @@ details.step > summary { display: flex; gap: 8px; align-items: baseline; padding
 .kv code { word-break: break-all; white-space: pre-wrap; }
 .kv.err code { color: #c0392b; }
 .kv.heal code { color: #b8860b; }
+/* A model's sentence among the run's own facts: a rule down its left edge,
+   muted and italic, labelled and signed — never another recorded row. */
+.narration { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; margin: 6px 0 3px;
+  padding-left: 8px; border-left: 2px solid var(--line); color: var(--muted); font-style: italic; }
+.narration .narr-k { font-style: normal; font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+  flex: none; width: 82px; cursor: help; }
+.narration .narr-t { flex: 1; min-width: 0; }
+.narration .narr-by { font-style: normal; font-size: 11px; opacity: .8; white-space: nowrap; }
 .muted { color: var(--muted); }
 .shot img { max-width: 100%; border: 1px solid var(--line); border-radius: 6px; margin-top: 6px; }
 .history { background: color-mix(in srgb, var(--muted) 7%, transparent); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
@@ -562,15 +911,46 @@ body.single .split { grid-template-columns: minmax(0, 1fr) 340px; }
 .seek { font: inherit; font-size: 11px; cursor: pointer; padding: 2px 8px; border-radius: 999px;
   border: 1px solid var(--line); background: transparent; color: var(--muted); white-space: nowrap; margin-left: 8px; }
 .seek:hover { border-color: var(--fg); color: var(--fg); }
+.findings { margin: 4px 0 18px; }
+.findings > .shead { font-weight: 600; font-size: 15px; padding: 6px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; }
+.findings > .shead .scount { color: var(--muted); font-weight: 400; font-size: 12px; }
+.fnote { font-size: 11px; color: var(--muted); margin: 6px 0 8px; }
+details.finding { border: 1px solid var(--line); border-left: 3px solid #c0392b; border-radius: 8px; margin: 6px 0; background: var(--panel, transparent); }
+details.finding.unclustered { border-left-color: var(--muted); }
+details.finding > summary { display: flex; align-items: baseline; gap: 10px; padding: 7px 12px; cursor: pointer; list-style: none; }
+.fkind { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; flex: none; }
+.ftitle { flex: 1; min-width: 0; }
+.fcount { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.fbody { padding: 4px 14px 12px; }
+.fcases { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.fcase a { font-family: ui-monospace, monospace; }
+.fcase .sealed { font-size: 11px; color: var(--muted); }
+.fcase em { font-size: 11px; color: var(--muted); font-style: normal; }
+details.never-ran { border: 1px dashed var(--line); border-radius: 10px; margin: 8px 0 18px; }
+details.never-ran > summary { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; list-style: none; }
+.nlist { display: flex; flex-wrap: wrap; gap: 4px 12px; font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
 `;
 
 export function renderCatalogReport(input: CatalogReportInput): string {
-  const budget: ShotBudget = { left: SCREENSHOT_BUDGET_BYTES, omitted: 0 };
+  const budget: MediaBudget = {
+    screenshotLeft: SCREENSHOT_BUDGET_BYTES,
+    recordingLeft: RECORDING_BUDGET_BYTES,
+    inline: 0,
+    screenshotsSpilled: 0,
+    screenshotsOmitted: 0,
+    recordingsSpilled: 0,
+    recordingsOmitted: 0,
+    spillScreenshot: input.spillScreenshot,
+    spillRecording: input.spillRecording,
+  };
+  const findings = buildFindingsSummary(input.cases);
+  const neverRan = input.cases.filter((c) => c.verdict === 'never-ran');
   const byScenario = new Map<string, CatalogReportCase[]>();
   for (const c of input.cases) {
     const key = c.scenario || 'ungrouped';
-    if (!byScenario.has(key)) byScenario.set(key, []);
-    byScenario.get(key)!.push(c);
+    const cases = byScenario.get(key);
+    if (cases === undefined) byScenario.set(key, [c]);
+    else cases.push(c);
   }
   const tally = new Map<string, number>();
   for (const c of input.cases) {
@@ -585,18 +965,33 @@ export function renderCatalogReport(input: CatalogReportInput): string {
       const counts = describeVerdictCounts(countVerdicts(cases), {
         review: cases.filter((c) => c.verdict === 'review').every((c) => recordOnlyCase(c)) ? 'recorded only' : 'awaiting review',
       });
+      // The counts still speak for every planned row; the sections are the
+      // cases that ran — a `never ran` row lives in the fold above.
       return (
         `<section class="scenario"><div class="shead">${esc(scenario)}` +
         `<span class="scount">${esc(counts)}</span></div>` +
-        cases.map((c) => caseSection(c, input, budget)).join('') +
+        cases
+          .filter((c) => c.verdict !== 'never-ran')
+          .map((c) => caseSection(c, input, budget))
+          .join('') +
         '</section>'
       );
     })
     .join('');
   const omittedNote =
-    budget.omitted === 0
+    budget.screenshotsOmitted === 0
       ? ''
-      : `<div class="meta">${budget.omitted} routine screenshot(s) omitted to keep this file portable — every one stays in its proof bundle.</div>`;
+      : `<div class="meta">${budget.screenshotsOmitted} routine screenshot(s) omitted to keep this file portable — every one stays in its proof bundle.</div>`;
+  const mediaDirName = catalogMediaDirName(input.runKey, input.title);
+  const spillParts = [
+    budget.screenshotsSpilled === 0
+      ? ''
+      : `${budget.screenshotsSpilled} screenshot(s) written beside this file in ${esc(mediaDirName)}/shots/`,
+    budget.recordingsSpilled === 0
+      ? ''
+      : `${budget.recordingsSpilled} recording(s) written beside this file in ${esc(mediaDirName)}/`,
+  ].filter((part) => part !== '');
+  const spillNote = spillParts.length === 0 ? '' : `<div class="meta">${spillParts.join(' · ')}</div>`;
   const finished = input.cases.filter((c) => c.verdict !== 'never-ran').length;
   // A live report reloads itself: its rows are still being filled in, and a
   // reader who opened it from the panel mid-run should not have to know that.
@@ -620,6 +1015,10 @@ export function renderCatalogReport(input: CatalogReportInput): string {
     ` title="Written beside this report: passed cases only, one step per row, photos embedded, video linked under every step">Passed cases (Excel)</a></div>` +
     liveNote +
     `<div class="tally">${[...tally.entries()].map(([label, n]) => `<span>${esc(label)}: <b>${n}</b></span>`).join('')}</div>` +
+    findingsSection(findings) +
+    dbBaselineSection(input) +
+    neverRanSection(neverRan) +
+    spillNote +
     omittedNote +
     sections +
     // The player source is also a VALUE in the page so a copy of it can carry
@@ -643,6 +1042,11 @@ export function catalogMediaDirName(runKey: string | null, title: string): strin
 /** `PL_06_05` → `pl-06-05` — the file-name stem a case's export artifacts share. */
 export function catalogCaseExportName(caseId: string): string {
   return slugify(caseId) || 'case';
+}
+
+/** `<case slug>.html` — the case's own report page, beside its workbook in the media folder (`case-page.ts`). */
+export function casePageName(caseId: string): string {
+  return `${catalogCaseExportName(caseId)}.html`;
 }
 
 /** `reports/<runKey slug>.html` — stable per run key, so a resume overwrites its own file. */

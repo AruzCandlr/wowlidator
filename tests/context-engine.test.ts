@@ -26,7 +26,6 @@ import { detectDbHint } from '../src/context/db-hint.js';
 import { ManifestIngester } from '../src/context/ingesters/manifest-ingester.js';
 import { ComponentIngester } from '../src/context/ingesters/component-ingester.js';
 import { MessageIngester, isMessageFile } from '../src/context/ingesters/message-ingester.js';
-import { toPromptContext } from '../src/context/query.js';
 import { RouteIngester } from '../src/context/ingesters/route-ingester.js';
 import { nearestRoutes, routeIsDeclared } from '../src/context/route-match.js';
 import { TestIngester } from '../src/context/ingesters/test-ingester.js';
@@ -265,6 +264,13 @@ describe('context engine', () => {
       assert.equal(routeIsDeclared('/en/admin/benefits/nope', routes), false);
       // No index, no opinion — the caller must not read this as "undeclared".
       assert.equal(routeIsDeclared('/en/anything', []), null);
+    });
+
+    it('matches a declared route behind the start URL deployment base path', () => {
+      const startUrl = 'https://sit.example.test/humi/th/login';
+      const deploymentRoutes = [...routes, '/:locale/login'];
+      assert.equal(routeIsDeclared('/humi/th/login', deploymentRoutes, startUrl), true);
+      assert.equal(routeIsDeclared('/other/th/login', deploymentRoutes, startUrl), false);
     });
   });
 
@@ -695,6 +701,13 @@ describe('context engine', () => {
       assert.deepEqual(concreteRouteUrl('/:locale/overtime', start), {
         ok: true,
         url: 'http://localhost:3200/en/overtime',
+      });
+    });
+
+    it('preserves a deployment base path before the locale', () => {
+      assert.deepEqual(concreteRouteUrl('/:locale/overtime', 'https://sit.example.test/humi/th/login'), {
+        ok: true,
+        url: 'https://sit.example.test/humi/th/overtime',
       });
     });
 

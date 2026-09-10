@@ -213,14 +213,12 @@ journey from a wander.
 
 `wanderedOffPage(goal, startUrl, url)` (`goal-evidence.ts`, pure): the page is
 on a different origin or path from the step's start (`differentPage` — a
-`?step=` change is the same page) **and** not at the destination the goal
-names (`goalDestination`/`atGoalDestination`; a goal naming none has nowhere
-off its page that counts). While that holds, the loop spends
-`AGENT_OFF_PAGE_TURNS` (8) — a turn counts when it moved the page again or only
-clicked; a turn that lands a **first-time form entry** (`FORM_ENTRY_ACTIONS`:
-fill, type, paste, selectOption, check, uncheck) off the page is free, because
-"open the form and fill it" legitimately lives off its start page for fifteen
-turns and a literal turn budget would cut a passing leg. Returning to the
+`?step=` change is the same page), is not BELOW the step's own page
+(`childPage`, 2026-09-09 — see the next paragraph) **and** is not at the
+destination the goal names (`goalDestination`/`atGoalDestination`; a goal
+naming none has nowhere off its page that counts, which is most goals — a goal
+is written in the user's terms and rarely holds a path at all). While that
+holds, the loop spends `AGENT_OFF_PAGE_TURNS` (8). Returning to the
 start page resets the allowance; a consent URL is the gate rung's to clear and
 is never counted (`CONSENT_GATE_URL_PATTERN`); arriving at a named destination
 still ends the leg by the destination rule before this one is consulted. Past
@@ -229,8 +227,10 @@ turn(s) elsewhere … without reaching …`, naming the page it is on. Lifted to
 `AGENT_NO_PROGRESS_OFF_TURNS` when early-stop is off, like the other two
 judges (`#offPageTurns`). Why it cannot slow a passing leg: a journey to a
 named destination is two to four page moves and arrives before the eighth; a
-leg whose work is on one other page pays nothing for the entries. Tests:
-`tests/goal-evidence.test.ts` (`wanderedOffPage`), `tests/agent-guards.test.ts`
+leg whose work is on one other page pays nothing for the turns that do that
+work. Tests:
+`tests/goal-evidence.test.ts` (`wanderedOffPage`, `childPage`),
+`tests/agent-guards.test.ts`
 (the constant's place among the ceilings). Measured on the HIR-EC-002
 benchmark (`e2e-02/02-…flow.json`, 2026-09-03 12:59 UTC, both rails, agent on
 opus): 558 s / 56 agent requests / 1.03M in-tokens / agent 296 s, longest
@@ -239,6 +239,115 @@ with steps 16 and 19 at 425 s and 478 s. The former wanderers (now steps 18
 and 20) ended in 56 s and 38 s by the agent's own `unreachable`; the
 allowance's stop message itself did not fire on either benchmark, and on ec09
 HIR-EC-009 (job-3, 12:39 UTC) no leg wandered at all.
+
+**Two corrections, both from PL_09_01 of run `be-high-sonnet-20260909-153617`
+(2026-09-09, lane c14).** That leg's goal was to create a fixture row: it
+started on the plans list, clicked the page's own Create control, filled the
+form correctly and submitted — and was ended as a wander on the turn AFTER the
+submit, while the model's own reasoning read *"the button now shows 'Creating…'
+disabled … wait for it to complete"*. The case scored `never ran: runtime
+error`: no verdict about the application at all. Two flaws combined, and each
+is fixed where it was.
+
+- **A page below the step's own is not off it** (`childPage`,
+  `goal-evidence.ts`, pure). `/…/plans` → `/…/plans/create` is a different
+  pathname, so `differentPage` called it another page and the allowance began
+  counting on a leg that had gone exactly where its goal sent it. A descendant
+  path is where a list page's own create / edit / detail view lives. The other
+  end of the journey is already read this way — `atGoalDestination` is
+  containment, so a goal naming `/plans` counts `/plans/create` as arrival —
+  and this applies the same reading to the page a step began on. Same origin
+  and a prefix at a SEGMENT boundary only, so a sibling (`/plans` → `/rules`)
+  and a near-miss (`/plans-archive`) still spend the allowance, which is the
+  wander HIR-EC-002 was. A start path of `/` has no children: everything is
+  below a site root, and the rule would otherwise withdraw the rail from every
+  leg that began on one — the same reason `goalDestination` refuses a bare `/`.
+  `atGoalDestination` was deliberately NOT widened: it ENDS a leg successfully,
+  and accepting a child there would settle a leg standing inside a form the
+  goal never named.
+- **A turn that did work off the page is free; a turn that moved the page is
+  not.** The old exemption was a first-time `FORM_ENTRY_ACTIONS` entry, and a
+  real form needs clicks: on this leg a date picker, an overlay dismissal and a
+  submit each spent a turn, and only the two `fill`s were exempt. The
+  exemption is now the structural one — **an ok action that engaged a control
+  (not an `IDLE_ACTIONS` look) after which the FULL tree changed** — which is
+  the work a page is visited for, however it is expressed. A turn that moved
+  the page again ALWAYS spends the allowance, whatever else it did: a wander is
+  made of page moves, so the eight-turn bound on HIR-EC-002's shape is
+  unchanged. A FAILED action is never free either — a leg that keeps missing
+  must still be bounded, and it is the miss that the allowance then counts.
+  The tree hash is the one the look judge (OA-10) and the re-activation credit
+  already compute; all three now share **one** measurement per turn
+  (`treeChangedSince`), so no turn pays two AX reads for one question. The
+  off-page block moved below the OA-10 block for that reason and for no other.
+  `FORM_ENTRY_ACTIONS` had no other reader and is gone.
+
+Not fixed here, and not this module's: the leg spent 716 s of its 777 s waiting
+for a data lock before its first click, and the goal itself is a 15-pair
+key-in sentence the generator wrote — both outside the loop.
+
+## A record the application says is already there IS there (`fixtureAlreadyPresent`, 2026-09-09)
+
+Live twice in one run (`be-high-sonnet-20260909-153617`), both fixture-creation
+legs whose row had survived an earlier run:
+
+- **PL_09_01** filled the create form with the plan id its goal names,
+  submitted, and read back `Plan ID already exists.` Its next decision was to
+  fill the SAME field with a different id — reasoning, verbatim, *"the goal
+  explicitly requires Plan ID=…; …best conservative action is to retry"* — a
+  value the flow's very next step (`expectVisible text=<the goal's id>`) could
+  never have matched.
+- **PL_06_05** called `fail` on the same message and the case ended `never ran:
+  no verdict — the agent's own account, unverified`.
+
+Two cases lost to a fixture that was present the whole time, and in both the
+application had answered the leg's question outright.
+
+`fixtureAlreadyPresent(goal, axTree)` (`goal-evidence.ts`, pure) is the settle,
+and every part of it is the PAGE's word:
+
+- a line of the tree **the harness itself read** carries a duplicate-key
+  refusal (`DUPLICATE_KEY_ERROR`: already exists / in use / taken / registered,
+  must be unique, is duplicated, duplicate key|entry|value|record|id, and the
+  sheets' own ซ้ำ / มีอยู่แล้ว / มีอยู่ในระบบ) **and** the words of a control the goal
+  names a value for — a refusal naming no field ("this record already exists")
+  scopes to nothing and is left alone;
+- `outcomeShown` finds that control still holding **the goal's own value** on
+  the live tree, so the value the application called taken is demonstrably the
+  value the goal requires and not a value the model says it typed.
+
+The loop consults it once per turn, on the full tree, and **only after the leg
+has acted** (`actions.length > 0`) — every rule in this module requires an
+observed transition, and a refusal standing on the page before the agent
+touched it is not this leg's evidence. It is withheld from a `readOnly` run
+for the same reason the observed-state settlement is: that rung cannot act,
+its goal is a question and its own `finish` carries the verdict. It settles the leg `success`, with
+`settledBy: 'fixture-present'` (a new value beside `observed-state` and
+`agent-claim`, never folded into either) and `endedBy: 'fixture-present'` (a
+PAGE-sourced stop, beside `arrived` and `cannot-offer`; mirrored into
+`AGENT_ENDED_BY_VALUES`, which refuses an unlisted value on read).
+
+**Why this is not a false pass.** The settle claims exactly one thing — the
+keyed record exists — and nothing about the other pairs of a multi-field goal.
+The deterministic step the flow puts after such a leg (`expectVisible
+text=<the id>`) is the independent witness, and if the row is not really there
+that step fails and the case fails honestly, which is strictly better than
+today's "never ran" with no verdict at all. The agent is never given a way to
+delete or overwrite the existing record, and it may not change the goal's
+value — the settle is what removes its reason to try.
+
+One deliberate withholding: a leg settled this way is **not** remembered
+(`#remember` is skipped). It performed no journey worth replaying — its script
+stops short of the creation — and a later run whose fixture is absent would
+replay it, succeed on every action and still leave the row uncreated.
+
+Tests: `tests/goal-evidence.test.ts` (`fixtureAlreadyPresent` — the live
+shape, the different-value case the leg made for itself, no refusal, a refusal
+naming no field, a field the goal states no value for, a goal with no readable
+pair, the Thai spelling, and a truncated tree) and `tests/agent-guards.test.ts`
+(the loop under a scripted model: the settle fires, the record says
+`fixture-present`, the turn that would have invented a new id is never spent,
+and a refusal already on the page before the leg acts settles nothing).
 
 ## The same control on the same page is not progress (`reactivation`, 2026-09-03)
 
@@ -322,3 +431,361 @@ branches on it beside the provider refusal, records the step `error`, files **no
 defect**, and throws a message naming the fix. Like `agentModelUnavailable`, it
 can only be true of a summary produced by a return that happens before turn 1,
 so it can never change the outcome of a leg that actually ran.
+
+## The judging turn sees the page (2026-09-08)
+
+`AgentObservation.screenshot` and the `sighted` run option. The loop is
+otherwise unchanged: one decision per turn, the same schema, the same guards.
+
+The split is between **driving** and **judging**. Driving asks "which control
+do I press next", and the accessibility tree answers it better than pixels do —
+it names controls, and a name is what a selector is built from. Judging asks
+"does the page show this", and the tree is frequently wrong about that: a value
+rendered into a plain div, a field that only looks disabled, a date whose
+displayed form is not its value, a popover standing where a textbox was asked
+for. All of those are invisible to the tree and obvious on screen.
+
+So `sighted` is off by default and set in exactly one place — the engine's
+`#agentTriage` read-only look, the rung that runs only after determinism has
+already failed. `LlmAgentModel.decide` forwards the image to
+`generateStructured`, which has taken `images` since the factory was written.
+
+Three rails, all load-bearing:
+- **The image never becomes the verdict.** `proved` still has to name an
+  element, and the harness still re-runs the author's own comparison against
+  it. Sight makes the agent a better witness, not the judge — the same rule as
+  everywhere else here.
+- **No vision is not a failure.** `looksLikeNoVision` matches the provider's
+  refusal of an image part (a text test, because the AI SDK surfaces it as a
+  message and the wording differs per provider), marks the agent instance
+  blind for good, and re-asks the same turn without the picture. A rung that
+  used to answer from the tree must never start erroring instead. Every other
+  error is re-thrown, so a real outage stays loud.
+- **One shot per turn, beside its own tree.** A screenshot from a different
+  moment is evidence about a different page. A failed capture is no image and
+  no change.
+
+Tests: `tests/smoke.test.ts` — the refusal/outage split in `looksLikeNoVision`,
+and that the image reaches the model only when one was taken.
+
+## Action authority: the mutation gate, the provenance ledger, and `blocked` (Phase B, 2026-09-05)
+
+Phase B of `docs/research/commerce-agents-patterns.md`. The loop refused an
+unscoped destructive click since PL_03_18, but three things were still missing:
+an identifier in the goal was taken as proof the session had seen the row; a
+batch had no way to say which categories of change it permits; and a refusal
+was an `ok: false` with a prefix in `error`, which every reader had to parse to
+learn that the application was never touched. All three live in
+`mutation-policy.ts` (pure) and one choke point in the loop.
+
+- **`ActionOutcome` on every `AgentAction`** (`engine/proof-bundle.ts`): `ok`,
+  `failed`, or `blocked` with a machine-readable `reason`
+  (`capability | provenance | approval | guardrail`), `rule`, `category`,
+  `target`, `policySource` and, for a provenance hold, the ledger's facts. The
+  boolean `ok` and the `error` string stay for every reader that predates it.
+  The existing destructive-scope and circling refusals are typed `guardrail`
+  and end the leg as blocked.
+- **`TargetProvenance`** is fed by `#captureTree` — the ONE way the class reads
+  the accessibility tree — and by nothing else: not the goal, not the model's
+  reasoning, not the selector it emitted. Reset at the top of every `run()`. A
+  `delete`/`approve` click must scope to identifiers that were observed this
+  session AND are in the latest capture, which the gate re-reads at the moment
+  of the click (`#provenanceForGate`), so a row that scrolled away, was
+  filtered out, or was already deleted is never acted on because it was once
+  on screen.
+- **`MutationPolicy`** is the host's manifest (`WOWLIDATOR_MUTATION_POLICY`,
+  `WorkflowAgentOptions.mutationPolicy`, `RunOptions.mutationPolicy`,
+  `SmartRunnerOptions.mutationPolicy`): `allow` (exhaustive when present),
+  `deny` (wins), `approved` entries for the irreversible categories, and an
+  `approveMutation` hook for the host's explicit yes. Categories are read off
+  the accessible name of the control the click lands on (`mutationCategoryOf`:
+  `delete`, `approve`, `submit`); everything else is ordinary and never gated.
+  Without a policy manifest, provenance is enforced, capability is
+  unrestricted, and an irreversible action still requires the host's explicit
+  approval hook. Goal text and model output can never supply that approval.
+- **A destructive flow has two halves, and the gate had them backwards**
+  (2026-09-08, RU_08_03). The category was read off the clicked control's name
+  alone, so a row's `ลบ` icon — which in humi's `rules-table-columns.tsx` only
+  calls `setDeleteTarget(rule)` and raises a dialog — was classified `delete`
+  and held, while the `ยืนยัน` INSIDE that dialog, the click that actually
+  destroys the row, matched `SUBMIT_NAME` and passed as reversible. The
+  harness held the harmless half and guarded nothing on the half that counts.
+  `MutationPhase` names them: a click inside a dialog is a `commit`, anything
+  else is an `open`, and a confirming control inside a dialog whose own text
+  is destructive **inherits that category** instead of `submit`. The dialog is
+  read off the live element (`#dialogFor`, `el.closest('[role=dialog]')`) and
+  from nowhere else — the same standard as provenance — and only when the
+  control's name already means something to the gate, so an ordinary click
+  still pays nothing. A confirmation names the record its button does not, so
+  the identifiers in the dialog's text scope the commit; without that the
+  commit half would be held as `destructive-unscoped`, which moves the block
+  to a rule that cannot be satisfied rather than making anything safer.
+  An `approved` entry may name a `phase`: `{ category: 'delete', phase:
+  'open' }` lets a case raise a confirmation and cancel it while every commit
+  still stops dead — which is what **56 of the 447 rows** of one BE catalog
+  need, the whole `PL_09_*` family among them. An entry naming no phase means
+  both, as every entry written before phases did.
+- **The gate runs inside `#act`**, before the browser is touched, so a planned
+  follow-up, a replayed script and the menu walker all pass it. A held
+  mutation is terminal for the leg (`WorkflowResult.blocked`): another model
+  turn does not change a policy, insisting does not make a row observed, and
+  an approval cannot be talked into existence. The runner records the step
+  `error` with `ProofStep.blocked`, files **no defect**, throws
+  `MutationBlockedError` (an `error` in `classifyStepFailure`, futile for
+  reconstruction), `harnessOnly` names it `blocked (reason, rule)`, and the
+  case scores blocked — exit 3, never 1. The report shows a "Held by the
+  run's rules" callout, the panel a `HELD (…)` line.
+
+Tests: `tests/mutation-policy.test.ts` — the gate, the ledger and the manifest
+parser (pure), and the loop under a scripted model on a real page (CDP): an
+unobserved id, a row that vanished, an observed row under an approving policy,
+a denied category, a missing approval, the host's yes, an ordinary journey
+under the strictest policy, a `runFlow` whose held leg is an error with no
+defect and a held report, and — for the two halves — a confirm that inherits
+its dialog's category, one that stays a `submit` inside a harmless dialog, and
+a `phase: 'open'` approval that runs the opener while still holding the commit.
+
+**The mutation hook waits after authority and before contact (2026-09-05).** `RunOptions.onMutation` (per-run before instance) observes only an allowed, classified `click` or targeted `press`, after `gateMutation` returned no hold and before the browser action starts. It may wait for a route-scoped data lock but never decides authority, changes a verdict, writes provenance, or runs for an ordinary click; its exception propagates as the action failure.
+
+## Skills and the contract (Phase C, 2026-09-05)
+
+Phase C of `docs/research/commerce-agents-patterns.md`, items 1 and 2.
+
+- **`agentContract({ dbCount, skills })`** (workflow-agent.ts) is the static
+  half of every turn — the system prompt and the decision schema — memoised
+  per configuration so equal options hand back the same string and schema
+  instances. Every turn is a fresh single-shot call and the only discount is a
+  provider's prompt cache on a byte-identical prefix; the contract is that
+  prefix, so nothing in it may vary turn to turn. `dbCount: false` (a run
+  with no database probe — `RunOptions.dbProbe` absent) withdraws the action
+  from the prompt and the schema's enum together; the dispatch already failed
+  it with advice, and now the model is never offered it. `AGENT_ACTIONS`
+  itself is unchanged. `AgentObservation.dbCount`/`skills` carry the
+  configuration to `LlmAgentModel.decide`; absent means "everything, no
+  skills", so every older caller reads as before.
+- **Skills** (`agent-skills.ts`): the sign-in, forms, tables, date-picker and
+  wizard paragraphs moved out of the base prompt VERBATIM into
+  `AGENT_SKILLS`, and `selectSkills` picks the ones a leg needs from the
+  goal, the first full tree and the first required-fields line — once per
+  leg, in `run()`, at $0 — so the system bytes hold for the leg. Selected
+  bodies are appended under `GUIDANCE FOR THIS GOAL:`; the base prompt keeps
+  the action contract, `DETERMINISM_RULES`, the EACH TURN procedure, WHAT THE
+  LOOP WILL REFUSE and the Rules for every variant. A skill is tactics only
+  and may never weaken the policy layer — `tests/agent-skills.test.ts` pins
+  the policy sentences out of every body. The chosen ids ride
+  `AgentRecord.skills` and the workflow step's `detail.skills`.
+- **Cache telemetry**: `StructuredResponse.cachedInputTokens` (the SDK's
+  `usage.inputTokenDetails.cacheReadTokens`) → `AgentDecision.cachedInputTokens`
+  → summed onto `AgentRecord.cachedInputTokens` and the step's
+  `detail.cachedInputTokens`, so whether the stable-first order is paying is a
+  number in the bundle rather than a belief.
+
+Tests: `tests/agent-contract.test.ts` (memoisation, the dbCount withdrawal,
+the policy blocks in every variant, the stable-prefix invariant of
+`buildUserPrompt`, cache reads reported by a mock model),
+`tests/agent-skills.test.ts` (selection per shape, determinism and order, no
+policy in a body, the base prompt without the moved paragraphs).
+
+## Why the leg ended is data: `endedBy`, and three classes of failed leg (task C3, 2026-09-05)
+
+Every failing `workflow` step used to end as step status `error` under one
+message, whatever ended it: the runner recorded the leg failed, threw
+`workflow agent failed: …`, and `classifyStepFailure` scored it `error`. So
+an evidence-backed "the list offers 9 options and none is the value" (the
+harness read the options itself, twice, after a settle) scored the same as
+"the agent gave up after 15 turns" (a harness limit) and the same as the
+model saying `fail` with a reason (a bare claim) — and a case with no later
+assertion scored blocked with "runtime error — the harness ended this case"
+for all three.
+
+**`AgentRecord.endedBy`** (`engine/proof-bundle.ts`, `AGENT_ENDED_BY`) is the
+loop's own stop, typed. It is set at every place `run()` already set its
+final `summary` and stopped, and changes nothing about WHEN the loop stops —
+the same walk through the loop records the same actions and the same
+summary as before, plus one word. By the source of the evidence:
+
+- page: `arrived` (the destination rule, including the zero-call rungs — a
+  replayed journey, a link the tree showed, a state already showing, a gate
+  cleared onto the destination), `cannot-offer` (`listboxCannotOffer`: the
+  goal's control enumerated twice, identically, `WAIT_SETTLE_MS` apart, and
+  the goal's value on none of the options), `fixture-present` (2026-09-09,
+  `fixtureAlreadyPresent`: the application's own duplicate-key refusal named
+  the goal's key while the tree showed that control holding the goal's value);
+- harness: `budget`, `stalled` (an ok action repeated on an unchanged page
+  after being told so), `no-progress` (the five-turn judge AND the look-only
+  handoff — `lookedOnly` tells them apart), `value-hunt`, `wandered`,
+  `model-error`, `blocked` (a mutation or guardrail hold — `blocked` carries
+  the record — or the multi-persona refusal before turn one, which has none);
+- model: `finish` (accepted; `settledBy` says whether the page or the claim
+  settled it), `fail`, `contradicted` (a finish the page refuted — the
+  destination rule or the observed-state settlement).
+
+**A `fail` is kept as a claim beside what the page showed.**
+`AgentRecord.unreachable = { claim, urlAfter, headingsAfter }`: `claim` is
+the model's reasoning verbatim (redacted like every other string on the
+record) and is labelled a claim in the type, because that is all it is; the
+URL and the headings are what `#captureTree` read that turn. A reader weighs
+one against the other. Nothing in `src/` files the claim as a finding.
+
+**A listbox miss is kept as facts, not only as a message.**
+`AgentAction.listbox` (`AgentListboxFacts`: trigger, value, shownCount,
+shownHead ≤ 8, filtered, searchedEmpty) is copied off the
+`ListboxOptionMissingError` in the one `catch` where `#act` misses, BEFORE
+`describe()` flattens it to the action's `error` string; on the settle-and-
+retry the second enumeration is the one kept. `listboxFacts()` is the pure
+writer.
+
+**The runner classes a failed leg by that source** (`agentLegFailure`,
+`engine/runner.ts`, pure over the redacted record), after the existing
+blocked / provider / authoring branches:
+
+- harness (`AGENT_HARNESS_STOPS`) → `AgentBudgetError`, message naming the
+  limit ("the 12-turn ceiling", "an action repeated on an unchanged page"),
+  still `error` in `classifyStepFailure`, still a blocked case — exactly the
+  outcome the untyped message produced, now saying which limit;
+- page (`cannot-offer`) → `AgentEvidenceError`, **`failed`** in
+  `classifyStepFailure`, with `detail.expected` (the value asked) and
+  `detail.actual` (the trigger's label, the count and head of the options)
+  written onto the step by `agentLegComparison`, so `expectedActual()` reads
+  the leg like an `expectText`. Reconstruction is futile for it: a rewrite
+  cannot make an option appear that the list enumerated twice without;
+- model (`fail`, `contradicted`, and every record from before the field
+  existed) → the plain `workflow agent failed:` error, `error` as before.
+  `harnessOnly` (`src/cli/exit.ts`) reads `agent.endedBy === 'fail'` off the
+  step's record — never the message — and words the case "no verdict — the
+  agent's own account, unverified: <claim>" instead of "runtime error — the
+  harness ended this case"; the case still scores blocked and exits 3.
+
+The bundle schema (`src/artifacts/schemas.ts`, `AgentRecordSchema`) accepts
+all three fields as the descriptive optionals they are and refuses an
+`endedBy` outside `AGENT_ENDED_BY_VALUES` (it steers a wording), mirrored
+from the engine's list and pinned equal by test. The reporter's wording
+tables were not touched: the new error messages are what it already prints.
+
+Tests: `tests/agent-guards.test.ts` ("the typed stop reason on the record
+(no browser)" — the loop driven against a fake `Page` whose CDP session and
+locators answer fixed data, so the REAL `#act` → `selectFromListbox` path
+throws a REAL `ListboxOptionMissingError`: budget, fail with the claim,
+finish, the listbox facts and the `cannot-offer` stop in one turn;
+`listboxFacts` and `headingsOf` pure), `tests/full-workflow.test.ts` ("a
+failed workflow leg is classed by the source of its evidence"),
+`tests/exit.test.ts` (the wording and the exit code), and
+`tests/artifact-schemas.test.ts` (a hand-written bundle with and without the
+fields, the refused vocabulary, the mirror).
+
+## A count is never a control (`QUANTIFIER_CONTROL`, 2026-09-08)
+
+Live (PL_06_07 on HUMI SIT, run key `pl-06-07-v2-csv@2026-09-08T07:53`, leg
+[11]). The authored goal was *"In the Condition searchable multi-select, select
+more than one value: 'ePatient' and 'Tops care', so that both appear as selected
+chips."* — and `goalOutcomes` read it as the pair `more than one` = `ePatient`.
+`OUTCOME_EQ` fired on the colon, which there INTRODUCES the values to pick and
+names no field; `CONTROL_LEAD` took the verb `select` and `CONTROL_TAIL` the
+generic noun `value`, leaving the quantifier alone as the control. `outcomeShown`
+then demanded one tree line carrying *more*, *than*, *one* AND `ePatient`, which
+no page can render, so every `finish` was refused, the leg was sealed short of
+its goal, the nine steps after it were skipped and the case ended `blocked` /
+`status: error`. The page was correct throughout: the agent's own `read` observed
+`text "ePatient Tops care", label "เงื่อนไข (Condition)*"` and the tree carried
+both `ลบ ePatient` and `ลบ Tops care` chips.
+
+Neither existing guard could reach it. The value side was a clean quoted
+literal, so `DESCRIBED_GOAL_VALUE` (built for HIR-EC-009 leg [13]) never saw the
+junk — it was on the CONTROL side. The colon-introduces-a-list rule (HIR-EC-009
+leg [38]) drops a colon pair only when ANOTHER pair begins inside its value
+span, and this sentence holds one pair. `NOT_A_CONTROL` screens sheet artifacts,
+not quantifiers.
+
+**The rule.** `QUANTIFIER_CONTROL` (`goal-evidence.ts`, consulted by
+`cleanControl` after `NOT_A_CONTROL`): a control that is ENTIRELY a count —
+a comparison or range (`more/less/fewer/greater than N`, `at least/at most N`,
+`no more/fewer than N`, `up to N`, `N or more/fewer`), a determiner
+(`all/any/both/each/every/either/some/several/multiple/many/various`, with an
+optional `of the N`), or a bare number word — with at most one generic counted
+noun after it (`value(s)`, `option(s)`, `item(s)`, `entries`, `choice(s)`,
+`chip(s)`, `tag(s)`, `row(s)`, `field(s)`, …) is not a control, and its pair is
+dropped. Dropping is the honest outcome the module already documents: the goal
+names no field a page can show, `goalOutcomes` returns `[]`, and the record says
+`settledBy: 'agent-claim'`. Nothing is invented — a "Condition" control is NOT
+guessed out of the sentence.
+
+Three narrowness choices, each load-bearing:
+- **Anchored on the whole cleaned control.** `Multiple Choice`, `All Employees`,
+  `Any Status` and `Number of Dependents` are field names and keep their pairs.
+- **A bare determiner may take only a PLURAL counted noun**, because
+  `Multiple Choice` is a real field name while `multiple choices` is a wording;
+  a count phrase and `each`/`every` take the singular too (`more than one
+  value`, `each value`).
+- **`at` is optional in `at least/at most`**, because `CONTROL_LEAD` strips it
+  as a preposition — `select at least two values: 'A'` reaches the screen as
+  `least two values`.
+
+**The value side is screened for the COUNTING phrases only**
+(`COUNTED_GOAL_VALUE` in `cleanValue`): a sheet writes the same expectation the
+other way round (`selected values = more than one`) and no tree renders that
+either. Bare determiners are deliberately NOT screened there — `Status = All`,
+`Coverage = Both`, `Type = Multiple` are real option labels, and dropping them
+would trade a checkable pair for a claim. Anchored, so `Company = More Than One
+Ltd` keeps its pair.
+
+Why it cannot slow or fail a passing leg: pure string work in a leaf module, no
+model call, no browser, no new state; it can only turn a pair the page could
+never show into no pair, which moves a leg from "finish refused twice, leg
+sealed" to "finish accepted on the claim". The one thing it gives up is that
+`goalCitedValues` no longer cites a value for such a goal, so the value-hunt
+judge (`AGENT_VALUE_HUNT_TURNS`) does not engage on it — the same position every
+goal this parse cannot read is already in, and the activation and off-page
+judges still bound the leg. Tests: `tests/goal-evidence.test.ts` (`a count is
+never a control (PL_06_07, 2026-09-08)` — the verbatim goal, the wording spread,
+the surviving field names, the value side, and the live pairs re-asserted
+unchanged). No benchmark re-run was taken: a catalog run was live on the machine
+and this change cannot move a turn count on a leg whose goal parses today.
+
+## A verified undo answers the approval question (2026-09-09)
+
+The mutation gate asked one question about an irreversible action — *did
+someone say yes to this?* — and until now that was the only question it could
+ask. So a delete on a run that had snapshotted the very tables it writes to was
+held exactly as hard as a delete on a run with no safety net at all.
+
+Live, be-high-ctx PL_09_01. The case exists to prove the Delete control opens
+its confirmation. It ended `ERROR: workflow blocked (approval,
+approval-missing)` having asked the application nothing, and the advice it
+printed — add an `approved` entry — is a person's yes, which a batch run at
+eight lanes has nobody to give.
+
+A verified restore is a **different answer to the same question**. It is not
+"someone approved this"; it is "this cannot outlive the run".
+
+`MutationPolicy.reversible` carries it, and four rules keep it honest:
+
+- **It is measured, never declared.** `run-cases.ts` sets it only where all
+  three facts the restore itself needs are true: a baseline was taken, a write
+  credential resolved (`restoreDbConfig()`), and tables came back
+  `restorable`. A snapshot with no credential — the common misconfiguration,
+  and this machine's own state until today — leaves it absent and the gate
+  holds as it always did. `resolveBaselineMode` had already degraded that case
+  to `snapshot`; this reads the same fact rather than a second opinion of it.
+- **The manifest cannot assert it.** `MutationPolicySchema` is `.strict()` and
+  gains no `reversible` key, so `WOWLIDATOR_MUTATION_POLICY` naming one is a
+  parse error, not a licence. The env manifest is a person's word; the undo is
+  the runner's measurement, and a typo in JSON must never license a delete.
+- **It grants approval only, never capability or provenance.** The check sits
+  after every capability and scope rule and before the host hook: a `deny`d
+  category stays denied, and a delete scoped to a row nobody has observed stays
+  held. An undo says the change will not outlive the run — never that the
+  action was well-formed or allowed.
+- **Its reach is recorded, because it is not total.** `tables` is the honest
+  bound: a baseline covers the tables the plan named, and a mutation reaching
+  beyond them is NOT undone by the restore. The gate approves on the strength
+  of the undo it has and the record states how far that undo goes, so a reader
+  judges the residue rather than infers it.
+
+The restore stays **per-run** — snapshot before the suite, restore after it.
+Per-case restore was considered and rejected: eight lanes share one database, so
+restoring after each verdict would undo the other seven lanes' in-flight state,
+and serialising to make it safe turns a ten-minute run into an hour.
+
+Tests: `tests/mutation-policy.test.ts` ("a verified undo answers the approval
+question"), including the empty-table, denied-category, unobserved-row and
+manifest-rejection cases.

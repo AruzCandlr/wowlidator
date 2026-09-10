@@ -26,6 +26,11 @@ import { RunHistory } from '../../history/run-history.js';
 import { probeIsUsable, probeRole } from '../../providers/probe.js';
 import type { CliOptions } from '../options.js';
 
+import type { Browser } from 'playwright';
+
+import type { TestCaseRow } from '../../catalog/test-case-table.js';
+import type { FetchJson, LookupGrounding, MasterDataLookup } from '../../context/master-data.js';
+
 /**
  * Verify each role end to end: key present, provider constructs, model id
  * actually resolves against the live API. Model ids drift far faster than this
@@ -364,11 +369,35 @@ export async function cmdContext(
  * no longer exists is reported, never fatal — its case renders without
  * evidence, exactly as a never-ran row does.
  */
-export async function cmdCatalogReport(target: string | undefined, _options: CliOptions): Promise<number> {
+export async function cmdCatalogReport(target: string | undefined, options: CliOptions): Promise<number> {
   const { readFile } = await import('node:fs/promises');
   const { readLedger } = await import('../suite-progress.js');
   const { buildCatalogReportCases, writeCatalogArtifacts } = await import('../catalog-live-report.js');
   type Bundle = import('../../engine/proof-bundle.js').ProofBundle;
+  const { narrateBundle, unnarrated } = await import('../../generator/step-narration.js');
+  const { composeNarrative, needsNarrative } = await import('../../generator/case-narrative.js');
+  const { buildCaseNarrativeModel, buildNarrationModel } = await import('../runtime.js');
+
+  // `--narrate` (or WOWLIDATOR_NARRATE=on) re-enters finished runs and gives
+  // every step a plain-language sentence, with no browser and no re-run. The
+  // narration is written back into the proof bundle — the durable record every
+  // surface reads — so the per-case report is re-rendered from it too, not
+  // only the catalog report this command exists to rebuild.
+  const narrationModel = buildNarrationModel(options);
+  // The case narrative is back-filled the same way, in the language the run
+  // chose (its ledger says), so a page rebuilt months later reads as the
+  // run's own report and not the rebuilder's default.
+  const narrativeModel = options.caseNarrativeBackfill ? buildCaseNarrativeModel(options) : null;
+  let narratedSteps = 0;
+  let narratedCases = 0;
+  let narrativesWritten = 0;
+  const { writeFile, rename } = await import('node:fs/promises');
+  /** Temp-file + rename, like every other durable write here: a torn proof bundle is unreadable to every reader. */
+  const writeJsonAtomic = async (file: string, value: unknown): Promise<void> => {
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    await rename(tmp, file);
+  };
 
   const ledgerPaths: string[] = [];
   const chosen = target === undefined ? resolve('.wowlidator', 'catalogs') : resolve(target);
@@ -392,15 +421,59 @@ export async function cmdCatalogReport(target: string | undefined, _options: Cli
       continue;
     }
     let missingProofs = 0;
+    const reportLang = ledger.launch?.reportLang ?? options.reportLang;
     const cases = await buildCatalogReportCases(ledger, async (id) => {
       const proofPath = ledger.outcomes[id]?.proofPath;
       if (typeof proofPath !== 'string' || proofPath === '') return null;
+      let bundle: Bundle;
       try {
-        return JSON.parse(await readFile(proofPath, 'utf8')) as Bundle;
+        bundle = JSON.parse(await readFile(proofPath, 'utf8')) as Bundle;
       } catch {
         missingProofs += 1;
         return null;
       }
+      if (narrativeModel !== null && needsNarrative(bundle, reportLang)) {
+        // The sheet's own card, from the flow the case ran — the same text the
+        // run gave the model — so a rebuilt narrative is the run's, not a
+        // different artefact written from the name alone.
+        const flowPath = ledger.outcomes[id]?.flowPath;
+        const caseText = await (async (): Promise<string> => {
+          if (typeof flowPath !== 'string' || flowPath === '') return bundle.name;
+          try {
+            const flow = JSON.parse(await readFile(flowPath, 'utf8')) as { caseContext?: unknown };
+            return typeof flow.caseContext === 'string' && flow.caseContext !== '' ? flow.caseContext : bundle.name;
+          } catch {
+            return bundle.name;
+          }
+        })();
+        const landed = await composeNarrative(bundle, caseText, {
+          model: narrativeModel,
+          lang: reportLang,
+          log: (line) => process.stderr.write(`${line}\n`),
+        });
+        if (landed) {
+          narrativesWritten += 1;
+          await writeJsonAtomic(proofPath, bundle);
+        }
+      }
+      if (narrationModel !== null && unnarrated(bundle).length > 0) {
+        const landed = await narrateBundle(bundle, bundle.name, {
+          model: narrationModel,
+          log: (line) => process.stderr.write(`${line}\n`),
+        });
+        if (landed > 0) {
+          narratedSteps += landed;
+          narratedCases += 1;
+          // Back onto disk first — a narration only in this process's memory
+          // would be lost the moment the rebuild finished.
+          await writeJsonAtomic(proofPath, bundle);
+          // The case's own report is its case page, rewritten by
+          // `writeCatalogArtifacts` below from this same bundle.
+          {
+          }
+        }
+      }
+      return bundle;
     });
     const recorded = ledger.planned.filter((id) => ledger.outcomes[id] !== undefined).length;
     if (recorded > 0 && missingProofs === recorded) {
@@ -421,6 +494,7 @@ export async function cmdCatalogReport(target: string | undefined, _options: Cli
         cases,
         // A ledger still marked running keeps the page reloading itself.
         live: ledger.ended === null,
+        lang: reportLang,
       });
       process.stdout.write(
         `  catalog report ${htmlPath}\n` +
@@ -429,6 +503,12 @@ export async function cmdCatalogReport(target: string | undefined, _options: Cli
           (missingProofs > 0 ? ` · ${missingProofs} proof bundle(s) no longer exist; those cases carry no evidence` : '') +
           '\n',
       );
+      if (narratedSteps > 0) {
+        process.stdout.write(`  narrated   ${narratedSteps} step(s) across ${narratedCases} case(s) in plain language (${narrationModel?.id ?? 'unknown'})\n`);
+      }
+      if (narrativesWritten > 0) {
+        process.stdout.write(`  narrative  written for ${narrativesWritten} case page(s) in ${reportLang} (${narrativeModel?.id ?? 'unknown'})\n`);
+      }
     } catch (error) {
       process.stderr.write(
         `  ! ${ledger.runKey ?? ledger.title}: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}\n`,
@@ -521,4 +601,201 @@ export async function cmdDb(sub: string | undefined, target: string | undefined,
     await writable.close().catch(() => undefined);
     await reader.close().catch(() => undefined);
   }
+}
+
+/**
+ * `wowlidator data check <catalog> --master-data <file> --url <app>` — the
+ * master-data grounding rung (`src/context/master-data.ts`): which of the
+ * codes a sheet's Test Data names exist in the application's own master, what
+ * they are called there, whether they are free, and whether the UI picker
+ * can reach them. A report for a person, never a gate: exit 0 whatever it
+ * finds, `--json` for tooling.
+ *
+ * The lookups are fetched over the HTTP execution plane's own seam. With
+ * `--as` (or a `--persona`) the command signs in on a tab of its own and
+ * sends through that browser context, so the application's cookies are used
+ * exactly as a run's backend steps use them; without credentials it sends
+ * plain HTTP and never touches Chrome. Tests inject `extra.fetchJson` to
+ * point the fetcher at a fixture server; the CLI wires the transport.
+ *
+ * Every fetched page is data: read through the declared JSON paths, compared
+ * as strings, never interpreted. A page that cannot be read makes its lookup
+ * `unknown` with the reason — unverified is not missing.
+ */
+export async function cmdData(
+  sub: string | undefined,
+  catalog: string | undefined,
+  options: CliOptions,
+  extra: { masterData?: string | undefined; fetchJson?: FetchJson | undefined } = {},
+): Promise<number> {
+  if (sub !== 'check') {
+    process.stderr.write(`wowlidator data: unknown subcommand ${sub ?? '(none)'} (expected: check)\n`);
+    return 2;
+  }
+  if (catalog === undefined) {
+    process.stderr.write('wowlidator data check: missing <catalog> — the sheet whose Test Data codes to check\n');
+    return 2;
+  }
+  if (extra.masterData === undefined) {
+    process.stderr.write('wowlidator data check: --master-data <file> is required — the lookup declaration (see the manual)\n');
+    return 2;
+  }
+  if (options.url === undefined && extra.fetchJson === undefined) {
+    process.stderr.write("wowlidator data check: --url <app> is required — the lookups' paths are resolved against it\n");
+    return 2;
+  }
+
+  const { readFile } = await import('node:fs/promises');
+  const { extractWorkbookSheets } = await import('../../catalog/extract.js');
+  const { parseTestCaseTable, parseWorkbookCases, testDataPairs } = await import('../../catalog/test-case-table.js');
+  const {
+    LookupFetcher,
+    describeGroundingFinding,
+    fetchJsonThrough,
+    groundPlan,
+    planLookups,
+    readMasterDataDeclaration,
+    renderGroundingReport,
+    summarizeGrounding,
+  } = await import('../../context/master-data.js');
+
+  // Progress goes to stderr: under --json stdout is one document, and in text
+  // mode the report is the output, not the narration.
+  const log = (line: string): void => {
+    process.stderr.write(`[wowlidator] ${line}\n`);
+  };
+
+  let lookups: MasterDataLookup[];
+  try {
+    lookups = await readMasterDataDeclaration(resolve(extra.masterData));
+  } catch (error) {
+    process.stderr.write(`wowlidator data check: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 2;
+  }
+
+  // The catalog is read exactly as `catalog` reads it: a CSV or a workbook
+  // whose columns already say what each row's Test Data is. Anything else
+  // would need the model extractor, and this rung makes no model call.
+  const catalogPath = resolve(catalog);
+  const format = formatFor(catalogPath);
+  let table: TestCaseRow[] | null = null;
+  try {
+    if (format === 'csv') table = parseTestCaseTable(await readFile(catalogPath, 'utf8'));
+    else if (format === 'xlsx') table = parseWorkbookCases(extractWorkbookSheets(await readFile(catalogPath)));
+    else {
+      process.stderr.write(`wowlidator data check: ${catalog} must be a .csv or .xlsx test-case table\n`);
+      return 2;
+    }
+  } catch (error) {
+    process.stderr.write(`wowlidator data check: cannot read ${catalog}: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 2;
+  }
+  if (table === null) {
+    process.stderr.write(`wowlidator data check: ${catalog} is not a test-case table (needs Test Case ID, steps and expected columns)\n`);
+    return 2;
+  }
+  const cases = table.map((row) => ({ caseId: row.caseId, pairs: testDataPairs(row.testData) }));
+  const plans = planLookups(lookups, cases);
+  log(`${table.length} row(s) in ${catalog}; ${lookups.length} lookup(s) → ${plans.length} fetch group(s)`);
+
+  // The transport. Injected by a test; otherwise the browser's own cookies
+  // when someone to sign in as was named, plain HTTP when not.
+  let fetchJson = extra.fetchJson;
+  let closeTransport: (() => Promise<void>) | undefined;
+  const notes: string[] = [];
+  if (fetchJson === undefined) {
+    const { BrowserTransport, FetchTransport } = await import('../../api/api-client.js');
+    const credentials = options.credentials ?? Object.values(options.personas)[0];
+    if (credentials === undefined || options.url === undefined) {
+      fetchJson = fetchJsonThrough(new FetchTransport());
+      notes.push("fetched over plain HTTP with no session — pass --as or --persona to use the application's own cookies");
+    } else {
+      const { prepare, cleanupChrome } = await import('../artifacts.js');
+      const { DEFAULT_CDP_URL } = await import('../../engine/runner.js');
+      const { SIGN_IN_URL_PATTERN, performSignIn } = await import('../../engine/sign-in.js');
+      const { acceptConsentGate } = await import('../../engine/consent-gate.js');
+      const { chromium } = await import('playwright');
+      const blocked = await prepare(options, options.url);
+      if (blocked !== null) return blocked;
+      const cdpUrl = options.cdp ?? DEFAULT_CDP_URL;
+      let browser: Browser;
+      try {
+        browser = await chromium.connectOverCDP(cdpUrl);
+      } catch (error) {
+        process.stderr.write(
+          `wowlidator data check: could not attach to a browser at ${cdpUrl}: ` +
+            `${error instanceof Error ? error.message.split('\n')[0] : String(error)}\n`,
+        );
+        return 3;
+      }
+      // A context of its own, so nothing this signs in as leaks into a run's
+      // session and nothing a run left behind decides what this reads.
+      const context = await browser.newContext();
+      closeTransport = async () => {
+        await context.close().catch(() => undefined);
+        await browser.close().catch(() => undefined);
+        await cleanupChrome(options);
+      };
+      const tab = await context.newPage();
+      try {
+        await tab.goto(options.url, { waitUntil: 'domcontentloaded' });
+        await tab.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
+        if (SIGN_IN_URL_PATTERN.test(tab.url())) {
+          log(`signing in as ${credentials.email} so the lookups carry the application's session…`);
+          const outcome = await performSignIn(tab, credentials);
+          if (!outcome.ok) {
+            notes.push(`sign-in as ${credentials.email} did not take (${outcome.reason}); the lookups were sent without a session`);
+          } else if (SIGN_IN_URL_PATTERN.test(tab.url())) {
+            notes.push(`sign-in as ${credentials.email} left the tab on ${tab.url()}; the lookups may have been sent without a session`);
+          }
+        }
+        await acceptConsentGate(tab).catch(() => false);
+      } catch (error) {
+        notes.push(
+          `could not open ${options.url} first (${error instanceof Error ? error.message.split('\n')[0] : String(error)}); ` +
+            'the lookups were sent without a session',
+        );
+      }
+      fetchJson = fetchJsonThrough(new BrowserTransport(context));
+    }
+  }
+
+  const results: LookupGrounding[] = [];
+  try {
+    const fetcher = new LookupFetcher(fetchJson);
+    for (const plan of plans) {
+      const result = await groundPlan(plan, fetcher, options.url);
+      results.push(result);
+      const where = Object.entries(result.bindings).map(([k, v]) => `${k}=${v}`).join(', ');
+      log(
+        `${result.field.join('/')}${where === '' ? '' : ` [${where}]`}: ${result.status}` +
+          (result.status === 'ok'
+            ? ` — ${result.rowsFetched} row(s), ${result.codes.length} code(s) checked`
+            : ` — ${result.reason ?? ''}`),
+      );
+    }
+  } finally {
+    await closeTransport?.();
+  }
+
+  const summary = summarizeGrounding(results);
+  const finding = describeGroundingFinding(results);
+  if (options.json) {
+    const document = {
+      catalog: catalogPath,
+      declaration: resolve(extra.masterData),
+      appUrl: options.url ?? null,
+      rowsRead: table.length,
+      notes,
+      lookups: results,
+      summary,
+      finding,
+    };
+    process.stdout.write(`${JSON.stringify(document, null, 2)}\n`);
+    return 0;
+  }
+  process.stdout.write(renderGroundingReport(results));
+  for (const line of notes) process.stdout.write(`note: ${line}\n`);
+  process.stdout.write(`\n${finding}\n`);
+  return 0;
 }

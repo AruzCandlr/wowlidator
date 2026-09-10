@@ -35,6 +35,7 @@ import {
   multiPersonaSummary,
   formGaps,
   formatFormGaps,
+  listboxCannotOffer,
 } from '../src/orchestrator/agent-guards.js';
 import {
   AGENT_ACTIONS,
@@ -44,14 +45,20 @@ import {
   AGENT_OFF_PAGE_TURNS,
   AGENT_VALUE_HUNT_TURNS,
   DEFAULT_AGENT_MAX_STEPS,
+  LISTBOX_HEAD,
   WorkflowAgent,
   agentEarlyStopDefault,
+  headingsOf,
+  listboxFacts,
   parseWherePairs,
   type AgentDecision,
   type AgentObservation,
 } from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
+import { ListboxOptionMissingError } from '../src/engine/listbox.js';
 import type { AxNode } from '../src/healer/jit-healer.js';
+import type { Page } from 'playwright';
+import type { OnMutation } from '../src/orchestrator/mutation-policy.js';
 
 const TREE = `RootWebArea "Queue" url="http://x.test/en/queue"
 heading "Probation Reviews"
@@ -130,6 +137,32 @@ describe('goalAlreadyShowing', () => {
       'a different dialog is not this one');
     assert.equal(goalAlreadyShowing('reach the reporting screen', [node('dialog', 'Anything')]), null,
       'a goal that names no surface never fires');
+  });
+});
+
+describe('listboxCannotOffer names the control across languages', () => {
+  const goal = 'Fill the job section with exactly these values: Position = 40106337, Gender = Male';
+  const decision = { action: 'selectOption', selector: 'role=button[name="ตำแหน่ง" i]', value: '40106337', url: '' };
+  const shown = ['Store Manager', 'Cashier', 'Sales Staff'];
+
+  it('the goal in one language and the selector in another do not meet on their own', () => {
+    assert.equal(listboxCannotOffer(decision, shown, goal), null);
+  });
+
+  it('the trigger label the page printed carries both names, and the judge fires', () => {
+    const verdict = listboxCannotOffer(decision, shown, goal, 'เลือกตำแหน่ง (Select Position)');
+    assert.deepEqual(verdict, { control: 'Position', value: '40106337', shown });
+  });
+
+  it('a trigger that names a different control is not evidence about this one', () => {
+    assert.equal(listboxCannotOffer(decision, shown, goal, 'เลือกบริษัท (Select Company)'), null);
+  });
+
+  it('a value the list does show is never a cannot-offer', () => {
+    assert.equal(
+      listboxCannotOffer(decision, ['40106337 - Studio Traffic Staff'], goal, 'เลือกตำแหน่ง (Select Position)'),
+      null,
+    );
   });
 });
 
@@ -393,6 +426,8 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
           : path === '/en/rows'
             ? '<h1>Plans</h1><table><tr><td>TH_MED_001</td><td><button onclick="document.title=\'deleted TH_MED_001\'">Delete</button></td></tr>' +
               '<tr><td>PL_03_18</td><td><button onclick="document.title=\'deleted PL_03_18\'">Delete</button></td></tr></table>'
+            : path === '/en/mutations'
+              ? '<title>mutations</title><h1>Order</h1><button onclick="document.title=\'submitted\'">Submit</button><button onclick="document.title=\'next\'">Next</button>'
             : path === '/en/stepper'
               ? // A date-picker year stepper: pressing Enter on it decrements the
                 // shown year, so the tree genuinely changes every time (never
@@ -414,6 +449,53 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
     );
+  });
+
+  it('awaits onMutation before a governed click, but never calls it for an ordinary or held click', async () => {
+    let releaseMutation: (() => void) | undefined;
+    const mutationMayContinue = new Promise<void>((resolve) => { releaseMutation = resolve; });
+    let reportMutation: ((request: Parameters<OnMutation>[0]) => void) | undefined;
+    const mutationReported = new Promise<Parameters<OnMutation>[0]>((resolve) => { reportMutation = resolve; });
+    const submit = scripted([{ action: 'click', selector: 'role=button[name="Submit" i]' }]);
+    const agent = new WorkflowAgent({
+      model: submit.model,
+      maxSteps: 1,
+      onMutation: async (request) => {
+        reportMutation?.(request);
+        await mutationMayContinue;
+      },
+    });
+    await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/mutations`, { waitUntil: 'domcontentloaded' });
+      const running = agent.run(page, 'submit the order form');
+      const request = await mutationReported;
+      assert.equal(await page.title(), 'mutations', 'the browser has not been touched while the hook is waiting');
+      assert.equal(request.category, 'submit');
+      assert.equal(request.url, `${origin}/en/mutations`);
+      assert.equal(request.target, 'Submit');
+      releaseMutation?.();
+      await running;
+      assert.equal(await page.title(), 'submitted');
+
+      let ordinaryCalls = 0;
+      const next = scripted([{ action: 'click', selector: 'role=button[name="Next" i]' }]);
+      await new WorkflowAgent({ model: next.model, maxSteps: 1, onMutation: () => { ordinaryCalls += 1; } })
+        .run(page, 'click Next');
+      assert.equal(ordinaryCalls, 0);
+
+      await page.goto(`${origin}/en/mutations`, { waitUntil: 'domcontentloaded' });
+      let heldCalls = 0;
+      const denied = scripted([{ action: 'click', selector: 'role=button[name="Submit" i]' }]);
+      const held = await new WorkflowAgent({
+        model: denied.model,
+        maxSteps: 1,
+        mutationPolicy: { deny: ['submit'] },
+        onMutation: () => { heldCalls += 1; },
+      }).run(page, 'submit the order form');
+      assert.equal(held.blocked?.rule, 'policy-deny');
+      assert.equal(heldCalls, 0);
+      assert.equal(await page.title(), 'mutations');
+    });
   });
 
   it('does not accept a finish that contradicts the goal\'s destination', async () => {
@@ -643,13 +725,27 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
       { action: 'click', selector: 'text=PL_03_18 >> xpath=.. >> role=button[name="Delete" i]' },
       { action: 'finish', reasoning: 'deleted' },
     ]);
-    const agent = new WorkflowAgent({ model, maxSteps: 4 });
+    // A delete is irreversible, so the mutation gate (Phase B, 2026-09-05)
+    // asks the host even when no manifest is configured. This test is about
+    // the scope guard, so the host says yes — and only for the row the goal
+    // names, which the gate must have observed on the page first.
+    const approvals: string[][] = [];
+    const agent = new WorkflowAgent({
+      model,
+      maxSteps: 4,
+      mutationPolicy: null,
+      approveMutation: (request) => {
+        approvals.push([...request.targets]);
+        return request.category === 'delete' && request.targets.includes('PL_03_18');
+      },
+    });
     const { result, title } = await withPage(CDP_URL, async (page) => {
       await page.goto(`${origin}/en/rows`, { waitUntil: 'domcontentloaded' });
       const result = await agent.run(page, 'delete the plan PL_03_18');
       return { result, title: await page.title() };
     });
     assert.equal(title, 'deleted PL_03_18', 'only the row the goal named was deleted');
+    assert.deepEqual(approvals, [['PL_03_18']], 'the host was asked once, for the scoped row only — never for the unscoped click');
     assert.equal(result.success, true, result.summary);
     const refused = result.actions[0];
     assert.equal(refused?.ok, false);
@@ -750,22 +846,25 @@ describe('the value-hunt guard (CDP) — a set-X-to-Y goal whose value never app
   });
 
   it('never fires again once the value has appeared once, however many turns follow', async () => {
-    // Turn 1 reaches the page that renders the value — the guard's
-    // `huntedValueSeenAtTurn` latches there — then MORE turns than
+    // The leg STARTS on the page that renders the value — the guard's
+    // `huntedValueSeenAtTurn` latches on the first tree — then MORE turns than
     // `AGENT_VALUE_HUNT_TURNS` follow, each a genuine click on a still-wrong
-    // control, exactly like the trip test above. The only difference is the
-    // one turn where the value was visible, and that alone must be enough to
-    // silence the guard for the rest of the leg.
+    // control, exactly like the trip test above. The only difference is that
+    // the value was visible once, and that alone must be enough to silence
+    // the guard for the rest of the leg. It starts there rather than going
+    // there because a leg that leaves its page and stays away is ended by the
+    // off-page allowance (`AGENT_OFF_PAGE_TURNS`, 2026-09-03) after eight
+    // turns — a different judge, which this test must not trip.
     const clicks = Array.from({ length: AGENT_VALUE_HUNT_TURNS + 3 }, (_, i) => ({
       action: 'click' as const,
       selector: `text="Other section ${i}"`,
     }));
-    const { model, seen } = scripted([{ action: 'goto' as const, url: `${origin}/en/found` }, ...clicks]);
+    const { model, seen } = scripted(clicks);
     // Capped exactly to the script's length: nothing here is meant to test
     // termination, only that the value-hunt guard stays quiet throughout.
-    const agent = new WorkflowAgent({ model, maxSteps: clicks.length + 1 });
+    const agent = new WorkflowAgent({ model, maxSteps: clicks.length });
     const result = await withPage(CDP_URL, async (page) => {
-      await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
+      await page.goto(`${origin}/en/found`, { waitUntil: 'domcontentloaded' });
       return agent.run(page, 'set Employee Group to "G - Internship"');
     });
     assert.doesNotMatch(result.summary, /never appeared/);
@@ -796,7 +895,7 @@ describe('a stall made only of looking (CDP)', { skip: skipBrowser }, () => {
   let origin: string;
 
   before(async () => {
-    server = createServer((req, res) => {
+    server = createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end('<h1>Plans</h1><p>Nothing here names a control the goal could press.</p>');
     });
@@ -881,7 +980,7 @@ describe('a read-only agent run', { skip: skipBrowser }, () => {
   before(async () => {
     // A summary card, the be100 shape: label and value in separate elements,
     // plus a button the agent must not be able to press.
-    server = createServer((req, res) => {
+    server = createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(
         '<h1>Plans</h1><div id="card"><span>TOTAL PLANS</span><span>75</span></div>' +
@@ -1229,5 +1328,265 @@ describe('formGaps (OA-6, pure half)', () => {
     );
     assert.equal(formatFormGaps([]), null);
     assert.match(formatFormGaps(gaps, 2) ?? '', /^REQUIRED AND STILL EMPTY \(5\): textbox "Bank\*" · button "Currency" value="— Select —" · … and 3 more$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The typed stop reason (task C3) — unit tier, no browser.
+//
+// The loop is driven against a FAKE page: an object that answers the two
+// things the loop reads off a browser — the CDP accessibility tree and the
+// locator calls the listbox procedure makes — with fixed data. Every other
+// browser fact stays in the CDP suites above; what is proved here is the
+// loop's OWN bookkeeping: which `endedBy` each stop records, that the
+// model's `fail` is kept as a claim beside what the page showed, and that a
+// real `ListboxOptionMissingError` thrown by the real `#act` (through the
+// engine's own `selectFromListbox`) lands on the action as typed facts.
+// ---------------------------------------------------------------------------
+
+interface FakePageOptions {
+  url: string;
+  /** The accessibility nodes the CDP session hands back. */
+  nodes: Array<{ role: string; name: string; url?: string; value?: string }>;
+  /** What the (only) control's DOM element reads as, for the listbox procedure. */
+  trigger: string;
+  /** The options its list holds. */
+  options: string[];
+}
+
+/**
+ * A page for the loop with no browser behind it. Locators resolve; the one
+ * element every locator points at is a `button` named `trigger` whose popup
+ * lists `options` and has no search box; role queries for an option match
+ * nothing, so a `selectOption` misses the way it does on a real list that
+ * lacks the value.
+ */
+function fakePage(opts: FakePageOptions): Page {
+  const optionEl = (text: string): unknown => ({ textContent: text, innerText: text, getAttribute: () => null });
+  const element = {
+    tagName: 'BUTTON',
+    innerText: opts.trigger,
+    textContent: opts.trigger,
+    getAttribute: () => null,
+    querySelectorAll: (selector: string): unknown[] =>
+      selector.includes('[role="option"]') ? opts.options.map(optionEl) : [],
+  };
+  const locator = (selector: string): unknown => {
+    const self: Record<string, unknown> = {
+      first: () => self,
+      nth: () => self,
+      locator: (inner: string) => locator(inner),
+      filter: () => self,
+      // A role query (`findOption`) matches nothing: the list lacks the value.
+      getByRole: () => locator('__role-query__'),
+      waitFor: async () => undefined,
+      click: async () => undefined,
+      fill: async () => undefined,
+      press: async () => undefined,
+      hover: async () => undefined,
+      scrollIntoViewIfNeeded: async () => undefined,
+      setChecked: async () => undefined,
+      count: async () => (selector === '__role-query__' ? 0 : 1),
+      // No search box in the popup — so the list is read whole, never filtered.
+      isVisible: async () => !/input|searchbox|textbox|combobox/.test(selector),
+      isEnabled: async () => true,
+      innerText: async () => '',
+      inputValue: async () => '',
+      all: async () => [],
+      allInnerTexts: async () => [],
+      ariaSnapshot: async () => '',
+      evaluate: async (fn: (el: unknown, arg: unknown) => unknown, arg?: unknown) => fn(element, arg),
+    };
+    return self;
+  };
+  const cdpNodes = opts.nodes.map((n, i) => ({
+    nodeId: String(i),
+    role: { value: n.role },
+    name: { value: n.name },
+    ...(n.value === undefined ? {} : { value: { value: n.value } }),
+    properties: n.url === undefined ? [] : [{ name: 'url', value: { value: n.url } }],
+  }));
+  return {
+    url: () => opts.url,
+    context: () => ({
+      newCDPSession: async () => ({
+        send: async (method: string) => (method === 'Accessibility.getFullAXTree' ? { nodes: cdpNodes } : {}),
+        detach: async () => undefined,
+      }),
+    }),
+    locator,
+    keyboard: { press: async () => undefined, insertText: async () => undefined },
+    waitForLoadState: async () => undefined,
+    waitForTimeout: async () => undefined,
+    goto: async () => undefined,
+  } as unknown as Page;
+}
+
+const FORM_URL = 'http://x.test/en/form';
+const FORM_NODES = [
+  { role: 'RootWebArea', name: 'Form', url: FORM_URL },
+  { role: 'heading', name: 'Reporting' },
+  { role: 'heading', name: 'Employment' },
+  { role: 'button', name: 'Employee Group' },
+  { role: 'button', name: 'Save' },
+];
+const TEN_OPTIONS = ['A - Alpha', 'B - Bravo', 'C - Charlie', 'D - Delta', 'E - Echo', 'F - Foxtrot', 'G - Golf', 'H - Hotel', 'I - India', 'J - Juliet'];
+
+describe('the typed stop reason on the record (no browser)', () => {
+  it('a leg that ends on the turn ceiling records endedBy = budget', async () => {
+    const { model } = scripted([{ action: 'wait', reasoning: 'let the page settle' }]);
+    const agent = new WorkflowAgent({ model, maxSteps: 1 });
+    const result = await agent.run(fakePage({ url: FORM_URL, nodes: FORM_NODES, trigger: 'Employee Group', options: TEN_OPTIONS }), 'reach the reporting screen');
+
+    assert.equal(result.success, false);
+    assert.equal(result.endedBy, 'budget');
+    assert.match(result.summary, /gave up after 1 turns/);
+    assert.equal(result.maxSteps, 1);
+    assert.equal(result.unreachable, undefined, 'only a fail carries the claim');
+  });
+
+  it('a leg the model ends with fail records endedBy = fail and the claim beside what the page showed', async () => {
+    const reasoning = 'the reporting screen is not linked from this page';
+    const { model } = scripted([{ action: 'fail', reasoning }]);
+    const agent = new WorkflowAgent({ model, maxSteps: 5 });
+    const result = await agent.run(fakePage({ url: FORM_URL, nodes: FORM_NODES, trigger: 'Employee Group', options: TEN_OPTIONS }), 'reach the reporting screen');
+
+    assert.equal(result.success, false);
+    assert.equal(result.endedBy, 'fail');
+    assert.equal(result.unreachable?.claim, reasoning, "the claim is the model's reasoning, verbatim");
+    assert.equal(result.unreachable?.urlAfter, FORM_URL);
+    assert.deepEqual(result.unreachable?.headingsAfter, ['Reporting', 'Employment'], 'the headings the harness read off the tree');
+    assert.equal(result.turns, 1);
+  });
+
+  it('a leg that finishes records endedBy = finish', async () => {
+    const { model } = scripted([{ action: 'finish', reasoning: 'the screen is up' }]);
+    const agent = new WorkflowAgent({ model, maxSteps: 5 });
+    const result = await agent.run(fakePage({ url: FORM_URL, nodes: FORM_NODES, trigger: 'Employee Group', options: TEN_OPTIONS }), 'reach the reporting screen');
+
+    assert.equal(result.success, true);
+    assert.equal(result.endedBy, 'finish');
+    assert.equal(result.settledBy, 'agent-claim', 'a goal naming no state rides the claim, and the record says so');
+    assert.equal(result.unreachable, undefined);
+  });
+
+  it('a selectOption miss lands the listbox facts on the action, copied off the typed error before it is flattened', async () => {
+    const { model } = scripted([
+      { action: 'selectOption', selector: 'role=button[name="Employee Group" i]', value: 'Z - Nothing', reasoning: 'pick the group' },
+      { action: 'fail', reasoning: 'no such group' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 4, actionTimeoutMs: 200 });
+    const result = await agent.run(
+      fakePage({ url: FORM_URL, nodes: FORM_NODES, trigger: 'Employee Group', options: TEN_OPTIONS }),
+      'set Employee Group to "Z - Nothing"',
+    );
+
+    const miss = result.actions.find((a) => a.action === 'selectOption');
+    assert.ok(miss, 'the selectOption was acted on');
+    assert.equal(miss.ok, false);
+    assert.match(miss.error ?? '', /no option named "Z - Nothing"/, 'the flattened message is still there for older readers');
+    assert.deepEqual(miss.listbox, {
+      trigger: 'Employee Group',
+      value: 'Z - Nothing',
+      shownCount: 10,
+      shownHead: TEN_OPTIONS.slice(0, 8),
+      filtered: false,
+      searchedEmpty: null,
+    });
+    assert.ok((miss.listbox?.shownHead.length ?? 99) <= LISTBOX_HEAD);
+    // The goal named the control and the value; the list was read whole,
+    // twice, and identical — the page's own enumeration ended the leg.
+    assert.equal(result.endedBy, 'cannot-offer');
+    assert.match(result.summary, /is not among the 10 option\(s\) the control offers/);
+    assert.equal(result.success, false);
+    assert.equal(result.turns, 1, 'no second model turn was spent on evidence the page already gave');
+  });
+
+  it('listboxFacts is pure: a hand-built error with a filtered list and an empty-row answer', () => {
+    const error = new ListboxOptionMissingError('Position', 'Q', TEN_OPTIONS, '', { filtered: true, searchedEmpty: 'Q' });
+    assert.deepEqual(listboxFacts(error, 'Q - Quebec'), {
+      trigger: 'Position',
+      value: 'Q - Quebec',
+      shownCount: 10,
+      shownHead: TEN_OPTIONS.slice(0, LISTBOX_HEAD),
+      filtered: true,
+      searchedEmpty: 'Q',
+    });
+    assert.deepEqual(listboxFacts(new ListboxOptionMissingError('Position', 'Q', [], 'no list'), 'Q'), {
+      trigger: 'Position',
+      value: 'Q',
+      shownCount: 0,
+      shownHead: [],
+      filtered: false,
+      searchedEmpty: null,
+    });
+  });
+
+  // PL_09_01 and PL_06_05 of run `be-high-sonnet-20260909-153617`
+  // (2026-09-09): a fixture-creation leg whose row survived an earlier run
+  // read back the application's own duplicate-key refusal. One leg typed a
+  // different id — which the flow's next `expectVisible` on the goal's id
+  // could never have matched — and was ended as a wander; the other called
+  // `fail`. Both cases ended with no verdict at all.
+  const CREATE_URL = 'http://x.test/en/admin/benefits/plans/create';
+  const TAKEN_NODES = [
+    { role: 'RootWebArea', name: 'Benefit Plans', url: CREATE_URL },
+    { role: 'heading', name: 'Create Benefit Plan' },
+    { role: 'textbox', name: 'Benefit Plan ID*', value: 'QA260908_BE_137' },
+    { role: 'StaticText', name: 'Plan ID already exists.' },
+    { role: 'button', name: 'Create Plan' },
+  ];
+  const CREATE_GOAL =
+    'Click Create Plan, then fill the new plan form with Country=Thailand, Status=Active, ' +
+    'Plan ID=QA260908_BE_137, Name=QA-Delete_37929Z, then submit/Insert so the new plan is saved';
+
+  it("a creation leg whose row is already there settles on the application's own refusal", async () => {
+    const { model, seen } = scripted([
+      { action: 'click', selector: 'role=button[name="Create Plan" i]', reasoning: 'submit the form' },
+      { action: 'fill', selector: 'role=textbox[name="Benefit Plan ID" i]', value: 'QA260908_BE_138', reasoning: 'the id is taken, try another' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 6 });
+    const result = await agent.run(
+      fakePage({ url: CREATE_URL, nodes: TAKEN_NODES, trigger: 'Create Plan', options: [] }),
+      CREATE_GOAL,
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.endedBy, 'fixture-present');
+    assert.equal(result.settledBy, 'fixture-present', 'never agent-claim: the page said it, not the model');
+    assert.match(result.settledEvidence ?? '', /Plan ID already exists\./);
+    assert.match(result.settledEvidence ?? '', /QA260908_BE_137/, "the control still holds the goal's own value");
+    assert.equal(seen.length, 1, 'the leg ended before the turn that would have invented a new id');
+    assert.equal(
+      result.actions.some((a) => a.value === 'QA260908_BE_138'),
+      false,
+      "the goal's value is never replaced",
+    );
+  });
+
+  it('does not settle before the leg has acted — a refusal already on the page is not this leg\'s evidence', async () => {
+    const { model } = scripted([{ action: 'fail', reasoning: 'nothing to do here' }]);
+    const agent = new WorkflowAgent({ model, maxSteps: 3 });
+    const result = await agent.run(
+      fakePage({ url: CREATE_URL, nodes: TAKEN_NODES, trigger: 'Create Plan', options: [] }),
+      CREATE_GOAL,
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.endedBy, 'fail', 'the first turn is judged as it always was');
+  });
+
+  it('headingsOf keeps named headings, in order, at most eight', () => {
+    const nodes = Array.from({ length: 10 }, (_, i) => ({ role: 'heading', name: `H${i}`, value: '' })) as unknown as AxNode[];
+    assert.deepEqual(headingsOf(nodes).length, 8);
+    assert.deepEqual(
+      headingsOf([
+        { role: 'heading', name: 'One', value: '' },
+        { role: 'button', name: 'Two', value: '' },
+        { role: 'heading', name: '', value: '' },
+        { role: 'heading', name: 'Three', value: '' },
+      ] as unknown as AxNode[]),
+      ['One', 'Three'],
+    );
   });
 });

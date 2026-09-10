@@ -440,10 +440,46 @@ const CONTROL_TAIL = /(?:\s+(?:control|dropdown|filter|field|selector|box|button
 const NOT_A_CONTROL =
   /^(?:\d+|(?:test\s+)?(?:step|case|row|scenario)\s*\d*|menu(?:\s+path)?|steps?|data|test\s+data|expected(?:\s+result)?|actual(?:\s+result)?|note|login|persona|url|preconditions?|result|(?:at|by|from|until|before|after|around)\s+\d+)$/iu;
 
+// A COUNT is never a control (2026-09-08, PL_06_07 on HUMI SIT, run key
+// `pl-06-07-v2-csv@2026-09-08T07:53`). The goal "In the Condition searchable
+// multi-select, select more than one value: 'ePatient' and 'Tops care', so
+// that both appear as selected chips" puts its colon where a LIST OF VALUES
+// begins, not where a field is named: `OUTCOME_EQ` read the pair `select more
+// than one value` : `ePatient`, `CONTROL_LEAD` took the verb and `CONTROL_TAIL`
+// the generic noun, and the leg was asked to prove that some line of the tree
+// carries the words `more`, `than`, `one` AND `ePatient`. No page renders that,
+// so every finish was refused, the leg was sealed short of its goal, the nine
+// steps after it were skipped and the case ended blocked — while the tree in
+// fact held both chips. Neither existing guard could reach it: the value side
+// was a clean quoted literal, so `DESCRIBED_GOAL_VALUE` never saw the junk, and
+// the colon-introduces-a-list rule below needs a SECOND pair inside the value
+// span, which a one-pair sentence has not got. Every multi-select row is
+// written this way, so this is the class, not the sentence.
+//
+// Screened only as the WHOLE control, after cleaning: "Multiple Choice", "All
+// Employees" and "Any Status" are field names a page can show and keep their
+// pair. A quantifier standing alone is not a field name in any sheet.
+const COUNT_WORD = String.raw`(?:\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)`;
+// The generic noun a quantifier counts — "more than one VALUE", "both OPTIONS".
+// A PLURAL noun is all a bare determiner may take, because "Multiple Choice"
+// is a real field name and "multiple choices" is a wording; a count phrase
+// ("more than one value") and each/every take the singular too.
+const COUNTED_NOUN_PLURAL = String.raw`(?:values|options|items|entries|choices|selections|chips|tags|elements|records|rows|fields|checkboxes|answers)`;
+const COUNTED_NOUN = String.raw`(?:${COUNTED_NOUN_PLURAL}|value|option|item|entry|choice|selection|chip|tag|element|record|row|field|checkbox|answer)`;
+// The counting half: a comparison or a range, never a label a control renders.
+// `at` is optional because `CONTROL_LEAD` strips it as a preposition, so
+// "select at least two values: 'A'" reaches this screen as `least two values`.
+const COUNT_PHRASE = String.raw`(?:(?:more|less|fewer|greater)\s+than\s+${COUNT_WORD}|(?:(?:at\s+)?least|(?:at\s+)?most|no\s+more\s+than|no\s+fewer\s+than|up\s+to)\s+${COUNT_WORD}|${COUNT_WORD}\s+or\s+(?:more|less|fewer))`;
+const QUANTIFIER_CONTROL = new RegExp(
+  String.raw`^(?:${COUNT_PHRASE}(?:\s+${COUNTED_NOUN})?|(?:each|every|either)(?:\s+${COUNTED_NOUN})?|(?:all|any|both|some|several|multiple|many|various)(?:\s+of)?(?:\s+the)?(?:\s+${COUNT_WORD})?(?:\s+${COUNTED_NOUN_PLURAL})?|${COUNT_WORD}(?:\s+${COUNTED_NOUN})?)$`,
+  'iu',
+);
+
 function cleanControl(raw: string): string | null {
   const pieces = raw.trim().split(CONTROL_CONNECTOR);
   const control = (pieces[pieces.length - 1] ?? '').trim().replace(CONTROL_LEAD, '').replace(CONTROL_TAIL, '').trim();
   if (control.length < 2 || !/\p{L}/u.test(control) || NOT_A_CONTROL.test(control)) return null;
+  if (QUANTIFIER_CONTROL.test(control)) return null;
   return control;
 }
 
@@ -458,11 +494,20 @@ function cleanControl(raw: string): string | null {
 // says the finish rode the claim, as for any goal naming no checkable pair.
 const DESCRIBED_GOAL_VALUE = /^(?:a|an|any|some|another|other|different|something|anything)\s+(?!-)\p{L}|\bother than\b|\(for example\b|\be\.g\.|\bsuch as\b/iu;
 
+// The counting half of the same class on the VALUE side (PL_06_07, 2026-09-08):
+// a sheet states the expectation as "selected values = more than one", and no
+// tree renders "more than one" either. ONLY the counting phrases are screened
+// here — a bare determiner IS a real option label ("Status = All", "Coverage =
+// Both", "Type = Multiple"), and dropping those would trade a checkable pair
+// for a claim. Anchored, so a value that merely begins with one of these words
+// ("More Than One Ltd") keeps its pair.
+const COUNTED_GOAL_VALUE = new RegExp(String.raw`^${COUNT_PHRASE}(?:\s+${COUNTED_NOUN})?$`, 'iu');
+
 function cleanValue(raw: string): string | null {
   const value = raw.trim();
   // A placeholder the author left in ("<plan name>") names no value.
   if (value === '' || value.length > 60 || /^<[^>]*>$/.test(value)) return null;
-  if (DESCRIBED_GOAL_VALUE.test(value)) return null;
+  if (DESCRIBED_GOAL_VALUE.test(value) || COUNTED_GOAL_VALUE.test(value)) return null;
   return value;
 }
 
@@ -747,6 +792,45 @@ export function differentPage(before: string, after: string): boolean {
 }
 
 /**
+ * Is `url` a page BELOW `startUrl` — the same origin, and a path `startUrl`'s
+ * path is a prefix of at a segment boundary (`/a/b` → `/a/b/create`)?
+ *
+ * Live (PL_09_01, run `be-high-sonnet-20260909-153617`, lane c14): a leg whose
+ * goal was to create a fixture row started on the plans list, clicked the
+ * page's own Create control, and the application opened the list page's own
+ * `…/create` view. `differentPage` reads that as another page, so the off-page
+ * allowance began counting on a leg that had gone exactly where its goal sent
+ * it; eight turns of ordinary form work later — a date picker, a company
+ * search, a submit — the leg was ended as a wander on the turn after the
+ * submit, and the case scored "never ran: runtime error" with no verdict at
+ * all.
+ *
+ * A descendant path is where a list page's own create / edit / detail view
+ * lives, on every application this harness has run against. The other end of
+ * the journey is already read that way: `atGoalDestination` is containment, so
+ * a goal naming `/plans` counts `/plans/create` as arrival — this applies the
+ * same reading to the page a step began on. A SIBLING (`/plans` → `/rules`) is
+ * not a child and still spends the allowance, which is the wander the rail was
+ * built for.
+ *
+ * A start path of `/` has no children here: everything is below a site root,
+ * so the rule would withdraw the rail from every leg that began on one — the
+ * same reason `goalDestination` refuses a bare `/`.
+ */
+export function childPage(startUrl: string, url: string): boolean {
+  try {
+    const a = new URL(startUrl);
+    const b = new URL(url);
+    if (a.origin !== b.origin) return false;
+    const base = a.pathname.replace(/\/+$/, '');
+    if (base.length < 2) return false;
+    return b.pathname === base || b.pathname.startsWith(`${base}/`);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Is the agent off the page its step began on, somewhere the goal did not
  * name?
  *
@@ -756,16 +840,84 @@ export function differentPage(before: string, after: string): boolean {
  * admin area), and every goto or click onto a fresh page was progress by the
  * no-progress judge's own rule, so only DEFAULT_AGENT_MAX_STEPS ended them —
  * 60 turns at ~7 s each. True when the URL is on a different origin or path
- * from `startUrl` (a `?step=` change is the same page, see `differentPage`)
- * AND is not at the destination the goal names — a goal naming no
- * destination has nowhere off its page that counts. Pure: what the loop
- * does with it (the AGENT_OFF_PAGE_TURNS allowance, the consent exemption,
- * the reset on return) lives beside the other judges in `workflow-agent`.
+ * from `startUrl` (a `?step=` change is the same page, see `differentPage`),
+ * is not BELOW the step's own page (`childPage` — the list's own create view
+ * is not a wander; PL_09_01, 2026-09-09) AND is not at the destination the
+ * goal names — a goal naming no destination has nowhere off its page that
+ * counts, which is most goals, since a goal is written in the user's terms
+ * and rarely holds a path at all. Pure: what the loop does with it (the
+ * AGENT_OFF_PAGE_TURNS allowance, the free turn for work that changed the
+ * page, the consent exemption, the reset on return) lives beside the other
+ * judges in `workflow-agent`.
  */
 export function wanderedOffPage(goal: string, startUrl: string, url: string): boolean {
   if (!differentPage(startUrl, url)) return false;
+  if (childPage(startUrl, url)) return false;
   const destination = goalDestination(goal);
   return destination === null || !atGoalDestination(url, destination);
+}
+
+/**
+ * The application's own statement that a record the goal asks for is ALREADY
+ * THERE — a duplicate-key refusal naming the field whose value the goal names.
+ *
+ * Live twice in one run (`be-high-sonnet-20260909-153617`, 2026-09-09). Both
+ * legs were fixture creation whose row survived from an earlier run:
+ *  - PL_09_01 filled the form with the plan id the goal names, submitted, and
+ *    read back `Plan ID already exists.` — then reasoned "the goal explicitly
+ *    requires Plan ID=…; …best conservative action is to retry" and typed a
+ *    DIFFERENT id, which the flow's very next step (`expectVisible` on the
+ *    id the goal names) could never have matched.
+ *  - PL_06_05 called `fail` on the same message, and the case ended "never
+ *    ran: no verdict — the agent's own account, unverified".
+ * Two cases lost to a fixture that was present the whole time.
+ *
+ * The evidence is the page's, never the model's summary: a line of the tree
+ * THE HARNESS read carries a duplicate-key refusal AND the words of a control
+ * the goal names a value for, and `outcomeShown` finds that control still
+ * holding that value on the live tree. So the value the application refused as
+ * taken is demonstrably the value the goal requires — not a value the model
+ * says it typed. Nothing here proves the OTHER pairs of a multi-field goal;
+ * what it settles is that the keyed record exists, and the deterministic step
+ * the flow puts after the leg (`expectVisible text=<the id>`) is the
+ * independent witness. If the row is not really there, that step fails and the
+ * case fails honestly — which is the outcome this replaces "never ran" with.
+ *
+ * Deliberately narrow: an error line that names no field, a goal whose pairs
+ * this module cannot read, or a control the live tree does not show holding
+ * the goal's value all return null and the leg goes on exactly as before.
+ */
+const DUPLICATE_KEY_ERROR =
+  /\balready\s+(?:exists?|in\s+use|taken|registered|been\s+(?:used|taken|registered))\b|\bmust\s+be\s+unique\b|\bis\s+(?:a\s+)?duplicated?\b|\bduplicate\s+(?:key|entry|value|record|id)\b|ซ้ำ|มีอยู่แล้ว|มีอยู่ในระบบ/iu;
+
+export interface FixturePresent {
+  /** The goal's own pair the application refused as taken. */
+  outcome: GoalOutcome;
+  /** The refusal, verbatim from the tree the harness read. */
+  error: string;
+  /** The line showing that control still holding the goal's value. */
+  shown: string;
+}
+
+export function fixtureAlreadyPresent(goal: string, axTree: string): FixturePresent | null {
+  if (!DUPLICATE_KEY_ERROR.test(axTree)) return null;
+  const outcomes = goalOutcomes(goal);
+  if (outcomes.length === 0) return null;
+  for (const raw of axTree.split('\n')) {
+    if (!DUPLICATE_KEY_ERROR.test(raw)) continue;
+    const line = raw.toLowerCase();
+    for (const outcome of outcomes) {
+      // The refusal must name the FIELD, the way "Plan ID already exists."
+      // does — a bare "this record already exists" scopes to nothing and is
+      // left alone. Same word test `outcomeShown` uses for a control.
+      const words = outcome.control.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
+      if (words.length === 0 || !words.every((w) => line.includes(w))) continue;
+      const shown = outcomeShown(outcome, axTree);
+      if (shown === null) continue;
+      return { outcome, error: raw.trim(), shown };
+    }
+  }
+  return null;
 }
 
 /** `?step=2#top` — the part of a URL that is not the page. Empty when unparsable. */

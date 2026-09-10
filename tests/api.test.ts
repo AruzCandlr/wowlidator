@@ -15,7 +15,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 
-import { FetchTransport, parseJson, recordOf } from '../src/api/api-client.js';
+import { ApiActions, resolveUrl } from '../src/api/api-actions.js';
+import {
+  FetchTransport,
+  parseJson,
+  recordOf,
+  type ApiRequestSpec,
+  type ApiResponse,
+  type ApiTransport,
+} from '../src/api/api-client.js';
+import {
+  buildHeaderProfile,
+  headerRefusal,
+  type HeaderObservation,
+  type HeaderProfile,
+} from '../src/api/header-profile.js';
 import { classifyCall, isBlockingFailure, type NetworkCall } from '../src/api/network-observer.js';
 import {
   REDACTED,
@@ -77,6 +91,21 @@ function call(overrides: Partial<NetworkCall> = {}): NetworkCall {
 }
 
 // --- Redaction --------------------------------------------------------------
+
+describe('resolveUrl (shared by request and goto steps)', () => {
+  it('keeps the deployment base path under an absolute path, for goto as for request', () => {
+    // The engine's `goto` had its own `new URL(url, baseUrl)` twin of this
+    // resolver; a 2026-09-05 smoke run authored `goto /th/admin/hire` under
+    // `https://h/humi` and the twin sent it to the gateway's 404 while the
+    // request resolver had already been fixed. One resolver now serves both.
+    assert.equal(resolveUrl('/th/admin/hire', 'https://h/humi'), 'https://h/humi/th/admin/hire');
+    assert.equal(resolveUrl('/humi/th/admin/hire', 'https://h/humi'), 'https://h/humi/th/admin/hire');
+    assert.equal(resolveUrl('https://h/th/x', 'https://h/humi'), 'https://h/th/x');
+    assert.equal(resolveUrl('/th/x', 'https://h'), 'https://h/th/x');
+    assert.equal(resolveUrl('/th/x', undefined), '/th/x');
+    assert.equal(resolveUrl('/humi', 'https://h/humi'), 'https://h/humi');
+  });
+});
 
 describe('redaction', () => {
   it('masks credential headers case-insensitively and keeps the names', () => {
@@ -581,6 +610,26 @@ describe('browser-free api flows', () => {
     assert.equal(bundle.summary.apiRequests, 2);
     assert.equal(bundle.cdpUrl, null, 'no browser was involved, and the bundle should say so');
     assert.equal(bundle.summary.totalSteps, 4);
+  });
+
+  it('an absolute-path request keeps the base URL\'s own path', async () => {
+    // `new URL('/api/x', 'https://h/app')` drops `/app` and asks the gateway
+    // instead of the application — measured live 2026-09-05 as 27 HTML 404s
+    // on paths the page itself called successfully under its base path.
+    const flow: Flow = {
+      name: 'base-path',
+      baseUrl: `${origin}/app`,
+      steps: [
+        { action: 'request', method: 'GET', url: '/api/orders/ord_1' },
+        { action: 'request', method: 'GET', url: '/app/api/orders/ord_1', intent: 'already under the base path' },
+        { action: 'request', method: 'GET', url: `${origin}/api/orders/ord_1`, intent: 'absolute stays absolute' },
+      ],
+    };
+    const bundle = await runFlow(flow, { cdpUrl: 'http://127.0.0.1:1', historyPath: null });
+    const urls = bundle.steps.map((s) => s.request?.url);
+    assert.equal(urls[0], `${origin}/app/api/orders/ord_1`);
+    assert.equal(urls[1], `${origin}/app/api/orders/ord_1`);
+    assert.equal(urls[2], `${origin}/api/orders/ord_1`);
   });
 
   it('still runs teardown after a failed body', async () => {
@@ -1803,5 +1852,320 @@ describe('variable store: {{date:…}} builtins and {{name+N}} arithmetic', () =
     store.set('label', 'Active');
     assert.throws(() => store.interpolate('{{label+1}}'), /is not a number/);
     assert.throws(() => store.interpolate('{{missing+1}}'), UnknownVariableError);
+  });
+});
+
+// --- The header floor for a deliberate request ------------------------------
+//
+// 2026-09-08, PL_11_03 / PL_10_23: `BrowserContext.request` shares the cookie
+// jar and no application headers at all, so an export pulled over `request`
+// came back `400 Missing required header(s)` with `requestHeaders: {}` on the
+// bundle — a harness fault filed as a backend defect. All pure: a stubbed
+// transport and a stubbed profile, no browser and no model.
+
+describe('header profile harvested from the page\'s own traffic', () => {
+  const target = { url: 'https://app.test/api/export', hasBody: false };
+
+  function sample(headers: Record<string, string>, origin = 'https://app.test'): HeaderObservation {
+    return { origin, headers };
+  }
+
+  it('merges the headers every observed same-origin call carried', () => {
+    const profile = buildHeaderProfile(
+      [
+        sample({ accept: 'application/json', 'x-source-system': 'web', referer: 'https://app.test/plans' }),
+        sample({ accept: 'application/json', 'x-source-system': 'web', referer: 'https://app.test/plans' }),
+      ],
+      target,
+    );
+    assert.ok(profile);
+    assert.equal(profile.headers['x-source-system'], 'web');
+    assert.equal(profile.headers['accept'], 'application/json');
+    assert.equal(profile.observedCalls, 2);
+    assert.deepEqual(profile.regenerated, []);
+  });
+
+  it('regenerates a per-request unique value rather than replaying one', () => {
+    const first = '4f1a2b3c-1111-4222-8333-abcdefabcdef';
+    const second = '9e8d7c6b-2222-4333-8444-fedcbafedcba';
+    const profile = buildHeaderProfile(
+      [sample({ 'x-correlation-id': first }), sample({ 'x-correlation-id': second })],
+      target,
+    );
+    assert.ok(profile);
+    const value = profile.headers['x-correlation-id'] ?? '';
+    assert.deepEqual(profile.regenerated, ['x-correlation-id']);
+    assert.notEqual(value, first);
+    assert.notEqual(value, second);
+    assert.match(value, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it('keeps the constant segments of a structured id and redraws only what varied', () => {
+    const profile = buildHeaderProfile(
+      [
+        sample({ traceparent: '00-1111111111111111111111111111aaaa-1111111111111111-01' }),
+        sample({ traceparent: '00-2222222222222222222222222222bbbb-2222222222222222-01' }),
+      ],
+      target,
+    );
+    assert.ok(profile);
+    const value = profile.headers['traceparent'] ?? '';
+    const parts = value.split('-');
+    assert.equal(parts[0], '00', 'the version prefix never varied, so it is kept');
+    assert.equal(parts[3], '01', 'the flags never varied either');
+    assert.equal(parts[1]?.length, 32);
+    assert.equal(parts[2]?.length, 16);
+    assert.match(value, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    assert.ok(!value.includes('1111111111111111111111111111aaaa'));
+  });
+
+  it('replays a header seen only once, because one sample cannot show variance', () => {
+    const profile = buildHeaderProfile([sample({ 'x-request-id': 'only-one' })], target);
+    assert.equal(profile?.headers['x-request-id'], 'only-one');
+    assert.deepEqual(profile?.regenerated, []);
+  });
+
+  it('never inherits a transport-owned header', () => {
+    const profile = buildHeaderProfile(
+      [
+        sample({
+          cookie: 'session=abc',
+          'content-length': '412',
+          host: 'app.test',
+          ':authority': 'app.test',
+          'accept-encoding': 'gzip',
+          'if-none-match': 'W/"7"',
+          'sec-fetch-mode': 'cors',
+          'x-source-system': 'web',
+        }),
+      ],
+      target,
+    );
+    assert.ok(profile);
+    for (const name of ['cookie', 'content-length', 'host', ':authority', 'accept-encoding', 'if-none-match', 'sec-fetch-mode']) {
+      assert.equal(profile.headers[name], undefined, `${name} must not travel`);
+    }
+    assert.equal(profile.headers['x-source-system'], 'web');
+  });
+
+  it('inherits a content-type only when the call actually sends a body', () => {
+    const observed = [sample({ 'content-type': 'application/json', accept: 'application/json' })];
+    assert.equal(buildHeaderProfile(observed, target)?.headers['content-type'], undefined);
+    assert.equal(
+      buildHeaderProfile(observed, { ...target, hasBody: true })?.headers['content-type'],
+      'application/json',
+    );
+  });
+
+  it('gives a cross-origin request nothing at all', () => {
+    const observed = [sample({ 'x-source-system': 'web' })];
+    assert.equal(buildHeaderProfile(observed, { url: 'https://other.test/api/x', hasBody: false }), null);
+    assert.equal(buildHeaderProfile(observed, { url: '/api/relative', hasBody: false }), null);
+  });
+});
+
+describe('a request step sends what the page sends', () => {
+  class RecordingTransport implements ApiTransport {
+    readonly id = 'recording';
+    readonly sent: ApiRequestSpec[] = [];
+    constructor(private readonly reply: ApiResponse) {}
+    async send(spec: ApiRequestSpec): Promise<ApiResponse> {
+      this.sent.push({ ...spec, headers: { ...(spec.headers ?? {}) } });
+      return this.reply;
+    }
+  }
+
+  const ok: ApiResponse = {
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    body: '{"ok":true}',
+    durationMs: 3,
+    sizeBytes: 11,
+  };
+
+  function actions(
+    transport: ApiTransport,
+    profile: HeaderProfile | null,
+  ): { api: ApiActions; bundle: ProofBundleBuilder } {
+    const bundle = new ProofBundleBuilder({ name: 'headers', cdpUrl: null, cachePath: null });
+    const api = new ApiActions({ transport, bundle, headerProfile: () => profile });
+    return { api, bundle };
+  }
+
+  const profile: HeaderProfile = {
+    headers: {
+      accept: 'application/json',
+      'x-source-system': 'web',
+      authorization: 'Bearer live-token-value',
+      'x-correlation-id': 'fresh-1234',
+    },
+    regenerated: ['x-correlation-id'],
+    observedCalls: 3,
+  };
+
+  it('puts the observed floor under the authored headers', async () => {
+    const transport = new RecordingTransport(ok);
+    const { api } = actions(transport, profile);
+    await api.request({ method: 'GET', url: 'https://app.test/api/export' });
+
+    const headers = transport.sent[0]?.headers ?? {};
+    assert.equal(headers['x-source-system'], 'web');
+    assert.equal(headers['accept'], 'application/json');
+    assert.equal(headers['authorization'], 'Bearer live-token-value');
+  });
+
+  it('never overwrites a header the flow authored, whatever its case', async () => {
+    const transport = new RecordingTransport(ok);
+    const { api } = actions(transport, profile);
+    await api.request({
+      method: 'GET',
+      url: 'https://app.test/api/export',
+      headers: { Accept: 'text/csv' },
+    });
+
+    const headers = transport.sent[0]?.headers ?? {};
+    assert.equal(headers['Accept'], 'text/csv');
+    assert.equal(headers['accept'], undefined, 'the floor must not shadow the authored spelling');
+    assert.equal(headers['x-source-system'], 'web', 'the rest of the floor still applies');
+  });
+
+  it('inheritHeaders false sends only what was authored — a malformed request stays expressible', async () => {
+    const transport = new RecordingTransport(ok);
+    const { api, bundle } = actions(transport, profile);
+    await api.request({
+      method: 'GET',
+      url: 'https://app.test/api/export',
+      headers: {},
+      inheritHeaders: false,
+    });
+
+    assert.deepEqual(transport.sent[0]?.headers, {});
+    assert.equal(bundle.steps[0]?.request?.inheritedHeaders, undefined);
+  });
+
+  it('records which headers the harness supplied, and redacts their values', async () => {
+    const transport = new RecordingTransport(ok);
+    const { api, bundle } = actions(transport, profile);
+    await api.request({ method: 'GET', url: 'https://app.test/api/export' });
+
+    const record = bundle.steps[0]?.request;
+    assert.ok(record);
+    assert.deepEqual(record.inheritedHeaders, [
+      'accept',
+      'authorization',
+      'x-correlation-id',
+      'x-source-system',
+    ]);
+    assert.deepEqual(record.regeneratedHeaders, ['x-correlation-id']);
+    // The raw bearer went out on the wire and must not survive into the bundle.
+    assert.equal(record.requestHeaders?.['authorization'], REDACTED);
+    assert.doesNotMatch(JSON.stringify(bundle.finish()), /live-token-value/);
+  });
+
+  it('sends exactly what it always did when nothing was observed', async () => {
+    const transport = new RecordingTransport(ok);
+    const { api, bundle } = actions(transport, null);
+    await api.request({ method: 'GET', url: 'https://app.test/api/export' });
+
+    assert.deepEqual(transport.sent[0]?.headers, {});
+    assert.equal(bundle.steps[0]?.request?.inheritedHeaders, undefined);
+  });
+
+  it('costs a header and never the step when the observer throws', async () => {
+    const transport = new RecordingTransport(ok);
+    const bundle = new ProofBundleBuilder({ name: 'throws', cdpUrl: null, cachePath: null });
+    const api = new ApiActions({
+      transport,
+      bundle,
+      headerProfile: () => {
+        throw new Error('observer detached');
+      },
+    });
+    await api.request({ method: 'GET', url: 'https://app.test/api/export' });
+    assert.equal(bundle.steps[0]?.status, 'passed');
+  });
+});
+
+describe('a header-level refusal is harness drift, not a backend defect', () => {
+  it('recognises an ordinary 4xx complaint about a header, and nothing else', () => {
+    assert.deepEqual(
+      headerRefusal(400, '{"message":"Missing required header(s): x-correlation-id, x-source-system"}'),
+      ['x-correlation-id', 'x-source-system'],
+    );
+    assert.ok(headerRefusal(412, 'The If-Match header is required'));
+    assert.equal(headerRefusal(400, '{"message":"name must not be empty"}'), null, 'a real validation failure');
+    assert.equal(headerRefusal(500, 'missing required header'), null, 'a 5xx is the server, whatever it says');
+    assert.equal(headerRefusal(200, 'missing required header'), null);
+  });
+
+  it('does not reproduce an id out of the response body', () => {
+    const names = headerRefusal(
+      400,
+      '{"message":"Missing required header: x-source-system","requestId":"4f1a2b3c-1111-4222-8333-abcdefabcdef"}',
+    );
+    assert.deepEqual(names, ['x-source-system']);
+  });
+
+  it('fails expectStatus with the harness-class name and files no defect', async () => {
+    const bundle = new ProofBundleBuilder({ name: 'refused', cdpUrl: null, cachePath: null });
+    const defects: string[] = [];
+    const api = new ApiActions({
+      transport: {
+        id: 'stub',
+        async send(): Promise<ApiResponse> {
+          return {
+            status: 400,
+            statusText: 'Bad Request',
+            headers: {},
+            body: '{"message":"Missing required header(s): x-correlation-id"}',
+            durationMs: 2,
+            sizeBytes: 50,
+          };
+        },
+      },
+      bundle,
+      recordDefect: (_category, _severity, title) => defects.push(title),
+    });
+
+    await api.request({ method: 'GET', url: 'https://app.test/api/export' });
+    await assert.rejects(() => api.expectStatus(200), (error: Error) => {
+      assert.equal(error.name, 'HeaderRefusedError');
+      assert.match(error.message, /x-correlation-id/);
+      assert.match(error.message, /harness drift, not a backend defect/);
+      return true;
+    });
+    assert.deepEqual(defects, [], 'the endpoint answered a malformed request correctly');
+    // The constitution survives: the request step itself still passed.
+    assert.equal(bundle.steps[0]?.status, 'passed');
+  });
+
+  it('still fails a plain 4xx as a backend finding when no header is named', async () => {
+    const bundle = new ProofBundleBuilder({ name: 'plain', cdpUrl: null, cachePath: null });
+    const defects: string[] = [];
+    const api = new ApiActions({
+      transport: {
+        id: 'stub',
+        async send(): Promise<ApiResponse> {
+          return {
+            status: 400,
+            statusText: 'Bad Request',
+            headers: {},
+            body: '{"message":"planCode must not be empty"}',
+            durationMs: 2,
+            sizeBytes: 40,
+          };
+        },
+      },
+      bundle,
+      recordDefect: (_category, _severity, title) => defects.push(title),
+    });
+
+    await api.request({ method: 'GET', url: 'https://app.test/api/export' });
+    await assert.rejects(() => api.expectStatus(200), (error: Error) => {
+      assert.notEqual(error.name, 'HeaderRefusedError');
+      return true;
+    });
+    assert.equal(defects.length, 1);
   });
 });

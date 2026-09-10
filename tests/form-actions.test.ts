@@ -116,6 +116,16 @@ const FORM_FIXTURE_HTML = `<!doctype html>
 
     <label><input id="agree" type="checkbox"> I agree</label>
     <button id="notify" type="button" aria-pressed="false">Notify me</button>
+    <button id="insert-btn" type="button" title="Insert">+</button>
+
+    <!-- PL_06_05 (be-sit-high-20260909-170213): required exposed only via
+         aria-required, not the HTML boolean attribute. -->
+    <label for="plan-id">Benefit Plan ID</label>
+    <input id="plan-id" type="text" aria-required="true">
+    <label for="plan-name">Plan Name</label>
+    <input id="plan-name" type="text" aria-required="false">
+    <label for="plan-notes">Notes</label>
+    <input id="plan-notes" type="text">
 
     <!-- humi-SIT's HumiDatePicker idiom: a read-only display named by its
          placeholder, drawn over the hidden date input the label points at. -->
@@ -129,6 +139,19 @@ const FORM_FIXTURE_HTML = `<!doctype html>
     <input id="search" type="text" autocomplete="off">
     <div id="suggestions" hidden>Suggested: matches</div>
 
+    <!-- HumiSearchableSelect's shape (src/engine/CLAUDE.md, ec10 post-mortem):
+         aria-haspopup="listbox" and nothing else — no aria-controls, and the
+         panel that opens is a bare search box. The role=listbox/option tree
+         does not exist in the DOM at all until something is typed. -->
+    <button id="country-btn" type="button" aria-haspopup="listbox">Country</button>
+    <div id="country-panel" hidden>
+      <input id="country-search" type="text" placeholder="Type to search...">
+      <ul id="country-list" role="listbox" hidden>
+        <li role="option" tabindex="-1">Thailand</li>
+        <li role="option" tabindex="-1">Vietnam</li>
+      </ul>
+    </div>
+
     <p id="status">idle</p>
     <script>
       const status = (t) => { document.getElementById('status').textContent = t; };
@@ -138,6 +161,17 @@ const FORM_FIXTURE_HTML = `<!doctype html>
       btn.addEventListener('click', () => { list.hidden = !list.hidden; });
       for (const el of list.querySelectorAll('[role="option"]')) {
         el.addEventListener('click', () => { status('city:' + el.textContent.trim()); list.hidden = true; });
+      }
+      const countryBtn = document.getElementById('country-btn');
+      const countryPanel = document.getElementById('country-panel');
+      const countrySearch = document.getElementById('country-search');
+      const countryList = document.getElementById('country-list');
+      countryBtn.addEventListener('click', () => { countryPanel.hidden = false; countryList.hidden = true; });
+      countrySearch.addEventListener('input', () => {
+        countryList.hidden = countrySearch.value.trim() === '';
+      });
+      for (const el of countryList.querySelectorAll('[role="option"]')) {
+        el.addEventListener('click', () => { status('country:' + el.textContent.trim()); countryPanel.hidden = true; });
       }
       document.getElementById('agree').addEventListener('change', (e) => status(e.target.checked ? 'agreed' : 'unagreed'));
       const notify = document.getElementById('notify');
@@ -268,6 +302,40 @@ describe('form actions against a real page (CDP)', { skip: skipBrowser }, () => 
     assert.match(step?.error ?? '', /no option named "Phuket"/);
   });
 
+  it('types into a search box that appears only after opening, when the list itself does not exist until typing starts (RC-5)', async () => {
+    const flow: Flow = {
+      name: 'lazy searchable listbox',
+      baseUrl: origin,
+      steps: [
+        { action: 'goto', url: '/' },
+        { action: 'selectOption', selector: '#country-btn', value: 'Thailand' },
+        { action: 'expectText', selector: '#status', value: 'country:Thailand' },
+      ],
+    };
+    const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'lazy-listbox.json') });
+    assert.equal(bundle.status, 'passed', bundle.error ?? 'the lazily-rendered list should still be found and picked');
+  });
+
+  it('still fails, naming what the list held, when the typed value matches nothing in it (RC-5)', async () => {
+    const flow: Flow = {
+      name: 'lazy searchable listbox, no match',
+      baseUrl: origin,
+      steps: [
+        { action: 'goto', url: '/' },
+        { action: 'selectOption', selector: '#country-btn', value: 'Laos', intent: 'a value the list never offers' },
+      ],
+    };
+    const bundle = await runFlow(flow, {
+      cdpUrl: CDP_URL,
+      cachePath: join(dir, 'lazy-listbox-miss.json'),
+      fastTimeoutMs: 500,
+      healedTimeoutMs: 500,
+    });
+    assert.notEqual(bundle.status, 'passed', 'typing a probe into the search box must never manufacture a match');
+    const step = bundle.steps.find((s) => s.action === 'selectOption');
+    assert.match(step?.error ?? '', /no option named "Laos"/);
+  });
+
   it('checks and unchecks a native checkbox, verifying the state moved', async () => {
     const flow: Flow = {
       name: 'checkbox',
@@ -301,6 +369,67 @@ describe('form actions against a real page (CDP)', { skip: skipBrowser }, () => 
     };
     const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'toggle.json') });
     assert.equal(bundle.status, 'passed', bundle.error ?? 'aria toggle should honour check/uncheck');
+  });
+
+  it('expectAttribute "required" is satisfied by aria-required="true" (PL_06_05)', async () => {
+    const flow: Flow = {
+      name: 'required via aria',
+      baseUrl: origin,
+      steps: [
+        { action: 'goto', url: '/' },
+        { action: 'expectAttribute', selector: '#plan-id', name: 'required', value: '' },
+      ],
+    };
+    const bundle = await runFlow(flow, { cdpUrl: CDP_URL, cachePath: join(dir, 'aria-required.json') });
+    assert.equal(bundle.status, 'passed', bundle.error ?? 'aria-required="true" must satisfy a bare `required` claim');
+    const step = bundle.steps.find((s) => s.action === 'expectAttribute');
+    assert.equal(step?.detail?.['matchedVia'], 'aria-required');
+  });
+
+  it('never turns a genuinely unrequired or absent state into a pass', async () => {
+    const notRequired = await runFlow(
+      {
+        name: 'aria-required false',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'expectAttribute', selector: '#plan-name', name: 'required', value: '' },
+        ],
+      },
+      { cdpUrl: CDP_URL, cachePath: join(dir, 'aria-required-false.json'), fastTimeoutMs: 500 },
+    );
+    assert.notEqual(notRequired.status, 'passed', 'aria-required="false" must not satisfy a required claim');
+    assert.match(notRequired.steps.find((s) => s.action === 'expectAttribute')?.error ?? '', /aria-required is "false"/);
+
+    const noAriaAtAll = await runFlow(
+      {
+        name: 'no aria attribute at all',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'expectAttribute', selector: '#plan-notes', name: 'required', value: '' },
+        ],
+      },
+      { cdpUrl: CDP_URL, cachePath: join(dir, 'aria-required-absent.json'), fastTimeoutMs: 500 },
+    );
+    assert.notEqual(noAriaAtAll.status, 'passed', 'no evidence of the state at all must not satisfy a required claim');
+    assert.match(noAriaAtAll.steps.find((s) => s.action === 'expectAttribute')?.error ?? '', /absent too/);
+  });
+
+  it('leaves a non-state attribute reading only the raw attribute, byte for byte (RU_07_01)', async () => {
+    const bundle = await runFlow(
+      {
+        name: 'title unaffected',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'expectAttribute', selector: '#insert-btn', name: 'title', value: 'Insert' },
+        ],
+      },
+      { cdpUrl: CDP_URL, cachePath: join(dir, 'title.json') },
+    );
+    assert.equal(bundle.status, 'passed', bundle.error ?? '');
+    assert.equal(bundle.steps.find((s) => s.action === 'expectAttribute')?.detail?.['matchedVia'], undefined);
   });
 
   it('type fires the per-keystroke events fill cannot', async () => {

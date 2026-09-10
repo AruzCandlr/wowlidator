@@ -29,6 +29,13 @@
 
 import type { CDPSession, Page } from 'playwright';
 
+import {
+  buildHeaderProfile,
+  originOf,
+  type HeaderObservation,
+  type HeaderProfile,
+  type HeaderProfileTarget,
+} from './header-profile.js';
 import { redactBody, redactHeaders, redactUrl, type RedactionPolicy } from './redact.js';
 
 /**
@@ -37,6 +44,26 @@ import { redactBody, redactHeaders, redactUrl, type RedactionPolicy } from './re
  * long run into a memory leak and a 40 MB bundle.
  */
 export const DEFAULT_MAX_CALLS = 300;
+
+/**
+ * How many of the page's own calls to keep RAW headers for.
+ *
+ * A separate, much smaller buffer from the ring above, and deliberately not
+ * part of it: these samples are unredacted, exist only in memory, and are read
+ * by exactly one caller (`headerProfile`). Small because a merge needs variety,
+ * not volume — a handful of calls already shows which header names the
+ * application always sends and which of them it computes per request.
+ */
+export const DEFAULT_MAX_HEADER_SAMPLES = 25;
+
+/**
+ * The types worth harvesting a header floor from.
+ *
+ * `Document` is excluded even though it is recorded: a navigation carries
+ * `accept: text/html`, `sec-fetch-mode: navigate` and none of the API headers,
+ * so merging it in would describe the wrong kind of call.
+ */
+const HARVESTED_TYPES: ReadonlySet<string> = new Set(['XHR', 'Fetch']);
 
 /**
  * Resource types worth recording.
@@ -92,6 +119,14 @@ export interface NetworkObserverOptions {
   redaction?: RedactionPolicy | undefined;
   /** Record request/response headers at all. Default true (already redacted). */
   headers?: boolean | undefined;
+  /**
+   * Keep a raw, in-memory header profile of the page's own XHR/Fetch calls, so
+   * a deliberate `request` step can go out looking like one of them. Default
+   * true. Turning it off returns `headerProfile()` to `null` and `request`
+   * steps to sending only what the flow authored.
+   */
+  harvestHeaders?: boolean | undefined;
+  maxHeaderSamples?: number | undefined;
 }
 
 interface CdpRequestWillBeSent {
@@ -163,11 +198,27 @@ export class NetworkObserver {
   #dropped = 0;
   #detached = false;
 
+  /**
+   * Raw request headers of the page's own XHR/Fetch calls, oldest first.
+   *
+   * **In memory only, and never in `#calls`.** `#record`'s ring buffer is what
+   * reaches the proof bundle, and everything in it has been through
+   * `redactHeaders` — which is exactly what makes it useless as a source for
+   * replaying a request. This second, unredacted buffer exists for
+   * `headerProfile()` alone; nothing else may read it, and nothing here is
+   * written to disk.
+   */
+  readonly #rawSamples: HeaderObservation[] = [];
+  readonly #harvestHeaders: boolean;
+  readonly #maxHeaderSamples: number;
+
   private constructor(session: CDPSession, options: NetworkObserverOptions) {
     this.#session = session;
     this.#maxCalls = options.maxCalls ?? DEFAULT_MAX_CALLS;
     this.#redaction = options.redaction ?? {};
     this.#headers = options.headers ?? true;
+    this.#harvestHeaders = options.harvestHeaders ?? true;
+    this.#maxHeaderSamples = options.maxHeaderSamples ?? DEFAULT_MAX_HEADER_SAMPLES;
   }
 
   /**
@@ -229,6 +280,38 @@ export class NetworkObserver {
     this.#byId.set(call.id, call);
     this.#calls.push(call);
     this.#trim();
+    this.#harvest(event);
+  }
+
+  /**
+   * Keep the raw headers of one of the page's own API calls.
+   *
+   * Deliberately reads `event.request.headers` rather than `call.requestHeaders`
+   * — the latter has already been through `redactHeaders`, and a `[redacted]`
+   * authorization is worse than none.
+   */
+  #harvest(event: CdpRequestWillBeSent): void {
+    if (!this.#harvestHeaders) return;
+    if (!HARVESTED_TYPES.has(event.type ?? '')) return;
+    const headers = event.request.headers;
+    if (!headers || Object.keys(headers).length === 0) return;
+    const origin = originOf(event.request.url);
+    if (origin === null) return;
+    this.#rawSamples.push({ origin, headers: { ...headers } });
+    while (this.#rawSamples.length > this.#maxHeaderSamples) this.#rawSamples.shift();
+  }
+
+  /**
+   * The header floor for a deliberate request to `target.url`: what the page's
+   * own same-origin calls all carried, with any per-request unique value drawn
+   * fresh. `null` when nothing was observed on that origin.
+   *
+   * The raw samples never leave this object — only the merged profile does, and
+   * its values reach a record through `redact.ts` like every other header.
+   */
+  headerProfile(target: HeaderProfileTarget): HeaderProfile | null {
+    if (this.#rawSamples.length === 0) return null;
+    return buildHeaderProfile(this.#rawSamples, target);
   }
 
   #onResponse(event: CdpResponseReceived): void {
@@ -320,6 +403,9 @@ export class NetworkObserver {
   async detach(): Promise<void> {
     if (this.#detached) return;
     this.#detached = true;
+    // The raw samples outlive nothing: the page is going away and they are the
+    // one unredacted thing this object holds.
+    this.#rawSamples.length = 0;
     try {
       await this.#session.send('Network.disable');
     } catch {

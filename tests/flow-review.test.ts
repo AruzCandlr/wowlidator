@@ -61,6 +61,41 @@ describe('auditGrounding — what the author wrote with nothing behind it', () =
     assert.match(findings[0]!.reason, /not a route/);
   });
 
+  it('a name the repository declares VERBATIM is grounded — the second source the prompt names (2026-09-08)', () => {
+    // Live (be-cycle1-sit RU_10_11 / RU_06_13): the page is reached only
+    // through an agent leg, so no tree covers it; the review answered `unsure`
+    // 507 times and, twice, `keep` quoting a message catalog. The step-evidence
+    // lookup finds that same declaration by string comparison, and the audit
+    // stops spending a model call to be told it.
+    const steps: FlowStep[] = [
+      { action: 'workflow', goal: 'open the rules page, end on /en/benefits-admin' },
+      { action: 'click', selector: 'role=button[name="Export CSV"]' },
+    ];
+    assert.equal(auditGrounding([], steps, evidence).length, 1, 'flagged without the lookup');
+    assert.equal(
+      auditGrounding([], steps, { ...evidence, declaredControls: ['export csv'] }).length,
+      0,
+      'and grounded with it, folded and case-insensitively',
+    );
+    assert.equal(
+      auditGrounding([], steps, { ...evidence, declaredControls: ['Export CSV of every rule'] }).length,
+      1,
+      'a longer declaration containing the name does not vouch for a name the run must match whole',
+    );
+  });
+
+  it('every alternative of an either/or step is grounded on its own by a declaration', () => {
+    const steps: FlowStep[] = [
+      { action: 'expectAnyVisible', selectors: ['text="เพิกเฉย"', 'text="ปฏิเสธ"'] } as unknown as FlowStep,
+    ];
+    assert.equal(auditGrounding([], steps, evidence).length, 1);
+    const one = auditGrounding([], steps, { ...evidence, declaredControls: ['เพิกเฉย'] });
+    assert.equal(one.length, 1, 'the other alternative is still ungrounded');
+    assert.match(one[0]!.reason, /ปฏิเสธ/);
+    assert.doesNotMatch(one[0]!.reason, /เพิกเฉย/);
+    assert.equal(auditGrounding([], steps, { ...evidence, declaredControls: ['เพิกเฉย', 'ปฏิเสธ'] }).length, 0);
+  });
+
   it('declines to judge selectors against a truncated tree, but still judges paths', () => {
     const findings = auditGrounding(
       [],

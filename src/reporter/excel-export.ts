@@ -44,7 +44,18 @@ import { crc32, deflateRawSync } from 'node:zlib';
 
 import { describeDbChanges, describeTarget, describeValueSource, expectedActual, type ProofStep } from '../engine/proof-bundle.js';
 import { catalogCaseExportName, type CatalogReportCase, type CatalogReportInput } from './catalog-report.js';
-import { describeAgentAction, describeResolution, observedEvidence, stepKindFacts, stepTarget } from './step-facts.js';
+import {
+  describeAgentAction,
+  describeResolution,
+  inconsequentialAgentLeg,
+  inconsequentialBrokenStep,
+  dbProofLines,
+  type BrokenStepRunLike,
+  narrationProofLine,
+  observedEvidence,
+  stepKindFacts,
+  stepTarget,
+} from './step-facts.js';
 
 /* ------------------------------------------------------------- zip writer */
 
@@ -203,8 +214,16 @@ export function passedCases(input: CatalogReportInput): CatalogReportCase[] {
  * compared, how the selector was found, what healed or broke. One line per
  * fact, in the order a reader checks them.
  */
-export function stepProof(step: ProofStep): string {
+export function stepProof(step: ProofStep, run?: BrokenStepRunLike | null | undefined): string {
   const lines: string[] = [];
+  // A workbook has no disclosure to fold behind, so a broken step that
+  // decided nothing is MARKED instead of hidden: the first line of its own
+  // log says the sealed status and why it did not decide this run's outcome,
+  // and every recorded line below it stays exactly as it was. The Result
+  // column is untouched — a status is never rewritten, only laid out.
+  // Same predicate and same wording as the two HTML reports.
+  const aside = run === null || run === undefined ? null : inconsequentialBrokenStep(step, run);
+  if (aside !== null) lines.push(aside.summary);
   const comparison = expectedActual(step);
   if (comparison !== null) lines.push(comparison);
   // The kind's own facts — the alternatives of an either/or, an upload's
@@ -222,21 +241,49 @@ export function stepProof(step: ProofStep): string {
   if (how !== null) lines.push(`resolved via ${step.resolution} — ${how.label}`);
   if (step.resolvedSelector && step.resolvedSelector !== step.selector) lines.push(`resolved as ${step.resolvedSelector}`);
   if (step.heal) lines.push(`healed → ${step.heal.to} (${step.heal.strategy}, ${(step.heal.confidence * 100).toFixed(0)}%)`);
+  if (step.blocked) {
+    // The typed hold (Phase B): the one fact a sheet reader needs from this
+    // step is that it is not a finding.
+    lines.push(`held (${step.blocked.reason}, ${step.blocked.rule}) — no verdict about the application: ${step.blocked.message}`);
+  }
   if (step.agent) {
+    // A workbook has no disclosure to fold behind, so the leg is MARKED
+    // instead of hidden: the line above says it did not decide this step's
+    // outcome, and every recorded line below it stays exactly as it was.
+    // Same predicate and same wording as the two HTML reports.
+    const aside = inconsequentialAgentLeg(step);
+    if (aside !== null) lines.push(aside.summary);
     lines.push(`agent: ${step.agent.summary ?? ''} (${step.agent.turns} turn(s))`.trim());
     // The turns that carry meaning beyond a click: what was saved for later
-    // steps and where the session ended. Every other turn is in the bundle.
+    // steps, where the session ended, and what the harness withheld. Every
+    // other turn is in the bundle.
     for (const a of step.agent.actions ?? []) {
+      if (a.outcome?.kind === 'blocked') {
+        lines.push(`agent ${a.action} held (${a.outcome.reason}): ${a.outcome.message}`);
+        continue;
+      }
       if (a.action !== 'save' && a.action !== 'signOut') continue;
       const { target: aimed, note } = describeAgentAction(a);
       lines.push(`agent ${a.action}: ${aimed}${note ? ` — ${note}` : ''}`);
     }
   }
   for (const o of observedEvidence(step)) lines.push(`observed: ${JSON.stringify(o.text)}${o.selector ? ` from ${o.selector}` : ''}`);
+  // The database check this step made, from the one projection all three
+  // surfaces read: the summary, the SQL that answered it with its bound
+  // parameters, and the rows it returned. Redacted at the source.
+  for (const line of dbProofLines(step)) lines.push(line);
   for (const line of describeDbChanges(step.dbChanges)) lines.push(line);
   if (step.dbProbeError) lines.push(`db baseline probe failed: ${step.dbProbeError}`);
   if (step.url) lines.push(`at ${step.url}`);
   if (step.error) lines.push(`error: ${step.error.split('\n')[0] ?? step.error}`);
+  // Last, after every recorded fact, and marked inside the line itself: a
+  // workbook cell has no muted colour and no hover to say whose words these
+  // are, so `narrationProofLine` carries the label and the model with them.
+  // The Proof column is the right home — it already IS "the step's own log",
+  // and a column of its own would sit empty on every run that did not ask
+  // for a narration and would read as a second recorded fact when it did.
+  const narration = narrationProofLine(step);
+  if (narration !== null) lines.push(narration);
   return lines.join('\n');
 }
 
@@ -246,6 +293,7 @@ function stepRows(
   step: ProofStep,
   r: number,
   videoHref: string | null,
+  run?: BrokenStepRunLike | null | undefined,
 ): number {
   const hasPhoto = typeof step.screenshot === 'string' && step.screenshot !== '';
   const cells =
@@ -259,7 +307,7 @@ function stepRows(
     textCell(`F${r}`, describeTarget(step.target) ?? '', S.wrap) +
     textCell(`G${r}`, step.status + (step.heal ? ' (healed)' : ''), S.wrap) +
     textCell(`H${r}`, fmtMs(step.durationMs), S.wrap) +
-    textCell(`I${r}`, stepProof(step), S.wrap) +
+    textCell(`I${r}`, stepProof(step, run), S.wrap) +
     (hasPhoto ? '' : textCell(`J${r}`, videoHref === null ? '—' : 'see the video row below', S.wrap));
   build.rows.push(rowXml(r, cells, hasPhoto ? PHOTO_ROW_HT : undefined));
   if (hasPhoto) {
@@ -331,7 +379,7 @@ function caseRows(build: SheetBuild, videos: CaseVideoFile[], c: CatalogReportCa
     bandRow(build, r, 'No steps were recorded for this case.', S.wrap);
     r += 1;
   }
-  for (const step of steps) r = stepRows(build, c, step, r, videoHref);
+  for (const step of steps) r = stepRows(build, c, step, r, videoHref, c.bundle);
   return r;
 }
 
@@ -373,7 +421,47 @@ export function buildCaseWorkbook(c: CatalogReportCase): WorkbookBuild {
   return { xlsx: buildZip(workbookParts(build, catalogCaseExportName(c.id).slice(0, 31))), videos, passedCases: 1 };
 }
 
-function workbookParts(build: SheetBuild, sheetName: string): ZipInput[] {
+/** The column widths of the step workbooks — Case, Step, Action, Description, Selector, Target, Result, Duration, Proof, Photo. */
+const STEP_SHEET_WIDTHS = [14, 6, 16, 44, 36, 34, 14, 10, 46, 45] as const;
+
+export interface TextWorkbookInput {
+  sheetName: string;
+  /** One sentence written alone in the first row, above the header — a rule or a headline the reader needs before the columns. */
+  preface?: string | undefined;
+  header: readonly string[];
+  rows: readonly (readonly string[])[];
+  /** Column widths, one per header column; the step sheet's when omitted. */
+  widths?: readonly number[] | undefined;
+}
+
+/**
+ * A plain text sheet through the same writer as the step workbooks — header
+ * row bold, every cell wrapped, no images, no links. What the findings
+ * export (`findings-export.ts`) is built with; at most `COLS.length` columns.
+ */
+export function buildTextWorkbook(input: TextWorkbookInput): Buffer {
+  if (input.header.length > COLS.length) {
+    throw new Error(`buildTextWorkbook: ${input.header.length} columns asked for, ${COLS.length} available`);
+  }
+  const build: SheetBuild = { rows: [], merges: [], images: [], links: [] };
+  let r = 1;
+  if (input.preface !== undefined && input.preface !== '') {
+    build.rows.push(rowXml(r, textCell(`A${r}`, input.preface, S.wrap)));
+    build.merges.push(`A${r}:${COLS[input.header.length - 1]}${r}`);
+    r += 1;
+  }
+  const cells = (values: readonly string[], style: number, row: number): string =>
+    values.map((value, i) => textCell(`${COLS[i]}${row}`, value, style)).join('');
+  build.rows.push(rowXml(r, cells(input.header, S.bold, r)));
+  r += 1;
+  for (const row of input.rows) {
+    build.rows.push(rowXml(r, cells(row.slice(0, input.header.length), S.wrap, r)));
+    r += 1;
+  }
+  return buildZip(workbookParts(build, input.sheetName.slice(0, 31), input.widths ?? STEP_SHEET_WIDTHS.slice(0, input.header.length)));
+}
+
+function workbookParts(build: SheetBuild, sheetName: string, widths: readonly number[] = STEP_SHEET_WIDTHS): ZipInput[] {
   const hasImages = build.images.length > 0;
   const xml = (body: string): Buffer => Buffer.from(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n${body}`, 'utf8');
 
@@ -446,7 +534,6 @@ function workbookParts(build: SheetBuild, sheetName: string): ZipInput[] {
     linkXml.push(`<hyperlink ref="${link.ref}" r:id="${id}"/>`);
   }
 
-  const widths = [14, 6, 16, 44, 36, 34, 14, 10, 46, 45];
   const cols = widths
     .map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`)
     .join('');
@@ -555,6 +642,7 @@ export function excelExportNames(htmlReportPath: string): { xlsxPath: string; me
 export async function writePassedCasesExcel(
   htmlReportPath: string,
   input: CatalogReportInput,
+  preserveVideoCaseIds: ReadonlySet<string> = new Set(),
 ): Promise<ExcelExportResult> {
   const { xlsxPath, mediaDir, mediaDirName } = excelExportNames(htmlReportPath);
   const { xlsx, videos, passedCases: count } = buildPassedCasesWorkbook(input, mediaDirName);
@@ -577,7 +665,9 @@ export async function writePassedCasesExcel(
   const removed: string[] = [];
   for (const c of input.cases) {
     if (c.verdict === 'passed') continue;
-    for (const stale of [join(mediaDir, `${catalogCaseExportName(c.id)}.xlsx`), join(mediaDir, caseVideoFile(c.id))]) {
+    const stalePaths = [join(mediaDir, `${catalogCaseExportName(c.id)}.xlsx`)];
+    if (!preserveVideoCaseIds.has(c.id)) stalePaths.push(join(mediaDir, caseVideoFile(c.id)));
+    for (const stale of stalePaths) {
       const gone = await rm(stale, { force: false }).then(() => true, () => false);
       if (gone) removed.push(stale);
     }

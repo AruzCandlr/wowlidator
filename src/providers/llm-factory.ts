@@ -34,7 +34,9 @@ import {
   type WowlidatorConfig,
 } from '../config.js';
 import { localFetch } from './local-fetch.js';
+import { createAgyCli } from './agy-cli.js';
 import { createClaudeCli } from './claude-cli.js';
+import { createCodexCli } from './codex-cli.js';
 import { createClaudeCloud, createClaudeTty } from './claude-tty.js';
 import { maybeLogClaudeQuota } from './claude-quota.js';
 import { dedupeKeyFor, serialGateFor } from './serial-gate.js';
@@ -165,6 +167,16 @@ export type ModelBuilder = (
  * common denominator — so nothing downstream knows which vendor answered.
  */
 const FACTORIES: Record<ProviderName, ModelBuilder> = {
+  'agy-cli': (_apiKey, modelId, options) =>
+    createAgyCli({
+      modelId,
+      ...(options?.effort === undefined ? {} : { effort: options.effort }),
+    }),
+  'codex-cli': (_apiKey, modelId, options) =>
+    createCodexCli({
+      modelId,
+      ...(options?.effort === undefined ? {} : { effort: options.effort }),
+    }),
   // No key: the CLI carries the operator's own session. See `claude-cli.ts`
   // for why the system prompt is replaced and the process runs from a
   // neutral directory.
@@ -335,6 +347,7 @@ export class LlmFactory {
   readonly #builders: Record<ProviderName, ModelBuilder>;
   readonly #cache = new Map<LlmRole, ResolvedModel>();
   readonly #keyIndex = new Map<ProviderName, number>();
+  readonly #providerFailures = new Map<LlmRole, number>();
 
   /**
    * @param builders Test-only. Overrides how a (provider, apiKey, modelId)
@@ -366,6 +379,16 @@ export class LlmFactory {
     return resolved;
   }
 
+  /**
+   * The role's model label — `provider:modelId` — WITHOUT resolving it: a
+   * report caption or a record field may name the model a role is routed to
+   * even when its key is absent, and must not demand the key to do so. Reads
+   * the same `modelIdFor` a resolved model carries, so the two agree.
+   */
+  labelFor(role: LlmRole): string {
+    return modelIdFor(this.config.roles[role]);
+  }
+
   /** Whether `forRole` would succeed — used to fail fast with a clear message. */
   canResolve(role: LlmRole): boolean {
     return (this.config.apiKeys[this.config.roles[role].provider]?.length ?? 0) > 0;
@@ -373,6 +396,10 @@ export class LlmFactory {
 
   get maxRetries(): number {
     return this.config.maxRetries;
+  }
+
+  providerFailures(): ReadonlyMap<LlmRole, number> {
+    return new Map(this.#providerFailures);
   }
 
   /**
@@ -411,6 +438,7 @@ export class LlmFactory {
         tried.push({ keyIndex: i, error });
         const hasNext = i < keys.length - 1;
         if (!hasNext || !isKeyExhaustedError(error)) {
+          this.#providerFailures.set(role, (this.#providerFailures.get(role) ?? 0) + 1);
           throw tried.length > 1 ? new AllKeysExhaustedError(role, provider, tried) : error;
         }
         // The cursor moves even before the next attempt succeeds, so a
@@ -464,6 +492,8 @@ export interface StructuredResponse<T> {
   object: T;
   inputTokens?: number | undefined;
   outputTokens?: number | undefined;
+  /** Input tokens the provider served from its prompt cache, when it reports them (Phase C telemetry). */
+  cachedInputTokens?: number | undefined;
 }
 
 /**
@@ -839,10 +869,12 @@ async function sendStructured<T>(
         : { providerOptions: request.providerOptions as never }),
     });
 
+    const cacheRead = result.usage.inputTokenDetails?.cacheReadTokens;
     return {
       object: result.object,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
+      ...(typeof cacheRead === 'number' ? { cachedInputTokens: cacheRead } : {}),
     };
   }
 }

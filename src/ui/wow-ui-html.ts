@@ -515,11 +515,12 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
   border: 1px solid var(--line-strong); border-radius: var(--r-sm);
   color: var(--ink); background: var(--panel); min-width: 0;
 }
-.picker .sel { flex: 0 0 auto; max-width: 190px; }
-.picker .inp { flex: 1 1 auto; font-family: var(--mono); font-size: var(--fs-mono); }
+.picker .sel { flex: 0 0 max-content; inline-size: max-content; max-inline-size: none; }
+.picker .inp { flex: 0 0 30ch; inline-size: 30ch; font-family: var(--mono); font-size: var(--fs-mono); }
 .picker .sel:focus, .picker .inp:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent-line); }
 .picker-note { margin-top: 4px; font-size: var(--fs-xs); color: var(--faint); }
 .picker-note .mono { font-family: var(--mono); font-size: var(--fs-mono); }
+.key-mask code { white-space: nowrap; }
 
 /* Live progress. The bar is a run in flight, so it is only ever on screen while
    something is actually moving — there is no finished state to style. */
@@ -1272,11 +1273,17 @@ function agentActionLog(acts) {
       value = '';
     }
     var observed = typeof a.observed === 'string' && a.observed !== '' ? '\n     observed ' + JSON.stringify(a.observed) : '';
-    return (a.ok ? '\u2713' : '\u2717') + ' ' + (i + 1) + '. ' + a.action + ' ' + target + value +
+    /* A held action (the typed "outcome", Phase B) is drawn as a hold: the
+       harness withheld it on a policy, provenance or approval rule, and the
+       line must not read as the application failing. */
+    var held = a.outcome && a.outcome.kind === 'blocked' ? a.outcome : null;
+    return (a.ok ? '\u2713' : held ? '\u25a1' : '\u2717') + ' ' + (i + 1) + '. ' + a.action + ' ' + target + value +
       (a.durationMs !== undefined && a.durationMs !== null ? ' (' + fmtMs(a.durationMs) + ')' : '') +
       observed +
       (a.reasoning ? '\n     ' + a.reasoning : '') +
-      (a.error ? '\n     FAILED: ' + String(a.error).split('\n')[0] : '');
+      (held
+        ? '\n     HELD (' + held.reason + ', ' + held.rule + '): ' + String(held.message).split('\n')[0]
+        : a.error ? '\n     FAILED: ' + String(a.error).split('\n')[0] : '');
   }).join('\n');
 }
 
@@ -1294,7 +1301,7 @@ function stepClaim(step) {
 function familyOf(bundle, step) {
   var defect = (bundle.defects || []).filter(function (d) { return d.stepIndex === step.index; })[0];
   if (defect) return defect.category;
-  if (step.status !== 'passed') return 'unclassified';
+  if (step.status !== 'passed' && step.status !== 'skipped') return 'unclassified';
   return null;
 }
 
@@ -2280,7 +2287,7 @@ function taskRow(task) {
 function firstFailure(card) {
   var bundle = S.bundles[card.runId];
   if (!bundle) return null;
-  var step = bundle.steps.filter(function (s) { return s.status !== 'passed'; })[0];
+  var step = bundle.steps.filter(function (s) { return s.status !== 'passed' && s.status !== 'skipped'; })[0];
   return step ? stepClaim(step) : null;
 }
 
@@ -3071,7 +3078,7 @@ function whyBlock(bundle) {
   } else {
     // The verdict travels with the bundle fetch; a bundle read before this
     // build (or a fetch that failed) still gets the honest floor.
-    var step = (bundle.steps || []).filter(function (s) { return s.status !== 'passed' && !s.superseded; })[0];
+    var step = (bundle.steps || []).filter(function (s) { return s.status !== 'passed' && s.status !== 'skipped' && !s.superseded; })[0];
     box.appendChild(el('div', { class: 'why-line', text: bundle.error || (step ? stepClaim(step) + ' \u2014 ' + ((step.error || '').split('\n')[0] || 'did not hold') : 'the run did not complete') }));
   }
   /* The system-error diagnosis, when the judge ran: which layer broke and the
@@ -3762,6 +3769,13 @@ function evidenceFix(panel, bundle, step) {
     }
   }
 
+  if (step.blocked) {
+    /* The typed hold that ended the leg (Phase B): named before the agent's
+       account, because it is the one fact this step carries — the harness
+       withheld the action, and nothing about the application was proved. */
+    panel.appendChild(el('div', { class: 'cap', text: 'Held by the run’s rules — no verdict about the application' }));
+    panel.appendChild(el('div', { class: 'repro', text: step.blocked.reason + ' · ' + step.blocked.rule + '\n' + step.blocked.message }));
+  }
   if (step.agent) {
     panel.appendChild(el('div', { class: 'cap', text: 'The navigation agent' }));
     panel.appendChild(el('div', { class: 'repro', text: step.agent.goal + '\n\n' + step.agent.summary }));
@@ -4139,7 +4153,7 @@ function renderHealed(main) {
     for (var i = 0; i < 5; i += 1) bars.appendChild(el('i', { class: confidence * 5 > i ? null : 'off' }));
 
     body.appendChild(el('tr', {}, [
-      el('td', {}, [
+      el('td', { class: 'key-mask' }, [
         el('div', {}, [el('code', { text: entry.key })]),
         el('div', { class: 'mono', style: 'margin-top:4px', text: '→ ' + entry.healed })
       ]),
@@ -6245,8 +6259,8 @@ function openFlowPlayer(bundle) {
       return {
         at: s.videoOffsetMs / 1000, step: s.index,
         text: s.intent || (s.action + (s.selector ? ' ' + s.selector : '')),
-        failed: s.status !== 'passed' && !s.superseded,
-        error: s.status !== 'passed' ? String(s.error || '').split('\n')[0] : ''
+        failed: s.status !== 'passed' && s.status !== 'skipped' && !s.superseded,
+        error: s.status !== 'passed' && s.status !== 'skipped' ? String(s.error || '').split('\n')[0] : ''
       };
     });
 

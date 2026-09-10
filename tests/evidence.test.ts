@@ -32,7 +32,10 @@ import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import type { AddressInfo } from 'node:net';
 
+import { chromium } from 'playwright';
+
 import { runFlow, type Flow } from '../src/engine/runner.js';
+import { CAPTURE_BOUNDS_ATTR, captureEvidence } from '../src/engine/evidence.js';
 import { renderReport, writeHtmlReport } from '../src/reporter/html-reporter.js';
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 
@@ -232,6 +235,94 @@ describe('per-step evidence (CDP)', { skip: skipBrowser }, () => {
       'the filmstrip is assembled in the browser from the images already present — ' +
         'rendering it server-side would double the size of the report',
     );
+  });
+});
+
+/** Reads a baseline JPEG's pixel dimensions from its own SOF marker. */
+function jpegSize(buffer: Buffer): { width: number; height: number } {
+  let i = 2;
+  while (i + 3 < buffer.length) {
+    if (buffer[i] !== 0xff) {
+      i += 1;
+      continue;
+    }
+    const marker = buffer[i + 1] as number;
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      i += 2;
+      continue;
+    }
+    if (marker === 0xd9) break;
+    const length = buffer.readUInt16BE(i + 2);
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return { height: buffer.readUInt16BE(i + 5), width: buffer.readUInt16BE(i + 7) };
+    }
+    i += 2 + length;
+  }
+  throw new Error('no SOF marker found in JPEG');
+}
+
+const FIXED_OVERLAY_HTML = `<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>fixed overlay fixture</title></head>
+  <body style="margin:0;">
+    <h1>Plain page, one viewport tall</h1>
+    <button id="open" type="button">Open</button>
+    <div id="overlay" role="dialog" aria-modal="true"
+         style="display:none;position:fixed;left:20px;top:900px;width:300px;height:400px;background:crimson;">
+      <p id="floor">overlay floor, 1300px from the document top</p>
+    </div>
+    <script>
+      document.getElementById('open').addEventListener('click', () => {
+        document.getElementById('overlay').style.display = 'block';
+      });
+    </script>
+  </body>
+</html>`;
+
+describe('a position: fixed overlay taller than the viewport (CDP)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+
+  before(async () => {
+    server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(FIXED_OVERLAY_HTML);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  });
+
+  it('is captured whole, not clipped at the viewport edge, and leaves no marker behind', async () => {
+    const browser = await chromium.connectOverCDP(CDP_URL);
+    const context = await browser.newContext({ viewport: { width: 1280, height: 1080 } });
+    try {
+      const page = await context.newPage();
+      await page.goto(origin);
+      await page.locator('#open').click();
+      // The overlay's own bottom edge sits at 900 + 400 = 1300px — 220px past
+      // the 1080px viewport, and the plain page contributes nothing past it,
+      // so an unfixed fullPage capture would end at 1080 and lose the floor.
+      const encoded = await captureEvidence(page, 'all', 'routine', 0);
+      assert.ok(encoded, 'the fixture must produce a screenshot');
+      const size = jpegSize(Buffer.from(encoded, 'base64'));
+      assert.ok(
+        size.height >= 1300,
+        `captured height ${size.height} must reach the overlay's floor at 1300, not stop at the 1080px viewport`,
+      );
+      assert.equal(
+        await page.locator(`[${CAPTURE_BOUNDS_ATTR}]`).count(),
+        0,
+        'the marker used to grow the capture must not survive the shutter',
+      );
+    } finally {
+      await context.close();
+      await browser.close();
+    }
   });
 });
 

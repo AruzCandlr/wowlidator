@@ -6,6 +6,7 @@
  *   wowlidator generate <url>    let an LLM write the tests by reading the page
  *   wowlidator author "<prompt>" turn a described test into one runnable flow
  *   wowlidator doctor            verify provider keys and model ids resolve
+ *   wowlidator data check <cat>  do the sheet's test-data codes exist, are they free, can the UI reach them
  *   wowlidator cache list        inspect healed selectors
  *   wowlidator cache forget      invalidate a repair (or all of them)
  *   wowlidator ui                open the control panel in a browser (--wow for wowUI)
@@ -22,6 +23,9 @@ import { DEFAULT_MAX_DRAFT_CASES } from './catalog/draft.js';
 import { loadConfig, loadDotEnv, type WowlidatorConfig } from './config.js';
 import { VIDEO_MODES, parseVideoMode } from './engine/video.js';
 import { DEFAULT_MUTATION_POLICY, MUTATION_POLICIES, type MutationPolicy } from './generator/test-generator.js';
+import { narrationEnabled } from './generator/step-narration.js';
+import { caseNarrativeEnabled } from './generator/case-narrative.js';
+import { REPORT_LANGS } from './engine/proof-bundle.js';
 import { LaunchPresets, formatPresetLine } from './history/launch-presets.js';
 import { main as mcpMain } from './mcp/server.js';
 import { closeClaudeSessions } from './providers/claude-cli-session.js';
@@ -33,6 +37,8 @@ import {
   LAUNCH_COMMANDS,
   SCREENSHOT_MODES,
   parseCaptureDelay,
+  parseCaseTimeout,
+  parseReportLang,
   parseContextBudget,
   parseScope,
   parseCredentials,
@@ -45,7 +51,7 @@ import {
 import { USAGE } from './cli/usage.js';
 import { cmdAuthor, cmdCatalog, cmdDraft, cmdGenerate } from './cli/commands/authoring.js';
 import { cmdGo } from './cli/commands/go.js';
-import { cmdCache, cmdCatalogReport, cmdContext, cmdDb, cmdDoctor, cmdHistory } from './cli/commands/maintenance.js';
+import { cmdCache, cmdCatalogReport, cmdContext, cmdData, cmdDb, cmdDoctor, cmdHistory } from './cli/commands/maintenance.js';
 import { cmdCrawl, cmdRun, cmdWatch } from './cli/commands/run.js';
 
 // Re-exported for the tests (tests/suite-outcomes.test.ts) and for embedders
@@ -138,6 +144,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'wait-for': { type: 'string' },
       open: { type: 'boolean', default: false },
       timeout: { type: 'string' },
+      'case-timeout': { type: 'string' },
       every: { type: 'string' },
       notify: { type: 'string' },
       'until-fail': { type: 'boolean', default: false },
@@ -155,6 +162,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       // than relying on a default the two surfaces disagree about.
       backend: { type: 'boolean', default: false },
       'no-agent-capture': { type: 'boolean', default: false },
+      narrate: { type: 'boolean', default: false },
+      'report-lang': { type: 'string' },
+      'no-case-narrative': { type: 'boolean', default: false },
+      'case-narrative': { type: 'boolean', default: false },
       'no-target-highlight': { type: 'boolean', default: false },
       'db-baseline': { type: 'string' },
       'db-baseline-tables': { type: 'string' },
@@ -197,6 +208,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       'repair-regenerate': { type: 'boolean', default: false },
       openapi: { type: 'string' },
       'db-schema': { type: 'string' },
+      // `data check`: the master-data lookup declaration. Not on CliOptions —
+      // the one command that reads it takes it beside the options, so no other
+      // command grows a field it never reads.
+      'master-data': { type: 'string' },
       api: { type: 'boolean', default: false },
       // Catalogs. `context-doc` rather than `context`: `--context` already
       // means the static repository index, and two things called context would
@@ -272,6 +287,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 2;
   }
 
+  // Before the credential parsers: `WOWLIDATOR_AS` and `WOWLIDATOR_PERSONAS` are
+  // documented as living in `.env`, and both are read from `process.env` at
+  // parse time — loaded after them, every persona in the file "had no credentials".
+  loadDotEnv();
+
   const credentials = parseCredentials(values.as);
   if (credentials === null) {
     process.stderr.write(
@@ -300,8 +320,6 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     );
     return 2;
   }
-
-  loadDotEnv();
 
   let config: WowlidatorConfig;
   try {
@@ -351,6 +369,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   // and an unparseable value is an error rather than a silent fallback — a
   // typo'd delay would otherwise be discovered as a filmstrip of blank frames.
   const captureDelayMs = parseCaptureDelay(values['capture-delay'], config.captureDelayMs);
+  const caseTimeoutMs = parseCaseTimeout(values['case-timeout']);
+  const reportLang = parseReportLang(values['report-lang']);
   const stepDelayRaw = values['step-delay'] ?? process.env['WOWLIDATOR_STEP_DELAY'];
   const stepDelayMs =
     stepDelayRaw === undefined || stepDelayRaw === ''
@@ -360,6 +380,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         : undefined;
   if (captureDelayMs === null) {
     process.stderr.write('wowlidator: --capture-delay must be a number of milliseconds\n');
+    return 2;
+  }
+  if (caseTimeoutMs === null) {
+    process.stderr.write('wowlidator: --case-timeout must be a non-negative integer number of seconds, or off\n');
+    return 2;
+  }
+  if (reportLang === null) {
+    process.stderr.write(`wowlidator: --report-lang must be one of ${REPORT_LANGS.join(', ')}\n`);
     return 2;
   }
 
@@ -377,6 +405,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     humanize,
     agentAssist: values['agent-assist'] === true || config.agentAssist,
     agentCapture: values['no-agent-capture'] !== true,
+    narrate: values['narrate'] === true || narrationEnabled(),
+    reportLang,
+    caseNarrative: values['no-case-narrative'] !== true && caseNarrativeEnabled(),
+    caseNarrativeBackfill: values['case-narrative'] === true,
     highlightTarget: values['no-target-highlight'] !== true,
     dbBaseline: values['db-baseline'],
     dbBaselineTables: (values['db-baseline-tables'] ?? process.env['WOWLIDATOR_DB_BASELINE_TABLES'] ?? '')
@@ -439,6 +471,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     waitFor: values['wait-for'],
     open: values.open === true,
     timeoutMs: values.timeout === undefined ? undefined : Number(values.timeout) * 1000,
+    caseTimeoutMs,
     every: values.every,
     notify: values.notify,
     untilFail: values['until-fail'] === true,
@@ -528,6 +561,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return cmdCatalogReport(positionals[1], options);
     case 'db':
       return cmdDb(positionals[1], positionals[2], options);
+    case 'data':
+      return cmdData(positionals[1], positionals[2], options, { masterData: values['master-data'] });
     case 'mcp':
       await mcpMain();
       return 0;
