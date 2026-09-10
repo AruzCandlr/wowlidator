@@ -3,7 +3,7 @@
  * Split out of cli.ts verbatim.
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { formatElapsed, phaseHeader, withLogTag } from '../log-format.js';
 
@@ -48,6 +48,8 @@ import {
 import { raiseSessionCapFor } from '../providers/claude-cli-session.js';
 import { ensureQuotaHold, quotaHolding, stopQuotaHold } from './quota-hold.js';
 import { describeDiagnosis, diagnoseError } from '../generator/error-diagnosis.js';
+import { narrateBundle } from '../generator/step-narration.js';
+import { composeNarrative } from '../generator/case-narrative.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
 import { growPool, laneBrowsers, writeFlowFile } from './artifacts.js';
 import { BrowserLease } from '../browser/pool.js';
@@ -58,7 +60,8 @@ import { SessionVault } from '../engine/session-vault.js';
 import { slugify } from '../reporter/html-reporter.js';
 import { RunHistory, formatTrend } from '../history/run-history.js';
 import { resolveReportPath, writeHtmlReport } from '../reporter/html-reporter.js';
-import { CatalogLiveReport } from './catalog-live-report.js';
+import { CatalogLiveReport, scenarioFromId, writeCasePageAt } from './catalog-live-report.js';
+import { catalogReportPath } from '../reporter/catalog-report.js';
 import {
   baselineMaxRows,
   baselinePath,
@@ -69,6 +72,7 @@ import {
   restoreBaseline,
   tablesNamedBySteps,
   takeBaseline,
+  restoreScript,
   writeBaseline,
   type Baseline,
   type DbBaselineProbe,
@@ -133,6 +137,8 @@ import {
   buildAgent,
   buildDataModel,
   buildDiagnosisModel,
+  buildCaseNarrativeModel,
+  buildNarrationModel,
   buildHealer,
   buildInvestigationAgent,
   buildReviewJudge,
@@ -143,6 +149,7 @@ import {
   runPersonas,
   stepLogger,
 } from './runtime.js';
+import { recoveryNote, type MutationReversibility } from '../orchestrator/mutation-policy.js';
 
 /**
  * What the runner hands its caller once the ledger is its to write: the
@@ -555,6 +562,11 @@ export async function runCases(
   let baselineProbeForRun: DbBaselineProbe | null = null;
   let baselineClient: DbClient | null = null;
   let activeBaseline: Baseline | null = null;
+  // What this run can actually put back — measured, never declared. Set only
+  // where a baseline was taken, a write credential resolved, and tables came
+  // back restorable; the mutation gate reads it as a standing undo, so an
+  // over-eager value here would license a delete nothing can reverse.
+  let runReversible: MutationReversibility | undefined;
   const priorBaseline = ledger?.dbBaseline;
   if (baselineResolved.mode !== 'off') {
     try {
@@ -606,7 +618,51 @@ export async function runCases(
             runKey: ledger?.runKey ?? null,
           });
           const path = await writeBaseline(baselinePath(ledger?.runKey ?? null), activeBaseline);
+          // **The undo is written down whether or not this run may perform
+          // it** (2026-09-09). Without a write credential the snapshot was
+          // inert: the run knew exactly how to put the tables back and had no
+          // way to say so. Real values, so it is a local file beside the
+          // baseline and never report content — the report links to it.
+          let restoreSqlPath: string | null = null;
+          try {
+            restoreSqlPath = path.replace(/\.json$/, '') + '.restore.sql';
+            await writeFile(restoreSqlPath, restoreScript(activeBaseline), 'utf8');
+            log?.(`db baseline  restore script ${restoreSqlPath} — run it with psql to put the tables back`);
+          } catch (error) {
+            // A script that could not be written is not a verdict about
+            // anything; the baseline itself still stands.
+            restoreSqlPath = null;
+            log?.(`db baseline  could not write the restore script: ${error instanceof Error ? error.message : String(error)}`);
+          }
           baselineProbeForRun = baselineProbe(baselineClient, activeBaseline, baselineMaxRows());
+          const restorableNow = activeBaseline.tables.filter((t) => t.restorable);
+          // **The WRITTEN recovery is the undo, not the credential**
+          // (2026-09-09, revised the same day). The first cut required
+          // `restoreDbConfig()`, which conflated two things: whether the way
+          // back exists, and whether this process may walk it. The script is
+          // written either way and restores the exact pre-run state, so a run
+          // that recorded one has an undo — a person performs it when the
+          // harness may not, which on a shared environment is often the better
+          // order. What must never happen is approving on an undo nobody can
+          // replay, so the script's presence is the condition, not the mode.
+          runReversible =
+            restorableNow.length > 0 && restoreSqlPath !== null
+              ? {
+                  tables: restorableNow.map((t) => t.table),
+                  by: 'db-baseline',
+                  script: restoreSqlPath,
+                }
+              : undefined;
+          if (runReversible !== undefined) {
+            log?.(
+              `db baseline  ${runReversible.tables.length} table(s) recoverable — irreversible actions on them ` +
+                'are approved by the recorded undo' +
+                (restoreDbConfig() === null
+                  ? '; no write credential, so run the restore script yourself when you are done'
+                  : '; the restore at the end performs it'),
+            );
+            log?.(`db baseline  ${recoveryNote({ reversible: runReversible }) ?? ''}`);
+          }
           const notRestorable = activeBaseline.tables.filter((t) => !t.restorable);
           log?.(
             `db baseline  snapshot ${path} — ` +
@@ -619,6 +675,7 @@ export async function runCases(
               tables: activeBaseline.tables.map((t) => t.table),
               takenAt: activeBaseline.takenAt,
               mode: baselineResolved.mode,
+              ...(restoreSqlPath === null ? {} : { restoreSql: restoreSqlPath }),
             };
             await writeLedger(where.ledger.path, ledger).catch(() => undefined);
           }
@@ -664,6 +721,8 @@ export async function runCases(
   // The post-run judge for a SYSTEM ERROR — a run that delivered no verdict.
   // Built once for the suite; called only on `status === 'error'` bundles.
   const diagnosisModel = buildDiagnosisModel(options);
+  const narrationModel = buildNarrationModel(options);
+  const narrativeModel = buildCaseNarrativeModel(options);
   // One session across the whole suite: the sign-in a case establishes is
   // banked as storage state and injected into later cases' own isolated
   // contexts (never a shared context), so a flow that does not sign itself
@@ -1209,7 +1268,7 @@ export async function runCases(
       dataGate: caseGate,
       reviewJudge: buildReviewJudge(options),
         healer: options.heal ? undefined : null,
-        agent: buildAgent(options, tag),
+        agent: buildAgent(options, tag, runReversible),
         dataModel: buildDataModel(options),
         updateBaselines: options.updateBaselines,
         network: options.network,
@@ -1275,6 +1334,35 @@ export async function runCases(
   `);
           }
         }
+        // Every step gets a plain-language sentence, written onto the bundle
+        // BEFORE it is persisted so the proof, the report and the panel all
+        // carry it — one call for the case, not one per step. Descriptive
+        // only: it cannot reach the verdict, and a failure here leaves the
+        // steps reading exactly as they always did.
+        if (narrationModel) {
+          const narrated = await narrateBundle(bundle, testCase.flow.caseContext ?? testCase.name, {
+            model: narrationModel,
+            log: (line) => emitTagged(tag, `${line}\n`, 'err'),
+          });
+          if (narrated > 0) emitTagged(tag, `  narrated  ${narrated} step(s) in plain language (${narrationModel.id})\n`);
+        }
+        // The case's own front page — lede, summary, tickets, note, open
+        // questions — written onto the bundle before it is persisted, in the
+        // run's report language, so the case page (`reporter/case-page.ts`)
+        // can show it without a model of its own. Same constitution as the
+        // narration: descriptive, attributed, never the verdict.
+        // Not for a run that delivers no verdict (a ceiling, never ran, the
+        // harness alone): the ledger seals those `blocked` and a resume
+        // replaces them, so a narrative would describe a status the page
+        // never shows and spend a call on a bundle about to be superseded.
+        if (narrativeModel && (blockedReason ?? neverRan(bundle) ?? harnessOnly(bundle)) === null) {
+          const landed = await composeNarrative(bundle, testCase.flow.caseContext ?? testCase.name, {
+            model: narrativeModel,
+            lang: options.reportLang,
+            log: (line) => emitTagged(tag, `${line}\n`, 'err'),
+          });
+          if (landed) emitTagged(tag, `  narrative  written for the case page in ${options.reportLang} (${narrativeModel.id})\n`);
+        }
         const proofPath = await writeProofBundle(bundle, options.out);
         const target = resolveReportPath(
           { path: options.report, dir: options.reportDir, enabled: options.reportEnabled },
@@ -1288,7 +1376,48 @@ export async function runCases(
             kind: testCase.kind,
           },
         );
-        const reportPath = target === null ? null : await writeHtmlReport(bundle, target);
+        // Two ways a run delivers no verdict (see `blocked` below); read here
+        // as well, because the page written next shows the verdict the
+        // ledger will seal, not the bundle's own status.
+        const blockedEarly = blockedReason ?? neverRan(bundle) ?? harnessOnly(bundle);
+        // A catalog case's report IS its case page (`reporter/case-page.ts`,
+        // 2026-09-10): the file the ledger names, the panel's card opens and
+        // the run folder holds. The per-run report (`html-reporter.ts`) stays
+        // for `run` / `go` / `generate` suites, which have no catalog index
+        // for a page to belong to. Written here so the path exists the
+        // moment it is printed; the live roll-up rewrites the same file.
+        const reportPath =
+          target === null
+            ? null
+            : ledger !== null && where.ledger !== undefined
+              ? await writeCasePageAt(
+                  target,
+                  {
+                    id: caseIdOf(bundle.name),
+                    name: bundle.name,
+                    scenario: testCase.scenarioId ?? testCase.group ?? scenarioFromId(caseIdOf(bundle.name)),
+                    verdict:
+                      blockedEarly !== null
+                        ? 'blocked'
+                        : effectiveStatus(bundle) === 'needs-review'
+                          ? 'review'
+                          : isPassing(effectiveStatus(bundle))
+                            ? 'passed'
+                            : 'failed',
+                    status: bundle.status,
+                    reason: blockedEarly,
+                    bundle,
+                    history: [],
+                    reportPath: target,
+                  },
+                  {
+                    title: where.indexTitle,
+                    runKey: ledger.runKey,
+                    lang: options.reportLang,
+                    indexPath: catalogReportPath(ledger.runKey, where.indexTitle),
+                  },
+                ).catch(async () => writeHtmlReport(bundle, target))
+              : await writeHtmlReport(bundle, target);
 
         emitTagged(
           tag,

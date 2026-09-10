@@ -636,6 +636,79 @@ export function restorePlan(baseline: Baseline, batch = 200): { sql: string; par
 }
 
 /**
+ * One Postgres literal for a value the driver returned.
+ *
+ * Only ever used to render `restorePlan`'s OWN parameters, which came out of
+ * this database through a schema-validated SELECT — this is not a path for
+ * anyone else's input, and no flow, sheet or model reaches it.
+ *
+ * Quoting assumes `standard_conforming_strings` (on by default since
+ * PostgreSQL 9.1), where a backslash is an ordinary character and doubling the
+ * single quote is the whole escape. The script says so in its own header, so a
+ * reader pasting it into a session with the legacy setting is warned rather
+ * than silently corrupted.
+ */
+export function sqlLiteral(value: unknown): string {
+  if (value === null || value === undefined) return 'NULL';
+  if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : `'${String(value)}'`;
+  if (typeof value === 'bigint') return value.toString();
+  if (value instanceof Date) return `'${value.toISOString()}'`;
+  if (value instanceof Uint8Array) return `'\\x${Buffer.from(value).toString('hex')}'::bytea`;
+  const text =
+    typeof value === 'object' ? JSON.stringify(value) : String(value);
+  return `'${text.replace(/'/g, "''")}'`;
+}
+
+/**
+ * The restore as a script a person can read, keep and run themselves
+ * (2026-09-09).
+ *
+ * `restoreBaseline` needs `WOWLIDATOR_DB_RESTORE_URL`, a write credential that
+ * a read-only QA environment often does not have — and without it the whole
+ * snapshot is inert: the run knows exactly how to put the tables back and has
+ * no way to say so. The knowledge and the permission are two different things,
+ * and only the second was missing.
+ *
+ * So the same pure `restorePlan` is rendered with its parameters inlined,
+ * which is the one thing a parameterised statement cannot be: pasteable. The
+ * run emits it whether or not it can execute it, and a person with the
+ * credential runs it when they choose.
+ *
+ * **It carries real values, so it is a local file and never report content** —
+ * the rule the baseline JSON beside it already follows. The report links to it
+ * and states the command; the rows stay out of anything shareable.
+ */
+export function restoreScript(baseline: Baseline, batch = 200): string {
+  const restorable = baseline.tables.filter((t) => t.restorable);
+  const skipped = baseline.tables.filter((t) => !t.restorable);
+  const head = [
+    '-- wowlidator: restore the tables to the state before this run.',
+    `-- taken   ${baseline.takenAt}`,
+    `-- run key ${baseline.runKey ?? '(none)'}`,
+    `-- tables  ${restorable.map((t) => `${t.table} (${t.rowCount} row(s))`).join(', ') || '(none)'}`,
+    ...(skipped.length > 0
+      ? [`-- NOT restored: ${skipped.map((t) => `${t.table} — ${t.reason ?? 'no primary key or over the row bound'}`).join('; ')}`]
+      : []),
+    '--',
+    '-- Assumes standard_conforming_strings = on (the default). It deletes and',
+    '-- reinserts every row of the tables above and nothing else; anything this',
+    '-- run changed OUTSIDE them is not undone by this script.',
+    '--   psql "$WOWLIDATOR_DB_RESTORE_URL" -v ON_ERROR_STOP=1 -f <this file>',
+    '',
+  ];
+  const body = restorePlan(baseline, batch).map(({ sql, params }) => {
+    // `$1`-style holes, highest index first so `$10` is never eaten by `$1`.
+    let text = sql;
+    for (let i = params.length; i >= 1; i -= 1) {
+      text = text.split(`$${i}`).join(sqlLiteral(params[i - 1]));
+    }
+    return `${text};`;
+  });
+  return [...head, ...body, ''].join('\n');
+}
+
+/**
  * Put the tables back, verify through the read-only client. `writable` must
  * be the restore connection (`connectDbWritable`); `reader` the ordinary one.
  */

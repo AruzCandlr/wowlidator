@@ -503,6 +503,29 @@ the global `no-hardcode` scan; `tests/ledger-ui.test.ts` adds `accountPicker`,
 `rememberedAccounts`, `personaLabelKey` and `loadPersonaAccounts` to the
 ships-unchanged composition list.
 
+## Publishing a report as an artifact (`POST /api/publish-artifact`, 2026-09-08)
+
+The per-case report's own **publish to artifact** button asks the panel to
+publish it. The page cannot start a Claude session, and the panel is also the
+only place that can decide whether the path it was handed is one this UI may
+read — so the route does both. The logic lives in
+`reporter/publish-artifact.ts`; the route is the boundary.
+
+`reportPath` arrives from a page, so it is a request and never a permission: it
+is resolved against `CATALOG_REPORT_DIR` when relative (the shape
+`/reports/<name>` sends), then checked with `isAllowed` against the same roots
+every other read here uses, then `stat`ed. The same rule as `/view`, applied to
+a path a button produced.
+
+**It approves no upload.** The spawned session raises Claude Code's own publish
+prompt, and the route's answer says so: the button reports "approve it in the
+Claude session" with the `claude attach <id>` to get there. The panel starting a
+publish and a person allowing it are two separate acts, deliberately.
+
+The route returns as soon as the session is backgrounded — the publish then
+waits on a human, and holding an HTTP request open for that is how a panel route
+becomes a hung tab.
+
 ## The console reads the output; it does not rewrite it (2026-09-04)
 
 **Surface:** both pages — the command-output section under a live job row and
@@ -590,3 +613,7 @@ stderr marker, the glyph colours, the sticky label, the fold and the list, the
 guarded `localStorage` reads and writes, Copy raw, the `[hidden]` rule and
 `conApplyAll` re-reading views in place; `tests/ledger-ui.test.ts` pins the
 same composition on `/` so the guarantee does not leave with `/wow`.
+
+## The catalog form names the case page's language (2026-09-10)
+
+Two advanced fields on `catalog-run`, grouped under Output on the Ledger page: `report-lang` (enum `en`|`th`, the CLI's `--report-lang`) and `no-case-narrative` (the CLI's `--no-case-narrative`). Both are plain flags the whitelist already declares; the panel states the choice and the CLI records it on the ledger's launch block, so a resume or a `wowlidator report` rebuild started from the panel writes each case's own page (`src/reporter/case-page.ts`, linked from the case's name in the catalog report) in the language the run chose. The page and its four DB sidecars sit flat in `<runKey slug>-media/`, two path levels under the reports folder, which is exactly what the `/reports/` route serves.

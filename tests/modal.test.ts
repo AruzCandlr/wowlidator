@@ -87,6 +87,45 @@ const PROMO_FIXTURE_HTML = `<!doctype html>
   </body>
 </html>`;
 
+// A popover whose ONLY dismiss is a click on a full-viewport, aria-hidden,
+// nameless click-catcher — no Escape handler, no close button. Clicking the
+// trigger opens both the panel and the catcher; the catcher then intercepts
+// every pointer event on #real-target underneath it. The shape live at
+// be-sit-high-fixed-20260910-141440 (PL_08_01), generalised.
+const SCRIM_FIXTURE_HTML = `<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>scrim fixture</title>
+    <style>
+      #catcher { position: fixed; inset: 0; z-index: 900; display: none; }
+      #popover { position: fixed; top: 8px; right: 8px; z-index: 901; display: none; background:#fff; border:1px solid #ccc; }
+      #topbar { position: sticky; top: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="topbar"><button id="todo" type="button" aria-haspopup="dialog">To-do</button></div>
+    <div id="catcher" aria-hidden="true"></div>
+    <div id="popover" role="dialog" aria-label="To-do list"><p>Nothing due.</p></div>
+    <button id="real-target" type="button">Real target</button>
+    <p id="status">idle</p>
+    <script>
+      const catcher = document.getElementById('catcher');
+      const popover = document.getElementById('popover');
+      document.getElementById('todo').addEventListener('click', () => {
+        catcher.style.display = 'block';
+        popover.style.display = 'block';
+      });
+      // Closes ONLY on a click on the catcher. No Escape handler anywhere.
+      catcher.addEventListener('click', () => {
+        catcher.style.display = 'none';
+        popover.style.display = 'none';
+      });
+      document.getElementById('real-target').addEventListener('click', () => {
+        document.getElementById('status').textContent = 'clicked';
+      });
+    </script>
+  </body>
+</html>`;
+
 async function cdpAvailable(url: string): Promise<boolean> {
   try {
     const response = await fetch(`${url}/json/version`, { signal: AbortSignal.timeout(1500) });
@@ -288,6 +327,97 @@ describe('automatic blocking-dialog recovery (CDP)', { skip: skipBrowser }, () =
     const defect = bundle.defects.find((d) => d.category === 'usability');
     assert.ok(defect, 'an unexpected-dialog defect should be recorded');
     assert.equal(defect?.severity, 'medium');
+  });
+});
+
+describe('a click-catcher scrim is clicked through (CDP)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+  let dir: string;
+
+  before(async () => {
+    server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(SCRIM_FIXTURE_HTML);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address() as AddressInfo;
+    origin = `http://127.0.0.1:${address.port}`;
+    dir = await mkdtemp(join(tmpdir(), 'wowlidator-scrim-'));
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('clicks through a scrim that closes only on click, then lands the real click', async () => {
+    // Open the To-do popover (which raises the catcher), then click the
+    // target underneath. The overlay rung's dismiss/Escape cannot close a
+    // click-to-close catcher; the scrim rung clicks it and the retry lands.
+    const flow: Flow = {
+      name: 'scrim blocks target',
+      baseUrl: origin,
+      steps: [
+        { action: 'goto', url: '/' },
+        { action: 'click', selector: '#todo', intent: 'open the To-do popover' },
+        { action: 'click', selector: '#real-target' },
+        { action: 'expectText', selector: '#status', value: 'clicked' },
+      ],
+    };
+
+    const bundle = await runFlow(flow, {
+      cdpUrl: CDP_URL,
+      cachePath: join(dir, 'scrim.json'),
+      fastTimeoutMs: 500,
+    });
+
+    assert.equal(bundle.status, 'passed', bundle.error ?? 'should click through the catcher and land the click');
+    const target = bundle.steps.find((s) => s.action === 'click' && s.selector === '#real-target');
+    assert.equal(target?.resolution, 'dialog');
+    assert.equal(target?.dialog?.button, 'click-catcher');
+    assert.ok(
+      (bundle.notes ?? []).some((note) => note.includes('click-catcher')),
+      'the note names the catcher that was clicked through',
+    );
+  });
+
+  it('a real modal with a named Close button still goes through the dismiss-button path, never a blind click', async () => {
+    // The promo fixture's modal has a named "Close" — the overlay/dialog rung
+    // must dismiss it by that button, not by clicking a catcher.
+    const promoServer = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(PROMO_FIXTURE_HTML);
+    });
+    await new Promise<void>((resolve) => promoServer.listen(0, '127.0.0.1', resolve));
+    const promoOrigin = `http://127.0.0.1:${(promoServer.address() as AddressInfo).port}`;
+    try {
+      const flow: Flow = {
+        name: 'named modal uses the button',
+        baseUrl: promoOrigin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'click', selector: '#real-target' },
+          { action: 'expectText', selector: '#status', value: 'clicked' },
+        ],
+      };
+      const bundle = await runFlow(flow, {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'named.json'),
+        fastTimeoutMs: 500,
+      });
+      assert.equal(bundle.status, 'passed', bundle.error ?? 'the named modal should be dismissed by its Close button');
+      const target = bundle.steps.find((s) => s.action === 'click' && s.selector === '#real-target');
+      assert.equal(target?.dialog?.button, 'Close', 'dismissed by name, not by a blind catcher click');
+    } finally {
+      promoServer.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        promoServer.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
   });
 });
 

@@ -279,7 +279,13 @@ ${selfCheck([
  * is entirely in the *second* ask, which is the first one that knows what did
  * not work.
  */
-const HEAL_ATTEMPTS = 3;
+/**
+ * Repair asks per failed selector. The value is entirely in the SECOND ask —
+ * the first one that knows what did not work (`HealRequest.rejected`). One was
+ * too few for the failure that actually happens; exported so
+ * `tests/healer-economy.test.ts` can pin the budget rather than trust it.
+ */
+export const HEAL_ATTEMPTS = 3;
 
 /**
  * The healer could not repair the selector, and here is everything it tried.
@@ -795,6 +801,13 @@ export interface HealOutcome {
   entry: HealedSelectorEntry;
   /** Wall-clock time of the whole repair, including AX capture and verification. */
   latencyMs: number;
+  /**
+   * What the pre-heal disclosure probe could not put back or could not do —
+   * a popover it opened and had to close with a click rather than Escape, or
+   * one it left open. Surfaced so a run can say the page state a heal ran on
+   * was the probe's doing, not the flow's.
+   */
+  probeWarnings?: string[] | undefined;
 }
 
 export interface HealInput {
@@ -841,10 +854,19 @@ export class JitHealer {
     // trigger is clicked. The model cannot pick a selector for something it
     // cannot see. Failures are swallowed (a probe must never abort a repair).
     let interactions: string | undefined;
+    const probeWarnings: string[] = [];
     try {
       const report = await probeInteractions(input.page);
       const formatted = formatProbeReport(report);
       if (formatted) interactions = formatted;
+      probeWarnings.push(...report.warnings);
+      for (const probe of report.probes) {
+        // A disclosure that needed a click to close is a fact about the page
+        // worth recording: Escape is the gesture every later rung reaches for.
+        if (probe.closedVia !== undefined && probe.closedVia !== 'escape') {
+          probeWarnings.push(`"${probe.trigger}" ignored Escape and was closed by ${probe.closedVia}`);
+        }
+      }
     } catch {
       // Safe to ignore — disclosure probing is a best-effort enrichment.
     }
@@ -972,7 +994,13 @@ export class JitHealer {
       model: this.model.id,
     });
 
-    return { selector: candidate, suggestion, entry, latencyMs: Date.now() - startedMs };
+    return {
+      selector: candidate,
+      suggestion,
+      entry,
+      latencyMs: Date.now() - startedMs,
+      ...(probeWarnings.length > 0 ? { probeWarnings } : {}),
+    };
   }
 
   /**

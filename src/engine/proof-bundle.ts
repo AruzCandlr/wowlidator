@@ -458,6 +458,17 @@ export interface ProvenanceFacts {
   latestSnapshotUrl: string | null;
 }
 
+/**
+ * Where a click sits in a two-step destructive flow.
+ *
+ * `open` — the control is not inside a dialog. It may raise a confirmation
+ *          the test can back out of, or it may commit at once; nothing on the
+ *          page says which before it is clicked.
+ * `commit` — the control is inside an open dialog, acting on a confirmation
+ *          already raised. This is the half that cannot be taken back.
+ */
+export type MutationPhase = 'open' | 'commit';
+
 export interface BlockedOutcome {
   kind: 'blocked';
   reason: BlockedReason;
@@ -468,6 +479,13 @@ export interface BlockedOutcome {
   target: string | null;
   /** Where the run's mutation policy came from (`env`, `cli`, `panel`, …), or null when none was configured. */
   policySource: string | null;
+  /**
+   * Which half of a two-step destructive flow the held click was — `open`
+   * (the control that may raise a confirmation) or `commit` (a control inside
+   * a confirmation already on screen). Absent on a hold that is not about a
+   * governed mutation.
+   */
+  phase?: MutationPhase | undefined;
   provenance?: ProvenanceFacts | undefined;
 }
 
@@ -494,7 +512,11 @@ export type ActionOutcome =
  *   (a replayed journey, a link the tree showed, a state already showing);
  *   `cannot-offer` — a control the goal names was opened and its WHOLE option
  *   list read twice, identically, after a settle, and the goal's value was on
- *   none of them (`ListboxOptionMissingError`, `listboxCannotOffer`).
+ *   none of them (`ListboxOptionMissingError`, `listboxCannotOffer`);
+ *   `fixture-present` — the application's own duplicate-key refusal named the
+ *   goal's key while the tree showed that control holding the goal's value,
+ *   so the record the leg would create is already there
+ *   (`fixtureAlreadyPresent`, 2026-09-09).
  * - Harness limits: `budget` (the turn ceiling), `stalled` (an ok action
  *   repeated on an unchanged page after being told so), `no-progress` (nothing
  *   advanced for the judge's count of turns — the look-only handoff included;
@@ -517,6 +539,7 @@ export const AGENT_ENDED_BY = [
   'no-progress',
   'value-hunt',
   'cannot-offer',
+  'fixture-present',
   'wandered',
   'blocked',
   'model-error',
@@ -633,11 +656,15 @@ export interface AgentRecord {
    * audit): `observed-state` — the harness re-read the goal's end state off
    * the live tree and `settledEvidence` is the line that showed it;
    * `agent-claim` — the goal named no checkable state and the model's word
-   * stands, with its reasoning as the evidence. Absent on a failure or a
+   * stands, with its reasoning as the evidence; `fixture-present`
+   * (2026-09-09) — the application's own duplicate-key refusal named the
+   * goal's key and the live tree showed that control holding the goal's
+   * value, so the record the leg would have created is already there and
+   * the flow's next assertion is the witness. Absent on a failure or a
    * zero-call rung. Audit finding: 20 of 22 agent legs on passed cases were
    * settled by the claim alone, invisibly; now the record says which.
    */
-  settledBy?: 'observed-state' | 'agent-claim' | undefined;
+  settledBy?: 'observed-state' | 'agent-claim' | 'fixture-present' | undefined;
   settledEvidence?: string | undefined;
   /**
    * Set when the leg ENDED on a held action: the mutation policy denied the
@@ -725,6 +752,19 @@ export interface ProofStep {
   action: string;
   /** The author's plain-language description of this step, verbatim from `FlowStep.intent`. */
   intent?: string | undefined;
+  /**
+   * One or two plain sentences saying what this step did and, when it broke,
+   * what went wrong — written by a model AFTER the run, from the step's own
+   * deterministic line (`formatStepLine`) and nothing else.
+   *
+   * Descriptive only. It never changes a status, never becomes a defect, and
+   * never feeds the findings signature (which keys off typed fields on
+   * purpose, so one cause stays one finding whatever language it is worded
+   * in). `by` is on the record because these are a model's words in a
+   * document otherwise made of the run's own, and every surface labels them
+   * as such. See `src/generator/step-narration.ts`.
+   */
+  narration?: StepNarration | undefined;
   /**
    * Who the step ran as — the persona label a `signIn` established on the
    * session the step drove — and on which Chrome (its CDP endpoint), once a
@@ -1200,6 +1240,58 @@ export interface GenerationProvenance {
   runKey?: string | undefined;
 }
 
+/** A model's plain-language reading of one step — see `ProofStep.narration`. */
+export interface StepNarration {
+  /** The sentences themselves. Application text inside them is quoted, never translated. */
+  text: string;
+  /** The model that wrote them, `provider:model` — narration is always attributed. */
+  by: string;
+  at: string;
+}
+
+/** The language a report's own labels and a model's prose are written in. */
+export type ReportLang = 'en' | 'th';
+export const REPORT_LANGS: readonly ReportLang[] = ['en', 'th'];
+
+/** One ticket a case's narrative proposes — the wording only; the defect it stands for is `defectId`. */
+export interface NarrativeTicket {
+  /** `app` — the application; `test` — the test or the harness. Who should act. */
+  kind: 'app' | 'test';
+  title: string;
+  detail: string;
+  owner: string;
+  /** The bundle defect this ticket restates, when it restates one. */
+  defectId?: string | undefined;
+}
+
+/** A question the sheet left open that the run can now answer — from the record, never invented. */
+export interface NarrativeQuestion {
+  question: string;
+  answer: string;
+  /** Which recorded fact the answer was read off. */
+  evidence: string;
+}
+
+/** See `ProofBundle.narrative`. Application text inside is quoted, never translated. */
+export interface CaseNarrative {
+  lang: ReportLang;
+  /** One sentence under the title: what was tested, with what, and what the record holds. */
+  lede: string;
+  /** The pre-read summary: what the case does, in the reader's words. */
+  summary: string;
+  /** The test data the run used, as the record shows it. */
+  testData: string;
+  /** What the sheet expected, restated. */
+  expected: string;
+  tickets: NarrativeTicket[];
+  /** The verifier's note — what a reader should know about how this run went. Empty when there is nothing to say. */
+  verifierNote: string;
+  questions: NarrativeQuestion[];
+  /** The model that wrote it, `provider:model` — a narrative is always attributed. */
+  by: string;
+  at: string;
+}
+
 /** What `error-diagnosis.ts` concluded about a SYSTEM ERROR after the run — see there. */
 export interface ErrorDiagnosis {
   /** Which layer broke: test-catalog | generator | agent | environment | application. */
@@ -1333,6 +1425,17 @@ export interface ProofBundle {
    */
   notes?: string[] | undefined;
   generatedBy?: GenerationProvenance | undefined;
+  /**
+   * The case told as a report a person reads first (2026-09-10): a lede, a
+   * pre-read summary, the ticket each defect deserves, the verifier's own
+   * note and the questions the case leaves open — written by a model AFTER
+   * the run from the same step lines, defects and DB evidence the report
+   * already prints, in the run's report language, and stored here so the
+   * per-case page can show it without calling a model itself. Descriptive
+   * only and always attributed (`by`); it cannot reach a verdict, a defect
+   * or a finding. See `generator/case-narrative.ts`.
+   */
+  narrative?: CaseNarrative | undefined;
   /**
    * Whether this test MEANS to prove acceptance or refusal. A negative test's
    * green run says "the application refused it, as required" — read without
@@ -1866,6 +1969,18 @@ export class ProofBundleBuilder {
     // say) must not relabel some earlier step's failure.
     if (action !== undefined && last.action !== action) return;
     last.status = status;
+  }
+
+  /**
+   * Add to the last recorded step's `detail` a fact learned right after it
+   * ran — the sibling of `reclassifyLastStep`, with the same action guard so
+   * a late observation never lands on an earlier step's record.
+   */
+  annotateLastStep(detail: Record<string, unknown>, action?: string): void {
+    const last = this.#steps[this.#steps.length - 1];
+    if (!last) return;
+    if (action !== undefined && last.action !== action) return;
+    last.detail = { ...(last.detail ?? {}), ...detail };
   }
 
   recordSkipped(step: SkippableStep, message: string): ProofStep {

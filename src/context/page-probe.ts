@@ -32,15 +32,27 @@
  * unmarked disclosure is a missed opportunity, an unmarked *action* clicked by
  * mistake is a write to someone's database.
  *
- * Every probe is closed with Escape and verified collapsed before the next one
- * opens, so one dialog cannot mask the next candidate.
+ * Every probe is put back before the next one opens, and "put back" is
+ * verified against the tree captured before the click, never assumed. Escape
+ * is the first gesture, not the only one: a popover that closes on "click
+ * outside" need not listen for Escape at all (live, 2026-09-10: a top-bar
+ * popover with a full-viewport click-catcher ignored it, the probe left it
+ * open, and its catcher then swallowed every later click of the case). So the
+ * gestures a person would try come next, cheapest and safest first — a
+ * neutral dismiss control inside what opened, the click-catcher itself (an
+ * element with no action of its own), and finally the trigger again, which a
+ * disclosure marks as a toggle. Only when all four fail is the disclosure
+ * reported left open, and probing stops there so one control's contents are
+ * never attributed to the next.
  *
  * Probing is diagnostic. Anything that goes wrong inside it is swallowed and
  * reported as a warning — it must never fail the generation it was helping.
  */
 
-import type { Page } from 'playwright';
+import type { Locator, Page } from 'playwright';
 
+import { findClickCatcher } from '../engine/click-catcher.js';
+import { findDismissButton, openDialogNow } from '../engine/modal.js';
 import { captureAxNodes, type AxNode } from '../healer/jit-healer.js';
 
 /**
@@ -80,6 +92,14 @@ const DISCLOSURE_SELECTOR = [
 export const DEFAULT_MAX_PROBES = 6;
 export const DEFAULT_PROBE_SETTLE_MS = 600;
 
+/** The gestures a probe tries, in order, to put a disclosure back. */
+export type CloseGesture = 'escape' | 'dismiss-button' | 'click-catcher' | 'trigger';
+
+export const CLOSE_GESTURES: readonly CloseGesture[] = ['escape', 'dismiss-button', 'click-catcher', 'trigger'];
+
+/** How long a disclosure is given to settle after a closing gesture. */
+export const CLOSE_SETTLE_MS = 200;
+
 export interface ProbeResult {
   /** The control that was clicked, as a reader would name it. */
   trigger: string;
@@ -87,6 +107,8 @@ export interface ProbeResult {
   revealed: AxNode[];
   /** True when the disclosure would not close again — see `probeInteractions`. */
   leftOpen?: boolean;
+  /** The gesture that put the disclosure back. Absent when it was left open. */
+  closedVia?: CloseGesture;
 }
 
 export interface ProbeReport {
@@ -159,36 +181,44 @@ export async function probeInteractions(
     report.skipped = candidates.length - maxProbes;
   }
 
+  const urlBefore = page.url();
   for (const candidate of candidates.slice(0, maxProbes)) {
     try {
       const trigger = page.locator(candidate.selector).first();
       await trigger.click({ timeout: 2_000 });
       await page.waitForTimeout(settleMs);
 
+      if (page.url() !== urlBefore) {
+        // A "disclosure" that navigated is mislabelled, and a probe that leaves
+        // the page on another URL has changed the run it was helping. Go back
+        // (best effort) and stop: nothing after this can be attributed.
+        report.warnings.push(
+          `"${candidate.label}" navigated to ${page.url()} instead of revealing content — ` +
+            'went back and stopped probing',
+        );
+        await page.goBack({ waitUntil: 'commit', timeout: 5_000 }).catch(() => undefined);
+        break;
+      }
+
       const after = await captureAxNodes(page);
       const revealed = after.filter((node) => !baselineKeys.has(keyOf(node)));
 
-      // Escape closes menus, dialogs and listboxes in every library that marks
-      // them correctly — which is the same set this probe is restricted to.
-      await page.keyboard.press('Escape');
-      await page.waitForTimeout(200);
-      const settled = await captureAxNodes(page);
-      const stillOpen = settled.some((node) => !baselineKeys.has(keyOf(node)));
+      const closed = await closeDisclosure(page, trigger, baselineKeys);
 
       if (revealed.length > 0) {
         report.probes.push(
-          stillOpen
+          closed === null
             ? { trigger: candidate.label, revealed, leftOpen: true }
-            : { trigger: candidate.label, revealed },
+            : { trigger: candidate.label, revealed, closedVia: closed },
         );
       }
 
-      if (stillOpen) {
+      if (closed === null) {
         // Whatever opened is still there and would contaminate every later
         // probe. Stop rather than attribute one control's contents to another.
         report.warnings.push(
-          `"${candidate.label}" would not close with Escape — stopped probing to avoid ` +
-            'attributing its contents to another control',
+          `"${candidate.label}" would not close (tried ${CLOSE_GESTURES.join(', ')}) — stopped ` +
+            'probing to avoid attributing its contents to another control',
         );
         break;
       }
@@ -234,6 +264,54 @@ export function formatProbeReport(report: ProbeReport): string {
     lines.push(`(${report.skipped} more disclosure(s) not opened — probe budget reached.)`);
   }
   return lines.join('\n');
+}
+
+/**
+ * Put an opened disclosure back, one gesture at a time, and say which one
+ * did it — `null` when none did. Every gesture is verified the same way:
+ * the tree holds nothing the baseline did not.
+ *
+ * Order is by how little each gesture can do beyond closing: Escape touches
+ * nothing; a neutral dismiss control is named for exactly this; a
+ * click-catcher has no action of its own by construction
+ * (`src/engine/click-catcher.ts`); the trigger is a toggle by ARIA contract,
+ * but it is still a control, so it goes last. A gesture that throws — the
+ * trigger under a catcher Playwright refuses to click through — is simply
+ * the next gesture's turn.
+ */
+async function closeDisclosure(
+  page: Page,
+  trigger: Locator,
+  baselineKeys: ReadonlySet<string>,
+): Promise<CloseGesture | null> {
+  const stillOpen = async (): Promise<boolean> => {
+    await page.waitForTimeout(CLOSE_SETTLE_MS);
+    const settled = await captureAxNodes(page);
+    return settled.some((node) => !baselineKeys.has(keyOf(node)));
+  };
+
+  await page.keyboard.press('Escape').catch(() => undefined);
+  if (!(await stillOpen())) return 'escape';
+
+  const dialog = await openDialogNow(page).catch(() => null);
+  if (dialog) {
+    const dismiss = await findDismissButton(dialog, { policy: 'automatic' }).catch(() => null);
+    if (dismiss) {
+      await dismiss.locator.click({ timeout: 2_000 }).catch(() => undefined);
+      if (!(await stillOpen())) return 'dismiss-button';
+    }
+  }
+
+  const catcher = await findClickCatcher(page);
+  if (catcher) {
+    await page.mouse.click(catcher.point.x, catcher.point.y).catch(() => undefined);
+    if (!(await stillOpen())) return 'click-catcher';
+  }
+
+  await trigger.click({ timeout: 2_000 }).catch(() => undefined);
+  if (!(await stillOpen())) return 'trigger';
+
+  return null;
 }
 
 function keyOf(node: AxNode): string {

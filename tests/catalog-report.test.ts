@@ -285,6 +285,24 @@ describe('export', () => {
   });
 });
 
+describe('the case page link', () => {
+  it('links the case name to the media folder by default, to the href the writer gives when it does, and carries the ledger path for the panel', () => {
+    const base = { title: 't', runKey: 'pl-02@2026-08-31T04:00:00.000Z', generatedAt: null };
+    const plain = renderCatalogReport({ ...base, cases: [kase({})] });
+    assert.match(plain, /<a class="open-case" href="pl-02-2026-08-31t04-00-00-000z-media\/pl-02-01\.html" onclick/);
+    const own = renderCatalogReport({
+      ...base,
+      cases: [kase({ reportPath: '/runs/x/humi-en-login-pl-02/01-catalog-pl-02-01.html' })],
+      casePageHref: () => '../runs/x/humi-en-login-pl-02/01-catalog-pl-02-01.html',
+    });
+    assert.match(own, /<a class="open-case" href="\.\.\/runs\/x\/humi-en-login-pl-02\/01-catalog-pl-02-01\.html" data-report="\/runs\/x\/humi-en-login-pl-02\/01-catalog-pl-02-01\.html" onclick/);
+    assert.match(own, /a\.href = '\/view\?path=' \+ encodeURIComponent/);
+    // A case with no bundle has no page and no link.
+    const none = renderCatalogReport({ ...base, cases: [kase({ verdict: 'blocked', status: null, bundle: null })] });
+    assert.doesNotMatch(none, /<a class="open-case"/);
+  });
+});
+
 describe('safety and paths', () => {
   it('escapes case names — application text cannot become markup', () => {
     const html = renderCatalogReport({
@@ -299,6 +317,153 @@ describe('safety and paths', () => {
     const p = catalogReportPath('be100-csv@2026-08-31T03:33:23.997Z', 'be100', '/tmp/x');
     assert.match(p, /^\/tmp\/x\/reports\/be100-csv-2026-08-31t03-33-23-997z\.html$/);
     assert.equal(catalogReportPath(null, 'My Catalog', '/tmp/x'), '/tmp/x/reports/my-catalog.html');
+  });
+});
+
+/* ------------------------------------------------------------- narration */
+
+/**
+ * `ProofStep.narration` in the catalog report's step detail (2026-09-07).
+ * The same sentence, the same label and the same attribution as the per-run
+ * report — both surfaces read it through `stepNarration` so they cannot
+ * disagree on the wording — placed after every recorded fact of the step and
+ * before none of them.
+ */
+describe('a step narrated in plain language', () => {
+  const narration = { text: 'Looked for "Create Plan" and found "สร้างแผนสวัสดิการ" instead.', by: 'groq:llama-3.3-70b', at: '2026-09-07T00:00:00.000Z' };
+  const narratedCase = (over: Partial<ProofStep> = {}): CatalogReportCase =>
+    kase({
+      bundle: bundle([
+        step({
+          index: 0, action: 'expectModal', intent: 'the Create Plan dialog is shown',
+          selector: 'role=dialog[name="Create Plan" i]', status: 'failed', error: 'could not resolve',
+          narration, ...over,
+        } as Partial<ProofStep>),
+      ]),
+    });
+
+  it('renders the sentence in the step detail, labelled, explained and signed', () => {
+    const html = renderCatalogReport({ title: 'be100', runKey: null, generatedAt: null, cases: [narratedCase()] });
+    const line = html.match(/<div class="narration">[\s\S]*?<\/div>/)?.[0] ?? '';
+    assert.notEqual(line, '', 'the narration renders in the step body');
+    // The catalog report's `esc` escapes `&<>"` — enough inside a double-quoted
+    // attribute, and the same escaping every other title on this page uses.
+    assert.match(line, /<span class="narr-k" title="A model's plain-language reading of this step's own recorded line[^"]*Descriptive only: it sets no status[^"]*">in plain language<\/span>/);
+    assert.match(line, /Looked for &quot;Create Plan&quot; and found &quot;สร้างแผนสวัสดิการ&quot; instead\./, 'application text is quoted, never translated');
+    assert.match(line, /— written by groq:llama-3\.3-70b<\/em>/, 'attributed where it is read');
+  });
+
+  it('comes after the step\'s recorded facts and displaces none of them', () => {
+    const html = renderCatalogReport({ title: 'be100', runKey: null, generatedAt: null, cases: [narratedCase()] });
+    const body = html.slice(html.indexOf('<div class="sbody">'));
+    for (const before of ['<span>intent</span>', '<span>selector</span>', '<div class="kv err"><span>error</span>']) {
+      assert.ok(body.indexOf(before) >= 0, `${before} still renders`);
+      assert.ok(body.indexOf(before) < body.indexOf('<div class="narration">'), `${before} is read before the narration, not after it`);
+    }
+  });
+
+  it('escapes the model\'s prose and the model\'s name', () => {
+    const html = renderCatalogReport({
+      title: 'be100', runKey: null, generatedAt: null,
+      cases: [narratedCase({ narration: { text: '<script>alert(1)</script>', by: '<img src=x onerror=1>', at: 'now' } } as Partial<ProofStep>)],
+    });
+    assert.ok(!html.includes('<script>alert(1)</script>'));
+    assert.ok(!html.includes('<img src=x'));
+    assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  });
+
+  it('a case with no narration renders exactly the bytes it did before narration existed', () => {
+    const c = narratedCase();
+    const withNarration = renderCatalogReport({ title: 'be100', runKey: null, generatedAt: null, cases: [c] });
+    delete (c.bundle!.steps[0] as { narration?: unknown }).narration;
+    const plain = renderCatalogReport({ title: 'be100', runKey: null, generatedAt: null, cases: [c] });
+    assert.doesNotMatch(plain, /class="narration"|in plain language<\/span>/);
+    assert.equal(withNarration.replace(/<div class="narration">[\s\S]*?<\/div>/g, ''), plain);
+  });
+});
+
+/* -------------------------------------------- the leg that decided nothing */
+
+/**
+ * The same fold as the per-run report, in the step detail pane (2026-09-08).
+ * Both surfaces ask `inconsequentialAgentLeg`, so they cannot disagree about
+ * which legs are noise or about the words they fold them behind — and neither
+ * of them removes anything from the document.
+ */
+describe('an agent leg that did not decide its step', () => {
+  const leg = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    goal: 'open the Company Code picker',
+    model: 'stub',
+    success: false,
+    summary: 'agent found nothing the goal names to act on',
+    turns: 2,
+    maxSteps: null,
+    latencyMs: 5,
+    actions: [{ index: 0, action: 'scroll', selector: '', value: null, url: 'u', reasoning: 'look further down', ok: true, durationMs: 1 }],
+    ...over,
+  });
+
+  const legCase = (over: Partial<ProofStep> = {}, agent: Record<string, unknown> = leg()): CatalogReportCase =>
+    kase({
+      bundle: bundle([
+        step({ index: 0, action: 'selectOption', intent: 'set the rule type', selector: 'role=combobox[name="Company Code" i]', agent, ...over } as Partial<ProofStep>),
+      ]),
+    });
+
+  const render = (c: CatalogReportCase): string => renderCatalogReport({ title: 'be100', runKey: null, generatedAt: null, cases: [c] });
+
+  it('folds a leg that did not decide the outcome, and keeps every turn inside the disclosure', () => {
+    const html = render(legCase());
+    // The catalog report's `esc` escapes `&<>"` and leaves the apostrophe —
+    // valid as element content, and the same escaping every other line here uses.
+    assert.match(html, /<details class="aside-leg"><summary>agent leg — did not affect this step's outcome: the step passed on the flow's own selector regardless<\/summary><div class="agent">/);
+    // Nothing left the pane: the summary line and the turn are still there.
+    assert.match(html, /agent found nothing the goal names to act on \(2 turn\(s\)\)/);
+    assert.match(html, /<ol class="turns"><li class="ok">scroll/);
+    assert.doesNotMatch(html, /<details class="aside-leg" open>/);
+  });
+
+  it('says "it never engaged a control the goal names" for a look-only leg — the same words the per-run report uses', () => {
+    const html = render(legCase({}, leg({ lookedOnly: true, endedBy: 'no-progress' })));
+    assert.match(html, /<summary>agent leg — did not affect this step's outcome: it never engaged a control the goal names<\/summary>/);
+  });
+
+  it('never folds a failing step, a hold, or the model\'s own "fail" claim', () => {
+    const held = { reason: 'irreversible', rule: 'manifest', message: 'no approval' };
+    for (const c of [
+      legCase({ status: 'failed', error: 'could not resolve' }),
+      legCase({ blocked: held } as Partial<ProofStep>),
+      legCase({}, leg({ blocked: held })),
+      legCase({}, leg({ endedBy: 'fail' })),
+      legCase({}, leg({ success: true })),
+    ]) {
+      const html = render(c);
+      assert.doesNotMatch(html, /<details class="aside-leg"/);
+      assert.match(html, /<div class="agent">/, 'the leg still renders, just not folded');
+    }
+  });
+
+  it('a case with no qualifying step renders exactly the bytes it did before folding existed', () => {
+    const c = legCase();
+    const folded = render(c);
+    // The one field the predicate reads and this page renders nowhere.
+    (c.bundle!.steps[0]!.agent as unknown as { endedBy?: string }).endedBy = 'fail';
+    const plain = render(c);
+    // The stylesheet always carries the rule; the MARKUP is what must be gone.
+    assert.doesNotMatch(plain, /<details class="aside-leg"/);
+    assert.equal(
+      folded.replace(/<details class="aside-leg"><summary>[^<]*<\/summary>([\s\S]*?)<\/details>/, '$1'),
+      plain,
+      'the fold is a wrapper; every other byte of the report is the same',
+    );
+  });
+
+  it('escapes the leg it folds and composes the summary from constants alone', () => {
+    const html = render(legCase({}, leg({ goal: '<script>alert(1)</script>', summary: '<img src=x onerror=1>' })));
+    assert.ok(!html.includes('<script>alert(1)</script>'));
+    assert.ok(!html.includes('<img src=x'));
+    const summaries = [...html.matchAll(/<details class="aside-leg"><summary>([^<]*)<\/summary>/g)].map((m) => m[1]);
+    assert.deepEqual(summaries, ["agent leg — did not affect this step's outcome: the step passed on the flow's own selector regardless"]);
   });
 });
 
@@ -664,6 +829,106 @@ describe('the recording plays (CDP)', { skip: skipBrowser }, () => {
       await page.close().catch(() => undefined);
       await context.close().catch(() => undefined);
       await browser.close().catch(() => undefined);
+    }
+  });
+});
+
+/* --------------------------------------- the database check, and the step that decided nothing */
+
+/**
+ * The catalog report shows a database check the way the per-run report and
+ * the workbook do (2026-09-08): the summary, the statement that answered the
+ * claim with its bound parameters, and the rows as a real table. One
+ * projection (`dbEvidence` in `step-facts.ts`), three surfaces — a fact added
+ * to one page and not the other is the first thing a reader notices.
+ */
+describe('a database check shows the query it ran', () => {
+  const dbCase = (db: Record<string, unknown>): CatalogReportCase =>
+    kase({ bundle: bundle([step({ index: 0, action: 'expectDbRow', intent: 'the plan row is there', db: db as never } as Partial<ProofStep>)]) });
+
+  const render = (c: CatalogReportCase): string =>
+    renderCatalogReport({ title: 'be100', runKey: null, generatedAt: null, cases: [c] });
+
+  const RECORD = {
+    kind: 'row',
+    table: 'benefit_plan',
+    where: 'id = 42 AND session_token = [redacted]',
+    expected: 'at least 1 row',
+    observed: '1 row(s)',
+    rows: [{ id: '42', name: 'Part time' }],
+    rowsMatched: 42,
+    durationMs: 12,
+    statements: [{ sql: 'SELECT * FROM "benefit_plan" WHERE "id" = $1 LIMIT 25', params: ['42'], tables: ['benefit_plan'] }],
+    note: 'read directly from the database while this flow ran',
+  };
+
+  it('renders the query, its parameters and the rows as a table with a header row', () => {
+    const html = render(dbCase(RECORD));
+    assert.match(html, /<span>db query<\/span><code>SELECT \* FROM &quot;benefit_plan&quot; WHERE &quot;id&quot; = \$1 LIMIT 25<\/code>/);
+    assert.match(html, /<span>db parameters<\/span><code>\$1 = 42<\/code>/);
+    assert.match(html, /<span>db rows returned<\/span><span>showing 1 of 42 row\(s\) — the sample is capped at 3<\/span>/);
+    assert.match(html, /<thead><tr><th>id<\/th><th>name<\/th><\/tr><\/thead>/);
+    assert.match(html, /<span>db where<\/span><span>id = 42 AND session_token = \[redacted\]<\/span>/);
+    assert.match(html, /<span>db expected<\/span><span>at least 1 row<\/span>/);
+  });
+
+  it('escapes the statement and every cell, and carries no unredacted value', () => {
+    const html = render(
+      dbCase({ ...RECORD, rows: [{ password: '[redacted]', name: '<script>alert(1)</script>' }], statements: [{ sql: 'SELECT "p" FROM "u" -- <script>x</script>', params: ['[redacted]'] }] }),
+    );
+    assert.ok(!html.includes('<script>alert(1)</script>'));
+    assert.ok(!html.includes('-- <script>x</script>'));
+    assert.match(html, /<th>password<\/th>/);
+    assert.match(html, /<td>\[redacted\]<\/td>/);
+  });
+
+  it('a bundle sealed before the statement existed shows its summary and no query row', () => {
+    const { statements: _dropped, rowsMatched: _also, ...older } = RECORD;
+    const html = render(dbCase(older));
+    assert.doesNotMatch(html, /<span>db query<\/span>/);
+    assert.doesNotMatch(html, /<span>db parameters<\/span>/);
+    assert.match(html, /<span>db where<\/span>/);
+    assert.match(html, /<span>db rows returned<\/span><span>1 row\(s\)<\/span>/);
+  });
+});
+
+/**
+ * A broken step that decided nothing is folded here too (2026-09-08), through
+ * the same `inconsequentialBrokenStep` predicate and in the same words. The
+ * step is already a closed disclosure in this pane, so folding means the
+ * ordinary colour and one honest line on its summary naming the sealed status
+ * — nothing leaves the pane, and no status is rewritten.
+ */
+describe('a step that broke without deciding the outcome', () => {
+  const steps = (broken: Partial<ProofStep> = {}): ProofStep[] => [
+    step({ index: 0, action: 'goto' }),
+    step({ index: 1, action: 'click', intent: 'dismiss the consent gate', selector: 'role=button[name="Accept" i]', status: 'failed', error: 'could not resolve', ...broken } as Partial<ProofStep>),
+    step({ index: 2, action: 'expectText', intent: 'the plan is listed', selector: 'text="Part time"' }),
+  ];
+  const render = (over: Partial<ProofBundle> = {}, broken: Partial<ProofStep> = {}): string =>
+    renderCatalogReport({
+      title: 'be100', runKey: null, generatedAt: null,
+      cases: [kase({ bundle: bundle(steps(broken), { status: 'passed-with-issues', ...over }) })],
+    });
+
+  it('folds it into an aside with the sealed status on the summary, and keeps the whole record', () => {
+    const html = render();
+    assert.match(html, /<details class="step aside">/);
+    assert.match(html, /<span class="saside">failed — did not decide this run's outcome: it makes no claim, the run carried past it, and every claim the run did make held<\/span>/);
+    // Nothing leaves the pane: the error and the intent are still in the body.
+    assert.match(html, /<span>error<\/span><code>could not resolve<\/code>/);
+    assert.match(html, /dismiss the consent gate/);
+    // The status word is on the summary; the row is simply not coloured as a finding.
+    assert.doesNotMatch(html, /<details class="step no"><summary><b class="dot"><\/b><span class="sname">1 click/);
+  });
+
+  it('never folds an assertion, an `error`, a hold, or anything on a run whose claims did not hold', () => {
+    assert.doesNotMatch(render({}, { action: 'expectVisible' }), /<details class="step aside"/);
+    assert.doesNotMatch(render({}, { status: 'error' }), /<details class="step aside"/);
+    const held = { reason: 'irreversible', rule: 'manifest', message: 'no approval' };
+    assert.doesNotMatch(render({}, { blocked: held } as Partial<ProofStep>), /<details class="step aside"/);
+    for (const status of ['failed', 'dead-end', 'needs-review']) {
+      assert.doesNotMatch(render({ status: status as ProofBundle['status'] }), /<details class="step aside"/, status);
     }
   });
 });

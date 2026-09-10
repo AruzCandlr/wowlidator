@@ -204,6 +204,30 @@ const AUTOHEAL_FIELD: Field = {
  * after. Shown on the catalog form because that is the run that writes to the
  * app's database case after case.
  */
+/**
+ * The language of each case's own report page and the narrative on it — the
+ * CLI's `--report-lang`, English by default. Recorded on the run's ledger, so
+ * a rebuild speaks the language the run chose. Labels only: application text
+ * is always shown as captured.
+ */
+const REPORT_LANG_FIELD: Field = {
+  name: 'report-lang',
+  label: 'Case page language',
+  type: 'enum',
+  choices: ['en', 'th'],
+  default: 'en',
+  help: 'The language each case\'s own report page is written in — its section titles and the model-written summary, tickets and notes on it. Application text, ids, SQL and selectors are shown exactly as recorded whatever you pick. Recorded on the run, so a rebuilt report keeps it.',
+  advanced: true,
+};
+
+const NO_CASE_NARRATIVE_FIELD: Field = {
+  name: 'no-case-narrative',
+  label: 'Case pages without the narrative',
+  type: 'boolean',
+  help: 'By default one generator-role call per case writes the case page\'s lede, pre-read summary, ticket wording, verifier note and open questions onto the proof bundle, labelled as the model\'s words; they explain and decide nothing. Tick to skip that call and leave each page to its recorded evidence — cheaper on a large catalog.',
+  advanced: true,
+};
+
 const DB_BASELINE_FIELD: Field = {
   name: 'db-baseline',
   label: 'Database baseline',
@@ -971,8 +995,10 @@ export const COMMANDS: readonly CommandSpec[] = [
       },
       ...SIGN_IN_FIELDS,
       BACKEND_FIELD,
-        DB_BASELINE_FIELD,
+      DB_BASELINE_FIELD,
       DB_URL_FIELD,
+      REPORT_LANG_FIELD,
+      NO_CASE_NARRATIVE_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },

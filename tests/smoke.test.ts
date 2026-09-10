@@ -29,8 +29,12 @@ import {
   NATIVE_SUBMIT_UNNAMED,
   StepResolutionError,
   triageVerdictOf,
+  acceptedCredentialSubmit,
+  credentialSettleOutcome,
   fillsLostToHydration,
+  hydrationResetEvidence,
   nativeFormResubmitDetected,
+  signInDidNotTakeAfter,
   signInDidNotTakeMessage,
   parseInterception,
   runFlow,
@@ -38,7 +42,15 @@ import {
   type Flow,
   type FlowStep,
 } from '../src/engine/runner.js';
-import { WorkflowAgent, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
+import {
+  SIGN_IN_ATTEMPTS,
+  retrySignIn,
+  signInAttemptCeiling,
+  type SignInAttemptOutcome,
+} from '../src/engine/sign-in.js';
+import { dialogIsIntendedContextGiven } from '../src/engine/modal.js';
+import { isClickCatcher, type ClickCatcherFacts } from '../src/engine/click-catcher.js';
+import { WorkflowAgent, looksLikeNoVision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
 import {
   LlmHealerModel,
   JitHealer,
@@ -193,6 +205,42 @@ describe('cache-manager', () => {
     const cache = new CacheManager({ filePath: path, warn: false });
     await cache.load();
     assert.equal(cache.size, 0);
+  });
+});
+
+describe('the judging turn sees the page', () => {
+  it('knows a model refusing an image from a model that is simply down', () => {
+    // The narrow half: these mean "this model has no eyes", and the rung
+    // should ask again blind rather than start erroring where it used to
+    // answer from the tree.
+    assert.equal(looksLikeNoVision(new Error('This model does not support image input')), true);
+    assert.equal(looksLikeNoVision(new Error('groq:llama-3.1-8b — images are not supported')), true);
+    assert.equal(looksLikeNoVision(new Error('Unsupported content part: image')), true);
+    assert.equal(looksLikeNoVision('no support for images in this request'), true);
+
+    // The loud half. A transient outage must stay loud: falling back blind on
+    // any failure would quietly halve the evidence every time a provider
+    // hiccups, which is worse than the failure it hid.
+    assert.equal(looksLikeNoVision(new Error('rate limit exceeded')), false);
+    assert.equal(looksLikeNoVision(new Error('circuit is open')), false);
+    assert.equal(looksLikeNoVision(new Error('fetch failed')), false);
+    assert.equal(looksLikeNoVision(new Error('')), false);
+  });
+
+  it('passes a screenshot to the model only when one was taken', async () => {
+    const seen: (boolean | undefined)[] = [];
+    const model = {
+      id: 'test:agent',
+      decide: async (o: AgentObservation) => {
+        seen.push(o.screenshot !== undefined);
+        return { action: 'finish' as const, selector: '', value: 'proved', url: '', reasoning: '', next: [] };
+      },
+    };
+    const shot = { data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' };
+    const base = { goal: 'g', url: 'u', axTree: '', history: [], stepsRemaining: 3 };
+    await model.decide({ ...base, screenshot: shot });
+    await model.decide(base);
+    assert.deepEqual(seen, [true, false], 'the image is present only when supplied');
   });
 });
 
@@ -1480,6 +1528,130 @@ describe('ambiguous selector repair (CDP)', { skip: skipBrowser }, () => {
   });
 });
 
+/**
+ * A page whose repeated-button ambiguity coincides with a backend endpoint
+ * that fails on every load — the exact shape of be-sit-high-20260909-170213's
+ * RU_06_12 and PL_10_01, where four `/humi/api/content-management/*`
+ * endpoints 500'd on every page and armed the backend rung on every step.
+ */
+const AMBIGUOUS_WITH_FAILING_BACKEND_HTML = `<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>ambiguous button, failing backend</title></head>
+  <body>
+    <button type="button">Edit</button>
+    <button type="button">Edit</button>
+    <button type="button">Edit</button>
+    <p id="status">idle</p>
+    <script>
+      fetch('/api/thing').catch(() => {});
+      document.querySelectorAll('button').forEach((btn, i) => {
+        btn.addEventListener('click', () => {
+          document.getElementById('status').textContent = 'clicked ' + i;
+        });
+      });
+    </script>
+  </body>
+</html>`;
+
+describe('the backend rung must not stand in for a demonstrably-resolved selector (RU_06_12, PL_10_01, 2026-09-10)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+  let dir: string;
+
+  before(async () => {
+    server = createServer((req, res) => {
+      if (req.url?.startsWith('/api/thing')) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'nope' }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(AMBIGUOUS_WITH_FAILING_BACKEND_HTML);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    dir = await mkdtemp(join(tmpdir(), 'wowlidator-backend-ambiguous-'));
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('a strict-mode violation alongside a failing backend call still reaches the healer', async () => {
+    const healerModel = new StubHealerModel((request) => {
+      assert.match(request.failureReason ?? '', /strict mode violation/);
+      return {
+        selector: 'role=button[name="Edit"] >> nth=0',
+        strategy: 'role',
+        confidence: 0.8,
+        reasoning: 'three identical rows; intent does not name a specific one',
+      };
+    });
+
+    const bundle = await runFlow(
+      {
+        name: 'strict-mode-violation-with-failing-backend',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'click', selector: 'role=button[name="Edit"]', intent: 'edit the item' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'strict-mode-with-backend.json'),
+        fastTimeoutMs: 500,
+        makeHealer: (cache) => new JitHealer({ model: healerModel, cache }),
+      },
+    );
+
+    // The backend failure genuinely happened — otherwise this test would prove
+    // nothing about the rung it targets.
+    assert.ok(bundle.summary.networkFailures >= 1, 'the fixture endpoint must have failed');
+    assert.equal(bundle.status, 'passed', bundle.error ?? 'the demonstrably-present control must still heal');
+    assert.equal(healerModel.calls.length, 1, 'the healer must be consulted despite the failing backend call');
+    const click = bundle.steps.find((step) => step.action === 'click');
+    assert.equal(click?.resolution, 'jit');
+    assert.equal(
+      bundle.summary.backendBlocked,
+      0,
+      'a selector that resolved to several elements was never actually backend-blocked',
+    );
+  });
+
+  it('a plain not-found alongside the same failing backend call still stops there, unhealed', async () => {
+    const healerModel = new StubHealerModel(() => {
+      throw new Error('the healer must not be reached when the backend already failed');
+    });
+
+    const bundle = await runFlow(
+      {
+        name: 'not-found-with-failing-backend',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'click', selector: 'role=button[name="Ghost"]', intent: 'a control the page never had' },
+        ],
+      },
+      {
+        cdpUrl: CDP_URL,
+        cachePath: join(dir, 'not-found-with-backend.json'),
+        fastTimeoutMs: 500,
+        makeHealer: (cache) => new JitHealer({ model: healerModel, cache }),
+      },
+    );
+
+    assert.ok(bundle.summary.networkFailures >= 1, 'the fixture endpoint must have failed');
+    assert.equal(bundle.status, 'dead-end');
+    assert.equal(healerModel.calls.length, 0, 'control plane must stay idle — the premise still holds here');
+    assert.equal(bundle.summary.backendBlocked, 1);
+  });
+});
+
 const healerRole = loadConfig().roles.healer;
 const healerKeyEnv = PROVIDER_META[healerRole.provider].envKey;
 
@@ -1545,6 +1717,39 @@ describe('a failure message must describe the failure it carries', () => {
       'late "role=main": expected text to contain "PB-001", got "Probation Review…"',
     ]);
     assert.match(error.message, /^"role=main" resolved, but its content did not hold/);
+  });
+
+  it('an intercepted action headlines as blocked, not as unresolved (PL_08_01, 2026-09-09)', () => {
+    // Steps 9-11 resolved this exact selector and read it visible and enabled;
+    // step 12 clicked it, an overlay took the pointer, and every rung reported
+    // only `locator.click: Timeout` — which names no cause. The header said the
+    // control could not be resolved, and that word was the premise the healer
+    // and the reconstruction both reasoned from, wrongly, for 60 seconds.
+    const error = new StepResolutionError(
+      'role=button[name="Insert" i] >> nth=0',
+      [
+        'fast "role=button[name="Insert" i] >> nth=0": locator.click: Timeout 1426ms exceeded.',
+        'scroll (clear of "div.humi-topbar") "role=button[name="Insert" i] >> nth=0": locator.click: Timeout 1860ms exceeded.',
+      ],
+      { blockedBy: 'div.humi-topbar' },
+    );
+    assert.match(error.message, /^"role=button\[name="Insert" i\] >> nth=0" resolved, but the action was blocked by div\.humi-topbar/);
+    assert.doesNotMatch(error.message, /could not resolve/);
+    assert.equal(error.blockedBy, 'div.humi-topbar');
+    // Classification is deliberately untouched: the step still could not
+    // proceed, so it is still a dead end — only the account of why changed.
+    assert.equal(error.contentOnly, false);
+  });
+
+  it('without a named interceptor the resolution header stands', () => {
+    // An element that genuinely never matched must keep reading as missing —
+    // Playwright cannot name an interceptor for one it never found, so the
+    // absence of `blockedBy` is the honest signal, not a guess.
+    const error = new StepResolutionError('role=button[name="Ghost"]', [
+      'fast "role=button[name="Ghost"]": locator.click: Timeout 1426ms exceeded.',
+    ]);
+    assert.match(error.message, /^could not resolve "role=button\[name="Ghost"\]"/);
+    assert.equal(error.blockedBy, undefined);
   });
 
   it('mixed attempts keep the resolution header', () => {
@@ -1716,6 +1921,12 @@ describe('the sign-in that never took effect', () => {
     assert.match(message ?? '', /the sign-in did not take effect/);
     assert.match(message ?? '', /\/en\/admin\/benefits\/rules/);
     assert.match(message ?? '', /not a redirect/, 'the wording must not claim a bounce');
+    // 2026-09-10: authored flows carry no assertion between the credential
+    // click and the next goto — the proof lives on the next page, and the
+    // engine judges the submit by the accepted POST and the goto landing.
+    assert.match(message ?? '', /accepted no credential submit/);
+    assert.match(message ?? '', /belongs on the page it goes to next/);
+    assert.doesNotMatch(message ?? '', /immediately after the submit click/, 'the old advice contradicts the generator rule');
   });
 
   it('never fires for a flow that stays on the sign-in page', () => {
@@ -1802,6 +2013,236 @@ describe('lost-fill detection — the hydration race, second signature', () => {
   it('an unreadable field is skipped, never guessed lost', async () => {
     const lost = await fillsLostToHydration(async () => null, [passwordFill]);
     assert.equal(lost, null);
+  });
+});
+
+describe('a sign-in URL is never evidence of no session; an accepted credential POST is evidence it took', () => {
+  // be-sit-high-20260909-170213 (2026-09-10): the application lands a
+  // SUCCESSFUL local sign-in back on its sign-in page — POST 200 with the
+  // session cookie, then a client redirect that re-mounts the login form
+  // EMPTY. The lost-fill read saw empty fields and replayed a working login;
+  // the URL read after the replay sealed 15/15 cases "the sign-in did not
+  // take effect" — including one whose next protected goto had landed.
+  const emailFill: FlowStep = {
+    action: 'fill',
+    selector: 'input[type=email]',
+    value: 'admin@cnext.test',
+    intent: 'Enter work email',
+  };
+  const passwordFill: FlowStep = {
+    action: 'fill',
+    selector: 'input[type=password]',
+    value: 'admin2026',
+    intent: 'Enter password',
+  };
+  const emptyFields = async (selector: string): Promise<string | null> =>
+    selector.includes('password') ? '' : 'admin@cnext.test';
+  const call = (method: string, status: number | undefined, url = 'https://x.test/api/auth/login') => ({
+    id: `${method}-${status ?? 'pending'}`,
+    method,
+    url,
+    resourceType: 'fetch',
+    status,
+    startedAt: 1,
+  });
+
+  it('acceptedCredentialSubmit: the first POST the server accepted, whatever the case of the method', () => {
+    const accepted = acceptedCredentialSubmit([
+      call('GET', 200, 'https://x.test/en/login'),
+      call('post', 200),
+      call('POST', 201, 'https://x.test/api/second'),
+    ]);
+    assert.equal(accepted?.url, 'https://x.test/api/auth/login');
+    assert.equal(acceptedCredentialSubmit([call('GET', 200)]), null, 'a GET is the native-submit signature, never a POST');
+    assert.equal(acceptedCredentialSubmit([call('POST', 401)]), null, 'a refused POST is a hydration-reset submit');
+    assert.equal(acceptedCredentialSubmit([call('POST', undefined)]), null, 'a POST still in flight is not evidence yet');
+    assert.equal(acceptedCredentialSubmit([]), null);
+  });
+
+  it('(a) an accepted POST beside empty fields: no replay, no lost-fill finding — and the fields are not even read', async () => {
+    let reads = 0;
+    const evidence = await hydrationResetEvidence(
+      async (selector) => {
+        reads += 1;
+        return emptyFields(selector);
+      },
+      [emailFill, passwordFill],
+      [call('POST', 200)],
+    );
+    assert.equal(evidence.lostField, null, 'the empty fields are the application re-mounting its form, not a reset');
+    assert.equal(evidence.accepted?.status, 200);
+    assert.equal(reads, 0, 'the network already answered; a page round-trip would only re-read the re-mounted form');
+    assert.equal(signInDidNotTakeAfter('https://x.test/en/login', evidence.accepted), false, 'the flag is never set');
+  });
+
+  it('(b) no POST beside empty fields: the replay and the finding exactly as before', async () => {
+    const evidence = await hydrationResetEvidence(emptyFields, [emailFill, passwordFill], [
+      call('GET', 200, 'https://x.test/en/login?'),
+    ]);
+    assert.equal(evidence.accepted, null);
+    assert.equal(evidence.lostField, 'input[type=password]');
+  });
+
+  it('(c) a 401 POST beside empty fields: a hydration-reset submit, replayed as before', async () => {
+    const evidence = await hydrationResetEvidence(emptyFields, [emailFill, passwordFill], [call('POST', 401)]);
+    assert.equal(evidence.accepted, null);
+    assert.equal(evidence.lostField, 'input[type=password]');
+  });
+
+  it('a non-credential block reads nothing and consults no traffic', async () => {
+    let reads = 0;
+    const evidence = await hydrationResetEvidence(
+      async () => {
+        reads += 1;
+        return '';
+      },
+      [{ action: 'fill', selector: 'role=searchbox', value: 'leave', intent: 'search' }],
+      [call('POST', 200)],
+    );
+    assert.deepEqual(evidence, { accepted: null, lostField: null });
+    assert.equal(reads, 0);
+  });
+
+  it('(d) after a replay, an accepted POST clears the verdict even on a sign-in URL; no POST keeps it', () => {
+    assert.equal(signInDidNotTakeAfter('https://x.test/en/login', call('POST', 200)), false);
+    assert.equal(signInDidNotTakeAfter('https://x.test/en/login', null), true, 'the pre-existing verdict, unchanged');
+    assert.equal(signInDidNotTakeAfter('https://x.test/en/me/home', null), false, 'off the sign-in page was always a submit that took');
+  });
+});
+
+describe('a credential click settles before the next step runs (2026-09-10)', () => {
+  // `click` returns when the click lands; a `goto` right after it aborts the
+  // login POST in flight. The settle reads the same three facts the verdict
+  // does, strongest first, and a page never on a sign-in URL settles at once.
+  const post = (status: number | undefined) => ({
+    id: 'p',
+    method: 'POST',
+    url: 'https://x.test/api/auth/login',
+    resourceType: 'fetch',
+    status,
+    startedAt: 1,
+  });
+
+  it('an accepted POST settles first, whatever the URL or the network say', () => {
+    assert.equal(
+      credentialSettleOutcome({ url: 'https://x.test/en/login', calls: [post(200)], networkIdle: false }),
+      'submit-accepted',
+    );
+  });
+
+  it('the URL leaving the sign-in page settles, and a page never on one settles at once', () => {
+    assert.equal(credentialSettleOutcome({ url: 'https://x.test/en/me/home', calls: [], networkIdle: false }), 'left-sign-in');
+    assert.equal(
+      credentialSettleOutcome({ url: 'https://x.test/en/settings/password', calls: [], networkIdle: false }),
+      'left-sign-in',
+      'a change-password form is credential-shaped and not a sign-in: no wait',
+    );
+  });
+
+  it('a quiet network settles a page still on the sign-in URL; an in-flight POST does not', () => {
+    assert.equal(credentialSettleOutcome({ url: 'https://x.test/en/login', calls: [post(undefined)], networkIdle: true }), 'network-idle');
+    assert.equal(credentialSettleOutcome({ url: 'https://x.test/en/login', calls: [post(undefined)], networkIdle: false }), null, 'keep waiting');
+    assert.equal(credentialSettleOutcome({ url: 'https://x.test/en/login', calls: [post(401)], networkIdle: false }), null, 'a refusal is not a settle by itself; the network going quiet is');
+  });
+});
+
+describe('a click-catcher scrim, and the intended-context evidence (RC, 2026-09-10, PL_08_01)', () => {
+  // The shared decision in `click-catcher.ts` — the healer's probe and the
+  // ladder's overlay rung both read it, so they cannot disagree about what
+  // may be clicked blind: only a layer with no name, no text and no action.
+  const vp = { width: 1280, height: 800 };
+  const cover = (over: Partial<ClickCatcherFacts> = {}): ClickCatcherFacts => ({
+    viewport: vp,
+    rect: { x: 0, y: 0, width: 1280, height: 800 },
+    position: 'fixed',
+    ariaHidden: true,
+    name: '',
+    text: '',
+    tag: 'DIV',
+    ...over,
+  });
+
+  it('a nameless, textless, full-viewport fixed div is a click-catcher', () => {
+    assert.equal(isClickCatcher(cover()), true);
+  });
+
+  it('a named button or a modal with text is never a catcher — those are read or acted on', () => {
+    assert.equal(isClickCatcher(cover({ tag: 'BUTTON' })), false, 'an actionable tag is out by construction');
+    assert.equal(isClickCatcher(cover({ name: 'Submit' })), false);
+    assert.equal(isClickCatcher(cover({ text: 'Are you sure?' })), false);
+  });
+
+  it('a 60px sticky bar and an absolute layer covering only the width are not catchers', () => {
+    assert.equal(isClickCatcher(cover({ position: 'sticky', rect: { x: 0, y: 0, width: 1280, height: 60 } })), false);
+    assert.equal(isClickCatcher(cover({ position: 'absolute', rect: { x: 0, y: 0, width: 1280, height: 300 } })), false);
+  });
+
+  it('the intended-context exemption needs the dialog open when the step began', () => {
+    // open-at-start + last action click → intended; appeared mid-ladder (the
+    // probe's own click) + last action click → blocker, dismissed as before.
+    assert.equal(dialogIsIntendedContextGiven('click', true), true);
+    assert.equal(dialogIsIntendedContextGiven('click', false), false);
+    assert.equal(dialogIsIntendedContextGiven('goto', true), false, 'a goto never opens the intended modal');
+    assert.equal(dialogIsIntendedContextGiven(null, true), false);
+  });
+});
+
+describe('the sign-in retry: reload, re-enter, re-click, up to the ceiling (2026-09-10)', () => {
+  // The loop as `executeSteps` and `performSignIn` drive it: each attempt is
+  // a reload, the fill block replayed (a reload empties the fields) and the
+  // click; the caller's own evidence — an accepted POST or the URL leaving
+  // the sign-in page — is what ends it early. The original submit and the
+  // hydration replay are attempts 1 and 2, so the loop starts at 2.
+  const scripted = (outcomes: readonly SignInAttemptOutcome[]) => {
+    const seen: number[] = [];
+    const attempt = async (n: number): Promise<SignInAttemptOutcome> => {
+      seen.push(n);
+      return outcomes[seen.length - 1] ?? 'not-yet';
+    };
+    return { attempt, seen };
+  };
+
+  it('an accepted POST on attempt 3 stops at 3 with the flag clear', async () => {
+    const { attempt, seen } = scripted(['signed-in']);
+    const result = await retrySignIn(attempt, 2, 10);
+    assert.deepEqual(result, { attempts: 3, didNotTake: false });
+    assert.deepEqual(seen, [3]);
+  });
+
+  it('ten refused submits stop at the ceiling with the flag set — bounded, never one more', async () => {
+    const { attempt, seen } = scripted([]);
+    const result = await retrySignIn(attempt, 2, 10);
+    assert.deepEqual(result, { attempts: 10, didNotTake: true });
+    assert.deepEqual(seen, [3, 4, 5, 6, 7, 8, 9, 10], 'attempts 3..10, exactly eight retries');
+  });
+
+  it('a retry whose own step failed ends the loop rather than spending the ceiling on a ladder walk', async () => {
+    const { attempt, seen } = scripted(['not-yet', 'failed']);
+    const result = await retrySignIn(attempt, 2, 10);
+    assert.deepEqual(result, { attempts: 4, didNotTake: true });
+    assert.deepEqual(seen, [3, 4]);
+  });
+
+  it('a lost session or a dead browser inside an attempt propagates — it is not an attempt', async () => {
+    await assert.rejects(
+      retrySignIn(async () => {
+        throw new Error('Target page, context or browser has been closed');
+      }, 2, 10),
+      /browser has been closed/,
+    );
+  });
+
+  it('WOWLIDATOR_SIGN_IN_ATTEMPTS=1 retries nothing; 0 means the same; garbage means the default', async () => {
+    assert.equal(signInAttemptCeiling({ WOWLIDATOR_SIGN_IN_ATTEMPTS: '1' }), 1);
+    assert.equal(signInAttemptCeiling({ WOWLIDATOR_SIGN_IN_ATTEMPTS: '0' }), 1);
+    assert.equal(signInAttemptCeiling({ WOWLIDATOR_SIGN_IN_ATTEMPTS: '4' }), 4);
+    assert.equal(signInAttemptCeiling({ WOWLIDATOR_SIGN_IN_ATTEMPTS: 'lots' }), SIGN_IN_ATTEMPTS);
+    assert.equal(signInAttemptCeiling({ WOWLIDATOR_SIGN_IN_ATTEMPTS: '-3' }), SIGN_IN_ATTEMPTS);
+    assert.equal(signInAttemptCeiling({}), 10);
+    const { attempt, seen } = scripted(['signed-in']);
+    const result = await retrySignIn(attempt, 2, signInAttemptCeiling({ WOWLIDATOR_SIGN_IN_ATTEMPTS: '1' }));
+    assert.deepEqual(result, { attempts: 2, didNotTake: true }, 'already past the ceiling: the verdict stands as before');
+    assert.deepEqual(seen, [], 'no reload, no re-entry, no click');
   });
 });
 

@@ -71,6 +71,7 @@ import {
   mutationTargets,
   mutationPolicyFromEnv,
   type ApproveMutation,
+  type DialogContext,
   type MutationPolicy,
   type OnMutation,
 } from './mutation-policy.js';
@@ -80,6 +81,7 @@ import {
   LlmFactory,
   generateStructuredForModel,
   type ModelSource,
+  type StructuredImage,
 } from '../providers/llm-factory.js';
 import type {
   ActionOutcome,
@@ -99,6 +101,7 @@ import {
   foldValue,
   goalCitedValues,
   goalDestination,
+  fixtureAlreadyPresent,
   goalOutcomes,
   outcomesShown,
   urlMoveNote,
@@ -216,11 +219,19 @@ export const AGENT_NO_PROGRESS_OFF_TURNS = 25;
  * and every goto or click onto a fresh page was progress by the no-progress
  * judge's rule, so nothing but DEFAULT_AGENT_MAX_STEPS ended them — 903 s
  * of a 1,377 s case at ~7 s a turn. A journey to a named destination is
- * two to four page moves; eight is well past any honest one. A turn off the
- * page that lands a FIRST-TIME form entry (fill, type, selectOption, check)
- * does not spend the allowance — "open the form and fill it" legitimately
- * lives off its start page for fifteen turns — and a return to the start
- * page resets it. A consent redirect is cleared by the gate rung and never
+ * two to four page moves; eight is well past any honest one.
+ *
+ * What SPENDS the allowance is the wander's own shape: a turn that moved the
+ * page again, or one that stayed put and did nothing that changed it. A turn
+ * that landed an ok interaction after which the full tree changed is free —
+ * that is the work a page is visited for, however it is expressed. The
+ * exemption used to be a FIRST-TIME form entry only, and a real form needs
+ * clicks: live (PL_09_01, run `be-high-sonnet-20260909-153617`, 2026-09-09)
+ * a date picker, an overlay dismissal and a submit each spent a turn of the
+ * allowance and the leg was ended as a wander on the turn AFTER it submitted,
+ * scoring the case "never ran: runtime error". A page below the step's own
+ * (`childPage`) is not off it at all. A return to the start page resets the
+ * allowance; a consent redirect is cleared by the gate rung and never
  * counted. Lifted to AGENT_NO_PROGRESS_OFF_TURNS when early-stop is off,
  * like the other two judges.
  */
@@ -281,19 +292,6 @@ export const INTERACTION_ACTIONS: ReadonlySet<string> = new Set([
   // a page-changing act, never a look, and never available to a reveal or
   // read-only run.
   'signOut',
-]);
-/**
- * The interactions that put a value INTO a control rather than open or
- * follow one — the work a form page is visited for. A first-time one of
- * these off the step's page does not spend AGENT_OFF_PAGE_TURNS.
- */
-export const FORM_ENTRY_ACTIONS: ReadonlySet<string> = new Set([
-  'fill',
-  'type',
-  'paste',
-  'selectOption',
-  'check',
-  'uncheck',
 ]);
 /** Everything a `readOnly` run may do: look, look again, and answer. */
 export const READ_ONLY_ACTIONS: ReadonlySet<string> = new Set([...IDLE_ACTIONS, 'finish', 'fail']);
@@ -555,6 +553,24 @@ export interface AgentObservation {
   goal: string;
   url: string;
   axTree: string;
+  /**
+   * What the page LOOKS like, for the turns that are judging rather than
+   * driving (2026-09-08).
+   *
+   * The accessibility tree is the right observation for navigation — it names
+   * controls, and a name is what a selector is built from. It is the wrong one
+   * for "does the page show this", because a great deal of what a tester
+   * validates never reaches it: a value rendered into a plain div, a field
+   * that merely looks disabled, a calendar popover standing where a textbox
+   * was asked for, a date whose displayed form is not its value. Every one of
+   * those reads as absent in the tree and present on the screen.
+   *
+   * So a sighted turn is offered only where determinism has already run out —
+   * `#agentTriage`'s read-only look, which cannot act and whose answer the
+   * harness re-checks — and never to the ordinary driving loop, where it would
+   * buy an image on every turn to answer a question the tree already answers.
+   */
+  screenshot?: StructuredImage | undefined;
   /** The test case this step serves — see `RunOptions.caseContext`. */
   caseContext?: string | undefined;
   /** What has been tried so far, and how it went. */
@@ -922,6 +938,28 @@ export interface LlmAgentModelOptions {
  * loop, not the model, owns budgeting and safety, so a weaker free model is
  * enough here as long as it can pick an action from the tree in front of it.
  */
+/**
+ * Does this failure mean "this model has no eyes", rather than "this call
+ * went wrong"?
+ *
+ * Deliberately a text test, and deliberately narrow. The AI SDK surfaces a
+ * provider's refusal of an image part as a message, not as a typed error, and
+ * the wording differs per provider — so the alternative is either to maintain
+ * a list of which model ids can see (which drifts faster than the code, the
+ * same reason `doctor` exists) or to fall back blind on EVERY failure, which
+ * would quietly halve the evidence on a transient outage. Matching the
+ * refusal itself keeps a real outage loud.
+ */
+export function looksLikeNoVision(error: unknown): boolean {
+  const text = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    /does not support (image|vision|multimodal)/.test(text) ||
+    /(image|vision|multimodal)[^.]{0,40}not supported/.test(text) ||
+    /unsupported[^.]{0,30}(image|content part)/.test(text) ||
+    /no support for images/.test(text)
+  );
+}
+
 export class LlmAgentModel implements AgentModel {
   readonly #source: ModelSource;
   readonly #maxOutputTokens: number;
@@ -962,6 +1000,7 @@ export class LlmAgentModel implements AgentModel {
       schema: contract.schema,
       system: contract.system,
       prompt: buildUserPrompt(observation),
+      ...(observation.screenshot === undefined ? {} : { images: [observation.screenshot] }),
       maxOutputTokens: this.#maxOutputTokens,
       maxRetries: this.#maxRetries,
     });
@@ -1052,6 +1091,21 @@ export interface RunOptions {
    * other leg's instance-wide budget.
    */
   maxSteps?: number | undefined;
+  /**
+   * Let the agent SEE the page, not only read its tree (2026-09-08).
+   *
+   * For a turn that judges rather than drives. A screenshot is attached to
+   * every ask of this run, so the model answers "does the page show this"
+   * from what a tester would actually look at. Off by default and everywhere
+   * else: the driving loop asks "which control do I press next", which the
+   * tree answers better and for free.
+   *
+   * Costs an image per turn and needs a vision-capable model on the `agent`
+   * role. A model without vision is not a failure here — the call is retried
+   * once, blind, and the run says so — because a rung that used to answer
+   * from the tree must never start erroring instead.
+   */
+  sighted?: boolean | undefined;
   /**
    * Look, never touch. Every action that could change the application —
    * click, fill, press, hover, goto, dbCount — is refused before it runs;
@@ -1677,6 +1731,22 @@ export class WorkflowAgent {
       const fullTree = renderTree(all, all.length);
       this.#lastTree = fullTree;
       treeKey = createHash('sha1').update(fullTree).digest('hex');
+      // Did the FULL tree change since this turn began? Three judges ask it —
+      // the re-activation credit, the OA-10 look credit and the off-page
+      // allowance — and the answer is one AX read, so it is measured at most
+      // once a turn and shared. `beat` is the extra frame a look needs (see
+      // OA-10 below); the first caller of the turn decides it, and there is
+      // never a second read to disagree with.
+      let treeChangedThisTurn: boolean | null = null;
+      const treeChangedSince = async (beat: boolean): Promise<boolean> => {
+        if (treeChangedThisTurn === null) {
+          if (treeKey === null) return false;
+          await page.waitForLoadState('networkidle', { timeout: NETWORK_SETTLE_MS }).catch(() => undefined);
+          if (beat) await page.waitForTimeout(LOOK_SETTLE_MS).catch(() => undefined);
+          treeChangedThisTurn = treeKeyOf(await this.#captureTree(page)) !== treeKey;
+        }
+        return treeChangedThisTurn;
+      };
       const axTree = renderTree(focusTree(all, goal, maxNodes), all.length);
       if (lastTreeSeen !== null && axTree !== lastTreeSeen) doneHere.clear();
       lastTreeSeen = axTree;
@@ -1690,6 +1760,44 @@ export class WorkflowAgent {
       // elision slot — built from the actions, so the history cap cannot
       // hide a filled field from the model.
       const ledger = doneLedger(actions);
+
+      // **A record the goal asks for, which the application itself says is
+      // already there, is present** (`fixtureAlreadyPresent`; PL_09_01 and
+      // PL_06_05 of run `be-high-sonnet-20260909-153617`, 2026-09-09). A
+      // creation leg whose row survived an earlier run reads back a
+      // duplicate-key refusal naming the goal's own key, and there is nothing
+      // it may honestly do next: changing the value would break the flow's
+      // own next assertion (one leg typed a different id and would have), and
+      // deleting the row is not this leg's to do. Both live legs ended with
+      // no verdict at all — one as a wander, one as the model's unverified
+      // `fail`. The settle is the PAGE's word: the refusal is a line the
+      // harness read, and `outcomeShown` confirms the control still holds the
+      // value the goal names, so the value the application called taken is
+      // demonstrably the goal's. What it claims is only that the keyed record
+      // exists; the deterministic step the flow puts after the leg is the
+      // independent witness, and a row that is not really there fails there,
+      // honestly. Consulted only once the leg has ACTED — every rule in
+      // `goal-evidence` requires an observed transition, and a refusal
+      // standing on the page before the agent touched it is not this leg's
+      // evidence.
+      // A `readOnly` run is withheld for the same reason the observed-state
+      // settlement is: it cannot act, its goal is a question and its own
+      // `finish` carries the verdict — settling that leg on a page fact would
+      // replace the answer the rung was asked for.
+      if (actions.length > 0 && runOptions.readOnly !== true) {
+        const present = fixtureAlreadyPresent(goal, fullTree);
+        if (present !== null) {
+          success = true;
+          summary =
+            `the application refused the goal's own value as already present — ${present.error} — with ` +
+            `${present.outcome.control} = ${JSON.stringify(present.outcome.value)} standing in the form ` +
+            `(${present.shown}), so the record this leg would create is already there; what the flow ` +
+            'asserts next is the witness';
+          this.#settledBy = { rule: 'fixture-present', evidence: `${present.error} | ${present.shown}` };
+          this.#endedBy = 'fixture-present';
+          break;
+        }
+      }
 
       // The value-hunt guard: a goal naming concrete values none of which
       // has shown up ANYWHERE after several turns is evidence the values are
@@ -1719,13 +1827,19 @@ export class WorkflowAgent {
       let decision: AgentDecision | null = null;
       let feedback: string | undefined;
       let refusedTurn = false;
+      // What the page looks like, for a judging run. Taken once per turn,
+      // beside the tree it belongs to — a shot from a different moment would
+      // be evidence about a different page. A failed capture is simply no
+      // image: the turn proceeds on the tree, exactly as it did before.
+      const shot = runOptions.sighted === true && !this.#blind ? await this.#shoot(page) : null;
       for (let ask = 0; ask < 2 && decision === null; ask += 1) {
         let candidate: AgentDecision;
         try {
-          candidate = await this.model.decide({
+          candidate = await this.#decideMaybeSighted({
             goal,
             url: page.url(),
             axTree,
+            ...(shot === null ? {} : { screenshot: shot }),
             ...(runOptions.caseContext === undefined ? {} : { caseContext: runOptions.caseContext }),
             ...(gapsLine === null ? {} : { formGaps: gapsLine }),
             // Snapshot: the agent keeps mutating `history`, and an observation
@@ -2168,8 +2282,7 @@ export class WorkflowAgent {
         return true;
       });
       if (!advanced && repeatedActivation && treeKey !== null && treeChangeCredits < AGENT_TREE_CHANGE_CREDITS) {
-        await page.waitForLoadState('networkidle', { timeout: NETWORK_SETTLE_MS }).catch(() => undefined);
-        if (treeKeyOf(await this.#captureTree(page)) !== treeKey) {
+        if (await treeChangedSince(false)) {
           advanced = true;
           treeChangeCredits += 1;
         }
@@ -2179,31 +2292,6 @@ export class WorkflowAgent {
           '(that control was already activated on this page this leg — activating it again is not progress; ' +
             'act on something the goal still needs, or call fail)',
         );
-      }
-      // **A leg off its page, short of anything the goal names, has a small
-      // allowance** (`AGENT_OFF_PAGE_TURNS`; the HIR-EC-002 wander). A turn
-      // counts when it moved the page again or only clicked; a first-time
-      // form entry off the page is the work a page is visited for and is
-      // free. A consent redirect is the gate rung's to clear, never a
-      // wander; returning to the step's page resets the allowance.
-      const turnEndUrl = page.url();
-      if (!CONSENT_GATE_URL_PATTERN.test(turnEndUrl)) {
-        if (!wanderedOffPage(goal, startUrl, turnEndUrl)) {
-          offPageTurns = 0;
-        } else {
-          const formEntry = turnActions.some(
-            (a) => a.ok && reactivations.get(a.index) === 'first' && FORM_ENTRY_ACTIONS.has(a.action),
-          );
-          if (differentPage(turnUrl, turnEndUrl) || !formEntry) offPageTurns += 1;
-          if (offPageTurns >= this.#offPageTurns) {
-            summary =
-              `agent wandered: left the step's page ${startUrl} and spent ${offPageTurns} turn(s) elsewhere ` +
-              `(now at ${turnEndUrl}) without reaching ${destination === null ? 'anything the goal names' : `the goal's destination ${destination}`}` +
-              ' — each move onto a fresh page counted as progress, so this allowance ended the leg';
-            this.#endedBy = 'wandered';
-            break;
-          }
-        }
       }
       // **A look that showed more is progress, a bounded number of times**
       // (OA-10). A lazily-rendered table appends rows on every scroll, and a
@@ -2221,13 +2309,48 @@ export class WorkflowAgent {
           // list fetches land on network idle (immediate on a quiet page),
           // and even a purely client-side append runs on the next frame —
           // measured, a scroll listener fired ~50 ms after `scrollBy`
-          // returned, past an immediate capture. One settle and one beat.
-          await page.waitForLoadState('networkidle', { timeout: NETWORK_SETTLE_MS }).catch(() => undefined);
-          await page.waitForTimeout(LOOK_SETTLE_MS).catch(() => undefined);
-          if (treeKeyOf(await this.#captureTree(page)) !== treeKey) {
+          // returned, past an immediate capture. One settle and one beat —
+          // `treeChangedSince(true)` is where both are paid, once a turn.
+          if (await treeChangedSince(true)) {
             advanced = true;
             treeChangeCredits += 1;
             history.push('(the page rendered more after that look — keep looking only while each look shows more)');
+          }
+        }
+      }
+      // **A leg off its page, short of anything the goal names, has a small
+      // allowance** (`AGENT_OFF_PAGE_TURNS`; the HIR-EC-002 wander). A turn
+      // that MOVED the page again always spends it: a wander is made of page
+      // moves, and that is the shape this rail was built for. A turn that
+      // stayed put and did WORK — an ok action that engaged a control, after
+      // which the full tree changed — is free, because that is what a page
+      // is visited for. Live (PL_09_01, `be-high-sonnet-20260909-153617`,
+      // 2026-09-09): the old exemption was a FIRST-TIME form entry only, so a
+      // real form's date picker, overlay dismissal and submit each spent the
+      // allowance and the leg was ended as a wander on the turn after it
+      // submitted. A FAILED action is never free — a leg that keeps missing
+      // must still be bounded — and neither is a look, which is never
+      // progress anywhere else in this loop. A consent redirect is the gate
+      // rung's to clear, never a wander; returning to the step's page, or
+      // anywhere below it (`childPage`), resets the allowance.
+      const turnEndUrl = page.url();
+      if (!CONSENT_GATE_URL_PATTERN.test(turnEndUrl)) {
+        if (!wanderedOffPage(goal, startUrl, turnEndUrl)) {
+          offPageTurns = 0;
+        } else {
+          const worked =
+            !differentPage(turnUrl, turnEndUrl) &&
+            turnActions.some((a) => a.ok && !IDLE_ACTIONS.has(a.action)) &&
+            (await treeChangedSince(true));
+          if (!worked) offPageTurns += 1;
+          if (offPageTurns >= this.#offPageTurns) {
+            summary =
+              `agent wandered: left the step's page ${startUrl} and spent ${offPageTurns} turn(s) elsewhere ` +
+              `(now at ${turnEndUrl}) without reaching ${destination === null ? 'anything the goal names' : `the goal's destination ${destination}`}` +
+              ' — every one of them moved the page again or changed nothing on it, and each move onto a fresh' +
+              ' page counted as progress, so this allowance ended the leg';
+            this.#endedBy = 'wandered';
+            break;
           }
         }
       }
@@ -2290,7 +2413,12 @@ export class WorkflowAgent {
       }
     }
 
-    if (success) this.#remember(key, memory, actions);
+    // A leg settled because the record was ALREADY there performed no
+    // journey worth replaying: its script stops short of the creation, and a
+    // later run whose fixture is absent would replay it, succeed on every
+    // action and still leave the row uncreated. The model pays for that leg
+    // instead.
+    if (success && this.#settledBy?.rule !== 'fixture-present') this.#remember(key, memory, actions);
 
     return this.#result(goal, success, summary, actions, turns, startedMs, inputTokens, outputTokens, effectiveMaxSteps);
   }
@@ -2765,24 +2893,26 @@ export class WorkflowAgent {
         .ariaSnapshot({ timeout: Math.min(TARGET_ATTACH_MS, this.#actionTimeoutMs) })
         .then(controlNameFromAriaSnapshot)
         .catch(() => null);
+      const dialog = await this.#dialogFor(page, decision, observedControlName);
       const held = await gateMutation({
         decision,
         goal: this.#goal,
         url: page.url(),
         policy: this.#policy,
-        provenance: await this.#provenanceForGate(page, decision, observedControlName),
+        provenance: await this.#provenanceForGate(page, decision, observedControlName, dialog),
         observedControlName,
+        dialog,
         approve: this.#approve,
       });
       if (held !== null) {
         this.#lastBlocked = held;
         throw new MutationBlockedError(held);
       }
-      const category = mutationCategoryFor(decision, observedControlName);
+      const category = mutationCategoryFor(decision, observedControlName, dialog);
       if (category !== null) {
         await this.#onMutation?.({
           category,
-          targets: mutationTargets(decision, this.#goal),
+          targets: mutationTargets(decision, this.#goal, dialog),
           selector: decision.selector,
           url: page.url(),
           goal: this.#goal,
@@ -3362,7 +3492,7 @@ export class WorkflowAgent {
    * goal named no checkable state and the model's word stands — visible in
    * the record so an all-claim run is never mistaken for a proved one).
    */
-  #settledBy: { rule: 'observed-state' | 'agent-claim'; evidence: string } | null = null;
+  #settledBy: { rule: 'observed-state' | 'agent-claim' | 'fixture-present'; evidence: string } | null = null;
   /** This run's read-only DB access, when the runner provided one. */
   #dbProbe: AgentDbProbe | null = null;
 
@@ -3407,10 +3537,78 @@ export class WorkflowAgent {
    * capture may predate a planned follow-up or a replayed step. Ordinary
    * clicks pay nothing — the gate returns before it reads the ledger.
    */
-  async #provenanceForGate(page: Page, decision: AgentDecision, observedControlName: string | null): Promise<TargetProvenance> {
-    const category = mutationCategoryFromName(observedControlName ?? '') ?? mutationCategoryOf(decision);
+  /**
+   * Whether this agent has learned its model cannot see. Sticky for the life
+   * of the instance: a model that refused an image once will refuse every
+   * image, and paying a failed call per turn to rediscover that is exactly
+   * the kind of waste the loop's other judges exist to stop.
+   */
+  #blind = false;
+
+  /** The page as a person would see it, or null if it could not be taken. */
+  async #shoot(page: Page): Promise<StructuredImage | null> {
+    try {
+      const data = await page.screenshot({ type: 'png', fullPage: false, timeout: TARGET_ATTACH_MS });
+      return { data, mediaType: 'image/png' };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * One decision, with the image if there is one — and blind if the model
+   * turns out not to have eyes.
+   *
+   * A provider that cannot take an image fails the whole call, which would
+   * turn a rung that used to answer from the tree into a rung that errors.
+   * That is the one thing a new rung may not do, so the failure is caught
+   * once, the instance is marked blind, and the same turn is asked again
+   * without the picture. Every other failure is re-thrown untouched: it is
+   * the caller's existing model-error path, and swallowing it here would hide
+   * a real outage behind a story about vision.
+   */
+  async #decideMaybeSighted(observation: AgentObservation): Promise<AgentDecision> {
+    if (observation.screenshot === undefined) return await this.model.decide(observation);
+    try {
+      return await this.model.decide(observation);
+    } catch (error) {
+      if (!looksLikeNoVision(error)) throw error;
+      this.#blind = true;
+      const { screenshot: _dropped, ...blind } = observation;
+      return await this.model.decide(blind);
+    }
+  }
+
+  async #provenanceForGate(
+    page: Page,
+    decision: AgentDecision,
+    observedControlName: string | null,
+    dialog?: DialogContext | null,
+  ): Promise<TargetProvenance> {
+    const category = mutationCategoryFor(decision, observedControlName, dialog);
     if (category !== null && IRREVERSIBLE_CATEGORIES.has(category)) await this.#captureTree(page);
     return this.#provenance;
+  }
+
+  /**
+   * The dialog this click lands inside, or null when it lands on the page.
+   *
+   * This is the fact that tells the two halves of a destructive flow apart, so
+   * it is read off the live element and nowhere else. It is asked for only
+   * when the control's own name already means something to the gate — an
+   * ordinary click pays nothing, as it did before. A failed read is null,
+   * which is the conservative answer: the click is treated as an `open`, and
+   * an `open` is gated at least as strictly as a `commit`.
+   */
+  async #dialogFor(page: Page, decision: AgentDecision, observedControlName: string | null): Promise<DialogContext | null> {
+    if (mutationCategoryFromName(observedControlName ?? '') === null && mutationCategoryOf(decision) === null) return null;
+    return await page.locator(decision.selector).first()
+      .evaluate((el) => {
+        const node = el as unknown as { closest?: (s: string) => { textContent?: string | null } | null };
+        const dialog = node.closest?.('[role="dialog"], [role="alertdialog"], dialog') ?? null;
+        return dialog === null ? null : { text: (dialog.textContent ?? '').slice(0, 400) };
+      }, undefined, { timeout: TARGET_ATTACH_MS })
+      .catch(() => null);
   }
 }
 

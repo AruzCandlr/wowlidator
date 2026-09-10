@@ -59,6 +59,7 @@ import type { ProofBundle, ProofStep } from '../engine/proof-bundle.js';
 import { describeDbChanges, describeTarget, describeValueSource, verdictFamily } from '../engine/proof-bundle.js';
 import { grimTheme } from './theme.js';
 import { slugify } from './html-reporter.js';
+import type { ReportLang } from '../engine/proof-bundle.js';
 import { buildFindingsSummary, findingsHeadline, statusCounts, type Finding, type FindingCase, type FindingsSummary } from './findings.js';
 import {
   countVerdicts,
@@ -66,12 +67,19 @@ import {
   describeResolution,
   describeVerdictCounts,
   displayCaseId,
+  inconsequentialAgentLeg,
+  inconsequentialBrokenStep,
+  dbEvidence,
+  DB_QUERY_LABEL,
+  DB_PARAMS_LABEL,
+  DB_ROWS_LABEL,
   observedEvidence,
   provenanceExtras,
   recordOnlyCase,
   recordedCaptures,
   sheetLabel,
   stepKindFacts,
+  stepNarration,
   stepTarget,
 } from './step-facts.js';
 
@@ -116,6 +124,14 @@ export interface CatalogReportCase {
   sheetCaseId?: string | undefined;
   sheet?: string | undefined;
   category?: string | undefined;
+  /**
+   * Where the ledger says this case's own report is (`LedgerOutcome.reportPath`),
+   * absolute. For a catalog run that file IS the case page (`case-page.ts`):
+   * it is what the panel's card and the run folder open, so the page is
+   * written there and the index links there. Absent or null: the page lives
+   * in the media folder beside the workbook.
+   */
+  reportPath?: string | null | undefined;
 }
 
 /** The sheet-side identity of a case: the row's own fields first, the bundle's stamp second. */
@@ -142,7 +158,37 @@ export interface CatalogReportInput {
    * proof bundle, exactly as today). Absent means inline-or-omit, the old
    * behaviour, which is what every small run and every test gets by default.
    */
+  /**
+   * What the run snapshotted before it began, and how to put it back
+   * (2026-09-09). Summary only, on purpose: the baseline's real values live in
+   * a local file that never enters a report (`src/api/CLAUDE.md`), and a
+   * redacted row would restore the wrong data. The page carries the counts,
+   * the file paths and the command; the rows stay out of anything shareable.
+   */
+  dbBaseline?:
+    | {
+        path: string;
+        tables: readonly string[];
+        takenAt: string;
+        mode: 'snapshot' | 'restore';
+        restoreSql?: string | undefined;
+        restored?: { at: string; ok: boolean; detail: string } | undefined;
+      }
+    | undefined;
   spillScreenshot?: ((caseId: string, stepIndex: number, base64: string) => string | null) | undefined;
+  /**
+   * The language the per-case pages are written in (`case-page.ts`) — off
+   * the ledger's launch record, so a rebuild speaks the run's language.
+   * English when absent.
+   */
+  lang?: ReportLang | undefined;
+  /**
+   * The href the case's name links to, relative to the catalog report, when
+   * the writer put the page somewhere other than the media folder (the
+   * ledger's own `reportPath`). Null falls back to the media folder; absent
+   * means the media folder for every case — the pure render's default.
+   */
+  casePageHref?: ((c: CatalogReportCase) => string | null) | undefined;
   /**
    * Where a recording goes when it is not carried inline: handed the case id
    * and the base64 webm, returns the href to play from, or null when it
@@ -221,6 +267,40 @@ function stepDetail(step: ProofStep, budget: MediaBudget, caseId: string): strin
   // is the one a reader must weigh.
   row('value', describeValueSource(step), false);
   row('url', step.url);
+  // The database check this step made: the same projection the per-run report
+  // and the workbook read (`step-facts.ts`), so the three cannot describe one
+  // check three ways. Redacted at the source; a bundle sealed before the
+  // statement was recorded shows the summary it always did and no query.
+  const db = dbEvidence(step);
+  if (db !== null) {
+    row(`db ${db.kind}`, db.target ?? '', false);
+    row('db where', db.where, false);
+    row('db expected', db.expected, false);
+    row('db observed', db.observed, false);
+    for (const statement of db.statements) {
+      row(`db ${DB_QUERY_LABEL}`, statement.sql);
+      if (statement.params.length > 0) {
+        row(
+          `db ${DB_PARAMS_LABEL}`,
+          statement.params.map((p, i) => `$${i + 1} = ${p}`).join(' · '),
+        );
+      }
+    }
+    if (db.rows.length > 0) {
+      rows.push(
+        `<div class="dbrows"><div class="kv"><span>db ${esc(DB_ROWS_LABEL)}</span><span>${esc(db.sample ?? '')}</span></div>` +
+          '<table><thead><tr>' +
+          db.columns.map((c) => `<th>${esc(c)}</th>`).join('') +
+          '</tr></thead><tbody>' +
+          db.rows
+            .map((r) => `<tr>${r.map((cell) => `<td>${esc(cell)}</td>`).join('')}</tr>`)
+            .join('') +
+          '</tbody></table></div>',
+      );
+    }
+    if (db.polledMs !== null) row('db polled', fmtMs(db.polledMs), false);
+    if (db.note !== null) row('db note', db.note, false);
+  }
   for (const line of describeDbChanges(step.dbChanges)) row('db', line, false);
   if (step.dbProbeError) row('db probe', step.dbProbeError, false);
   if (step.error) rows.push(`<div class="kv err"><span>error</span><code>${esc(step.error)}</code></div>`);
@@ -243,14 +323,19 @@ function stepDetail(step: ProofStep, budget: MediaBudget, caseId: string): strin
         return `<li class="${t.ok ? 'ok' : 'no'}">${held}${esc(t.action)} <code>${esc(target)}</code>${note ? ` <em>${esc(note)}</em>` : ''}${t.error ? ` — ${esc(t.error)}` : ''}</li>`;
       })
       .join('');
-    rows.push(
+    const leg =
       (a.blocked === undefined
         ? ''
         : `<div class="kv held"><span>held</span><span>${esc(a.blocked.reason)} · ${esc(a.blocked.rule)} — no verdict about the application</span></div>`) +
-        `<div class="agent"><div class="kv"><span>agent</span><span>${esc(a.summary ?? '')} (${a.turns} turn(s))</span></div>` +
-        (turns === '' ? '' : `<ol class="turns">${turns}</ol>`) +
-        '</div>',
-    );
+      `<div class="agent"><div class="kv"><span>agent</span><span>${esc(a.summary ?? '')} (${a.turns} turn(s))</span></div>` +
+      (turns === '' ? '' : `<ol class="turns">${turns}</ol>`) +
+      '</div>';
+    // A leg that neither rescued this step nor broke it is folded behind a
+    // closed disclosure, in the ordinary colour — the same treatment and the
+    // same wording the per-run report gives it (`step-facts.ts`). Nothing
+    // leaves the pane: what was tried is evidence, just not the outcome.
+    const aside = inconsequentialAgentLeg(step);
+    rows.push(aside === null ? leg : `<details class="aside-leg"><summary>${esc(aside.summary)}</summary>${leg}</details>`);
   }
   // What the agent READ off the page on an observe-and-record leg — the
   // evidence such a leg has (OA-14), quoted verbatim with where it was read.
@@ -262,6 +347,18 @@ function stepDetail(step: ProofStep, budget: MediaBudget, caseId: string): strin
           .map((o) => `<li><code>${esc(o.text)}</code>${o.selector ? ` <em>from ${esc(o.selector)}</em>` : ''}${o.url ? ` <em>at ${esc(o.url)}</em>` : ''}</li>`)
           .join('') +
         '</ul></div>',
+    );
+  }
+  // Last of the step's text, after every recorded fact and never before one:
+  // a model's reading of the line above it, labelled and signed, the same
+  // wording the per-run report and the workbook use (`step-facts.ts`). Every
+  // run that did not ask for a narration renders exactly what it always did.
+  const narration = stepNarration(step);
+  if (narration !== null) {
+    rows.push(
+      `<div class="narration"><span class="narr-k" title="${esc(narration.note)}">${esc(narration.label)}</span>` +
+        `<span class="narr-t">${esc(narration.text)}</span>` +
+        `<em class="narr-by">— ${esc(narration.attribution)}</em></div>`,
     );
   }
   if (step.screenshot) {
@@ -443,11 +540,22 @@ function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: Me
       : steps
           .filter((s) => !s.superseded)
           .map((s) => {
-            const tone = s.status === 'passed' ? 'ok' : s.status === 'skipped' ? 'skip' : 'no';
+            // A broken step that decided nothing is laid out as an aside: the
+            // step is already a closed disclosure here, so folding it means
+            // the ordinary colour and one honest line on the summary naming
+            // the sealed status and why it did not decide. Nothing leaves the
+            // pane; the body is exactly what it was. Same predicate and same
+            // wording as the per-run report and the workbook.
+            const aside = bundle === null || bundle === undefined
+              ? null
+              : inconsequentialBrokenStep(s, bundle);
+            const tone =
+              aside !== null ? 'aside' : s.status === 'passed' ? 'ok' : s.status === 'skipped' ? 'skip' : 'no';
             return (
               `<details class="step ${tone}"><summary><b class="dot"></b>` +
               `<span class="sname">${s.index} ${esc(s.action)}</span>` +
               `<span class="ssub">${esc(s.intent ?? stepTarget(s) ?? '')}</span>` +
+              (aside === null ? '' : `<span class="saside">${esc(aside.summary)}</span>`) +
               `<span class="sms">${esc(fmtMs(s.durationMs))}</span>` +
               seekControl(s, hasVideo) +
               '</summary>' +
@@ -480,7 +588,20 @@ function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: Me
   return (
     `<details class="case" id="${anchor}" data-name="${esc(c.name)}">` +
     `<summary><span class="chip ${chip.cls}">${esc(chip.label)}</span>` +
-    `<span class="cname">${esc(c.name)}${sheetChip}${sheetTag}</span>` +
+    // The case's own page (2026-09-10): written beside the workbook for
+    // every case that has a bundle, so the name is the way in. `stopPropagation`
+    // keeps the click from also toggling the row, the same rule as the export
+    // button; a case with no bundle has no page and its name stays plain text.
+    `<span class="cname">${
+      bundle
+        ? `<a class="open-case" href="${esc(input.casePageHref?.(c) ?? `${catalogMediaDirName(input.runKey, input.title)}/${casePageName(c.id)}`)}"${
+            // The absolute path too: served by the panel (`/reports/<file>`), a
+            // relative href into another tree cannot be followed, and the page
+            // script re-points the link at the panel's own `/view?path=` door.
+            typeof c.reportPath === 'string' && c.reportPath !== '' ? ` data-report="${esc(c.reportPath)}"` : ''
+          } onclick="event.stopPropagation()" title="This case's own report page: summary, tickets, the database evidence and the queries behind it, the film and the stills">${esc(c.name)}</a>`
+        : esc(c.name)
+    }${sheetChip}${sheetTag}</span>` +
     (bundle ? `<span class="cms">${esc(fmtMs(bundle.caseDurationMs ?? bundle.durationMs))}</span>` : '') +
     exportControl(c, input) +
     '</summary>' +
@@ -555,6 +676,46 @@ function findingsSection(summary: FindingsSummary): string {
  * 252-row remainder used to render 252 full sections a reader had to scroll
  * past; the ids are all still here, each in its own `<span>`.
  */
+/**
+ * The state this run found, and the way back to it.
+ *
+ * A mutating run against a shared environment leaves it changed, and until now
+ * the only account of that was a line in a log nobody keeps. The snapshot
+ * always knew how to undo itself; what it lacked was a write credential — and
+ * the knowledge and the permission are different things. So the report states
+ * what was captured and names the script that reverses it, whether or not this
+ * run was allowed to run that script itself.
+ *
+ * No row values here. They are in the local baseline and its script, which are
+ * deliberately not report content.
+ */
+function dbBaselineSection(input: CatalogReportInput): string {
+  const b = input.dbBaseline;
+  if (b === undefined) return '';
+  const restored = b.restored;
+  const state =
+    restored !== undefined
+      ? restored.ok
+        ? `<span class="chip pass">restored ${esc(restored.at)}</span>`
+        : `<span class="chip fail">restore failed</span>`
+      : b.mode === 'restore'
+        ? '<span class="chip">restore armed for the end of the run</span>'
+        : '<span class="chip never">snapshot only — the tables were left as this run left them</span>';
+  const script =
+    b.restoreSql === undefined
+      ? '<p>No restore script was written for this run.</p>'
+      : `<p>Put the tables back with:</p><pre><code>psql "$WOWLIDATOR_DB_RESTORE_URL" -v ON_ERROR_STOP=1 -f ${esc(b.restoreSql)}</code></pre>` +
+        '<p class="muted">The script deletes and reinserts every row of the tables above and nothing else — anything this run changed outside them is not undone by it.</p>';
+  return (
+    '<section class="db-baseline"><h2>Database before this run</h2>' +
+    `<p>${state} · captured ${esc(b.takenAt)}</p>` +
+    `<p>Tables: ${b.tables.length === 0 ? '(none)' : b.tables.map((t) => `<code>${esc(t)}</code>`).join(', ')}</p>` +
+    `<p class="muted">Snapshot: <code>${esc(b.path)}</code>${restored !== undefined ? ` · ${esc(restored.detail)}` : ''}</p>` +
+    script +
+    '</section>'
+  );
+}
+
 function neverRanSection(cases: readonly CatalogReportCase[]): string {
   if (cases.length === 0) return '';
   return (
@@ -622,6 +783,14 @@ document.addEventListener('click', function (e) {
 document.querySelectorAll('details.case').forEach(wowWireCase);
 /* An exported single case is already open, so its toggle never fires. */
 document.querySelectorAll('body.single video').forEach(wowHydrateVideo);
+/* Under the panel a case page in the run's own folder is reached through /view,
+   the panel's one door to a file outside the reports folder; off the panel the
+   relative href already works. */
+if (location.pathname.indexOf('/reports/') === 0) {
+  document.querySelectorAll('a.open-case[data-report]').forEach(function (a) {
+    a.href = '/view?path=' + encodeURIComponent(a.getAttribute('data-report'));
+  });
+}
 `;
 
 const EXPORT_SCRIPT = `
@@ -666,10 +835,21 @@ h1 { font-size: 20px; margin: 0 0 4px; }
 .chip.record { background: color-mix(in srgb, #1f7a8c 14%, transparent); color: #1f7a8c; border: 1px dashed #1f7a8c; }
 .chip.never { background: color-mix(in srgb, var(--muted) 18%, transparent); color: var(--muted); }
 .sid { font-size: 11px; color: var(--muted); margin-left: 8px; font-family: ui-monospace, monospace; }
+.cname a.open-case { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
+.cname a.open-case:hover { color: var(--fg); border-bottom-style: solid; }
 .ctag { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; margin-left: 8px; }
 .captures { background: color-mix(in srgb, #1f7a8c 8%, transparent); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
 .captures .kv code { color: #1f7a8c; }
 .observed em, .turns em { color: var(--muted); font-style: normal; font-size: 11px; }
+/* A leg that did not decide the step: folded, ordinary colour, never red —
+   the same treatment a superseded attempt gets in the per-run report. */
+.dbrows { margin: 4px 0; }
+.dbrows table { border-collapse: collapse; font-size: 11px; margin-top: 3px; }
+.dbrows th, .dbrows td { border: 1px solid var(--line); padding: 2px 6px; text-align: left; vertical-align: top; }
+.dbrows th { color: var(--muted); font-weight: 600; }
+.step.aside > summary .saside { color: var(--muted); font-size: 11px; }
+details.aside-leg { margin: 4px 0; }
+details.aside-leg > summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 details.case { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; background: var(--panel, transparent); }
 details.case > summary { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; list-style: none; }
 details.case > summary .cname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -686,6 +866,8 @@ details.step.skip { color: var(--muted); }
 details.step.ok .dot { background: var(--pass, #2e7d32); }
 details.step.no .dot { background: #c0392b; }
 details.step.skip .dot { background: var(--muted); }
+details.step.aside { border-left-style: dashed; }
+details.step.aside .dot { background: var(--muted); }
 details.step > summary { display: flex; gap: 8px; align-items: baseline; padding: 4px 8px; cursor: pointer; list-style: none; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
 .sname { font-weight: 600; white-space: nowrap; }
@@ -697,6 +879,14 @@ details.step > summary { display: flex; gap: 8px; align-items: baseline; padding
 .kv code { word-break: break-all; white-space: pre-wrap; }
 .kv.err code { color: #c0392b; }
 .kv.heal code { color: #b8860b; }
+/* A model's sentence among the run's own facts: a rule down its left edge,
+   muted and italic, labelled and signed — never another recorded row. */
+.narration { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; margin: 6px 0 3px;
+  padding-left: 8px; border-left: 2px solid var(--line); color: var(--muted); font-style: italic; }
+.narration .narr-k { font-style: normal; font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+  flex: none; width: 82px; cursor: help; }
+.narration .narr-t { flex: 1; min-width: 0; }
+.narration .narr-by { font-style: normal; font-size: 11px; opacity: .8; white-space: nowrap; }
 .muted { color: var(--muted); }
 .shot img { max-width: 100%; border: 1px solid var(--line); border-radius: 6px; margin-top: 6px; }
 .history { background: color-mix(in srgb, var(--muted) 7%, transparent); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
@@ -826,6 +1016,7 @@ export function renderCatalogReport(input: CatalogReportInput): string {
     liveNote +
     `<div class="tally">${[...tally.entries()].map(([label, n]) => `<span>${esc(label)}: <b>${n}</b></span>`).join('')}</div>` +
     findingsSection(findings) +
+    dbBaselineSection(input) +
     neverRanSection(neverRan) +
     spillNote +
     omittedNote +
@@ -851,6 +1042,11 @@ export function catalogMediaDirName(runKey: string | null, title: string): strin
 /** `PL_06_05` → `pl-06-05` — the file-name stem a case's export artifacts share. */
 export function catalogCaseExportName(caseId: string): string {
   return slugify(caseId) || 'case';
+}
+
+/** `<case slug>.html` — the case's own report page, beside its workbook in the media folder (`case-page.ts`). */
+export function casePageName(caseId: string): string {
+  return `${catalogCaseExportName(caseId)}.html`;
 }
 
 /** `reports/<runKey slug>.html` — stable per run key, so a resume overwrites its own file. */

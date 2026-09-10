@@ -40,6 +40,9 @@ Usage:
                                            (one step per row, photos embedded,
                                            video linked under every step) from
                                            the ledgers on disk — no re-run
+                                           add --narrate to give every step a
+                                           plain-language sentence in the same
+                                           pass (no browser, no re-run)
                                            (default: .wowlidator/catalogs/)
   wowlidator db restore [<baseline.json> | <runKey> | <ledger.progress.json>]
                                            put the tables back to the snapshot a
@@ -272,6 +275,35 @@ catalog — a document of claims (.md .csv .html .txt .json .yaml .xlsx .pdf .mm
                        rectangle is drawn around the element each step acted
                        on or checked (its selector, role, name and box are
                        recorded on the step as "target" either way).
+  --narrate            After each case, have the healer-role model write one
+                       plain-language sentence per step onto the proof bundle,
+                       so the report says what each step did in words anyone
+                       can read. One call per case, not one per step; the
+                       sentence is labelled as the model's and can never
+                       change a verdict, a defect or a finding. OFF by default
+                       (WOWLIDATOR_NARRATE=on is the same switch) because it
+                       spends the model window on every case that runs, and is
+                       skipped when the healer role has no key. Also available
+                       on 'wowlidator report' to back-fill finished runs.
+  --report-lang <en|th>
+                       The language of each case's own report page — its
+                       labels and the model-written narrative on it. English
+                       by default (WOWLIDATOR_REPORT_LANG is the same switch).
+                       Recorded on the run's ledger, so 'wowlidator report'
+                       rebuilds in the language the run chose. Application
+                       text is always shown as captured, never translated.
+  --no-case-narrative  Leave the case page to its evidence: skip the one
+                       generator-role call per case that writes its lede,
+                       pre-read summary, ticket wording, verifier note and
+                       open questions onto the bundle. The narrative is
+                       labelled as the model's and can never change a
+                       verdict, a defect or a finding
+                       (WOWLIDATOR_CASE_NARRATIVE=off is the same switch).
+  --case-narrative     On 'wowlidator report': back-fill the case narrative
+                       onto finished runs that have none, in the language the
+                       run recorded (a rebuild cannot change it). One
+                       generator-role call per case; off unless asked, since a
+                       rebuild is otherwise no re-run.
   --no-agent-capture   Capture the page immediately instead of letting the
                        agent steady it first (wait out spinners, dismiss
                        overlays, prime lazy content). The pilot is on by

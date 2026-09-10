@@ -1,22 +1,30 @@
 #!/usr/bin/env node
 // Print the state of a stopped catalog run from its ledger.
-// Usage: node .claude/skills/catalog-triage/ledger.mjs <path-to-.claims.progress.json> [--reasons]
+// Usage: node .claude/skills/catalog-triage/ledger.mjs [<ledger path> | <run folder or its name> | latest] [--reasons]
+//
+// The ledger is found the way `wowlidate`'s own scripts find it (`paths.mjs`):
+// a run launched through `newrun.mjs` keeps its ledger in
+// `<report-dir>/runs/<slug>-<stamp>/catalogs/`, which a fresh shell cannot
+// see through WOWLIDATOR_REPORT_DIR alone — that is the "no ledger" a triage
+// used to print about a run with a perfectly good one (2026-09-10).
 
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 
-const [, , path, ...rest] = process.argv;
-if (!path) {
-  console.error('usage: ledger.mjs <path-to-.claims.progress.json> [--reasons]');
-  process.exit(2);
-}
-if (!existsSync(path)) {
-  console.error(`no ledger at ${path}`);
-  console.error('a catalog run\'s ledger lives beside its claims file, in');
-  console.error('<report-dir>/catalogs/ — never .wowlidator/catalogs/.');
-  console.error('<report-dir> is WOWLIDATOR_REPORT_DIR when .env sets it,');
-  console.error('and .wowlidator/reports otherwise. Check that first:');
-  console.error("  grep -E '^WOWLIDATOR_REPORT_DIR=' .env");
+import { describeLedgerSearch, findLedger, loadDotEnv } from '../wowlidate/paths.mjs';
+
+const args = process.argv.slice(2);
+const ref = args.find((a) => !a.startsWith('--'));
+const rest = args.filter((a) => a.startsWith('--'));
+loadDotEnv();
+const path = findLedger(ref);
+if (path === null) {
+  console.error(ref === undefined || ref === 'latest' ? 'no ledger found anywhere a run on this machine writes' : `no ledger matches ${ref}`);
+  console.error(describeLedgerSearch());
+  console.error('a run launched with newrun.mjs keeps its ledger in <report-dir>/runs/<slug>-<stamp>/catalogs/;');
+  console.error('one launched by hand keeps it in <report-dir>/catalogs/, where <report-dir> is');
+  console.error("WOWLIDATOR_REPORT_DIR when .env sets it (grep -E '^WOWLIDATOR_REPORT_DIR=' .env), else .wowlidator/reports.");
+  console.error('a folder with a log and no ledger is a run that has not sealed its first case yet, or died before it.');
   process.exit(2);
 }
 

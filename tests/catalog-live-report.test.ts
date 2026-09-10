@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 import {
@@ -220,6 +220,73 @@ describe('the findings export rides with the report', () => {
 
     assert.match(html, /omitted for size — it stays in the proof bundle/);
     assert.ok(!html.includes('screenshot(s) written beside this file'));
+  });
+});
+
+describe('each case with a bundle gets its own page beside its workbook (case-page.ts)', () => {
+  it('writes <media>/<case>.html and the DB sidecars for a case with a DB step, links it from the row, and none for a never-ran row', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'wow-live-'));
+    const ledger = newLedger('be100.csv', ['BE_01_01', 'BE_01_02', 'BE_02_01']);
+    ledger.runKey = 'be100-csv@2026-09-02T04:00:00.000Z';
+    ledger.launch = { catalog: 'be100.csv', claims: 'be100.claims.json', reportLang: 'th' };
+    const withDb = bundle('BE_01_01 create', 'failed', {
+      steps: [
+        step({ index: 0, intent: 'open the page' }),
+        step({
+          index: 1, action: 'expectDbRow', status: 'failed', url: null,
+          db: {
+            kind: 'row', table: 'benefit_plan', where: 'id = 7', expected: 'status = ACTIVE', observed: 'status = DRAFT', durationMs: 12,
+            statements: [{ sql: 'SELECT * FROM "benefit_plan" WHERE "id" = $1 LIMIT 25', params: ['7'], tables: ['benefit_plan'] }],
+            rows: [{ id: '7', status: 'DRAFT' }], rowsMatched: 1,
+          },
+        } as Partial<ProofStep>),
+      ],
+    });
+    const plain = bundle('BE_01_02 list', 'passed');
+    for (const b of [withDb, plain]) {
+      const proofPath = join(cwd, `${b.name.split(' ')[0]}.json`);
+      writeFileSync(proofPath, JSON.stringify(b), 'utf8');
+      recordOutcome(ledger, { name: b.name, verdict: b.status === 'passed' ? 'passed' : 'failed', bundle: b }, { proofPath });
+    }
+    // The ledger names where BE_01_02's own report is — a run folder of its
+    // own, as the run loop writes it — so its page goes THERE and the index
+    // links there; BE_01_01 has no reportPath and lands in the media folder.
+    const ownReport = join(cwd, 'runs', 'be', 'humi-en-login-be-01', '02-catalog-be-01-02-list.html');
+    ledger.outcomes['BE_01_02']!.reportPath = ownReport;
+    // A stale page from an earlier pass for the case that never ran this time.
+    mkdirSync(mediaDir(cwd), { recursive: true });
+    writeFileSync(join(mediaDir(cwd), 'be-02-01.html'), '<p>stale</p>', 'utf8');
+    const cases = await buildCatalogReportCases(ledger, async (id) => {
+      const proofPath = ledger.outcomes[id]?.proofPath;
+      return typeof proofPath === 'string' ? (JSON.parse(readFileSync(proofPath, 'utf8')) as ProofBundle) : null;
+    });
+    const artifacts = await writeCatalogArtifacts(
+      { title: ledger.title, runKey: ledger.runKey, generatedAt: null, cases, lang: ledger.launch.reportLang },
+      cwd,
+    );
+    assert.deepEqual(artifacts.casePages, [join(mediaDir(cwd), 'be-01-01.html'), ownReport]);
+    const own = readFileSync(ownReport, 'utf8');
+    assert.match(own, /<a href="\.\.\/\.\.\/\.\.\/reports\/be100-csv-2026-09-02t04-00-00-000z\.html">/);
+    assert.ok(!existsSync(join(mediaDir(cwd), 'be-01-02.html')));
+    const page = readFileSync(join(mediaDir(cwd), 'be-01-01.html'), 'utf8');
+    assert.match(page, /<html lang="th">/);
+    assert.match(page, /Query ที่ใช้เก็บหลักฐาน DB/);
+    assert.match(page, /SELECT \* FROM &quot;benefit_plan&quot; WHERE &quot;id&quot; = \$1 LIMIT 25;/);
+    assert.match(page, /<a href="\.\.\/be100-csv-2026-09-02t04-00-00-000z\.html">/);
+    assert.match(readFileSync(join(mediaDir(cwd), 'be-01-01-db-query.sql'), 'utf8'), /BEGIN TRANSACTION READ ONLY;/);
+    assert.match(readFileSync(join(mediaDir(cwd), 'be-01-01-db-evidence.csv'), 'utf8'), /^step,check,table,where,expected,observed,row,field,value\n1,row,benefit_plan,id = 7,/);
+    // No baseline diff on this run: the before/after chips are plain, and the files do not exist.
+    assert.ok(!existsSync(join(mediaDir(cwd), 'be-01-01-db-before.csv')));
+    assert.match(page, /<span class="chip muted"><code>db-before\.csv<\/code>/);
+    // A case with no DB step has a page and no sidecars; a never-ran case has neither, and its stale page is gone.
+    assert.ok(!existsSync(join(dirname(ownReport), '02-catalog-be-01-02-list-db-query.sql')));
+    assert.ok(!existsSync(join(mediaDir(cwd), 'be-01-02-db-query.sql')));
+    assert.ok(!existsSync(join(mediaDir(cwd), 'be-02-01.html')));
+    // The index links each page from the case's name, relative to itself.
+    const html = readFileSync(artifacts.htmlPath, 'utf8');
+    assert.match(html, /<a class="open-case" href="be100-csv-2026-09-02t04-00-00-000z-media\/be-01-01\.html"/);
+    assert.match(html, /<a class="open-case" href="\.\.\/runs\/be\/humi-en-login-be-01\/02-catalog-be-01-02-list\.html"/);
+    assert.doesNotMatch(html, /be-02-01\.html/);
   });
 });
 

@@ -132,8 +132,14 @@
 
   .outcomes { max-height:520px; overflow-y:auto; }
   .out-row { display:flex; align-items:center; gap:10px; padding:10px 18px;
-             border-bottom:1px solid var(--line); }
+             border-bottom:1px solid var(--line);
+             color:inherit; text-decoration:none; }
   .out-row:last-child{border-bottom:none}
+  a.out-row { cursor:pointer; }
+  a.out-row:hover { background:var(--panel-2); }
+  a.out-row:hover .name { color:var(--accent-ink); }
+  .out-row .go { color:var(--accent-ink); }
+  .out-row.nolink .t { color:var(--faint); }
   .verdict-pill { font-family:var(--mono); font-size:10.5px; font-weight:600;
                   text-transform:uppercase; letter-spacing:.04em; padding:2px 8px;
                   border-radius:999px; flex:none; }
@@ -152,6 +158,100 @@
   footer { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap;
            font-family:var(--mono); font-size:10.5px; color:var(--faint); padding:4px 4px 0; }
   footer span { overflow-wrap:anywhere; }
+
+  /* ── Claude session ─────────────────────────────────────────────────── */
+  .claude-body { display:grid; grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);
+                 gap:18px; padding:16px 18px; align-items:start; }
+  @media (max-width:860px){ .claude-body{grid-template-columns:minmax(0,1fr)} }
+
+  .qrows { display:flex; flex-direction:column; gap:11px; }
+  .qrow { display:grid; grid-template-columns:96px minmax(0,1fr) 42px; gap:10px;
+          align-items:center; }
+  .qrow .ql { font-family:var(--mono); font-size:11px; color:var(--muted);
+              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .qrow .qp { font-family:var(--mono); font-size:12px; font-weight:600;
+              font-variant-numeric:tabular-nums; text-align:right; }
+  .qbar { position:relative; height:8px; border-radius:999px; background:var(--panel-2);
+          border:1px solid var(--line); overflow:hidden; }
+  .qbar > i { display:block; height:100%; border-radius:999px; transition:width .5s ease; }
+  .qbar.ok > i{background:var(--ok)} .qbar.warn > i{background:var(--warn)}
+  .qbar.bad > i{background:var(--bad)}
+  .qrow.ok .qp{color:var(--ok)} .qrow.warn .qp{color:var(--warn)} .qrow.bad .qp{color:var(--bad)}
+  /* The hold line: where dispatch stops, drawn on the bar it applies to, so a
+     bar approaching it reads as "about to pause", not "about to fail". */
+  .qbar .hold { position:absolute; top:-1px; bottom:-1px; width:1px;
+                background:var(--bad); opacity:.55; }
+  .qmeta { font-family:var(--mono); font-size:10.5px; color:var(--faint);
+           grid-column:2 / -1; margin-top:-6px; }
+
+  .ctiles { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px;
+            background:var(--line); border:1px solid var(--line); border-radius:10px;
+            overflow:hidden; }
+  .ctile { background:var(--panel); padding:10px 12px; display:flex;
+           flex-direction:column; gap:2px; min-width:0; }
+  .ctile .n { font-family:var(--mono); font-size:17px; font-weight:600;
+              font-variant-numeric:tabular-nums; letter-spacing:-.01em;
+              overflow:hidden; text-overflow:ellipsis; }
+  .ctile .lbl { font-size:10px; font-family:var(--mono); text-transform:uppercase;
+                letter-spacing:.06em; color:var(--faint); }
+
+  .roles { display:flex; flex-direction:column; gap:5px; margin-top:12px; }
+  .role-row { display:grid; grid-template-columns:minmax(0,70px) minmax(0,1fr) auto;
+              gap:8px; align-items:baseline; font-family:var(--mono); font-size:11px; }
+  .role-row .rn { color:var(--accent-ink); overflow:hidden; text-overflow:ellipsis; }
+  .role-row .rb { height:5px; border-radius:999px; background:var(--panel-2);
+                  border:1px solid var(--line); overflow:hidden; }
+  .role-row .rb > i { display:block; height:100%; background:var(--accent-ink); opacity:.55; }
+  .role-row .rv { color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+
+  .calls { max-height:196px; overflow-y:auto; border-top:1px solid var(--line); }
+  .call-row { display:grid; grid-template-columns:58px 64px minmax(0,1fr) auto;
+              gap:8px; padding:5px 18px; align-items:baseline;
+              font-family:var(--mono); font-size:11px; }
+  .call-row:nth-child(odd){ background:var(--panel-2); }
+  .call-row .ct { color:var(--faint); }
+  .call-row .cr { color:var(--accent-ink); overflow:hidden; text-overflow:ellipsis; }
+  .call-row .cm { color:var(--muted); overflow:hidden; text-overflow:ellipsis; }
+  .call-row .cw { color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .call-row.err .cm { color:var(--bad); }
+  .call-row.cold .cm::after { content:' · cold'; color:var(--warn); }
+
+  /* -- The run log, verbatim ------------------------------------------ */
+  .term-h { flex-wrap:wrap; row-gap:8px; }
+  .term-h .n { flex:1 1 140px; text-align:left; }
+  .tools { display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:none; }
+  .tools input[type=search] { font-family:var(--mono); font-size:11.5px;
+      padding:4px 10px; border-radius:999px; border:1px solid var(--line-strong);
+      background:var(--panel-2); color:var(--ink); width:180px; }
+  .tools input[type=search]:focus { outline:none; border-color:var(--accent-ink); }
+  .tools label { font-family:var(--mono); font-size:11px; color:var(--muted);
+      display:inline-flex; align-items:center; gap:5px; cursor:pointer; user-select:none; }
+  .tools button { font-family:var(--mono); font-size:11px; padding:4px 10px;
+      border-radius:999px; border:1px solid var(--line-strong); background:var(--panel-2);
+      color:var(--muted); cursor:pointer; white-space:nowrap; }
+  .tools button:hover { color:var(--ink); border-color:var(--faint); }
+  .tools button.on { color:var(--accent-ink); background:var(--accent-soft);
+      border-color:transparent; }
+
+  .out-tools { display:flex; flex-direction:column; gap:8px; padding:10px 18px;
+               border-bottom:1px solid var(--line); }
+  .out-tools input[type=search] { width:100%; }
+  .vfilters { display:flex; gap:6px; flex-wrap:wrap; }
+
+  /* A terminal stays a terminal in either theme -- the run's own colours are
+     the point, and a light-mode console reads as a document, not a tail. */
+  .term { background:#0b0e11; color:#c9d3dd; font-family:var(--mono);
+          font-size:11.5px; line-height:1.5; padding:10px 14px; height:380px;
+          min-height:140px; overflow:auto; resize:vertical;
+          border-radius:0 0 14px 14px; white-space:pre-wrap;
+          overflow-wrap:anywhere; }
+  .term .tline { padding:0; }
+  .term .tp    { color:#5eb0c4; }
+  .term .ok    { color:#5fd39a; }
+  .term .bad   { color:#f2837f; }
+  .term .warn  { color:#e8b464; }
+  .term .faint { color:#5d6b78; }
+  .term .empty { color:#5d6b78; text-align:left; padding:0; }
 
   ::-webkit-scrollbar { width:8px; }
   ::-webkit-scrollbar-thumb { background:var(--line-strong); border-radius:8px; }
@@ -183,15 +283,50 @@
     <div class="tiles" id="tiles"></div>
   </div>
 
+  <div class="panel" id="claudePanel" hidden>
+    <div class="panel-h">
+      <span class="t">Claude</span>
+      <span class="n" id="claudeRoles">&mdash;</span>
+    </div>
+    <div class="claude-body">
+      <div>
+        <div class="qrows" id="quotaRows"></div>
+        <div class="roles" id="roleSpend"></div>
+      </div>
+      <div class="ctiles" id="claudeTiles"></div>
+    </div>
+    <div class="panel-h" style="border-top:1px solid var(--line)">
+      <span class="t">Recent model calls</span><span class="n" id="callsMeta">&mdash;</span>
+    </div>
+    <div class="calls" id="calls"></div>
+  </div>
+
   <div class="cols">
     <div class="panel">
       <div class="panel-h"><span class="t">Live activity</span><span class="n" id="feedCount">&mdash;</span></div>
       <div class="feed" id="feed"><div class="empty">Waiting for the run to write its first line&hellip;</div></div>
     </div>
     <div class="panel">
-      <div class="panel-h"><span class="t">Recent outcomes</span><span class="n" id="outcomeCount">&mdash;</span></div>
+      <div class="panel-h"><span class="t">Outcomes</span><span class="n" id="outcomeCount">&mdash;</span></div>
+      <div class="out-tools">
+        <input type="search" id="outFilter" placeholder="search id, scenario, status, reason&hellip;" autocomplete="off" spellcheck="false">
+        <span class="vfilters tools" id="outVerdicts"></span>
+      </div>
       <div class="outcomes" id="outcomes"><div class="empty">No case has a verdict yet.</div></div>
     </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-h term-h">
+      <span class="t">Run log</span>
+      <span class="n" id="termMeta">&mdash;</span>
+      <span class="tools">
+        <input type="search" id="termFilter" placeholder="filter lines&hellip;" autocomplete="off" spellcheck="false">
+        <label><input type="checkbox" id="termFollow" checked> follow</label>
+        <button type="button" id="termClear">clear view</button>
+      </span>
+    </div>
+    <div class="term" id="term"><div class="empty">Waiting for the run&rsquo;s log&hellip;</div></div>
   </div>
 
   <footer>
@@ -238,7 +373,287 @@
     el.hidden = false;
   }
 
+  function usd(n) {
+    n = num(n);
+    return n >= 100 ? '$' + n.toFixed(0) : n >= 1 ? '$' + n.toFixed(2) : '$' + n.toFixed(3);
+  }
+  function toks(n) {
+    n = num(n);
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return Math.round(n / 1e3) + 'k';
+    return String(n);
+  }
+  function dur(ms) {
+    ms = num(ms);
+    if (ms < 1000) return Math.round(ms) + 'ms';
+    if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+    var m = Math.floor(ms / 60000);
+    if (m < 60) return m + 'm ' + Math.round((ms % 60000) / 1000) + 's';
+    return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+  }
+  function untilTime(iso) {
+    if (!iso) return '';
+    var ms = new Date(iso).getTime() - Date.now();
+    if (!isFinite(ms)) return '';
+    if (ms <= 0) return 'resets now';
+    var m = Math.round(ms / 60000);
+    if (m < 60) return 'resets in ' + m + 'm';
+    var h = Math.floor(m / 60);
+    if (h < 24) return 'resets in ' + h + 'h ' + (m % 60) + 'm';
+    return 'resets in ' + Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+  }
+  function clockOnly(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    return isFinite(d.getTime()) ? d.toTimeString().slice(0, 8) : '';
+  }
+  // A window is judged against the hold, not against 100%: dispatch stops at
+  // the hold percent, so that — not exhaustion — is the line that matters.
+  function quotaClass(percent, severity, hold) {
+    if (severity === 'exceeded' || (hold && percent >= hold)) return 'bad';
+    if (severity === 'warning' || percent >= (hold ? hold - 10 : 75)) return 'warn';
+    return 'ok';
+  }
+
   var lastSig = null;
+
+  // -- Outcomes ---------------------------------------------------------
+  // Two things the list did not do before: it held only the newest forty, and
+  // it rebuilt itself every three seconds. Both mattered once a row became a
+  // link — a search over forty rows answers "is it recent" rather than "where
+  // is PL_04_13", and a list that reshuffles on a timer moves the row out from
+  // under the click. So the whole set is held, and it repaints only when the
+  // set itself changes; the ages are touched up in place between times.
+  var outs = { sig: null, list: [], shown: [], filter: '', verdict: 'all', planned: 0, reached: 0 };
+  var VERDICTS = ['all', 'passed', 'failed', 'review', 'blocked'];
+
+  function fileUrl(p) {
+    // encodeURI leaves # and ? alone, and either one truncates a file:// path
+    // into a fragment or a query — a real hazard for a slugged report name.
+    return 'file://' + encodeURI(p).replace(/#/g, '%23').replace(/\?/g, '%3F');
+  }
+
+  function outcomeMatches(o) {
+    if (outs.verdict !== 'all' && o.verdict !== outs.verdict) return false;
+    if (!outs.filter) return true;
+    return (o.id + ' ' + (o.name || '') + ' ' + (o.status || '') + ' ' +
+            (o.scenario || '') + ' ' + (o.reason || '')).toLowerCase()
+           .indexOf(outs.filter) >= 0;
+  }
+
+  function paintOutcomes() {
+    var box = $('outcomes');
+    var list = outs.list;
+    var shown = list.filter(outcomeMatches);
+    outs.shown = shown;
+
+    if (!list.length) {
+      box.innerHTML = '<div class="empty">No case has a verdict yet.</div>';
+    } else if (!shown.length) {
+      box.innerHTML = '<div class="empty">No sealed case matches this filter.</div>';
+    } else {
+      box.innerHTML = shown.map(function (o) {
+        var link = o.reportPath ? fileUrl(o.reportPath) : null;
+        var tip = (o.status ? o.status + ' — ' : '') + (o.reason || '') +
+                  (link ? '\n\nopen report: ' + o.reportPath : '\n\nno report was written for this case');
+        var open = link
+          ? '<a class="out-row" href="' + esc(link) + '" target="_blank" rel="noopener"'
+          : '<div class="out-row nolink"';
+        return open + ' title="' + esc(tip) + '">' +
+          '<span class="verdict-pill ' + esc(o.verdict) + '">' + esc(o.verdict) + '</span>' +
+          '<span class="name">' + esc(o.name || o.id) +
+            (o.reason ? '<small>' + esc(o.reason) + '</small>' : '') + '</span>' +
+          '<span class="t">' + relTime(o.at) +
+            (link ? ' <span class="go">&#8599;</span>' : '') + '</span>' +
+          (link ? '</a>' : '</div>');
+      }).join('');
+    }
+
+    var counts = { all: list.length, passed: 0, failed: 0, review: 0, blocked: 0 };
+    for (var i = 0; i < list.length; i++) {
+      if (counts[list[i].verdict] !== undefined) counts[list[i].verdict]++;
+    }
+    $('outVerdicts').innerHTML = VERDICTS.map(function (v) {
+      return '<button type="button" class="' + (outs.verdict === v ? 'on' : '') +
+        '" data-v="' + v + '">' + v + ' ' + counts[v] + '</button>';
+    }).join('');
+
+    var filtered = outs.verdict !== 'all' || outs.filter;
+    $('outcomeCount').textContent = filtered
+      ? shown.length + ' of ' + list.length + ' shown'
+      : outs.reached + ' of ' + outs.planned;
+  }
+
+  // Ages go stale between repaints; nudge them without rebuilding, so a row
+  // never moves under a pointer that is already on its way to it.
+  function touchOutcomeTimes() {
+    var rows = $('outcomes').children;
+    for (var i = 0; i < rows.length && i < outs.shown.length; i++) {
+      var t = rows[i].querySelector('.t');
+      if (!t) continue;
+      var link = outs.shown[i].reportPath;
+      t.innerHTML = esc(relTime(outs.shown[i].at)) +
+        (link ? ' <span class="go">&#8599;</span>' : '');
+    }
+  }
+
+  function renderOutcomes(s) {
+    var c = s.counts || {};
+    var list = Array.isArray(s.outcomes) ? s.outcomes
+             : Array.isArray(s.recentOutcomes) ? s.recentOutcomes : [];
+    outs.list = list;
+    outs.planned = num(c.planned);
+    outs.reached = num(c.passed) + num(c.failed) + num(c.review) + num(c.blocked);
+    var sig = list.length + '|' + (list.length ? list[0].id + '|' + list[0].at : '');
+    if (sig !== outs.sig) { outs.sig = sig; paintOutcomes(); }
+    else touchOutcomeTimes();
+  }
+
+  // -- The run log, verbatim -------------------------------------------
+  // The activity feed above is filtered: it drops prompts, llm lines and rule
+  // separators so a person can read it. This is the other half -- the log as
+  // the run actually wrote it. Lines are appended by absolute byte offset, so
+  // none is ever printed twice and the view keeps far more than the watcher's
+  // 256KB window ever holds at once. Filter, follow and clear touch this
+  // page's own DOM and nothing else: still nothing here can reach the run.
+  var term = { off: -1, file: null, filter: '', follow: true, primed: false };
+
+  function termClass(t) {
+    if (/(^|\])\s+!\s/.test(t)) return 'warn';
+    if (/\[llm |^\s*(ask|response|prompt):/i.test(t)) return 'faint';
+    if (/\u2717|\bfailed\b|\berror\b|Timeout|could not|refus/i.test(t)) return 'bad';
+    if (/\u2713|\bpassed\b/i.test(t)) return 'ok';
+    return '';
+  }
+
+  function renderTerm(s) {
+    var box = $('term');
+    var lines = Array.isArray(s.logLines) ? s.logLines : [];
+    var file = s.logFile || null;
+
+    // A watcher restart, a different run, or a truncated log rewinds the
+    // offsets. Starting over is the only honest answer -- appending would
+    // interleave two different files into one scrollback.
+    if (file !== term.file || (lines.length && lines[lines.length - 1].o < term.off)) {
+      box.innerHTML = ''; term.off = -1; term.primed = false; term.file = file;
+    }
+
+    if (!lines.length) {
+      if (!term.primed) {
+        box.innerHTML = '<div class="empty">' + (file
+          ? 'Waiting for the run&rsquo;s log&hellip;'
+          : 'This run writes no log file the watcher can find.') + '</div>';
+      }
+      $('termMeta').textContent = file || '—';
+      return;
+    }
+    if (!term.primed) { box.innerHTML = ''; term.primed = true; }
+
+    var stick = term.follow || (box.scrollHeight - box.scrollTop - box.clientHeight < 40);
+    var frag = document.createDocumentFragment();
+    var added = 0;
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      if (ln.o <= term.off) continue;
+      var d = document.createElement('div');
+      d.className = 'tline ' + termClass(ln.t);
+      var m = ln.t.match(/^(\[[^\]]{1,28}\])([\s\S]*)$/);
+      d.innerHTML = m ? '<span class="tp">' + esc(m[1]) + '</span>' + esc(m[2]) : esc(ln.t);
+      if (term.filter && ln.t.toLowerCase().indexOf(term.filter) < 0) d.hidden = true;
+      frag.appendChild(d);
+      term.off = ln.o; added++;
+    }
+    if (added) {
+      box.appendChild(frag);
+      while (box.childElementCount > 4000) box.removeChild(box.firstElementChild);
+      if (stick) box.scrollTop = box.scrollHeight;
+    }
+    $('termMeta').textContent = (file || '') + '  ·  ' + box.childElementCount + ' lines held' +
+      (num(s.logBytes) ? '  ·  ' + Math.round(num(s.logBytes) / 1024) + 'KB on disk' : '');
+  }
+
+
+  function renderClaude(cl) {
+    var panel = $('claudePanel');
+    if (!cl) { panel.hidden = true; return null; }
+    panel.hidden = false;
+
+    var hold = num(cl.holdPercent) || null;
+    var limits = (cl.quota && Array.isArray(cl.quota.limits)) ? cl.quota.limits : [];
+    var session = null;
+    for (var i = 0; i < limits.length; i++) if (limits[i].kind === 'session') session = limits[i];
+
+    $('claudeRoles').textContent = cl.roles
+      ? Object.keys(cl.roles).map(function (r) { return r + ' ' + cl.roles[r]; }).join('  ·  ')
+      : '';
+
+    var rows = $('quotaRows');
+    if (!limits.length) {
+      rows.innerHTML = '<div class="qmeta" style="grid-column:1/-1;margin:0">' +
+        esc((cl.quota && cl.quota.note) || cl.note || 'no quota reading') + '</div>';
+    } else {
+      rows.innerHTML = limits.map(function (l) {
+        var p = Math.max(0, Math.min(100, num(l.percent)));
+        var k = quotaClass(p, l.severity, hold);
+        return '<div class="qrow ' + k + '">' +
+          '<span class="ql">' + esc(l.label || l.kind) + '</span>' +
+          '<span class="qbar ' + k + '"><i style="width:' + p + '%"></i>' +
+            (hold && l.kind === 'session' ? '<span class="hold" style="left:' + hold + '%"></span>' : '') +
+          '</span>' +
+          '<span class="qp">' + p + '%</span>' +
+          '<span class="qmeta">' + esc(untilTime(l.resetsAt)) +
+            (l.severity && l.severity !== 'normal' ? ' · ' + esc(l.severity) : '') + '</span>' +
+        '</div>';
+      }).join('');
+    }
+
+    var u = cl.usage;
+    var today = (u && u.today) || {};
+    var calls = num(today.calls);
+    var warmPct = calls ? Math.round((num(today.warmCalls) / calls) * 100) : 0;
+    $('claudeTiles').innerHTML = [
+      [calls ? String(calls) : '0', 'calls today'],
+      [usd(today.costUsd), 'cost today'],
+      [toks(today.outputTokens), 'out tokens'],
+      [calls ? dur(num(today.wallMs) / calls) : '—', 'avg call']
+    ].map(function (t) {
+      return '<div class="ctile"><span class="n">' + esc(t[0]) +
+             '</span><span class="lbl">' + esc(t[1]) + '</span></div>';
+    }).join('');
+
+    var spend = $('roleSpend');
+    var byRole = (u && Array.isArray(u.byRole)) ? u.byRole : [];
+    var top = byRole.length ? num(byRole[0].costUsd) : 0;
+    spend.innerHTML = byRole.map(function (r) {
+      var w = top > 0 ? (num(r.costUsd) / top) * 100 : 0;
+      return '<div class="role-row">' +
+        '<span class="rn">' + esc(r.role) + '</span>' +
+        '<span class="rb"><i style="width:' + w + '%"></i></span>' +
+        '<span class="rv">' + num(r.calls) + ' · ' + usd(r.costUsd) + '</span></div>';
+    }).join('');
+
+    var list = $('calls');
+    var rc = Array.isArray(cl.recentCalls) ? cl.recentCalls : [];
+    if (!rc.length) {
+      list.innerHTML = '<div class="empty">The claude-cli ledger has no calls yet.</div>';
+    } else {
+      list.innerHTML = rc.map(function (c) {
+        var cls = 'call-row' + (c.finish ? ' err' : '') + (c.path === 'cold' ? ' cold' : '');
+        return '<div class="' + cls + '">' +
+          '<span class="ct">' + esc(clockOnly(c.ts)) + '</span>' +
+          '<span class="cr">' + esc(c.role) + '</span>' +
+          '<span class="cm">' + esc(c.modelId) + (c.finish ? ' · ' + esc(c.finish) : '') + '</span>' +
+          '<span class="cw">' + dur(c.wallMs) + '</span></div>';
+      }).join('');
+    }
+    var meta = [];
+    if (u && u.lastCallAt) meta.push('last ' + relTime(u.lastCallAt));
+    if (num(cl.warmFailures) > 0) meta.push(num(cl.warmFailures) + ' warm-session drops');
+    if (num(cl.reAsks) > 0) meta.push(num(cl.reAsks) + ' re-asks');
+    $('callsMeta').textContent = meta.join(' · ') || '—';
+
+    return { session: session, hold: hold, note: cl.note };
+  }
 
   function render(s) {
     if (!s) return;
@@ -281,6 +696,30 @@
     }
     if (num(s.chromeAlive) > 0) chips.push('<span class="chip">chrome ' + num(s.chromeAlive) + '</span>');
     if (num(s.authored) > 0) chips.push('<span class="chip">' + num(s.authored) + ' authored</span>');
+
+    // Is the run still a process? Distinct from every other reading here,
+    // which only ever says what it wrote, not whether it still exists.
+    var rn = s.runner || null;
+    if (rn && rn.alive) {
+      chips.push('<span class="chip ok"><span class="dot pulse"></span>pid ' + num(rn.pid) +
+        ' &middot; up ' + esc(rn.uptime) + (num(rn.count) > 1 ? ' &middot; ' + num(rn.count) + ' proc' : '') +
+        '</span>');
+    } else if (rn && !s.ended && num(c.planned) > 0) {
+      chips.push('<span class="chip bad"><span class="dot"></span>no runner process</span>');
+    }
+
+    // The Claude half. Its session chip sits with the run's own status chips
+    // because a run and the window it is spending fail together: a catalog
+    // that stops at 85% is not broken, and one at 12% that stopped is.
+    var cl = renderClaude(s.claude);
+    if (cl && cl.session) {
+      var k = quotaClass(num(cl.session.percent), cl.session.severity, cl.hold);
+      chips.push('<span class="chip ' + k + '">claude session ' + num(cl.session.percent) + '%' +
+        (cl.hold ? ' / ' + cl.hold : '') + '</span>');
+    }
+    if (num(s.claude && s.claude.warmFailures) > 0) {
+      chips.push('<span class="chip warn">' + num(s.claude.warmFailures) + ' warm drops</span>');
+    }
     $('statusChips').innerHTML = chips.join('');
 
     // Two clocks, and conflating them is how a dead run looks alive: logMtime is
@@ -295,7 +734,12 @@
     if (readStale) {
       showNotice('No fresh reading for <b>' + relTime(s.updatedAt) +
         '</b> — the watcher is not running, so these numbers are frozen. Restart it with ' +
-        '<b>node .claude/skills/wowlidate/monitor/watch.mjs</b>.', 'bad');
+        '<b>npx tsx .claude/skills/wowlidate/monitor/watch.mjs</b>.', 'bad');
+    } else if (s.phase === 'gone') {
+      showNotice('<b>No catalog process is running</b>, the log has been silent for ' +
+        relTime(s.logMtime) + ', and the ledger carries no end seal &mdash; this run was ' +
+        'killed or crashed rather than finishing. Sealed verdicts are kept; a plain ' +
+        '<b>--resume</b> continues under the same run key.', 'bad');
     } else if (s.note) {
       showNotice(esc(s.note), 'warn');
     } else if (!s.ended && logAge > 120000 && s.phase !== 'waiting') {
@@ -323,23 +767,12 @@
     lastSig = sig;
     $('feedCount').textContent = num(s.requestsSeenThisWindow) + ' llm req in window';
 
-    var out = $('outcomes');
-    var os = Array.isArray(s.recentOutcomes) ? s.recentOutcomes : [];
-    if (!os.length) {
-      out.innerHTML = '<div class="empty">No case has a verdict yet.</div>';
-    } else {
-      out.innerHTML = os.map(function (o) {
-        return '<div class="out-row">' +
-          '<span class="verdict-pill ' + esc(o.verdict) + '">' + esc(o.verdict) + '</span>' +
-          '<span class="name" title="' + esc(o.reason) + '">' + esc(o.name || o.id) +
-            (o.reason ? '<small>' + esc(o.reason) + '</small>' : '') + '</span>' +
-          '<span class="t">' + relTime(o.at) + '</span></div>';
-      }).join('');
-    }
-    $('outcomeCount').textContent = reached + ' of ' + planned;
+    renderOutcomes(s);
 
     $('runKeyText').textContent = 'run key: ' + (s.runKey || '—');
     $('logPathText').textContent = s.logFile || s.ledgerFile || '';
+
+    renderTerm(s);
   }
 
   function load() {
@@ -354,10 +787,46 @@
       $('updatedChip').className = 'chip bad';
       $('updatedText').textContent = 'no run-state.js';
       showNotice('No <b>run-state.js</b> beside this page. Start the watcher: ' +
-        '<b>node .claude/skills/wowlidate/monitor/watch.mjs</b>', 'bad');
+        '<b>npx tsx .claude/skills/wowlidate/monitor/watch.mjs</b>', 'bad');
     };
     document.head.appendChild(el);
   }
+
+  // Every one of these changes what this page shows and nothing else.
+  $('outFilter').addEventListener('input', function () {
+    outs.filter = this.value.trim().toLowerCase();
+    paintOutcomes();
+  });
+  $('outVerdicts').addEventListener('click', function (ev) {
+    var b = ev.target.closest('button[data-v]');
+    if (!b) return;
+    outs.verdict = b.getAttribute('data-v');
+    paintOutcomes();
+  });
+
+  $('termFilter').addEventListener('input', function () {
+    term.filter = this.value.trim().toLowerCase();
+    var box = $('term');
+    for (var i = 0; i < box.children.length; i++) {
+      var el = box.children[i];
+      el.hidden = !!(term.filter && el.textContent.toLowerCase().indexOf(term.filter) < 0);
+    }
+  });
+  $('termFollow').addEventListener('change', function () {
+    term.follow = this.checked;
+    if (term.follow) { var b = $('term'); b.scrollTop = b.scrollHeight; }
+  });
+  $('termClear').addEventListener('click', function () {
+    $('term').innerHTML = ''; term.primed = false; // the view, never the run
+  });
+  $('term').addEventListener('scroll', function () {
+    // Scrolling up is how a person says "hold still". Honour it rather than
+    // yanking them back to the bottom three seconds later.
+    if (term.follow && this.scrollHeight - this.scrollTop - this.clientHeight > 60) {
+      term.follow = false;
+      $('termFollow').checked = false;
+    }
+  });
 
   load();
   setInterval(load, POLL_MS);

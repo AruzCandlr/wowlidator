@@ -31,7 +31,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import type { CaseOutcome } from './exit.js';
-import type { DeadEndRisk } from '../engine/proof-bundle.js';
+import type { DeadEndRisk, ReportLang } from '../engine/proof-bundle.js';
 import type { Flow } from '../engine/runner.js';
 import { FlowFileSchema, SuiteLedgerSchema, parseArtifact } from '../artifacts/schemas.js';
 
@@ -176,6 +176,13 @@ export interface SuiteLedger {
         categories?: string[] | undefined;
         /** Whether Blocked / Pending rows were authored on purpose (`--include-blocked`). */
         includeBlocked?: boolean | undefined;
+        /**
+         * The language the run's per-case pages and narratives were written
+         * in (`--report-lang`). A `wowlidator report` rebuild reads it so the
+         * pages it rewrites speak the language the run chose, not the
+         * rebuilder's default.
+         */
+        reportLang?: ReportLang | undefined;
       }
     | undefined;
   /**
@@ -192,6 +199,13 @@ export interface SuiteLedger {
         tables: string[];
         takenAt: string;
         mode: 'snapshot' | 'restore';
+        /**
+         * The runnable restore script written beside the baseline
+         * (`restoreScript`). Present whether or not this run could execute it:
+         * knowing how to put the tables back and being allowed to are two
+         * different things, and only the second needs a write credential.
+         */
+        restoreSql?: string | undefined;
         restored?: { at: string; ok: boolean; detail: string } | undefined;
       }
     | undefined;

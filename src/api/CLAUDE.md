@@ -173,6 +173,90 @@ Two capabilities, one boundary rule, specified in `docs/sequence-testing-spec.md
 
 **Deferred, on purpose, both disclosed in the specs' status banners:** the observed-window→Mermaid renderer (spec A's S9) and OTel trace ingestion with `traceparent` injection (spec B's D10 — the causal "called as planned" tier and the unlock for the diagram's backend lanes).
 
+## A deliberate `request` goes out looking like one the application makes (2026-09-08)
+
+`BrowserContext.request` shares the browser context's **cookie jar and nothing
+else**. No `referer`, no `origin`, no `user-agent`, no `accept`, and none of the
+headers the SPA's own `fetch`/XHR attaches. Measured on live bundles
+(PL_11_03, PL_10_23): `GET …/benefit/plan/export` → `400
+{"errorCode":"ERR_BAD_REQUEST","message":"Missing required header(s): …"}`,
+recorded with `requestHeaders: {}`, filed as a `backend`/`high` defect against
+an application that was refusing a malformed request exactly as it should. The
+same call clicked by a person returned 200. **That is a harness fault reported
+as an application defect**, and it is the whole reason the section exists.
+
+The fix is evidence, never a list of header names. `NetworkObserver` already
+sees every `XHR`/`Fetch` the page issues, headers included, so the floor for a
+deliberate `request` is *merged from what was observed* (`header-profile.ts`,
+pure; `NetworkObserver.headerProfile()`; `ApiActionsOptions.headerProfile`,
+injected by `SmartRunner` as `() => this.#network?.headerProfile(target)` so a
+persona hand-off re-points it exactly like the transport). Six rules, each with
+a test in `tests/api.test.ts`:
+
+- **A floor, never an override.** An authored header always wins, compared
+  case-insensitively, so a flow that wrote `Accept: text/csv` keeps it against an
+  observed `accept`.
+- **A per-request unique value is regenerated, not replayed.** The signal is
+  structural — the same name observed with a *different* value on every call.
+  `freshValue` rebuilds it segment by segment on `-`, keeping the parts that
+  never varied (a `traceparent`'s `00` version and `01` flags) and redrawing the
+  parts that did from the same alphabet and width; an all-UUID column becomes a
+  fresh `randomUUID()`. **Two observations are the minimum**: with one sample
+  there is nothing to tell a constant from a unique value, so it is replayed —
+  disclosed, not implied away.
+- **Transport-owned headers never travel**: `cookie` (the context carries the
+  jar; a stale copy is the one way to send the call as somebody the run no
+  longer is), `content-length`, `host`, the HTTP/2 pseudo-headers, the
+  conditional headers, `accept-encoding`, and `sec-fetch-*` — which state the
+  mode and destination of the fetch the *browser* made. `content-type` is
+  inherited only by a call that actually sends a body. `sec-ch-*` is kept: a
+  client hint describes the browser, and it is the same browser.
+- **Scoped to the origin.** A cross-origin `request` inherits nothing — the
+  application's bearer is the application's.
+- **The raw samples are in memory only.** `#record` runs `redactHeaders` before
+  storing, which is what makes the ring buffer useless as a replay source; the
+  raw profile is a second, small (`DEFAULT_MAX_HEADER_SAMPLES` 25) buffer that
+  `all()` never sees, that `detach()` clears, and whose values reach a record
+  only through `redact.ts` like every other header. The redaction rule above is
+  untouched.
+- **`FetchTransport` gets nothing.** A browser-free flow has no page to harvest
+  from and inventing a profile for it would be guessing rather than observing;
+  `runApiFlow` passes no `headerProfile` and behaves exactly as before.
+
+**`download` was already correct and is left alone.** `SmartRunner.download` →
+`captureDownload` arms `page.waitForEvent('download')` and then *clicks* — a
+real navigation by Chrome, carrying the page's own headers. There is no
+fetch-a-url-directly path; `BrowserTransport` was the single place that bypassed
+them. An export pulled over `request` is the shape that broke, and it now ends
+at the same floor.
+
+**The opt-out is `inheritHeaders: false`** on the `request` step (also in
+`flowStepSchema`). A negative test that means to send a malformed request writes
+it and gets exactly what it authored. An empty `headers: {}` is deliberately
+*not* the switch: an absent key and an empty object survive a JSON round trip
+and an optional zod field differently, and a generator emitting `{}` would
+silently disarm the floor for every step it wrote.
+
+**The record says who supplied what.** `RequestRecord.inheritedHeaders` and
+`.regeneratedHeaders` carry names only (values stay in `requestHeaders`,
+redacted). `requestHeaders: {}` under a 400 is what made this diagnosable at
+all, so the property a reader needs — telling the harness's headers from the
+test's — is preserved rather than lost.
+
+**And when the floor still is not enough, `HeaderRefusedError`.** A 4xx whose
+body names a missing or invalid header is harness drift, and follows the 405
+precedent exactly: a NAME, not prose — `classifyStepFailure` scores it `error`
+(so `harnessOnly` records the case **blocked**, no defect), `reconstructionFutile`
+declines the rewrite (no rewrite invents a header nobody was seen sending), and
+`ApiActions.#assert` rethrows it before a defect is filed. Consulted **only
+inside a status assertion that has already failed**, so a negative test that
+provokes a 400 and asserts one is untouched; only on 4xx, never 5xx; and the
+message names the headers the complaint mentioned and what the harness did
+inherit, without quoting the body (an id-shaped token is dropped rather than
+reproduced — never emit a payload we could not inspect). The constitution
+survives whole: a non-2xx still does not fail a `request` step, `expectStatus`
+is still where a status becomes pass/fail.
+
 ## A 405 is the test's own verb, not the endpoint's fault
 
 `MethodRefusedError` joined `UnknownVariableError` and `NoResponseError` in the harness-class family (2026-08-25). A 405/501 means the endpoint exists and does not answer the verb the flow chose — the test drifting from the endpoint, never a finding about the application.
@@ -259,3 +343,82 @@ tables that happened to and names the flag that includes them next time.
 an equality filter; all three must exist in the introspected schema or nothing
 runs; the statement is a parameterised `SELECT … LIMIT 1` (or `count(*)` to prove a
 candidate absent) on the read-only client; values pass through `redactValue`.
+
+## The statement a DB check ran is on its record (2026-09-08)
+
+`DbCheckRecord` carried the redacted `where` summary, an expected/observed
+pair and a capped row sample — everything except **what SQL answered the
+claim**. `DbActions` now records it (`DbStatementRecord`: the parameterized
+`sql`, the bound `params`, the `tables` it read) for every kind that runs a
+statement — `row`, `delta`, `unchanged`, `called`, `snapshot` — plus
+`rowsMatched`, so a reader can tell three rows from the first three of
+forty-two.
+
+Three rules make it safe and honest, and each is why the field is shaped this
+way:
+
+- **The values are redacted at the source, and the placeholders stay
+  placeholders.** The SQL is built here from identifiers that already passed
+  the schema membership gate, so the text carries nothing secret; a bound
+  value is a value out of the flow, and a `where` keyed on a session token is
+  exactly where a credential enters. `#buildWhere` returns the driver's
+  parameters and their `redactValue` renderings side by side. Inlining the
+  values would both misstate the statement and put back what redaction just
+  took out — the report renders this record and never re-derives a value.
+- **A poll is one statement, not twenty.** `StatementLog` dedupes on the SQL
+  and its bound values; `polledMs` is what says it polled.
+- **A check refused before any SQL ran has no statement.** An undeclared
+  table, an unparseable where, no connection: the field is absent and the
+  existing refusal message stands. Nothing is invented for a check that never
+  made one.
+
+The three report surfaces read it through one projection (`dbEvidence` /
+`dbProofLines` in `src/reporter/step-facts.ts`). Tests: `tests/db.test.ts`
+("the statement on the record" — the placeholders and the redacted values, a
+polled check recorded once, a failed check carrying the statement that
+disproved it, every kind, and the grounding refusal that carries none).
+
+## The undo is written down whether or not the run may perform it (2026-09-09)
+
+`restoreBaseline` needs `WOWLIDATOR_DB_RESTORE_URL`, a write credential a
+read-only QA environment often does not have — and without it the whole
+snapshot was inert. The run had captured every row of every table it was about
+to touch, knew exactly how to put them back, and had no way to say so. Nothing
+reached the person who could.
+
+**Knowing how to undo and being permitted to are different things, and only the
+second needed a credential.** So the same pure `restorePlan` is rendered with
+its parameters inlined — the one thing a parameterised statement cannot be:
+pasteable — and written beside the baseline as `<runKey>.restore.sql`, every
+run, credential or not. A person with the write access runs it when they choose:
+
+```
+psql "$WOWLIDATOR_DB_RESTORE_URL" -v ON_ERROR_STOP=1 -f <run>/…​.restore.sql
+```
+
+Four things keep it truthful:
+
+- **It carries real values, so it is a local file and never report content** —
+  the rule the baseline JSON beside it already follows. Redacting the rows would
+  produce a script that restores the wrong data, which is worse than none, so
+  the choice is not "redact or publish" but "keep it local". The report links to
+  it and states the command; the values stay out of anything shareable.
+- **It says what it does not cover.** Tables that are not `restorable` (no
+  primary key, or over the row bound) are named in the header with their reason,
+  and the script states that anything the run changed outside its tables is not
+  undone by it. The bound on the claim travels with the claim.
+- **It says what it assumes.** `standard_conforming_strings = on` (the default
+  since 9.1) is what makes doubling the single quote the whole escape, and the
+  header names it, so a session with the legacy setting is warned rather than
+  silently corrupted.
+- **`sqlLiteral` only ever renders `restorePlan`'s own parameters**, which came
+  out of this database through a schema-validated SELECT. No flow, sheet or
+  model reaches it.
+
+The catalog report gains a **Database before this run** section: what was
+captured, when, which tables, whether the restore is armed / ran / was
+snapshot-only, and the command. It reads from `ledger.dbBaseline`, so a report
+rebuilt months later by `wowlidator report` still names the way back.
+
+Tests: `tests/db-baseline.test.ts` ("the undo is written down…"), including the
+quote-escaping and not-restorable cases.

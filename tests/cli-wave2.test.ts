@@ -308,6 +308,126 @@ describe('the authoring-side row helpers', () => {
     assert.equal(helpers.openingControlOf('1. เปิดหน้า\n2. อ่านค่า\n3. ตรวจสอบ\n4. กดปุ่ม "Add"'), null, 'only the first three steps');
   });
 
+  // 2026-09-09, be-high RU_06_12: the row's own click was on the FOURTH line
+  // (a locale preamble and a `0.` reference line came first) and named the
+  // control with a noun the old pattern could not read — so the capture never
+  // opened the popup the case is about, and the flow asserted a string only
+  // the sheet uses. Measured on the 1,286-row workbook: 318 rows named an
+  // opening control before, 383 after, none lost and none renamed.
+  it('openingControlNamesOf reads the click past a preamble, through a noun, and with the row\'s alias', () => {
+    const preamble =
+      'QA default locale = en; start at https://app.test/en/login\n' +
+      '0. Route reference /en/admin/rules (locale=en); read the Test Data of the row above.\n' +
+      '1. เข้าสู่เมนูที่กำหนด\n' +
+      '2. กดไอคอน Edit (Make Correction) ของ Rule ที่มีประวัติการแก้ไขค่า Field\n' +
+      '3. ตรวจสอบรายละเอียดของแต่ละรายการ';
+    assert.deepEqual(helpers.openingControlNamesOf(preamble), ['Edit', 'Make Correction']);
+    // The sheet's word first, the application's second: the capture clicks
+    // whichever of the two the page actually carries.
+    assert.equal(helpers.openingControlOf(preamble), 'Edit');
+    // A control the row DESCRIBES rather than names — the gloss is the only
+    // name a page can carry.
+    assert.deepEqual(
+      helpers.openingControlNamesOf('1. เข้าสู่เมนูที่กำหนด\n2. นำเมาส์ไปวางที่ไอคอนดินสอ\n3. กดไอคอนดินสอ (Make correction)'),
+      ['Make correction'],
+    );
+    assert.deepEqual(helpers.openingControlNamesOf('1. เข้าสู่เมนู\n2. กดไอคอน Layers (Insert)'), ['Insert']);
+    // The line's veto is absolute: a gloss cannot smuggle a save or a delete
+    // into a click this takes on someone's application.
+    assert.deepEqual(helpers.openingControlNamesOf('1. กดไอคอน Bin (Delete)'), []);
+    assert.deepEqual(helpers.openingControlNamesOf('1. กดปุ่ม "Save" (บันทึก)'), []);
+    // A bracket that is not a name for the control is no candidate.
+    assert.deepEqual(helpers.openingControlNamesOf('1. กดไอคอนดินสอ (ครั้งที่ 2)'), []);
+    // Counted by the sheet's own numbers, so a step 4 is still out of reach.
+    assert.deepEqual(helpers.openingControlNamesOf('0. อ้างอิง\n1. เปิดหน้า\n2. อ่านค่า\n3. ตรวจสอบ\n4. กดปุ่ม "Add"'), []);
+    assert.deepEqual(helpers.openingControlNamesOf(''), []);
+  });
+
+  // The journey section is the author's only account of what the capture did
+  // and did not see. Every reason the capture may not cover the row's page
+  // rides on the FIRST line, because that is the one line the per-row
+  // narrowing (`focusTreeText(..., keepHead = 1)`) keeps verbatim.
+  it('journeyTreeSection says what was not captured — a cut tree, an unread panel, a click that matched nothing', () => {
+    const complete = helpers.journeyTreeSection({
+      landed: 'https://app.test/en/admin/rules',
+      tree: 'button "Create Rule"\nrow "Rule-2"',
+      tabWanted: null,
+      tabSelected: null,
+      opened: null,
+    });
+    assert.doesNotMatch(complete, /NOT CAPTURED/, 'a complete capture reads exactly as it did');
+
+    const cut = helpers.journeyTreeSection({
+      landed: 'https://app.test/en/admin/rules',
+      tree: 'button "Create Rule"\n[TREE TRUNCATED: showing 200 of 640 nodes. Elements may exist that are not listed.]',
+      tabWanted: null,
+      tabSelected: null,
+      opened: null,
+    });
+    const header = cut.split('\n')[0] as string;
+    assert.match(header, /CUT SHORT/);
+    assert.match(header, /NOT\s+CAPTURED/);
+    assert.match(header, /never evidence/, 'the sheet\'s wording is not evidence the application renders it');
+
+    const tabs = helpers.journeyTreeSection({
+      landed: 'https://app.test/en/admin/rules',
+      tree: 'button "Create Rule"',
+      tabWanted: null,
+      tabSelected: null,
+      opened: {
+        name: 'Make Correction',
+        selector: 'role=button[name="Make Correction" i]',
+        url: 'https://app.test/en/admin/rules',
+        tree: 'dialog "Make Correction"\ntab "Detail"\ntab "History"\ntab "History"',
+        navigated: false,
+      },
+    });
+    const tabHeader = tabs.split('\n')[0] as string;
+    assert.match(tabHeader, /"Detail", "History"/, 'each tab once, in document order');
+    assert.match(tabHeader, /NOT CAPTURED, not absent/);
+    assert.match(tabHeader, /application's word for it, never the sheet's/);
+
+    const missed = helpers.journeyTreeSection({
+      landed: 'https://app.test/en/admin/rules',
+      tree: 'button "Create Rule"',
+      tabWanted: null,
+      tabSelected: null,
+      opened: null,
+      openingMissed: ['Edit', 'Make Correction'],
+    });
+    const missedHeader = missed.split('\n')[0] as string;
+    assert.match(missedHeader, /"Edit" \/ "Make Correction" matched no control here/);
+    assert.match(missedHeader, /workflow goal/);
+
+    // The observed sign-in landing rides INSIDE the section: the per-row
+    // narrowing keeps only the first line verbatim, and that line has to be
+    // the one saying which page this tree is and what it does not cover.
+    const withLanding = helpers.journeyTreeSection({
+      landed: 'https://app.test/en/admin/rules',
+      tree: 'button "Create Rule"',
+      tabWanted: null,
+      tabSelected: null,
+      opened: null,
+      landing: 'SIGN-IN LANDING (observed): the application landed on https://app.test/en.',
+    });
+    assert.match(withLanding.split('\n')[0] as string, /^ANOTHER PAGE IN THIS JOURNEY/);
+    assert.match(withLanding, /SIGN-IN LANDING \(observed\)/);
+    assert.ok(
+      withLanding.indexOf('SIGN-IN LANDING') < withLanding.indexOf('button "Create Rule"'),
+      'the landing sentence still comes before the tree it was read beside',
+    );
+  });
+
+  it('treeWasCut and unreadPanelsIn read the tree the capture actually wrote', () => {
+    assert.equal(helpers.treeWasCut('button "A"'), false);
+    assert.equal(helpers.treeWasCut('button "A"\n[TREE TRUNCATED: showing 200 of 640 nodes.]'), true);
+    assert.equal(helpers.treeWasCut('button "A"\n[TREE NARROWED: showing 80 of 300 nodes.]'), true);
+    assert.deepEqual(helpers.unreadPanelsIn('tab "Detail"\nbutton "Save"\ntab "History"\ntab "Detail"'), ['Detail', 'History']);
+    // A tab is a `tab` line, not a word inside another node's name.
+    assert.deepEqual(helpers.unreadPanelsIn('button "tab \"History\""'), []);
+    assert.deepEqual(helpers.unreadPanelsIn('tab "A"\ntab "B"\ntab "C"', 2), ['A', 'B']);
+  });
+
   it('sliceRows filters by sheet and category, case-insensitively', () => {
     const rows = [
       row({ caseId: 'A', sheet: 'EC', category: 'Hiring' }),

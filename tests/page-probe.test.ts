@@ -34,6 +34,21 @@ const PROBE_FIXTURE_HTML = `<!doctype html>
     <button id="danger">Delete everything</button>
     <p id="damage" hidden>DELETED</p>
 
+    <!-- A popover library's shape: a full-viewport click-catcher plus the
+         panel, closed ONLY by a click on the catcher. No Escape handler. -->
+    <button id="todo" aria-haspopup="dialog" aria-expanded="false" aria-label="Inbox">Inbox</button>
+    <div id="scrim" hidden aria-hidden="true" style="position:fixed;inset:0;z-index:40"></div>
+    <div id="inbox" role="dialog" aria-label="Inbox panel" hidden style="position:fixed;top:40px;right:40px;z-index:50">
+      <p>No tasks</p>
+      <a href="#all">View all tasks</a>
+    </div>
+
+    <!-- A menu that ignores Escape but toggles closed on its own trigger. -->
+    <button id="more" aria-haspopup="menu" aria-expanded="false">More options</button>
+    <div id="moremenu" role="menu" hidden>
+      <button role="menuitem">Export</button>
+    </div>
+
     <button id="stuck" aria-haspopup="dialog" aria-expanded="false">Open sticky dialog</button>
     <div id="sticky" role="dialog" aria-label="Sticky" hidden>
       <p>This one ignores Escape.</p>
@@ -53,6 +68,18 @@ const PROBE_FIXTURE_HTML = `<!doctype html>
       });
       document.getElementById('stuck').addEventListener('click', () => {
         document.getElementById('sticky').hidden = false;
+      });
+      const setInbox = (open) => {
+        document.getElementById('scrim').hidden = !open;
+        document.getElementById('inbox').hidden = !open;
+        document.getElementById('todo').setAttribute('aria-expanded', String(open));
+      };
+      document.getElementById('todo').addEventListener('click', () => setInbox(true));
+      document.getElementById('scrim').addEventListener('click', () => setInbox(false));
+      document.getElementById('more').addEventListener('click', () => {
+        const m = document.getElementById('moremenu');
+        m.hidden = !m.hidden;
+        document.getElementById('more').setAttribute('aria-expanded', String(!m.hidden));
       });
     </script>
   </body>
@@ -104,6 +131,7 @@ describe('interaction probe (CDP)', { skip: skipBrowser }, () => {
 
     const identity = report.probes.find((p) => /Active role/.test(p.trigger));
     assert.ok(identity, 'the identity menu should have been probed');
+    assert.equal(identity.closedVia, 'escape');
     const names = identity.revealed.map((node) => node.name);
     assert.ok(
       names.some((name) => name.includes('Take Action on Behalf of')),
@@ -129,20 +157,48 @@ describe('interaction probe (CDP)', { skip: skipBrowser }, () => {
 
   it('stops and says so when a disclosure will not close', async () => {
     await page.goto(origin, { waitUntil: 'domcontentloaded' });
-    // Both disclosures are candidates; the sticky one ignores Escape, so
-    // whatever it opened would be attributed to the next control probed.
+    // Every disclosure is a candidate; the sticky one has no catcher, no
+    // dismiss control and a trigger that does not toggle, so nothing can put
+    // it back and whatever it opened would be attributed to the next control.
     const report = await probeInteractions(page);
-    if (report.warnings.length > 0) {
-      assert.match(report.warnings.join(' '), /would not close|stopped probing/);
-    }
+    assert.match(report.warnings.join(' '), /would not close \(tried escape, dismiss-button, click-catcher, trigger\)/);
     const stickyProbe = report.probes.find((p) => /sticky/i.test(p.trigger));
-    if (stickyProbe) assert.equal(stickyProbe.leftOpen, true);
+    assert.ok(stickyProbe, 'the sticky dialog should have been probed');
+    assert.equal(stickyProbe.leftOpen, true);
+    assert.equal(stickyProbe.closedVia, undefined);
+  });
+
+  it('puts back a popover that ignores Escape by clicking its click-catcher (2026-09-10)', async () => {
+    await page.goto(origin, { waitUntil: 'domcontentloaded' });
+    const report = await probeInteractions(page, { maxProbes: 6 });
+    const inbox = report.probes.find((p) => /Inbox/.test(p.trigger));
+    assert.ok(inbox, 'the inbox popover should have been probed');
+    assert.equal(inbox.leftOpen, undefined, 'the popover was reported left open');
+    assert.equal(inbox.closedVia, 'click-catcher');
+    assert.ok(
+      inbox.revealed.some((node) => /View all tasks|No tasks/.test(node.name)),
+      `the panel's contents should have been recorded, got ${JSON.stringify(inbox.revealed.map((n) => n.name))}`,
+    );
+    // The page is as it was found: the catcher is gone, so a click on the
+    // page lands on the page — the live failure was every later click of a
+    // case being swallowed by exactly this element.
+    assert.equal(await page.locator('#scrim').isVisible(), false, 'the click-catcher was left over the page');
+    assert.equal(await page.locator('#inbox').isVisible(), false, 'the panel was left open');
+  });
+
+  it('puts back a menu that ignores Escape by toggling its trigger', async () => {
+    await page.goto(origin, { waitUntil: 'domcontentloaded' });
+    const report = await probeInteractions(page, { maxProbes: 6 });
+    const more = report.probes.find((p) => /More options/.test(p.trigger));
+    assert.ok(more, 'the menu should have been probed');
+    assert.equal(more.closedVia, 'trigger');
+    assert.equal(await page.locator('#moremenu').isVisible(), false, 'the menu was left open');
   });
 
   it('reports the budget it did not spend rather than looking exhaustive', async () => {
     await page.goto(origin, { waitUntil: 'domcontentloaded' });
     const report = await probeInteractions(page, { maxProbes: 1 });
-    assert.equal(report.skipped, 1, 'the un-probed disclosure should be counted');
+    assert.equal(report.skipped, 3, 'the un-probed disclosures should be counted');
     assert.match(formatProbeReport(report), /probe budget reached/);
   });
 

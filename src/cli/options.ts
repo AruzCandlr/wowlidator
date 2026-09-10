@@ -3,6 +3,7 @@
  * helpers. Split out of cli.ts verbatim.
  */
 
+import { REPORT_LANGS, type ReportLang } from '../engine/proof-bundle.js';
 import { CONTEXT_BUDGET_CHARS } from '../catalog/retrieve.js';
 import type { WowlidatorConfig } from '../config.js';
 import type { ScreenshotMode, VideoMode } from '../engine/runner.js';
@@ -66,6 +67,38 @@ export interface CliOptions {
    * no key.
    */
   agentCapture: boolean;
+  /**
+   * Narrate every step in plain language after each case, onto the bundle so
+   * the report can show it (`--narrate`, or `WOWLIDATOR_NARRATE=on`). OFF by
+   * default, unlike the other post-run judges: this fires once per case rather
+   * than only on a system error, and a suite that spends its model window on
+   * prose finishes its remaining cases on refusals. Degrades silently when the
+   * healer role has no key. See `generator/step-narration.ts`.
+   */
+  narrate: boolean;
+  /**
+   * The language the per-case report page and the case narrative are written
+   * in (`--report-lang en|th`, or `WOWLIDATOR_REPORT_LANG`). English by
+   * default. Recorded on the suite ledger so a `wowlidator report` rebuild
+   * speaks the same language the run did. Labels only: application text is
+   * always shown as captured, never translated.
+   */
+  reportLang: ReportLang;
+  /**
+   * Write the case narrative — a model's plain-language telling of each case
+   * onto its bundle for the per-case page (`--no-case-narrative` disables).
+   * ON by default, unlike `narrate`: the page is built around it. One
+   * generator-role call per case; degrades silently to the evidence-only page
+   * when the role has no key. See `generator/case-narrative.ts`.
+   */
+  caseNarrative: boolean;
+  /**
+   * `--case-narrative` on `wowlidator report`: back-fill the narrative onto
+   * finished runs' bundles. A rebuild is "no re-run", so spending one
+   * generator call per case across every ledger on disk is asked for, never
+   * assumed — the `--narrate` rule, one flag over.
+   */
+  caseNarrativeBackfill: boolean;
   /**
    * Review each authored flow against the codebase and documents before it
    * is written (`--no-author-review` disables). On by default, like the
@@ -381,6 +414,17 @@ export function parseCaptureDelay(raw: string | undefined, configured: number): 
     return null;
   }
   return parsed;
+}
+
+/**
+ * `--report-lang`, then `WOWLIDATOR_REPORT_LANG`, then English. Rejects an
+ * unknown language rather than falling back: a page in the wrong language is
+ * quieter than a refusal, and the ledger will carry whatever was chosen into
+ * every rebuild.
+ */
+export function parseReportLang(raw: string | undefined, env: NodeJS.ProcessEnv = process.env): ReportLang | null {
+  const chosen = (raw ?? env['WOWLIDATOR_REPORT_LANG'] ?? 'en').trim().toLowerCase();
+  return (REPORT_LANGS as readonly string[]).includes(chosen) ? (chosen as ReportLang) : null;
 }
 
 export function parseCaseTimeout(

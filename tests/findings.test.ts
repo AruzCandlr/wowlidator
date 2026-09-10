@@ -397,11 +397,41 @@ describe('the signature never reads prose', () => {
     assert.equal(buildFindings([a, b]).length, 1);
   });
 
-  it('the source of findings.ts and findings-export.ts reads no summary, error or reasoning field, and imports no model', () => {
+  it('a narration on the failing step changes no signature and splits no finding', () => {
+    // `ProofStep.narration` is a model's prose, worded differently on every
+    // case and in whatever language the model chose. A key built from it
+    // would split one cause into as many findings as there are wordings —
+    // the exact failure the typed-fields rule exists to prevent. Two cases
+    // that differ ONLY in their narration still cluster, and the key is the
+    // key the same case has with no narration at all.
+    const plain = apiCase('P_01', 'POST', 'http://api.test/v1/plans', 500, 'expected status 201, got 500');
+    const bare = signatureOf(plain)!.key;
+    const narrate = (c: CatalogReportCase, text: string): CatalogReportCase => {
+      for (const s of c.bundle!.steps) {
+        (s as { narration?: unknown }).narration = { text, by: 'groq:llama-3.3-70b', at: '2026-09-07T00:00:00.000Z' };
+      }
+      return c;
+    };
+    const a = narrate(apiCase('P_01', 'POST', 'http://api.test/v1/plans', 500, 'expected status 201, got 500'), 'Asked the server to create a plan; it answered with an error.');
+    const b = narrate(apiCase('P_02', 'POST', 'http://api.test/v1/plans', 500, 'expected status 201, got 500'), 'ขอให้ระบบสร้างแผน แต่ระบบตอบกลับด้วยข้อผิดพลาด');
+    assert.equal(signatureOf(a)!.key, bare, 'a narrated case keys exactly as it did unnarrated');
+    assert.equal(signatureOf(a)!.key, signatureOf(b)!.key);
+    const findings = buildFindings([a, b]);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0]!.cases.length, 2);
+    // And no surface of the export repeats the prose as if it were evidence.
+    const prose = /Asked the server to create a plan|ขอให้ระบบสร้างแผน/;
+    assert.doesNotMatch(renderFindingsMarkdown(findings, input([a, b])), prose);
+    for (const sheet of extractWorkbookSheets(buildFindingsWorkbook(input([a, b])))) {
+      assert.doesNotMatch(sheet.rows.flat().join('\n'), prose);
+    }
+  });
+
+  it('the source of findings.ts and findings-export.ts reads no summary, error, reasoning or narration field, and imports no model', () => {
     for (const file of ['findings.ts', 'findings-export.ts']) {
       const source = readFileSync(join(import.meta.dirname, '..', 'src', 'reporter', file), 'utf8');
       const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
-      for (const field of ['summary', 'error', 'reasoning']) {
+      for (const field of ['summary', 'error', 'reasoning', 'narration']) {
         assert.doesNotMatch(code, new RegExp(`\\.${field}\\b`), `${file} must not read .${field}`);
         assert.doesNotMatch(code, new RegExp(`\\[['"]${field}['"]\\]`), `${file} must not read ['${field}']`);
       }

@@ -16,11 +16,15 @@ The ledger is the only witness, so **read it before you type a launch command.**
 
 ## First five minutes
 
-1. **Find the ledger** — `<report-dir>/catalogs/<slug>.claims.progress.json`, where
-   `<report-dir>` is `WOWLIDATOR_REPORT_DIR` if `.env` sets it and
-   `.wowlidator/reports` otherwise. Check that variable first; see §1.
-2. **Read its state** — `node .claude/skills/catalog-triage/ledger.mjs <ledger>`.
-   Note `runKey` and whether `ended` is null.
+1. **Find the ledger** — `node .claude/skills/wowlidate/resume.mjs` lists every
+   run on the machine with its run folder and ledger path. A run launched
+   through `newrun.mjs` keeps its ledger in
+   `<report-dir>/runs/<slug>-<stamp>/catalogs/`; one launched by hand in
+   `<report-dir>/catalogs/`; `<report-dir>` is `WOWLIDATOR_REPORT_DIR` if
+   `.env` sets it and `.wowlidator/reports` otherwise. See §1.
+2. **Read its state** — `node .claude/skills/catalog-triage/ledger.mjs latest`
+   (or a run folder's name, or a ledger path). Note `runKey` and whether
+   `ended` is null.
 3. **Read the blocked chains** — the top of `reports/<slug>-NNN-findings.md`.
    One root can hold nineteen cases.
 4. **Decide** plain `--resume` (almost always) versus surgical `--rerun-case`.
@@ -50,6 +54,19 @@ right after launching, and confirm the run key is the one you meant to continue:
 grep -E "no progress ledger|catalog run key" <run>.log
 ```
 
+**Runs launched through `wowlidate`'s `newrun.mjs` are one level deeper.** The
+launch exports `WOWLIDATOR_REPORT_DIR=<report-dir>/runs/<slug>-<stamp>` for
+that shell only, so the ledger is at
+`<report-dir>/runs/<slug>-<stamp>/catalogs/<claims>.progress.json` and a new
+session's `.env` does not point there. `ledger.mjs`, `resume.mjs` and the
+monitor's `watch.mjs` all search every run folder (`paths.mjs`, `catalogDirs`)
+since 2026-09-10, so `ledger.mjs latest` or `ledger.mjs <run name>` finds it;
+before that, a triage from a fresh shell printed "no ledger" about a run with a
+perfectly good one. **A run folder holding a log and a claims file but no
+ledger is a run that died before sealing its first case** — read the log's
+last `wowlidator:` line; on 2026-09-10 it was a stale Chrome on port 9333
+(§9's `pkill`).
+
 The durable record is the ledger beside the claims file. Its top-level keys are
 `version, title, planned, startedAt, updatedAt, generatedAt, runKey, outcomes,
 ended, launch, authored`, and four of them carry the whole story:
@@ -66,9 +83,13 @@ ended, launch, authored`, and four of them carry the whole story:
 it is usually the biggest number on the page.
 
 ```bash
-node .claude/skills/catalog-triage/ledger.mjs \
-  .wowlidator/reports/catalogs/<slug>.claims.progress.json [--reasons]
+node .claude/skills/catalog-triage/ledger.mjs latest [--reasons]        # the newest ledger anywhere
+node .claude/skills/catalog-triage/ledger.mjs be-sit-high [--reasons]   # a run folder's name, or a prefix
+node .claude/skills/catalog-triage/ledger.mjs <path-to-.claims.progress.json> [--reasons]
 ```
+
+When nothing matches it prints every directory it searched and the newest
+ledgers it found, so the next command is a copy, not a guess.
 
 It prints the run key, whether it ended, the verdict tally, the never-ran and
 authored counts, the launch parameters to match, and — the check worth having —

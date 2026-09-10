@@ -28,9 +28,12 @@ import {
   gateMutation,
   mutationCategoryFor,
   mutationCategoryOf,
+  mutationPhaseOf,
   mutationPolicyFromEnv,
   mutationTargets,
   parseMutationPolicy,
+  recoveryNote,
+  reversibleHere,
   type MutationPolicy,
   type MutationRequest,
 } from '../src/orchestrator/mutation-policy.js';
@@ -110,6 +113,35 @@ describe('mutationCategoryOf — which clicks a policy governs', () => {
   });
 });
 
+// --- the two halves of a destructive flow ------------------------------------
+
+describe('the confirm inside a delete dialog is the delete, not a submit', () => {
+  const confirm = click('role=dialog >> role=button[name="Confirm"]');
+  const thaiConfirm = click('role=dialog >> role=button[name="ยืนยัน"]');
+
+  it('inherits the destructive category from the dialog it confirms', () => {
+    assert.equal(mutationCategoryFor(confirm, 'Confirm', { text: 'Delete this plan? This cannot be undone.' }), 'delete');
+    assert.equal(mutationCategoryFor(thaiConfirm, 'ยืนยัน', { text: 'ยืนยันการลบกฎเงื่อนไขสิทธิ์นี้หรือไม่' }), 'delete');
+    assert.equal(mutationCategoryFor(confirm, 'Confirm', { text: 'Approve this request?' }), 'approve');
+  });
+
+  it('is still an ordinary submit inside a dialog that destroys nothing', () => {
+    assert.equal(mutationCategoryFor(confirm, 'Confirm', { text: 'Save these changes?' }), 'submit');
+    assert.equal(mutationCategoryFor(confirm, 'Confirm', null), 'submit');
+  });
+
+  it('never downgrades a control that is destructive in its own right', () => {
+    const inDialog = click('role=dialog >> role=button[name="Delete"]');
+    assert.equal(mutationCategoryFor(inDialog, 'Delete', { text: 'Save these changes?' }), 'delete');
+  });
+
+  it('calls a click inside a dialog the commit, and one on the page the opener', () => {
+    assert.equal(mutationPhaseOf({ text: 'Delete this plan?' }), 'commit');
+    assert.equal(mutationPhaseOf(null), 'open');
+    assert.equal(mutationPhaseOf(undefined), 'open');
+  });
+});
+
 describe('mutationTargets — what provenance must vouch for', () => {
   const goal = 'delete the plan PL_03_18';
   it('is the row the selector scopes to, never the verb', () => {
@@ -185,6 +217,43 @@ describe('gateMutation — capability, provenance, approval, in that order', () 
     assert.equal(held?.reason, 'provenance');
     assert.equal(held?.rule, 'destructive-unscoped');
     assert.equal(held?.target, null);
+  });
+
+  it('lets a case open a delete confirmation it will cancel, without licensing the delete itself', async () => {
+    // RU_08_03 and 55 other rows of the BE catalog: click the delete icon,
+    // then Cancel / X, and prove the row survived. Approving the opening half
+    // must run the case; it must NOT let the confirm inside the dialog through.
+    const openOnly: MutationPolicy = { approved: [{ category: 'delete', target: '*', phase: 'open' }], source: 'test' };
+    assert.equal(await gate(openOnly, ledgerShowing(ROWS)), null, 'the icon that raises the dialog runs');
+
+    const confirmed = await gateMutation({
+      decision: click('role=dialog >> role=button[name="Confirm"]'),
+      goal, url: 'http://x.test/en/rows', policy: openOnly,
+      provenance: ledgerShowing(ROWS),
+      observedControlName: 'Confirm',
+      dialog: { text: 'Delete PL_03_18? This cannot be undone.' },
+    });
+    assert.equal(confirmed?.kind, 'blocked', 'the commit inside the dialog still stops');
+    assert.equal(confirmed?.category, 'delete');
+    assert.equal(confirmed?.phase, 'commit');
+  });
+
+  it('a phase-less approval still means both halves, as it always did', async () => {
+    const both: MutationPolicy = { approved: [{ category: 'delete', target: '*' }], source: 'test' };
+    assert.equal(await gate(both, ledgerShowing(ROWS)), null);
+    assert.equal(await gateMutation({
+      decision: click('role=dialog >> role=button[name="Confirm"]'),
+      goal, url: 'http://x.test/en/rows', policy: both,
+      provenance: ledgerShowing(ROWS),
+      observedControlName: 'Confirm',
+      dialog: { text: 'Delete PL_03_18? This cannot be undone.' },
+    }), null);
+  });
+
+  it('records which half it held, and tells an opener how to be approved as one', async () => {
+    const held = await gate(null, ledgerShowing(ROWS));
+    assert.equal(held?.phase, 'open');
+    assert.match(held?.message ?? '', /phase "open"/);
   });
 
   it('lets an observed, scoped delete through when the host explicitly approves it without a manifest', async () => {
@@ -654,5 +723,121 @@ describe('the loop withholds a mutation before the browser is touched (CDP)', { 
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('a verified undo answers the approval question (PL_09_01, 2026-09-09)', () => {
+  // PL_09_01 exists to prove the Delete control opens its confirmation. It
+  // ended `ERROR: approval-missing` having asked the application nothing —
+  // held exactly as hard as a delete on a run with no safety net, on a run
+  // that had snapshotted the very tables it writes to.
+  // The file's own table and helpers — PL_03_18 is the row they show.
+  const del = () => click('role=row[name="PL_03_18" i] >> role=button[name="Delete" i]');
+  const gate = (policy: MutationPolicy | null, provenance = ledgerShowing(ROWS)) =>
+    gateMutation({
+      decision: del(),
+      goal: 'delete the plan PL_03_18',
+      url: 'http://x.test/en/rows',
+      policy,
+      provenance,
+      observedControlName: 'Delete',
+    });
+
+  it('holds the delete when the run has no undo', async () => {
+    const held = await gate(null);
+    assert.equal(held?.rule, 'approval-missing');
+  });
+
+  it('lets it through when the run verified a restore', async () => {
+    const held = await gate({ reversible: { tables: ['benefit_plan'], by: 'db-baseline', script: '/tmp/x.restore.sql' } });
+    assert.equal(held, null, 'a change that cannot outlive the run needs no second yes');
+  });
+
+  it('an empty table list is no undo at all', async () => {
+    // A snapshot with nothing restorable must not read as a safety net.
+    const held = await gate({ reversible: { tables: [], by: 'db-baseline', script: '/tmp/x.restore.sql' } });
+    assert.equal(held?.rule, 'approval-missing');
+    assert.equal(reversibleHere({ reversible: { tables: [], by: 'db-baseline', script: '/tmp/x.restore.sql' } }), false);
+  });
+
+  it('never overrules capability or provenance — reversibility is not a licence', async () => {
+    // A delete the policy DENIES stays denied, undo or no undo: an undo says
+    // the change will not outlive the run, never that it was allowed.
+    const denied = await gate({ deny: ['delete'], reversible: { tables: ['benefit_plan'], by: 'db-baseline', script: '/tmp/x.restore.sql' } });
+    assert.equal(denied?.kind, 'blocked');
+    assert.notEqual(denied?.reason, 'approval');
+
+    // And a row nobody has observed is still unscoped, undo or no undo.
+    const unseen = await gate({ reversible: { tables: ['benefit_plan'], by: 'db-baseline', script: '/tmp/x.restore.sql' } }, new TargetProvenance());
+    assert.equal(unseen?.kind, 'blocked');
+    assert.equal(unseen?.reason, 'provenance');
+  });
+
+  it('reversible is not accepted from a hand-written manifest — it is measured, not declared', () => {
+    // The env manifest is a person's word; the undo is the runner's
+    // measurement. Letting JSON assert it would let a typo license a delete.
+    assert.throws(
+      () => parseMutationPolicy('{"reversible":{"tables":["benefit_plan"],"by":"db-baseline"}}', 'test'),
+      MutationPolicyError,
+    );
+  });
+});
+
+describe('does the manifest actually clear the two errors? (2026-09-09)', () => {
+  // The exact manifest handed to the PL_09_01 run, parsed the way the run
+  // parses it, against the two halves of the same destructive flow.
+  const OPEN_ONLY = parseMutationPolicy('{"approved":[{"category":"delete","target":"*","phase":"open"}]}', 'env');
+  const BOTH = parseMutationPolicy('{"approved":[{"category":"delete","target":"*"}]}', 'env');
+  const rowIcon = click('role=row[name="PL_03_18" i] >> role=button[name="Delete" i]');
+  const gate = (policy: MutationPolicy | null, dialog?: unknown) =>
+    gateMutation({
+      decision: rowIcon,
+      goal: 'delete the plan PL_03_18',
+      url: 'http://x.test/en/rows',
+      policy,
+      provenance: ledgerShowing(ROWS),
+      observedControlName: 'Delete',
+      ...(dialog === undefined ? {} : { dialog: dialog as never }),
+    });
+
+  it('clears the opening click — the half the case needs', async () => {
+    assert.notEqual(await gate(null), null, 'blocked without a manifest');
+    assert.equal(await gate(OPEN_ONLY), null, 'and allowed with one');
+  });
+
+  it('still stops the commit inside the dialog — phase "open" is not a blank cheque', async () => {
+    // This is why the first error can come BACK wearing a different reason: a
+    // flow that goes on to confirm meets the commit gate, which `open` never
+    // approved. The message differs, the run still errors.
+    const held = await gate(OPEN_ONLY, { text: 'Confirm delete plan? This cannot be undone.' });
+    assert.notEqual(held, null);
+    assert.equal(held?.reason, 'approval');
+  });
+
+  it('a phase-less entry approves both halves, and really deletes', async () => {
+    assert.equal(await gate(BOTH), null);
+    assert.equal(await gate(BOTH, { text: 'Confirm delete plan? This cannot be undone.' }), null);
+  });
+});
+
+describe('the undo is the written script, not the credential (2026-09-09)', () => {
+  const withScript = { tables: ['benefit_plan'], by: 'db-baseline', script: '/tmp/be.restore.sql' };
+
+  it('a snapshot nobody can replay is not an undo', () => {
+    // The condition is the SCRIPT, not the mode and not a credential: an
+    // approval resting on an undo that was never written down is no approval.
+    assert.equal(reversibleHere({ reversible: { tables: ['benefit_plan'], by: 'db-baseline' } }), false);
+    assert.equal(reversibleHere({ reversible: withScript }), true);
+  });
+
+  it('states the recovery in words a person can act on', () => {
+    const note = recoveryNote({ reversible: withScript });
+    assert.match(note ?? '', /recoverable: 1 table\(s\) \(benefit_plan\)/);
+    assert.match(note ?? '', /psql .* -f \/tmp\/be\.restore\.sql/);
+  });
+
+  it('says nothing when there is nothing to say', () => {
+    assert.equal(recoveryNote(null), null);
+    assert.equal(recoveryNote({ reversible: { tables: [], by: 'db-baseline', script: '/tmp/x.sql' } }), null);
   });
 });

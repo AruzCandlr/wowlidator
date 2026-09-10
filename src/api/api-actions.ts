@@ -14,6 +14,7 @@
 import type { ProofBundleBuilder } from '../engine/proof-bundle.js';
 import type { DefectCategory, DefectSeverity } from '../engine/proof-bundle.js';
 import { parseJson, recordOf, type ApiRequestSpec, type ApiResponse, type ApiTransport } from './api-client.js';
+import { headerRefusal, type HeaderProfile, type HeaderProfileTarget } from './header-profile.js';
 import type { RedactionPolicy } from './redact.js';
 import { UnknownVariableError, VariableStore, extractPath, stringifyExtracted } from './variables.js';
 
@@ -56,12 +57,72 @@ export function methodRefused(status: number): boolean {
   return status === 405 || status === 501;
 }
 
+/**
+ * The endpoint refused the request as MALFORMED at the header level — a 4xx
+ * whose body names a missing or invalid header.
+ *
+ * The same family as `MethodRefusedError`, built from the same live lesson and
+ * following it exactly: as prose in a message it would reach a reader and no
+ * verdict, so it is a NAME. `classifyStepFailure` scores it `error` (every
+ * broken step being `error` lets `harnessOnly` record the case **blocked** — no
+ * defect), and `reconstructionFutile` declines to rewrite the step, because no
+ * rewrite of a `request` can invent a header the harness never observed the
+ * application sending.
+ *
+ * Live (2026-09-08, PL_11_03 and PL_10_23): `GET …/benefit/plan/export` through
+ * `BrowserContext.request` sent no application headers at all and came back
+ * `400 Missing required header(s)`, recorded with `requestHeaders: {}` and
+ * filed as a `backend`/`high` defect against an application that was answering
+ * correctly. `header-profile.ts` is the other half — it supplies the floor so
+ * this class fires rarely; when it still fires, the harness could not observe
+ * the header and says so instead of blaming the endpoint.
+ */
+export class HeaderRefusedError extends Error {
+  override readonly name = 'HeaderRefusedError';
+}
+
+/**
+ * The sentence appended to a header-level refusal, in the voice `expectStatus`
+ * already uses for method drift: name the class, say where to look, and refuse
+ * to imply a finding about the application.
+ */
+function headerDriftAdvice(names: readonly string[], sent: readonly string[]): string {
+  const wanted =
+    names.length === 0
+      ? 'a header'
+      : names.length === 1
+        ? `the header ${names[0]}`
+        : `one of the headers ${names.join(', ')}`;
+  const floor =
+    sent.length === 0
+      ? 'the harness inherited no headers from the page for this call (nothing same-origin was ' +
+        'observed, or observation was off)'
+      : `the harness inherited ${sent.join(', ')} from the page's own calls`;
+  return (
+    ` — the request was refused for ${wanted}, which the harness could not supply: ${floor}. ` +
+    'This is harness drift, not a backend defect; a deliberate `request` sends only what the flow ' +
+    'authored plus what the page was seen to send, and the application asks for more than was seen.'
+  );
+}
+
 /** A `request` step's parameters, as authored in a `.flow.json`. */
 export interface FlowRequestSpec {
   method: string;
   /** Relative urls resolve against `Flow.baseUrl`, same as `goto`. */
   url: string;
   headers?: Record<string, string> | undefined;
+  /**
+   * Whether this call may inherit the header floor harvested from the page's
+   * own same-origin traffic. Default true.
+   *
+   * **This is the opt-out spelling, and it is explicit on purpose.** A negative
+   * test that means to send a malformed request writes `inheritHeaders: false`
+   * and gets exactly what it authored and nothing else. An empty `headers: {}`
+   * is NOT the switch: an absent key and an empty object survive a JSON round
+   * trip and an optional zod field differently, and a generator that emitted
+   * `{}` would silently disarm the floor for every step it wrote.
+   */
+  inheritHeaders?: boolean | undefined;
   /** An object is JSON-encoded; a string is sent verbatim. */
   body?: unknown;
   /** `{ orderId: '$.data.id' }` — variable name to JSON path. */
@@ -80,6 +141,13 @@ export interface FlowRequestSpec {
   baseUrl?: string | undefined;
 }
 
+/** What `#buildRequest` produced, plus which headers it — not the flow — supplied. */
+interface BuiltRequest {
+  sent: ApiRequestSpec;
+  inherited: string[];
+  regenerated: string[];
+}
+
 export interface ApiActionsOptions {
   transport: ApiTransport;
   bundle: ProofBundleBuilder;
@@ -91,6 +159,15 @@ export interface ApiActionsOptions {
    * behaviour, kept for embedders and tests).
    */
   variables?: VariableStore | undefined;
+  /**
+   * The header floor for one call, merged from the page's own observed traffic.
+   *
+   * Injected by `SmartRunner` from its `NetworkObserver`. A browser-free flow
+   * passes nothing — `FetchTransport` has no page to harvest from, and inventing
+   * a profile for it would be guessing rather than observing — so `runApiFlow`
+   * behaves exactly as it did before this seam existed.
+   */
+  headerProfile?: ((target: HeaderProfileTarget) => HeaderProfile | null) | undefined;
   redaction?: RedactionPolicy | undefined;
   /** The page's url, when there is a page. Recorded on each step. */
   currentUrl?: (() => string | null) | undefined;
@@ -138,6 +215,7 @@ export class ApiActions {
   #transport: ApiTransport;
   readonly #bundle: ProofBundleBuilder;
   readonly #redaction: RedactionPolicy;
+  readonly #headerProfile: (target: HeaderProfileTarget) => HeaderProfile | null;
   readonly #currentUrl: () => string | null;
   readonly #recordDefect: (
     category: DefectCategory,
@@ -148,6 +226,13 @@ export class ApiActions {
 
   /** The most recent response — what `expectStatus`/`expectJson` assert against. */
   #lastResponse: ApiResponse | null = null;
+
+  /**
+   * Header names the harness supplied on that request, so a later
+   * `expectStatus` can say what the floor did and did not reach. Names only;
+   * the values were never held here.
+   */
+  #lastInherited: readonly string[] = [];
 
   /**
    * Swap the transport — a browser transport is bound to one context's
@@ -163,6 +248,7 @@ export class ApiActions {
     this.#transport = options.transport;
     this.#bundle = options.bundle;
     this.#redaction = options.redaction ?? {};
+    this.#headerProfile = options.headerProfile ?? (() => null);
     this.#currentUrl = options.currentUrl ?? (() => null);
     this.#recordDefect = options.recordDefect ?? (() => undefined);
   }
@@ -186,9 +272,9 @@ export class ApiActions {
     const intent = spec.intent;
     const redaction = spec.redaction ?? this.#redaction;
 
-    let sent: ApiRequestSpec;
+    let built: BuiltRequest;
     try {
-      sent = this.#buildRequest(spec);
+      built = this.#buildRequest(spec);
     } catch (error) {
       // An unknown {{variable}} or an unserialisable body — fail at the point
       // of use, naming the thing that's missing.
@@ -202,6 +288,8 @@ export class ApiActions {
       throw new Error(message);
     }
 
+    const { sent, inherited, regenerated } = built;
+
     let response: ApiResponse;
     try {
       response = await this.#transport.send(sent);
@@ -210,7 +298,7 @@ export class ApiActions {
       this.#record('request', intent, startedAt, started, {
         status: 'failed',
         detail: { method: sent.method, url: sent.url, intent },
-        request: recordOf(sent, null, { redaction, error: message }),
+        request: recordOf(sent, null, { redaction, error: message, inherited, regenerated }),
         error: message,
       });
       this.#recordDefect(
@@ -223,6 +311,7 @@ export class ApiActions {
     }
 
     this.#lastResponse = response;
+    this.#lastInherited = inherited;
 
     // Extraction happens after the call and can fail it: a test that asked to
     // save `$.id` and got a body without one is broken *here*, not three steps
@@ -267,14 +356,27 @@ export class ApiActions {
         `application. ${saveError}`;
     }
 
+    // The header half of the same rule (2026-09-08). A body that names a
+    // missing or invalid header says the harness sent a malformed request —
+    // the floor above did not reach far enough — and no reading of the
+    // response body was ever going to hold what the save wanted.
+    const refusedHeaders = methodDrift ? null : headerRefusal(response.status, response.body);
+    const headerDrift = saveError !== undefined && refusedHeaders !== null;
+    if (headerDrift && refusedHeaders) {
+      saveError =
+        `${sent.method} ${sent.url} — ${response.status} ${response.statusText}` +
+        `${headerDriftAdvice(refusedHeaders, inherited)} ${saveError}`;
+    }
+
     this.#record('request', intent, startedAt, started, {
       status: saveError ? 'failed' : 'passed',
       detail: { method: sent.method, url: sent.url, status: response.status, intent },
-      request: recordOf(sent, response, { redaction, saved, error: saveError }),
+      request: recordOf(sent, response, { redaction, saved, error: saveError, inherited, regenerated }),
       error: saveError,
     });
 
     if (saveError) {
+      if (headerDrift) throw new HeaderRefusedError(saveError);
       // A method the endpoint does not offer files no defect against anyone:
       // the body the save wanted was never going to exist, and the reason is
       // the request's own verb. Same rule as `UnknownVariableError` below in
@@ -314,6 +416,17 @@ export class ApiActions {
             `expected status ${allowed.join(' or ')}, got ${response.status} ${response.statusText}` +
               ' — a method-level refusal means the request\'s own method is wrong (test drift from the ' +
               'endpoint\'s spec), not a backend defect; the endpoint exists and does not answer this verb',
+          );
+        }
+        // The header-level twin (2026-09-08), consulted only here — inside a
+        // status assertion that has ALREADY failed. A negative test that means
+        // to provoke a 400 and asserts one never reaches this branch, so a
+        // deliberate malformed request still passes as it always did.
+        const refused = headerRefusal(response.status, response.body);
+        if (refused !== null) {
+          throw new HeaderRefusedError(
+            `expected status ${allowed.join(' or ')}, got ${response.status} ${response.statusText}` +
+              headerDriftAdvice(refused, this.#lastInherited),
           );
         }
         throw new Error(
@@ -390,8 +503,17 @@ export class ApiActions {
     return this.#lastResponse;
   }
 
-  /** Interpolate and serialise a flow's request spec into a transport call. */
-  #buildRequest(spec: FlowRequestSpec): ApiRequestSpec {
+  /**
+   * Interpolate and serialise a flow's request spec into a transport call, and
+   * put the observed header floor under it.
+   *
+   * **The floor is a floor: an authored header always wins.** The merge only
+   * ever fills a name the flow did not write, compared case-insensitively — a
+   * flow that authored `Content-Type` keeps it against an observed
+   * `content-type`. `inheritHeaders: false` skips the floor entirely, which is
+   * how a negative test still sends a deliberately malformed request.
+   */
+  #buildRequest(spec: FlowRequestSpec): BuiltRequest {
     const headers = this.variables.interpolateDeep({ ...(spec.headers ?? {}) });
     let body: string | undefined;
 
@@ -406,12 +528,43 @@ export class ApiActions {
       }
     }
 
+    const url = resolveUrl(this.variables.interpolate(spec.url), spec.baseUrl);
+    const authored = new Set(Object.keys(headers).map((name) => name.toLowerCase()));
+    const inherited: string[] = [];
+    const regenerated: string[] = [];
+
+    if (spec.inheritHeaders !== false) {
+      // Diagnostic input on the execution plane's hot path: an observer that
+      // throws must cost a header, never the step. Same rule as every other
+      // read of the network observer.
+      let profile: HeaderProfile | null = null;
+      try {
+        profile = this.#headerProfile({ url, hasBody: body !== undefined });
+      } catch {
+        profile = null;
+      }
+      if (profile) {
+        for (const [name, value] of Object.entries(profile.headers)) {
+          if (authored.has(name)) continue;
+          headers[name] = value;
+          inherited.push(name);
+          if (profile.regenerated.includes(name)) regenerated.push(name);
+        }
+        inherited.sort();
+        regenerated.sort();
+      }
+    }
+
     return {
-      method: spec.method.toUpperCase(),
-      url: resolveUrl(this.variables.interpolate(spec.url), spec.baseUrl),
-      headers,
-      body,
-      timeoutMs: spec.timeoutMs,
+      sent: {
+        method: spec.method.toUpperCase(),
+        url,
+        headers,
+        body,
+        timeoutMs: spec.timeoutMs,
+      },
+      inherited,
+      regenerated,
     };
   }
 
@@ -449,7 +602,11 @@ export class ApiActions {
       if (
         error instanceof UnknownVariableError ||
         error instanceof NoResponseError ||
-        error instanceof MethodRefusedError
+        error instanceof MethodRefusedError ||
+        // …and a request the harness itself sent malformed at the header level
+        // (2026-09-08): the endpoint refused a call the application would never
+        // have made, which says nothing about the endpoint.
+        error instanceof HeaderRefusedError
       ) {
         throw error;
       }

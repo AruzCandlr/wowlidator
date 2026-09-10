@@ -1185,7 +1185,7 @@ var ADV_GROUPS = [
   ['Recording', ['video', 'screenshots', 'capture-delay', 'step-delay', 'no-target-highlight']],
   ['Behaviour', ['no-heal', 'no-agent', 'no-agent-early-stop', 'no-reconstruct', 'no-network', 'no-history', 'quarantine-flaky', 'update-baselines', 'no-author-review', 'no-agent-capture', 'no-value-resolution', 'concurrency', 'author-concurrency', 'author-attempts', 'sheet-order', 'db-baseline']],
   ['Chrome', ['headless', 'browsers', 'no-ensure-chrome', 'stop-chrome', 'wait-for', 'cdp']],
-  ['Output', ['report', 'no-report', 'junit', 'ctrf', 'suite', 'flow', 'catalog-out', 'claims-out', 'context-out', 'cache', 'out']]
+  ['Output', ['report', 'no-report', 'report-lang', 'no-case-narrative', 'junit', 'ctrf', 'suite', 'flow', 'catalog-out', 'claims-out', 'context-out', 'cache', 'out']]
 ];
 var VERB = { doctor: 'Run the doctor', 'context-list': 'List saved repositories', 'cache-list': 'List healed selectors', 'history-clear': 'Clear run history', 'context-build': 'Build the index', 'context-show': 'Show the index', 'context-add': 'Scan and save', 'cache-forget': 'Forget', watch: 'Start watching' };
 

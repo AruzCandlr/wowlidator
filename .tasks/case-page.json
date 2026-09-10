@@ -1,0 +1,92 @@
+[
+  {
+    "id": 1,
+    "title": "Bundle + option seams",
+    "desc": "Add CaseNarrative type and bundle.narrative to proof-bundle.ts; reportLang (en|th) and caseNarrative flags to CliOptions/cli.ts/usage.ts; launch.reportLang on the ledger.",
+    "expected": "npm run typecheck passes; --report-lang th parses; default en; WOWLIDATOR_REPORT_LANG honoured.",
+    "status": "done",
+    "created": "20260910142726",
+    "evidence": "npm run typecheck clean after adding reportLang/caseNarrative options, CaseNarrative type, ledger launch.reportLang",
+    "verified_at": "20260910143110",
+    "review": {
+      "status": "approved",
+      "at": "20260910145502"
+    },
+    "completed": "20260910145502"
+  },
+  {
+    "id": 2,
+    "title": "Case narrative model",
+    "desc": "src/generator/case-narrative.ts: CaseNarrativeModel.compose() on the generator role, structured output (lede, summary, tickets, verifier note, questions) in the chosen language, applyNarrative onto the bundle, buildCaseNarrativeModel in runtime.ts.",
+    "expected": "tests/case-narrative.test.ts passes with jsonModel: prompt carries only step lines/defects/db lines/claim, no credential; apply never overwrites; empty answer leaves bundle unchanged.",
+    "status": "done",
+    "created": "20260910142726",
+    "evidence": "tests/case-narrative.test.ts: 11 pass \u2014 prompt content, no credential, apply boundary, compose no-op/failure",
+    "verified_at": "20260910144523",
+    "review": {
+      "status": "approved",
+      "at": "20260910145502"
+    },
+    "completed": "20260910145502"
+  },
+  {
+    "id": 3,
+    "title": "Case page renderer + sidecars",
+    "desc": "src/reporter/case-page.ts: renderCasePage (template style, en/th labels), DB query section per DB step with SQL+params+rows, HTTP block per request step, before/after from dbChanges, sidecar builders for db-query.sql, db-before.csv, db-after.csv, db-evidence.csv.",
+    "expected": "tests/case-page.test.ts: sections render from bundle only, escaping, redacted params only, no query section without statements, th labels when lang=th, sidecar contents.",
+    "status": "done",
+    "created": "20260910142726",
+    "evidence": "tests/case-page.test.ts: 23 pass; real bundle RU_10_03 rendered en+th and screenshotted headless \u2014 query section shows SQL, params, rows, chips",
+    "verified_at": "20260910144524",
+    "review": {
+      "status": "approved",
+      "at": "20260910145502"
+    },
+    "completed": "20260910145502"
+  },
+  {
+    "id": 4,
+    "title": "Wire into catalog artifacts",
+    "desc": "catalog-live-report.ts writes <media>/<case>.html and sidecars for every case with a bundle; catalog-report.ts case name links to it; CatalogReportInput carries lang; stale pages removed for never-ran.",
+    "expected": "catalog-report test asserts the link; writeCatalogArtifacts test asserts files exist; wowlidator report rebuild produces pages.",
+    "status": "done",
+    "created": "20260910142726",
+    "evidence": "tests/catalog-live-report.test.ts: 15 pass incl. pages+sidecars on disk, index link, stale page removed, th off ledger",
+    "verified_at": "20260910144524",
+    "review": {
+      "status": "approved",
+      "at": "20260910145502"
+    },
+    "completed": "20260910145502"
+  },
+  {
+    "id": 5,
+    "title": "Narrative in run and rebuild",
+    "desc": "run-cases.ts composes the narrative after narration before writeProofBundle; maintenance.ts report composes when missing and writes bundle back; caseText from flow.caseContext.",
+    "expected": "typecheck; cli tests still pass; run log prints 'narrative' line.",
+    "status": "done",
+    "created": "20260910142726",
+    "evidence": "npm run typecheck clean; full npm test 2559/2560 then ledger-ui fixed \u2192 17 pass",
+    "verified_at": "20260910144524",
+    "review": {
+      "status": "approved",
+      "at": "20260910145502"
+    },
+    "completed": "20260910145502"
+  },
+  {
+    "id": 6,
+    "title": "Panel, skill, docs",
+    "desc": "ui/commands.ts enum field report-lang on run/catalog/go forms; wowlidate SKILL asks for language; reporter/generator CLAUDE.md and root CLAUDE.md updated.",
+    "expected": "ui tests pass; docs mention the case page and the language flag.",
+    "status": "done",
+    "created": "20260910142726",
+    "evidence": "ledger-ui.test.ts 17 pass after grouping fields; docs written in 3 CLAUDE.md + usage + wowlidate SKILL",
+    "verified_at": "20260910144524",
+    "review": {
+      "status": "approved",
+      "at": "20260910145502"
+    },
+    "completed": "20260910145502"
+  }
+]

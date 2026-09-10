@@ -1347,7 +1347,7 @@ describe('formGaps (OA-6, pure half)', () => {
 interface FakePageOptions {
   url: string;
   /** The accessibility nodes the CDP session hands back. */
-  nodes: Array<{ role: string; name: string; url?: string }>;
+  nodes: Array<{ role: string; name: string; url?: string; value?: string }>;
   /** What the (only) control's DOM element reads as, for the listbox procedure. */
   trigger: string;
   /** The options its list holds. */
@@ -1403,6 +1403,7 @@ function fakePage(opts: FakePageOptions): Page {
     nodeId: String(i),
     role: { value: n.role },
     name: { value: n.name },
+    ...(n.value === undefined ? {} : { value: { value: n.value } }),
     properties: n.url === undefined ? [] : [{ name: 'url', value: { value: n.url } }],
   }));
   return {
@@ -1519,6 +1520,60 @@ describe('the typed stop reason on the record (no browser)', () => {
       filtered: false,
       searchedEmpty: null,
     });
+  });
+
+  // PL_09_01 and PL_06_05 of run `be-high-sonnet-20260909-153617`
+  // (2026-09-09): a fixture-creation leg whose row survived an earlier run
+  // read back the application's own duplicate-key refusal. One leg typed a
+  // different id — which the flow's next `expectVisible` on the goal's id
+  // could never have matched — and was ended as a wander; the other called
+  // `fail`. Both cases ended with no verdict at all.
+  const CREATE_URL = 'http://x.test/en/admin/benefits/plans/create';
+  const TAKEN_NODES = [
+    { role: 'RootWebArea', name: 'Benefit Plans', url: CREATE_URL },
+    { role: 'heading', name: 'Create Benefit Plan' },
+    { role: 'textbox', name: 'Benefit Plan ID*', value: 'QA260908_BE_137' },
+    { role: 'StaticText', name: 'Plan ID already exists.' },
+    { role: 'button', name: 'Create Plan' },
+  ];
+  const CREATE_GOAL =
+    'Click Create Plan, then fill the new plan form with Country=Thailand, Status=Active, ' +
+    'Plan ID=QA260908_BE_137, Name=QA-Delete_37929Z, then submit/Insert so the new plan is saved';
+
+  it("a creation leg whose row is already there settles on the application's own refusal", async () => {
+    const { model, seen } = scripted([
+      { action: 'click', selector: 'role=button[name="Create Plan" i]', reasoning: 'submit the form' },
+      { action: 'fill', selector: 'role=textbox[name="Benefit Plan ID" i]', value: 'QA260908_BE_138', reasoning: 'the id is taken, try another' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 6 });
+    const result = await agent.run(
+      fakePage({ url: CREATE_URL, nodes: TAKEN_NODES, trigger: 'Create Plan', options: [] }),
+      CREATE_GOAL,
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.endedBy, 'fixture-present');
+    assert.equal(result.settledBy, 'fixture-present', 'never agent-claim: the page said it, not the model');
+    assert.match(result.settledEvidence ?? '', /Plan ID already exists\./);
+    assert.match(result.settledEvidence ?? '', /QA260908_BE_137/, "the control still holds the goal's own value");
+    assert.equal(seen.length, 1, 'the leg ended before the turn that would have invented a new id');
+    assert.equal(
+      result.actions.some((a) => a.value === 'QA260908_BE_138'),
+      false,
+      "the goal's value is never replaced",
+    );
+  });
+
+  it('does not settle before the leg has acted — a refusal already on the page is not this leg\'s evidence', async () => {
+    const { model } = scripted([{ action: 'fail', reasoning: 'nothing to do here' }]);
+    const agent = new WorkflowAgent({ model, maxSteps: 3 });
+    const result = await agent.run(
+      fakePage({ url: CREATE_URL, nodes: TAKEN_NODES, trigger: 'Create Plan', options: [] }),
+      CREATE_GOAL,
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.endedBy, 'fail', 'the first turn is judged as it always was');
   });
 
   it('headingsOf keeps named headings, in order, at most eight', () => {

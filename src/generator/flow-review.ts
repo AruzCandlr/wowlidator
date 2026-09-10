@@ -68,6 +68,20 @@ export interface ReviewEvidence {
   /** Route patterns the repository declares. */
   declaredRoutes?: readonly string[] | undefined;
   /**
+   * Control names the step-evidence lookup found the repository declares
+   * VERBATIM (`src/generator/step-evidence.ts`, 2026-09-08). A selector on one
+   * of these is grounded: the authoring prompt's own order is tree, then
+   * repository, then a workflow leg, and on a page no capture reached the
+   * repository is the only source left. Measured on be-cycle1-sit: the review
+   * answered `unsure` 507 times for pages behind a workflow leg, and twice
+   * answered `keep` quoting a message catalog that had declared the string all
+   * along — a model call spent on what a string comparison settles for
+   * nothing. Matched exactly, never by containment.
+   */
+  declaredControls?: readonly string[] | undefined;
+  /** Those declarations as evidence lines, so a decision the model does make can quote one. */
+  declaredEvidence?: string | undefined;
+  /**
    * The request as the author saw it — the claim, the sheet row, and the
    * context documents. The documents are the part the reviewer reads here.
    */
@@ -189,6 +203,22 @@ function hasSelector(step: FlowStep): step is FlowStep & { selector: string } {
 }
 
 /**
+ * Is this selector's name one the repository itself declares the application
+ * renders? Exact, whitespace-folded and case-insensitive — the step-evidence
+ * lookup verified it against the index by string comparison, and containment
+ * would let a longer declared string vouch for a name the run must match whole.
+ */
+function declaredByCode(selector: string, evidence: ReviewEvidence): boolean {
+  const declared = evidence.declaredControls ?? [];
+  if (declared.length === 0) return false;
+  const fold = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
+  const name = selectorName(selector);
+  if (name === null || name.trim() === '') return false;
+  const needle = fold(name);
+  return declared.some((one) => fold(one) === needle);
+}
+
+/**
  * The steps an author wrote with nothing behind them. Deterministic, $0.
  *
  * Declines to judge a selector against a truncated tree — past the node
@@ -249,7 +279,9 @@ export function auditGrounding(
       // is audited on its own, and one finding names every ungrounded one so
       // the reviewer repoints the list as a whole.
       if (step.action === 'expectAnyVisible') {
-        const ungrounded = step.selectors.filter((one) => selectorGrounded(one, tree) === false);
+        const ungrounded = step.selectors.filter(
+          (one) => selectorGrounded(one, tree) === false && !declaredByCode(one, evidence),
+        );
         if (ungrounded.length > 0) {
           findings.push({
             section,
@@ -265,7 +297,7 @@ export function auditGrounding(
       }
       if (!hasSelector(step)) return;
       const grounded = selectorGrounded(step.selector, tree);
-      if (grounded === false) {
+      if (grounded === false && !declaredByCode(step.selector, evidence)) {
         findings.push({
           section,
           index,
@@ -413,6 +445,12 @@ function buildPrompt(request: ReviewRequest): string {
     parts.push(`\nROUTES THE APPLICATION DECLARES:\n${evidence.declaredRoutes.map((r) => `  ${r}`).join('\n')}`);
   }
   if (evidence.projectContext) parts.push(`\nSOURCE INDEX (what the codebase declares):\n${evidence.projectContext}`);
+  if (evidence.declaredEvidence) {
+    parts.push(
+      '\nSOURCE INDEX, looked up for the names THIS flow uses (found by string comparison, not by a model):\n' +
+        evidence.declaredEvidence,
+    );
+  }
   // The author's prompt opens with the full supporting-document set — already
   // paid for once during authoring, and the reviewer judges steps against the
   // claim and the trees above, not against background prose. Elide everything
@@ -474,6 +512,10 @@ function evidenceText(evidence: ReviewEvidence): string {
     evidence.journeyTree,
     evidence.interactions,
     evidence.projectContext,
+    // What the step-evidence lookup found the repository declares about this
+    // flow's own names: part of the source index, arriving separately because
+    // the row's ranked slice was chosen before the flow existed.
+    evidence.declaredEvidence,
     evidence.prompt,
   ]
     .filter((t): t is string => t !== undefined)

@@ -116,6 +116,9 @@ import {
 import {
   performSignIn,
   performSignOut,
+  retrySignIn,
+  signInAttemptCeiling,
+  SIGN_IN_RELOAD_TIMEOUT_MS,
 } from './sign-in.js';
 import {
   acceptConsentGate,
@@ -127,13 +130,14 @@ import { generateValue, type DataKind } from '../data/mock-data.js';
 import type { DataModel } from '../data/data-model.js';
 import {
   describeDialog,
-  dialogIsIntendedContext,
+  dialogIsIntendedContextGiven,
   dialogMentions,
   findDismissButton,
   openDialogNow,
   selectorInsideDialog,
   waitForDialog,
 } from './modal.js';
+import { findClickCatcher } from './click-catcher.js';
 import {
   exactTextSelector,
   headRoleOf,
@@ -687,6 +691,13 @@ export class StepResolutionError extends Error {
   readonly attempts: string[];
   /** What the page was showing — stamped by the denial guard, carried to the step. */
   pageContext?: string[] | undefined;
+  /**
+   * The interceptor that took the pointer, when one was named. Present only
+   * where the selector RESOLVED and the action could not be performed, so a
+   * reader (and the healer) can tell "the control is missing" from "something
+   * is over it".
+   */
+  readonly blockedBy?: string | undefined;
   /** Repair candidates the healer proposed and the ladder refused. */
   rejectedHeals?: RejectedHeal[] | undefined;
   /**
@@ -706,7 +717,15 @@ export class StepResolutionError extends Error {
      * (the not-found rung), a declared wait that ran out — and the step must
      * classify `failed`, never `dead-end`, whatever the attempt lines say.
      */
-    options: { verdict?: string | undefined } = {},
+    options: {
+      verdict?: string | undefined;
+      /**
+       * What Playwright named as intercepting the pointer (`parseInterception`).
+       * Its presence is PROOF the selector resolved: the engine cannot report
+       * an interceptor for an element it never found.
+       */
+      blockedBy?: string | undefined;
+    } = {},
   ) {
     // "Could not resolve" must not headline a failure where every rung DID
     // resolve the selector and the content behind it was wrong — that header
@@ -726,6 +745,29 @@ export class StepResolutionError extends Error {
     // then held 51, not that the control was missing.
     const stateContradicted = endedInStateContradiction(attempts);
     const verdict = options.verdict !== undefined;
+    // **The element was found and the ACTION could not be performed.**
+    //
+    // The third way a resolved selector fails, beside a content miss and a
+    // state contradiction — and the one this header got wrong. A click an
+    // overlay swallows produces nothing but `locator.click: Timeout … exceeded`
+    // on every rung, which names no cause, so the message fell through to
+    // "could not resolve" about a control the ladder had just measured.
+    //
+    // Live (be-high-opusgen PL_08_01, 2026-09-09): steps 9, 10 and 11 resolved
+    // `role=button[name="Insert" i] >> nth=0` and read it visible and enabled;
+    // step 12 clicked the same selector, was blocked by `div.humi-topbar`, and
+    // reported that it could not be resolved. The word is not cosmetic — it is
+    // the premise every later reader takes: the healer was asked to repair a
+    // correct selector and concluded "nothing on this page serves the author's
+    // intent", and reconstruction invented a cause ("the unsupported
+    // case-insensitive `i` flag") that steps 9–11 disprove. 60 s per occurrence
+    // to be told something false.
+    //
+    // `blockedBy` is not a guess: Playwright names the interceptor out of its
+    // own actionability log, and it cannot name one for an element it never
+    // found. Classification is deliberately unchanged — a step that could not
+    // act still could not proceed — only the account of WHY.
+    const blockedBy = options.blockedBy;
     const contentOnly = textOnly || stateContradicted || verdict;
     super(
       verdict
@@ -734,12 +776,15 @@ export class StepResolutionError extends Error {
           ? `"${selector}" resolved, but the claim did not hold after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`
           : contentOnly
             ? `"${selector}" resolved, but its content did not hold after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`
-            : `could not resolve "${selector}" after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`,
+            : blockedBy !== undefined
+              ? `"${selector}" resolved, but the action was blocked by ${blockedBy} after ${attempts.length} attempt(s) — the control is on the page and something over it took the pointer:\n  - ${attempts.join('\n  - ')}`
+              : `could not resolve "${selector}" after ${attempts.length} attempt(s):\n  - ${attempts.join('\n  - ')}`,
     );
     this.name = 'StepResolutionError';
     this.selector = selector;
     this.attempts = attempts;
     this.contentOnly = contentOnly;
+    this.blockedBy = blockedBy;
   }
 
   /** Every rung resolved the selector and only the CONTENT missed. */
@@ -1707,6 +1752,45 @@ export function valueMatches(asked: string, held: string): boolean {
   return foldedMatch(asked, held) !== null;
 }
 
+/**
+ * `expectAttribute` names whose truth `formatAxNode` unifies into one tree
+ * line (`required`, `disabled`, …) whether the application marks it with the
+ * bare HTML boolean attribute or the `aria-<name>` one. An author reading
+ * that line has no way to know which spelling produced it — see
+ * `ariaStateMatches` for the fallback this enables.
+ */
+export const ARIA_STATE_ATTRIBUTES: ReadonlySet<string> = new Set([
+  'required',
+  'disabled',
+  'checked',
+  'readonly',
+  'selected',
+  'expanded',
+]);
+
+/**
+ * Whether `expected` is satisfied by the `aria-<name>` spelling of a state
+ * `expectAttribute`'s raw attribute comparison already missed (PL_06_05,
+ * be-sit-high-20260909-170213: `aria-required="true"`, the claim written
+ * against the bare `required` attribute, which Playwright's `getAttribute`
+ * read as `null`). Pure — the caller has already read both attributes.
+ *
+ * `expected === ''` is the idiom flows already use for a bare HTML boolean
+ * attribute's mere presence (`<input required>` reads back `''`), and the
+ * same empty string against the ARIA spelling means the same thing — "this
+ * state holds" — which only `aria-<name>="true"` answers. Any other
+ * `expected` (`"true"`, `"false"`, `"mixed"` for a tri-state `aria-checked`)
+ * is compared to the ARIA value directly, so a claim that already spells the
+ * ARIA token out keeps working unchanged. A state the ARIA attribute never
+ * mentions (`null`) satisfies nothing — a genuinely absent state must still
+ * fail, whichever spelling was asked for.
+ */
+export function ariaStateMatches(expected: string, ariaValue: string | null): boolean {
+  if (ariaValue === null) return false;
+  if (ariaValue === expected) return true;
+  return expected === '' && ariaValue === 'true';
+}
+
 const NAVIGATING_ACTIONS: ReadonlySet<string> = new Set([
   'goto',
   'click',
@@ -2113,6 +2197,17 @@ export class SmartRunner {
       bundle: this.bundle,
       variables,
       redaction: this.#networkRedaction,
+      // The header floor for a deliberate `request` (2026-09-08).
+      // `BrowserContext.request` shares the context's cookie jar and NOTHING
+      // else — no referer, no origin, no user-agent, none of the headers the
+      // SPA's own fetch attaches — so an export pulled over `request` came back
+      // 400 `Missing required header(s)` and was filed as a backend defect. The
+      // evidence for what the application sends is already being collected, so
+      // read it from there rather than naming headers here. A getter, not the
+      // observer itself: `#network` follows the active persona's page, and a
+      // hand-off must re-point the floor the same way it re-points the
+      // transport.
+      headerProfile: (target) => this.#network?.headerProfile(target) ?? null,
       currentUrl: () => this.#currentUrl(),
       recordDefect,
     });
@@ -4190,9 +4285,24 @@ export class SmartRunner {
       }
       this.#lastGotoAskedSignIn = true;
       const outcome = await performSignIn(this.page, { email: persona.email, password: persona.password });
+      if (outcome.attempts > 1) detail['attempts'] = outcome.attempts;
       if (!outcome.ok) {
         detail['urlAfter'] = this.page.url();
         throw new Error(`signIn as ${persona.label} (${persona.email}) did not take — ${outcome.reason}`);
+      }
+      if (outcome.attempts > 2) {
+        this.bundle.note(
+          `signIn as ${persona.label}: the sign-in took ${outcome.attempts} attempts — the page was ` +
+            'reloaded and the credentials entered again until the submit took',
+        );
+      }
+      if (outcome.acceptedSubmit !== undefined) {
+        detail['submitAccepted'] = outcome.acceptedSubmit;
+        this.bundle.note(
+          `signIn as ${persona.label}: the credential submit was accepted (${outcome.acceptedSubmit}) and ` +
+            `the page returned to the sign-in URL ${this.page.url()} — the application's landing after ` +
+            'signing in, not a lost session; the next navigation is what proves the session',
+        );
       }
       const consentSettled =
         this.#consentPolicy === 'accept'
@@ -4515,11 +4625,27 @@ export class SmartRunner {
         await locator.waitFor({ state: 'attached', timeout });
         const actual = await locator.getAttribute(name);
         detail['actual'] = actual ?? '(attribute absent)';
-        if (actual !== expected) {
+        if (actual === expected) return;
+        if (!ARIA_STATE_ATTRIBUTES.has(name)) {
           throw new Error(
             `expected @${name} to be ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
           );
         }
+        // The application may expose this state via `aria-${name}` instead
+        // of the bare attribute — the tree the author read unifies both
+        // spellings (`ariaStateMatches`), so a claim naming the wrong one is
+        // not a defect in the application.
+        const ariaName = `aria-${name}`;
+        const ariaValue = await locator.getAttribute(ariaName);
+        if (ariaStateMatches(expected, ariaValue)) {
+          detail['actual'] = `${actual ?? '(attribute absent)'} (${ariaName}=${JSON.stringify(ariaValue)})`;
+          detail['matchedVia'] = ariaName;
+          return;
+        }
+        throw new Error(
+          `expected @${name} to be ${JSON.stringify(expected)}, got ${JSON.stringify(actual)} ` +
+            `(${ariaName} is ${ariaValue === null ? 'absent too' : JSON.stringify(ariaValue)})`,
+        );
       },
       detail,
     );
@@ -5667,6 +5793,58 @@ export class SmartRunner {
     return mark;
   }
 
+  /**
+   * A plain observer mark for a caller outside the ladder (`executeSteps`'
+   * credential-submit evidence). Deliberately NOT `#takeNetMark`: that one
+   * moves the evidence floor every step's backend rung reads, and a mark
+   * taken for a different question must not shift it.
+   */
+  netMark(): number | undefined {
+    return this.#network?.mark();
+  }
+
+  /** Every call the page made since `mark`; empty without an observer. */
+  callsSince(mark: number | undefined): NetworkCall[] {
+    if (mark === undefined || !this.#network) return [];
+    try {
+      return this.#network.since(mark);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Wait, bounded by the healed timeout, until `credentialSettleOutcome`
+   * answers — polled, because two of its three facts (the observer's calls,
+   * the URL) are reads and only `networkidle` is an event. Without an
+   * observer the accepted-POST half never fires and the other two decide.
+   */
+  async settleCredentialSubmit(
+    mark: number | undefined,
+  ): Promise<{ settledOn: CredentialSettle | 'timeout'; waitedMs: number }> {
+    const started = Date.now();
+    const deadline = started + this.#healedTimeoutMs;
+    let networkIdle = false;
+    this.page
+      .waitForLoadState('networkidle', { timeout: this.#healedTimeoutMs })
+      .then(() => {
+        networkIdle = true;
+      })
+      .catch(() => undefined);
+    for (;;) {
+      let url = '';
+      try {
+        url = this.page.url();
+      } catch {
+        url = '';
+      }
+      const outcome = credentialSettleOutcome({ url, calls: this.callsSince(mark), networkIdle });
+      if (outcome !== null) return { settledOn: outcome, waitedMs: Date.now() - started };
+      if (Date.now() >= deadline) return { settledOn: 'timeout', waitedMs: Date.now() - started };
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
   #networkEvidence(mark: number | undefined): {
     calls: NetworkCall[];
     failures: NetworkCall[];
@@ -6190,7 +6368,12 @@ export class SmartRunner {
       .catch(() => undefined);
     this.bundle.note(
       `session bootstrap: the flow assumes a signed-in user and the browser had no session, ` +
-        `so the run signed in as ${this.#credentials.email} and returned to ${askedUrl}`,
+        `so the run signed in as ${this.#credentials.email} and returned to ${askedUrl}` +
+        (outcome.attempts > 2 ? ` (the sign-in took ${outcome.attempts} attempts)` : '') +
+        (outcome.acceptedSubmit === undefined
+          ? ''
+          : ` (the credential submit was accepted — ${outcome.acceptedSubmit} — and the page ` +
+            'stayed on the sign-in URL, the application\'s own landing)'),
     );
     // Green, and still a finding: the flow depends on a precondition it does
     // not establish, and every fresh browser will pay this again until the
@@ -6335,6 +6518,51 @@ export class SmartRunner {
         `submitted without it and no session was created. The run waited for hydration and ` +
         `replayed the fill block and the click once. This is also an application finding: a ` +
         `form a fast user can fill before hydration silently discards their input.`,
+      (step as { selector?: string }).selector,
+    );
+  }
+
+  /**
+   * A credential submit the server accepted, on a page that then returned
+   * to the sign-in URL — the application's landing, not a lost session
+   * (be-sit-high-20260909-170213, 2026-09-10). Disclosed on the click step
+   * and as a note, the way `sessionEstablished`/`consentAccepted` are; no
+   * finding, because nothing went wrong, and no verdict, because the next
+   * protected `goto` is what proves the session.
+   */
+  noteAcceptedSubmitLanding(step: FlowStep, call: NetworkCall): void {
+    const submit = `${call.method.toUpperCase()} ${call.url} ${call.status ?? ''}`.trim();
+    this.bundle.annotateLastStep({ submitAccepted: submit }, step.action);
+    this.bundle.note(
+      `${(step as { selector?: string }).selector ?? step.action}: the credential submit was accepted ` +
+        `(${submit}) and the page returned to the sign-in URL ${this.page.url()} — the application's ` +
+        'landing after signing in, not a lost session; the sign-in was not replayed',
+    );
+  }
+
+  /**
+   * The sign-in retry loop ran — one finding for the whole loop, never one
+   * per attempt: a login that needs reloading before it takes is a fact
+   * about the application, and a login that never took after the ceiling is
+   * the same fact with the verdict left to the session guard.
+   */
+  recordSignInRetryFinding(step: FlowStep, attempts: number, ceiling: number, didNotTake: boolean): void {
+    const selector = (step as { selector?: string }).selector ?? step.action;
+    this.#recordRuntimeDefect(
+      'usability',
+      'medium',
+      didNotTake
+        ? `The sign-in did not take after ${attempts} attempts`
+        : `The sign-in took ${attempts} attempts`,
+      `Clicking ${selector} left the page on the sign-in URL with no accepted credential submit, ` +
+        `so the run reloaded the sign-in page, entered the credentials again and clicked again ` +
+        `(up to ${ceiling} attempts in total). ` +
+        (didNotTake
+          ? `None of the ${attempts} attempts took: the page stayed on the sign-in URL and no submit ` +
+            `was accepted. The credentials or the sign-in form are the problem; the next page that ` +
+            `needs a session carries the verdict.`
+          : `Attempt ${attempts} took. A sign-in that needs ${attempts - 1} retries before it takes ` +
+            `is a finding about the sign-in itself, not about the feature under test.`),
       (step as { selector?: string }).selector,
     );
   }
@@ -6495,6 +6723,29 @@ export class SmartRunner {
         intercepted = parseInterception(error.message);
       }
     };
+    // Every failure this ladder raises carries the interceptor it saw, so no
+    // rung can report "could not resolve" about an element the engine watched
+    // something else take the pointer from. One builder, so a throw site added
+    // later cannot forget it.
+    const resolutionFailure = (): StepResolutionError =>
+      new StepResolutionError(
+        selector,
+        attempts,
+        intercepted === null ? {} : { blockedBy: intercepted.label },
+      );
+
+    // Which dialog, if any, was already open when this step's resolution
+    // BEGAN — the evidence rung 1.5's intended-context exemption was missing
+    // (be-sit-high-fixed-20260910-141440, PL_08_01). A dialog present now was
+    // opened by the previous step; one that appears only later in this ladder
+    // (the JIT probe's own click, the agent) was not, whatever `#lastAction`
+    // says. `openDialogNow` is a single `count()` on the usual dialog-free
+    // page, so a passing fast-path step pays effectively nothing; the label
+    // read only happens when a dialog is actually open.
+    const dialogOpenAtStart = await openDialogNow(this.page);
+    const dialogLabelAtStart = dialogOpenAtStart
+      ? await describeDialog(dialogOpenAtStart).catch(() => null)
+      : null;
 
     // 1. Fast path — $0, short timeout.
     try {
@@ -6537,7 +6788,7 @@ export class SmartRunner {
       } catch (error) {
         attempts.push(`late "${selector}" (${this.#healedTimeoutMs}ms): ${describeAttempt(error)}`);
       }
-      throw new StepResolutionError(selector, attempts);
+      throw resolutionFailure();
     }
 
     // 1.02. **A read-only shell over the real input** (2026-09-02).
@@ -6618,7 +6869,7 @@ export class SmartRunner {
       // few seconds — and the agent may know the control's own way in.
       const entered = await this.#agentEnter(action, selector, intent, entry, attempts);
       if (entered !== null) return entered;
-      const failure = new StepResolutionError(selector, attempts);
+      const failure = resolutionFailure();
       throw failure;
     }
 
@@ -6669,7 +6920,7 @@ export class SmartRunner {
             // A disabled day is the picker's own verdict about the date
             // (`DateOutOfRangeError`) — nothing below can move a min/max.
             if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
-              throw new StepResolutionError(selector, attempts);
+              throw resolutionFailure();
             }
           }
         }
@@ -6705,7 +6956,7 @@ export class SmartRunner {
           : `known dead end: identical failure at step ${priorDeadEnd.step} on this same page — ` +
               'not repaid; the page has not changed its answer, fix the flow',
       );
-      throw new StepResolutionError(selector, attempts);
+      throw resolutionFailure();
     }
 
     // 1.1. Non-standard syntax sanitizer (e.g. StaticText[name="X"] -> text="X")
@@ -6797,7 +7048,7 @@ export class SmartRunner {
         } catch (error) {
           attempts.push(`open-popup (opened "${opened}") "${selector}": ${describeAttempt(error)}`);
           if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
-            throw new StepResolutionError(selector, attempts);
+            throw resolutionFailure();
           }
         }
       }
@@ -7033,14 +7284,19 @@ export class SmartRunner {
     {
       const openNow = await openDialogNow(this.page);
       if (openNow) {
-        const context = dialogIsIntendedContext(this.#lastAction)
+        const nowLabel = await describeDialog(openNow).catch(() => 'dialog');
+        // Intended context needs evidence: the dialog must have been open
+        // when the step began, not have appeared mid-ladder. Compared by
+        // label — the same string `describeDialog` gives everywhere.
+        const wasOpenAtStart = dialogLabelAtStart !== null && dialogLabelAtStart === nowLabel;
+        const context = dialogIsIntendedContextGiven(this.#lastAction, wasOpenAtStart)
           ? `opened by the previous ${this.#lastAction}`
           : (await selectorInsideDialog(openNow, selector))
             ? 'holding the very control this step is aimed at'
             : null;
         if (context !== null) {
           attempts.push(
-            `dialog: a "${await describeDialog(openNow).catch(() => 'dialog')}" ${context} ` +
+            `dialog: a "${nowLabel}" ${context} ` +
               'is treated as the intended context, not a blocker — not dismissed',
           );
         } else {
@@ -7105,6 +7361,28 @@ export class SmartRunner {
           );
         }
       }
+
+      // 1.65. **A click-catcher scrim — click through it.** A popover can
+      // render an invisible full-viewport layer whose only job is to close
+      // it on the next click, and which closes on NOTHING else — so the
+      // dismiss-button and Escape above both no-op and the scrim keeps
+      // intercepting every click (be-sit-high-fixed-20260910-141440, PL_08_01:
+      // a `position:fixed; inset:0; aria-hidden` catcher inside the top bar).
+      // `isClickCatcher` proves the element is nameless, textless, aria-hidden
+      // and viewport-covering — so clicking it is the dismiss a person makes
+      // and can never be a Submit/Delete (those have names). Still $0, after
+      // the cheaper dismiss/Escape and before any model.
+      const scrim = await this.#clickThroughScrim(intercepted);
+      if (scrim) {
+        try {
+          const value = await run(this.page.locator(selector), this.#fastTimeoutMs);
+          return { value, resolution: 'dialog', resolvedSelector: selector, dialog: scrim };
+        } catch (error) {
+          attempts.push(
+            `fast (after clicking the ${scrim.button} that blocked the page) "${selector}": ${describe(error)}`,
+          );
+        }
+      }
     }
 
     const cacheKey = CacheManager.key(this.page.url(), selector);
@@ -7133,15 +7411,30 @@ export class SmartRunner {
     // an error banner or an empty state. The second outcome is strictly worse
     // than failing, because the suite goes green while checking the wrong
     // thing. Same reasoning that puts dialog dismissal ahead of healing.
+    //
+    // A strict-mode violation is the one thing that falsifies the premise
+    // outright: Playwright cannot report "resolved to N elements" for a
+    // control that never rendered, so a request failure recorded alongside one
+    // is not evidence the DATA behind the control never arrived — the control
+    // arrived, N times over. Live (be-sit-high-20260909-170213, RU_06_12,
+    // PL_10_01): four `/humi/api/content-management/*` endpoints 500 on every
+    // page load in that environment, so this rung was armed on effectively
+    // every step, and an ambiguous `role=` selector — which has no narrowing
+    // rung of its own by design, unlike a `text=` selector (1.3 above) —
+    // dead-ended as "could not resolve" about a button that matched 25 times.
+    // The healer is the correct next rung here, and it is safe: it still
+    // verifies a candidate resolves to exactly one element before accepting
+    // it, so this cannot heal onto the wrong control, only stop treating a
+    // demonstrably-present one as backend-blocked.
     const blocking = netMark === undefined ? [] : this.#networkEvidence(netMark).failures;
-    if (blocking.length > 0) {
+    if (blocking.length > 0 && !attempts.some((line) => line.includes('strict mode violation'))) {
       this.bundle.noteBackendBlocked();
       attempts.push(
         `backend: ${blocking.length} request(s) failed while this step was waiting ` +
           `(${describeCall(blocking[0]!)}${blocking.length > 1 ? ', …' : ''}) — ` +
           'no repair attempted, the selector is not the problem',
       );
-      throw new StepResolutionError(selector, attempts);
+      throw resolutionFailure();
     }
 
     // 2.5. Stranded on a sign-in page — a stop, not another attempt.
@@ -7160,7 +7453,7 @@ export class SmartRunner {
     const stranded = this.#strandedMessage();
     if (stranded !== null) {
       attempts.push(`declined to heal: ${stranded.split('\n')[0] ?? stranded}`);
-      throw new StepResolutionError(selector, attempts);
+      throw resolutionFailure();
     }
 
     // 2.6. Denied surface — a stop, not another attempt.
@@ -7192,7 +7485,7 @@ export class SmartRunner {
           'or grant the account access. No selector change can fix this.',
         selector,
       );
-      const failure = new StepResolutionError(selector, attempts);
+      const failure = resolutionFailure();
       failure.pageContext = [denial];
       throw failure;
     }
@@ -7271,7 +7564,7 @@ export class SmartRunner {
       } catch (error) {
         attempts.push(`late "${selector}" (${window}ms): ${describeAttempt(error)}`);
         if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
-          throw new StepResolutionError(selector, attempts);
+          throw resolutionFailure();
         }
       }
       if (!(await this.#anyNameOnPage(absenceNames))) {
@@ -7329,7 +7622,7 @@ export class SmartRunner {
         // against 3). That reading is the verdict — see 1.01; nothing below
         // can change it, and everything below costs time or a model call.
         if (isStateContradiction(attempts[attempts.length - 1] ?? '')) {
-          throw new StepResolutionError(selector, attempts);
+          throw resolutionFailure();
         }
         if (patience !== undefined) {
           attempts.push(
@@ -7441,6 +7734,14 @@ export class SmartRunner {
         }
 
         if (outcome !== null) {
+          // The healer's pre-heal probe may have changed the page it then
+          // read — a disclosure left open, one closed by a click rather than
+          // Escape, a trigger that navigated. Disclosed as notes, so the
+          // report can say the page state this heal ran on was the probe's
+          // doing. No verdict, no defect.
+          for (const warning of outcome.probeWarnings ?? []) {
+            this.bundle.note(`${selector}: disclosure probe — ${warning}`);
+          }
           const heal: HealRecord = {
             from: selector,
             to: outcome.selector,
@@ -7490,7 +7791,7 @@ export class SmartRunner {
     const entered = await this.#agentEnter(action, selector, intent, entry, attempts);
     if (entered !== null) return entered;
 
-    const failure = new StepResolutionError(selector, attempts);
+    const failure = resolutionFailure();
     if (rejectedHeals?.length) failure.rejectedHeals = rejectedHeals;
     throw failure;
   }
@@ -7812,6 +8113,10 @@ export class SmartRunner {
       `A test step has failed ${attempts.length} times and you are being asked to look at the ` +
       `page ONCE and say which of three things is true. Do NOT click, type or navigate — you ` +
       `may only wait and scroll.\n` +
+      `You are given a SCREENSHOT of the page as well as its accessibility tree. Trust what you ` +
+      `can see: a value can be shown on screen and be absent from the tree, and that is exactly ` +
+      `the case this step keeps missing. Name the element from the tree when you can, and say ` +
+      `what you saw in "reasoning" when the two disagree.\n` +
       `THE STEP: ${action} "${selector}"${expected === undefined ? '' : `, expecting ${JSON.stringify(expected)}`}.\n` +
       `WHAT IT IS FOR: ${what}.\n` +
       `WHAT WENT WRONG LAST: ${lastFailure}\n` +
@@ -7829,6 +8134,13 @@ export class SmartRunner {
     try {
       look = await this.#agent.run(this.page, lookGoal, {
         readOnly: true,
+        // The judging turn SEES the page (2026-09-08). This rung exists for
+        // the claims the tree cannot settle, and a great many of those are
+        // visible and untree'd: a value rendered into a div, a control that
+        // only looks disabled, a calendar popover where a textbox was asked
+        // for. The driving loop stays blind — it asks what to press next, and
+        // the tree answers that better and for free.
+        sighted: true,
         caseContext: this.#caseContext,
       });
     } catch (error) {
@@ -7987,6 +8299,37 @@ export class SmartRunner {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Click through a click-catcher scrim (be-sit-high-fixed-20260910-141440).
+   * A popover can lay an invisible full-viewport layer over the page that
+   * closes it on the next click and on nothing else, so the dismiss-button
+   * and Escape above both no-op. `findClickCatcher` (the shared decision in
+   * `click-catcher.ts`, the same one the healer's probe uses, so the two
+   * cannot disagree) returns a point whose TOPMOST element is a catcher — a
+   * nameless, textless, viewport-covering layer with no action of its own, so
+   * the point is over the catcher and never over the step's target (which
+   * would otherwise be the topmost element there). A real mouse click at that
+   * point is the dismiss a person performs; the point is then re-tested and
+   * the caller's retry of the author's own selector is the final arbiter.
+   */
+  async #clickThroughScrim(intercepted: { css: string | null; label: string }): Promise<DialogRecord | null> {
+    const catcher = await findClickCatcher(this.page);
+    if (catcher === null) return null;
+    try {
+      await this.page.mouse.click(catcher.point.x, catcher.point.y);
+      await this.page.waitForTimeout(350);
+    } catch {
+      return null;
+    }
+    // Gone? A fresh probe at the same spot must no longer find a catcher there.
+    const stillThere = await findClickCatcher(this.page);
+    if (stillThere !== null && stillThere.point.x === catcher.point.x && stillThere.point.y === catcher.point.y) {
+      return null;
+    }
+    this.bundle.note(`${intercepted.label}: a click-catcher (${catcher.label}) covered the page and closed only on a click — clicked through it`);
+    return { name: intercepted.label, button: 'click-catcher' };
   }
 
   async #dismissBlockingDialog(open?: Locator | null): Promise<DialogRecord | null> {
@@ -8629,6 +8972,11 @@ export function classifyStepFailure(action: string, error: unknown): StepIssue['
       // A 405/501 is the endpoint refusing the VERB the test chose — the
       // flow's fault, never the application's (2026-08-25, be100 PL_03_03).
       error.name === 'MethodRefusedError' ||
+      // A 4xx naming a header the harness could not supply is the same class
+      // one level down (2026-09-08, PL_11_03/PL_10_23): `BrowserContext.request`
+      // shares the cookie jar and no application headers, so the call the
+      // harness sent was malformed and the endpoint was right to refuse it.
+      error.name === 'HeaderRefusedError' ||
       // A backend step in a run that turned the backend off is a limit the
       // run was given, never a finding about the application.
       error.name === 'BackendDisabledError' ||
@@ -8741,6 +9089,8 @@ function reconstructionFutile(error: unknown): boolean {
       error.name === 'NoResponseError' ||
       // Nor can a rewrite give a handler a method it does not export.
       error.name === 'MethodRefusedError' ||
+      // Nor can it invent a header the page was never observed sending.
+      error.name === 'HeaderRefusedError' ||
       // Nor can a rewrite give a run permission it was denied.
       error.name === 'BackendDisabledError' ||
       // Nor can a rewritten selector conjure a route the application lacks.
@@ -8894,11 +9244,14 @@ export function signInDidNotTakeMessage(state: {
     `for ${state.lastGotoPath}, which needs a session. Nothing after this point can say ` +
     `anything about the feature under test.\n` +
     `  This is not a redirect: the page never left the sign-in screen when the credentials ` +
-    `were submitted. The click landed before the application hydrated, so the form ` +
-    `submitted natively (or hydration reset the fields), and the replay did not recover it.\n` +
-    `  Fix the flow's sign-in: assert something only a signed-in page shows immediately ` +
-    `after the submit click, so the failure is caught here rather than as a pile of ` +
-    `defects about the feature.`
+    `were submitted and the server accepted no credential submit. The click landed before ` +
+    `the application hydrated, so the form submitted natively (or hydration reset the ` +
+    `fields), and neither the replay nor the sign-in retries recovered it.\n` +
+    `  The engine judges the submit itself — by the credential POST the server accepted ` +
+    `and by the next protected page landing — so the flow's proof of the sign-in belongs ` +
+    `on the page it goes to next: a control only a signed-in page shows, asserted there, ` +
+    `so a sign-in that fails is caught as one finding rather than as a pile of defects ` +
+    `about the feature.`
   );
 }
 
@@ -8973,6 +9326,81 @@ export async function fillsLostToHydration(
   return null;
 }
 
+/**
+ * The POST the server accepted while a credential-shaped click ran, or null.
+ *
+ * "Still on a sign-in URL" is not evidence of "no session"
+ * (be-sit-high-20260909-170213, 2026-09-10): the application under test
+ * lands a SUCCESSFUL local sign-in back on its sign-in page — the click POSTs
+ * the credentials, the server answers 200 with the session cookie, and the
+ * client's own redirect re-mounts the login page with empty fields. The
+ * network is what tells that apart from the two hydration signatures: a
+ * hydration-reset submit posts empty credentials and is refused (4xx), and a
+ * pre-hydration native submit is a GET (the URL signature). Method compared
+ * case-insensitively; a call still in flight (`status` undefined) is not yet
+ * evidence either way.
+ */
+export function acceptedCredentialSubmit(calls: readonly NetworkCall[]): NetworkCall | null {
+  for (const call of calls) {
+    if (call.method.toUpperCase() !== 'POST') continue;
+    if (call.status !== undefined && call.status < 400) return call;
+  }
+  return null;
+}
+
+/**
+ * The lost-fill signature, read only when the network has NOT already
+ * answered. An accepted POST beside empty fields is the landing above, not a
+ * reset — so the fields are not even read, and there is no finding and no
+ * replay. Without one, `fillsLostToHydration` decides exactly as before.
+ */
+export async function hydrationResetEvidence(
+  valueOf: (selector: string) => Promise<string | null>,
+  fills: readonly FlowStep[],
+  calls: readonly NetworkCall[],
+): Promise<{ accepted: NetworkCall | null; lostField: string | null }> {
+  if (!credentialShapedBlock(fills)) return { accepted: null, lostField: null };
+  const accepted = acceptedCredentialSubmit(calls);
+  if (accepted !== null) return { accepted, lostField: null };
+  return { accepted: null, lostField: await fillsLostToHydration(valueOf, fills) };
+}
+
+/**
+ * Did the replayed submit take? The URL alone never answers (see
+ * `acceptedCredentialSubmit`): only a sign-in URL WITHOUT an accepted POST
+ * during the replayed click is a sign-in that did not take.
+ */
+export function signInDidNotTakeAfter(url: string, accepted: NetworkCall | null): boolean {
+  return looksLikeSignIn(url) && accepted === null;
+}
+
+/** Why the settle after a credential click ended — see `SmartRunner.settleCredentialSubmit`. */
+export type CredentialSettle = 'submit-accepted' | 'left-sign-in' | 'network-idle';
+
+/**
+ * Has the page said enough, after a credential click, for the next step to
+ * run? `click` returns when the click lands, so a following `goto` can abort
+ * the login POST in flight and arrive with no session — and authored flows
+ * now carry no assertion between the credential click and that goto (the
+ * sign-in proof lives on the next page). The same three facts the verdict
+ * reads, in the order they are strongest: the server accepted the POST, the
+ * URL left the sign-in page, the network went quiet. A page that was never
+ * on a sign-in URL settles at once.
+ */
+export function credentialSettleOutcome(state: {
+  url: string;
+  calls: readonly NetworkCall[];
+  networkIdle: boolean;
+}): CredentialSettle | null {
+  if (acceptedCredentialSubmit(state.calls) !== null) return 'submit-accepted';
+  if (!looksLikeSignIn(state.url)) return 'left-sign-in';
+  if (state.networkIdle) return 'network-idle';
+  return null;
+}
+
+/** A settle shorter than this is not worth a line on the step. */
+export const CREDENTIAL_SETTLE_NOTE_MS = 500;
+
 async function executeSteps(
   runner: SmartRunner,
   steps: readonly FlowStep[],
@@ -8990,6 +9418,9 @@ async function executeSteps(
   // observation rather than an assumption about what a login URL looks like.
   let urlBeforeFills: string | null = null;
   let hydrationReplayed = false;
+  // The observer mark taken right before a click that follows a fill block —
+  // what `acceptedCredentialSubmit` reads the submit's own POST from.
+  let clickMark: number | undefined;
   for (let rawIndex = 0; rawIndex < steps.length; rawIndex += 1) {
     const raw = steps[rawIndex];
     if (raw === undefined) break;
@@ -9069,6 +9500,7 @@ async function executeSteps(
             (step as { intent?: string | undefined }).intent,
           );
           await runner.paceStep();
+          if (step.action === 'click' && recentFills.length > 0) clickMark = runner.netMark();
           try {
             await executeStep(runner, step, baseUrl, issues);
             runner.noteAction(step.action);
@@ -9178,6 +9610,20 @@ async function executeSteps(
         if (recentFills.length === 0) urlBeforeFills = runner.page.url();
         recentFills.push(original);
       } else if (original.action === 'click') {
+        // A credential click settles before anything else reads the page:
+        // the next step may be the `goto` that proves the session, and a
+        // goto issued while the login POST is in flight aborts it. Bounded
+        // by the healed timeout; free on an application that navigates
+        // promptly; recorded on the click only when it waited materially.
+        if (credentialShapedBlock(recentFills)) {
+          const settle = await runner.settleCredentialSubmit(clickMark);
+          if (settle.waitedMs >= CREDENTIAL_SETTLE_NOTE_MS) {
+            runner.bundle.annotateLastStep(
+              { settledOn: settle.settledOn, settledAfterMs: settle.waitedMs },
+              'click',
+            );
+          }
+        }
         const param = hydrationReplayed
           ? null
           : await nativeFormResubmitDetected(
@@ -9189,57 +9635,152 @@ async function executeSteps(
         // Same race, second signature: no URL evidence because the form never
         // navigated — hydration reset the controlled inputs instead, and the
         // click submitted emptiness (DB_04_01/DB_06_01/DB_07_01 live). Only
-        // consulted when the first signature is absent, and it reads the
-        // fields once, immediately.
-        const lostField =
+        // consulted when the first signature is absent AND the network has
+        // not already said the submit was accepted (`acceptedCredentialSubmit`
+        // — an application that lands a successful sign-in back on its
+        // sign-in page re-mounts the form empty, which reads exactly like a
+        // reset). It reads the fields once, immediately.
+        const evidence =
           param !== null || hydrationReplayed
-            ? null
-            : await fillsLostToHydration(async (selector) => {
-                try {
-                  return await runner.page.locator(selector).inputValue({ timeout: 1_000 });
-                } catch {
-                  return null;
-                }
-              }, recentFills);
+            ? { accepted: null, lostField: null }
+            : await hydrationResetEvidence(
+                async (selector) => {
+                  try {
+                    return await runner.page.locator(selector).inputValue({ timeout: 1_000 });
+                  } catch {
+                    return null;
+                  }
+                },
+                recentFills,
+                runner.callsSince(clickMark),
+              );
+        const lostField = evidence.lostField;
         if (param !== null || lostField !== null) {
-          hydrationReplayed = true;
-          const reason =
-            param !== null
-              ? 'the form submitted natively before hydration'
-              : 'hydration reset the filled fields';
-          if (param !== null) runner.recordNativeResubmitFinding(original, param);
-          else runner.recordLostFillFinding(original, lostField as string);
           await runner.page
             .waitForLoadState('networkidle', { timeout: 10_000 })
             .catch(() => undefined);
-          await runner.page.waitForTimeout(300).catch(() => undefined);
-          try {
-            for (const fill of recentFills) {
-              await executeStep(runner, markReplayed(fill, reason), baseUrl, issues);
+          // The lost-fill read may have run while the submit's POST was still
+          // in flight; now that the network is quiet, the same question once
+          // more before a working sign-in is replayed. A native GET (`param`)
+          // is never an accepted POST, so that signature is not re-asked.
+          const settled = param === null ? acceptedCredentialSubmit(runner.callsSince(clickMark)) : null;
+          if (settled !== null) {
+            runner.noteAcceptedSubmitLanding(original, settled);
+            runner.noteSignInOutcome(false);
+          } else {
+            hydrationReplayed = true;
+            const reason =
+              param !== null
+                ? 'the form submitted natively before hydration'
+                : 'hydration reset the filled fields';
+            if (param !== null) runner.recordNativeResubmitFinding(original, param);
+            else runner.recordLostFillFinding(original, lostField as string);
+            await runner.page.waitForTimeout(300).catch(() => undefined);
+            // The replay's own POST is what judges the replay.
+            let replayMark: number | undefined;
+            try {
+              for (const fill of recentFills) {
+                await executeStep(runner, markReplayed(fill, reason), baseUrl, issues);
+              }
+              replayMark = runner.netMark();
+              await executeStep(runner, markReplayed(original, reason), baseUrl, issues);
+              // The replay's POST may still be in flight when the click returns.
+              await runner.settleCredentialSubmit(replayMark);
+            } catch (error) {
+              if (error instanceof SessionLostError) throw error;
+              // A failed replay classifies like any failed step; the original
+              // finding already says what went wrong the first time.
+              const kind = classifyStepFailure(original.action, error);
+              runner.bundle.reclassifyLastStep(kind, original.action);
+              issues.push({
+                action: original.action,
+                selector: (original as { selector?: string }).selector ?? null,
+                kind,
+                message: error instanceof Error ? error.message : String(error),
+              });
             }
-            await executeStep(runner, markReplayed(original, reason), baseUrl, issues);
-          } catch (error) {
-            if (error instanceof SessionLostError) throw error;
-            // A failed replay classifies like any failed step; the original
-            // finding already says what went wrong the first time.
-            const kind = classifyStepFailure(original.action, error);
-            runner.bundle.reclassifyLastStep(kind, original.action);
-            issues.push({
-              action: original.action,
-              selector: (original as { selector?: string }).selector ?? null,
-              kind,
-              message: error instanceof Error ? error.message : String(error),
-            });
+            // Did the recovery work? Only a credential block can answer, and
+            // only after the replay: still on the sign-in page WITHOUT an
+            // accepted POST means this run holds no session, and every later
+            // step is about to be asserted against a page it has no right to
+            // be on. See `#strandedMessage`.
+            let didNotTake = signInDidNotTakeAfter(
+              runner.page.url(),
+              acceptedCredentialSubmit(runner.callsSince(replayMark)),
+            );
+            // The sign-in retry (2026-09-10): before the verdict that would
+            // seal the case, reload the sign-in page, enter the credentials
+            // again and click again, up to `signInAttemptCeiling()`
+            // submissions in total (the original and the hydration replay
+            // are the first two). Only the evidence ends it early — an
+            // accepted POST or the URL leaving the sign-in page — so a
+            // retry can produce a session only by signing in. A step of a
+            // retry that itself fails ends the loop: the ceiling is for a
+            // login that did not take, not for a control that no longer
+            // resolves, and each of those would be a whole ladder walk.
+            if (didNotTake) {
+              const ceiling = signInAttemptCeiling();
+              const signInUrl = urlBeforeFills;
+              const retried = await retrySignIn(
+                async (attempt) => {
+                  const retryReason = `sign-in retry ${attempt} of ${ceiling}`;
+                  const reloaded =
+                    signInUrl === null
+                      ? runner.page.reload({ waitUntil: 'domcontentloaded', timeout: SIGN_IN_RELOAD_TIMEOUT_MS })
+                      : runner.page.goto(signInUrl, { waitUntil: 'domcontentloaded', timeout: SIGN_IN_RELOAD_TIMEOUT_MS });
+                  await reloaded.catch(() => undefined);
+                  await runner.page
+                    .waitForLoadState('networkidle', { timeout: 10_000 })
+                    .catch(() => undefined);
+                  try {
+                    for (const fill of recentFills) {
+                      await executeStep(runner, markReplayed(fill, retryReason), baseUrl, issues);
+                    }
+                    const retryMark = runner.netMark();
+                    await executeStep(runner, markReplayed(original, retryReason), baseUrl, issues);
+                    await runner.settleCredentialSubmit(retryMark);
+                    return signInDidNotTakeAfter(
+                      runner.page.url(),
+                      acceptedCredentialSubmit(runner.callsSince(retryMark)),
+                    )
+                      ? 'not-yet'
+                      : 'signed-in';
+                  } catch (error) {
+                    if (error instanceof SessionLostError || error instanceof BrowserGoneError) throw error;
+                    if (error instanceof Error && isBrowserGone(error.message)) {
+                      throw new BrowserGoneError(
+                        `the browser went away during a sign-in retry (${error.message.split('\n')[0]}) — ` +
+                          'this is an environment failure, not an application result',
+                      );
+                    }
+                    const kind = classifyStepFailure(original.action, error);
+                    runner.bundle.reclassifyLastStep(kind);
+                    issues.push({
+                      action: original.action,
+                      selector: (original as { selector?: string }).selector ?? null,
+                      kind,
+                      message: error instanceof Error ? error.message : String(error),
+                    });
+                    return 'failed';
+                  }
+                },
+                2,
+                ceiling,
+              );
+              didNotTake = retried.didNotTake;
+              if (retried.attempts > 2) {
+                runner.recordSignInRetryFinding(original, retried.attempts, ceiling, didNotTake);
+              }
+            }
+            runner.noteSignInOutcome(didNotTake);
           }
-          // Did the recovery work? Only a credential block can answer, and
-          // only after the replay: still on the sign-in page means this run
-          // holds no session, and every later step is about to be asserted
-          // against a page it has no right to be on. See `#strandedMessage`.
-          runner.noteSignInOutcome(looksLikeSignIn(runner.page.url()));
         } else if (credentialShapedBlock(recentFills)) {
           // A credential submit with no hydration evidence and no sign-in URL
           // left behind is a submit that worked — clear any earlier verdict,
           // so a flow that retries its login is judged on the retry.
+          if (evidence.accepted !== null && looksLikeSignIn(runner.page.url())) {
+            runner.noteAcceptedSubmitLanding(original, evidence.accepted);
+          }
           runner.noteSignInOutcome(false);
         }
         recentFills.length = 0;
@@ -9252,13 +9793,15 @@ async function executeSteps(
     }
     runner.dataGate?.after(raw);
     if (
-      raw.action === 'workflow' &&
       issues.length > issuesBefore &&
+      closesDependentTail(raw.action, issues[issues.length - 1]?.kind) &&
       skipAfterFailedLeg()
     ) {
-      const goal = raw.goal.slice(0, 80);
+      const reason = raw.action === 'workflow' ? ` (${raw.goal.slice(0, 80)})` : '';
+      const outcome =
+        raw.action === 'workflow' ? 'did not reach its goal' : raw.action === 'goto' ? 'did not land' : 'never resolved';
       const failedStep = runner.bundle.steps[runner.bundle.steps.length - 1];
-      const message = `not run: depends on step ${failedStep?.index ?? rawIndex} (${goal}), which did not reach its goal`;
+      const message = `not run: depends on step ${failedStep?.index ?? rawIndex}${reason}, which ${outcome}`;
       const tail = dependentTail(steps, rawIndex);
       for (const skippedIndex of tail) {
         const skipped = steps[skippedIndex];
@@ -9284,12 +9827,12 @@ const PLACE_REESTABLISHING_ACTIONS: ReadonlySet<FlowStep['action']> = new Set([
 ]);
 
 /**
- * The steps after a failed `workflow` leg that only made sense on the page the
- * leg was meant to reach: everything up to the next action that re-establishes
- * where the run is, OR the next browser-free step — a `request`/DB step reads
- * nothing off the page, and the assertions after it belong to it, not to the
- * leg (a consent case whose leg dead-ends still proves its claim through the
- * API it calls next).
+ * The steps after a failed place-establishing step (see `closesDependentTail`)
+ * that only made sense on the page it was meant to reach: everything up to
+ * the next action that re-establishes where the run is, OR the next
+ * browser-free step — a `request`/DB step reads nothing off the page, and the
+ * assertions after it belong to it, not to the failed step (a consent case
+ * whose leg dead-ends still proves its claim through the API it calls next).
  */
 export function dependentTail(steps: readonly FlowStep[], failedIndex: number): number[] {
   const tail: number[] = [];
@@ -9299,6 +9842,43 @@ export function dependentTail(steps: readonly FlowStep[], failedIndex: number): 
     tail.push(index);
   }
   return tail;
+}
+
+/**
+ * Whether a step's own failure means nothing after it, until the flow
+ * explicitly re-establishes where it is, can be trusted as its own finding —
+ * the trigger half of `dependentTail`, which already scopes WHERE that tail
+ * ends.
+ *
+ * `workflow` and `goto` are unconditional: a leg either reaches its goal or
+ * it does not, and a navigation either lands on the intended page or it does
+ * not — there is no state in between where "resolved, but something else was
+ * true" could mean the run is nonetheless somewhere useful. Live
+ * (be-sit-high-20260909-170213, RU_06_12, PL_07_02): a plain failed `click`
+ * left three, then fourteen, assertions to dead-end on their own against a
+ * record the flow never opened, each filed as its own high-severity defect —
+ * the same shape a failed `workflow` leg was already protected against.
+ *
+ * `click` is narrower than `workflow`/`goto` on purpose: most flows are one
+ * page of independent checks with the occasional click, and a click that
+ * resolved an element and genuinely acted on it — its content or state
+ * disagreeing only afterwards — changed something real, so the steps after
+ * it still deserve their own verdict rather than being swept into this one's
+ * tail. Only a `dead-end` click gives the same certainty `workflow`/`goto`
+ * already have: the ladder never actually touched anything — the selector
+ * never resolved to one element, or something blocked the pointer before it
+ * could land (`classifyStepFailure`'s `dead-end`, as opposed to `failed` for
+ * a resolved element whose content or state disagreed) — so nothing changed,
+ * and nothing after it can be about anything but the page this step already
+ * stood on.
+ */
+export function closesDependentTail(
+  action: FlowStep['action'],
+  lastIssueKind: StepIssue['kind'] | undefined,
+): boolean {
+  if (action === 'workflow' || action === 'goto') return true;
+  if (action === 'click') return lastIssueKind === 'dead-end';
+  return false;
 }
 
 export function skipAfterFailedLeg(env: NodeJS.ProcessEnv = process.env): boolean {

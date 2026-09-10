@@ -24,12 +24,13 @@
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, relative } from 'node:path';
 
-import type { ProofBundle } from '../engine/proof-bundle.js';
+import type { ProofBundle, ReportLang } from '../engine/proof-bundle.js';
 import { RunHistory, analyseTrend, formatTrend } from '../history/run-history.js';
 import {
+  casePageName,
   catalogReportPath,
   catalogCaseExportName,
   catalogMediaDirName,
@@ -38,6 +39,7 @@ import {
   type CatalogReportCase,
   type CatalogReportInput,
 } from '../reporter/catalog-report.js';
+import { caseSidecarName, caseSidecars, renderCasePage } from '../reporter/case-page.js';
 import { caseVideoFile, writePassedCasesExcel, type ExcelExportResult } from '../reporter/excel-export.js';
 import { writeFindingsExports, type FindingsExportResult } from '../reporter/findings-export.js';
 import { caseIdOf, type SuiteLedger } from './suite-progress.js';
@@ -82,6 +84,7 @@ export async function buildCatalogReportCases(
       reason: outcome?.reason ?? null,
       bundle,
       history: bundle === null ? [] : await historyOf(bundle),
+      reportPath: outcome?.reportPath ?? null,
     });
   }
   return cases;
@@ -90,6 +93,8 @@ export async function buildCatalogReportCases(
 export interface CatalogArtifacts {
   htmlPath: string;
   excel: ExcelExportResult;
+  /** The per-case pages written this pass (`case-page.ts`), absolute. */
+  casePages: string[];
   /** `<base>-findings.md` and `<base>-findings.xlsx` — the root causes, model-free (`reporter/findings-export.ts`). */
   findings: FindingsExportResult;
 }
@@ -138,10 +143,103 @@ export async function writeCatalogArtifacts(input: CatalogReportInput, cwd?: str
       return null;
     }
   };
-  await writeCatalogReport(htmlPath, renderCatalogReport({ ...input, spillScreenshot, spillRecording }));
+  const casePageHref = (c: CatalogReportCase): string | null =>
+    c.bundle === null ? null : relative(dirname(htmlPath), casePageTarget(htmlPath, input, c));
+  await writeCatalogReport(htmlPath, renderCatalogReport({ ...input, spillScreenshot, spillRecording, casePageHref }));
   const excel = await writePassedCasesExcel(htmlPath, input, spilledRecordingCases);
   const findings = await writeFindingsExports(htmlPath, input);
-  return { htmlPath, excel, findings };
+  const casePages = await writeCasePages(htmlPath, input, (id) => excelVideoCases.has(id) || spilledRecordingCases.has(id));
+  return { htmlPath, excel, findings, casePages };
+}
+
+/** Where a case's page goes: the ledger's own `reportPath` when it has one, else the media folder beside its workbook. */
+function casePageTarget(htmlPath: string, input: CatalogReportInput, c: CatalogReportCase): string {
+  if (typeof c.reportPath === 'string' && c.reportPath !== '') return c.reportPath;
+  return join(dirname(htmlPath), catalogMediaDirName(input.runKey, input.title), casePageName(c.id));
+}
+
+export interface CasePageContext {
+  title: string;
+  runKey: string | null;
+  lang: ReportLang;
+  /** The catalog report's absolute path — the page links back to it relatively. */
+  indexPath: string;
+  /** A recording file beside the page, when one exists there; the bundle's own data otherwise. */
+  videoHref?: string | null | undefined;
+}
+
+/**
+ * One case's page and its DB sidecars, at `target`. The one writer both the
+ * run loop (right after the case seals, so the file the ledger names exists
+ * the moment it is named) and the catalog roll-up (every live rewrite and
+ * every `wowlidator report` rebuild) go through, so the two cannot differ.
+ * An older file at `target` is removed first: absent is honest, stale is
+ * wrong.
+ */
+export async function writeCasePageAt(target: string, c: CatalogReportCase, ctx: CasePageContext): Promise<string> {
+  const dir = dirname(target);
+  await mkdir(dir, { recursive: true });
+  await rm(target, { force: true }).catch(() => undefined);
+  const sidecars = caseSidecars(c, ctx.lang);
+  for (const kind of ['query', 'before', 'after', 'evidence'] as const) {
+    const path = join(dir, caseSidecarName(c.id, kind));
+    const content = sidecars[kind];
+    if (content === null) await rm(path, { force: true }).catch(() => undefined);
+    else await writeFile(path, content, 'utf8');
+  }
+  const html = renderCasePage({
+    case: c,
+    title: ctx.title,
+    runKey: ctx.runKey,
+    lang: ctx.lang,
+    indexHref: relative(dir, ctx.indexPath),
+    sidecars,
+    videoHref: ctx.videoHref ?? null,
+  });
+  await writeFile(target, html, 'utf8');
+  return target;
+}
+
+/**
+ * One page per case that has a bundle, beside its workbook in the media
+ * folder, with its four DB sidecars — and no page for a case that has none
+ * (a never-ran row, a blocked one without a bundle): a stale page from an
+ * earlier pass is removed so the folder never holds a report the index does
+ * not link. Never fatal: a page that cannot be written is reported by its
+ * absence from the returned list, and the catalog report already stands.
+ */
+export async function writeCasePages(
+  htmlPath: string,
+  input: CatalogReportInput,
+  hasVideoFile: (caseId: string) => boolean,
+): Promise<string[]> {
+  const mediaDir = join(dirname(htmlPath), catalogMediaDirName(input.runKey, input.title));
+  const lang = input.lang ?? 'en';
+  const written: string[] = [];
+  for (const c of input.cases) {
+    const mediaPage = join(mediaDir, casePageName(c.id));
+    const mediaSidecars = (['query', 'before', 'after', 'evidence'] as const).map((kind) => join(mediaDir, caseSidecarName(c.id, kind)));
+    if (c.bundle === null) {
+      for (const stale of [mediaPage, ...mediaSidecars]) await rm(stale, { force: true }).catch(() => undefined);
+      continue;
+    }
+    const target = casePageTarget(htmlPath, input, c);
+    try {
+      written.push(
+        await writeCasePageAt(target, c, {
+          title: input.title,
+          runKey: input.runKey,
+          lang,
+          indexPath: htmlPath,
+          // The recording is a file only in the media folder; a page elsewhere embeds its own.
+          videoHref: target === mediaPage && hasVideoFile(c.id) ? caseVideoFile(c.id) : null,
+        }),
+      );
+    } catch {
+      // The index stands without this page; the row's link 404s rather than the run failing.
+    }
+  }
+  return written;
 }
 
 /** The history lines the report explains a case with, from the run log. */
@@ -275,6 +373,13 @@ export class CatalogLiveReport {
         generatedAt: ledger.generatedAt,
         cases,
         live: !this.#final,
+        // Straight off the ledger, which is where the runner recorded it — so
+        // a rebuilt report says the same thing as the live one, and a `report`
+        // run months later still names the way back.
+        ...(ledger.dbBaseline === undefined ? {} : { dbBaseline: ledger.dbBaseline }),
+        // The run's own choice, off the ledger — so the live pages and a
+        // rebuild months later are in the same language.
+        ...(ledger.launch?.reportLang === undefined ? {} : { lang: ledger.launch.reportLang }),
       };
       this.#last = await writeCatalogArtifacts(input, this.#options.cwd);
       return this.#last;

@@ -32,7 +32,7 @@
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, readdir, rename as renameFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { dirname, extname, join, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -84,6 +84,7 @@ import { ARCHIVED_DIR, readProof, readProofIndex, readProofWithPath, groupRuns }
 import { listCatalogRuns, missingPersonaPasswords } from './catalog-runs.js';
 import { ledgerPathFor } from '../cli/suite-progress.js';
 import { CATALOG_REPORT_DIR } from '../reporter/catalog-report.js';
+import { publishArtifact } from '../reporter/publish-artifact.js';
 import { buildVerdict } from '../reporter/verdict.js';
 import { renderLedger } from './ledger-html.js';
 import { renderWowUi } from './wow-ui-html.js';
@@ -417,6 +418,49 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
     (path === '/api/jobs' || path === '/api/catalog-runs/resume' || /^\/api\/jobs\/[^/]+\/resume$/.test(path))
   ) {
     json(res, { error: ctx.usageCap.holdMessage(), usageCap: ctx.usageCap.describe() }, 409);
+    return;
+  }
+
+  // ---- publishing a report as an artifact ---------------------------------
+  // The report's own button asks for this. The page cannot start a Claude
+  // session, so the panel does — and the panel is also the only place that can
+  // decide whether the path it was handed is one this UI may read at all. The
+  // publish ITSELF still raises Claude Code's permission prompt in that
+  // session: nothing here approves an upload on a person's behalf.
+  if (path === '/api/publish-artifact' && req.method === 'POST') {
+    let body: { reportPath?: unknown };
+    try {
+      body = ((await readBody(req)) as typeof body) ?? {};
+    } catch (error) {
+      json(res, { error: error instanceof Error ? error.message : String(error) }, 400);
+      return;
+    }
+    const given = typeof body.reportPath === 'string' ? body.reportPath : '';
+    // A path arrives from a page, so it is a request, never a permission. It is
+    // resolved against the reports folder when relative (that is the shape
+    // /reports/<name> sends) and then checked against the same roots every
+    // other read here is checked against.
+    const target = isAbsolute(given) ? resolve(given) : resolve(CATALOG_REPORT_DIR, given);
+    if (given === '' || given.includes('\0') || !isAllowed(target, [...ctx.roots, resolve(CATALOG_REPORT_DIR)])) {
+      json(res, { error: 'that path is outside the directories this UI may read' }, 403);
+      return;
+    }
+    const info = await stat(target).catch(() => null);
+    if (!info?.isFile()) {
+      json(res, { error: 'no such report file' }, 404);
+      return;
+    }
+    try {
+      const outcome = await publishArtifact({ reportPath: target });
+      json(res, {
+        title: outcome.title,
+        strippedFilm: outcome.strippedFilm,
+        bytes: outcome.bytes,
+        sessionId: outcome.sessionId,
+      });
+    } catch (error) {
+      json(res, { error: error instanceof Error ? error.message : String(error) }, 500);
+    }
     return;
   }
 

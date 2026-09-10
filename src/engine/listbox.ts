@@ -343,10 +343,44 @@ export async function selectFromListbox(
   const settleMs = options.settleMs ?? 250;
   const triggerName = (await readTrigger(trigger, 250)) ?? 'the trigger';
 
+  // A search box on the page before the trigger was even touched is not
+  // evidence of anything the click did; counted here so the fallback below
+  // can tell "the click revealed one" from "one was already sitting there".
+  const searchBoxesBefore = await page.locator(SEARCH_INPUT).filter({ visible: true }).count().catch(() => 0);
+
   const expanded = await attr(trigger, 'aria-expanded', 250);
   if (expanded !== 'true') await trigger.first().click({ timeout });
 
-  const opened = await openList(page, trigger, timeout);
+  let opened = await openList(page, trigger, timeout);
+  if (opened === null && options.typeToFilter !== false) {
+    // Some triggers (`aria-haspopup="listbox"` and nothing else — the
+    // `HumiSearchableSelect` shape this module's header already names) open
+    // onto a bare search box with no role=listbox/option anywhere yet: the
+    // list is created only once the search is narrowed, so `openList` above
+    // had nothing to find and timed out looking for it. A search-shaped
+    // input that appeared as a RESULT of the click — never one already on
+    // the page, which searching page-wide could grab by coincidence — is
+    // worth one probe keystroke before giving up, the way a person facing an
+    // apparently-empty dropdown starts typing rather than assuming it is
+    // broken. The probe need not be the exact match: it only has to cause
+    // the real list to render; the per-part loop below re-types the correct
+    // head into it regardless, once a container exists to scope that search
+    // to. A short retry budget — the list rendering in response to a
+    // keystroke is a re-render, not the network fetch `waitForListToFill`
+    // is patient for.
+    const revealed = page.locator(SEARCH_INPUT).filter({ visible: true });
+    const revealedCount = await revealed.count().catch(() => 0);
+    if (revealedCount > searchBoxesBefore) {
+      const firstPart = splitMultiValue(value)[0] ?? value;
+      const probe = codeAndLabelOf(firstPart)?.code ?? firstPart;
+      await revealed
+        .nth(revealedCount - 1)
+        .fill(probe, { timeout })
+        .catch(() => undefined);
+      await page.waitForTimeout(settleMs);
+      opened = await openList(page, trigger, Math.min(timeout, 1_500));
+    }
+  }
   if (opened === null) {
     await page.keyboard.press('Escape').catch(() => undefined);
     throw new ListboxOptionMissingError(triggerName, value, [], `no listbox or menu became visible within ${timeout} ms of opening`);

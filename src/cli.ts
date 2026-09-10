@@ -23,6 +23,9 @@ import { DEFAULT_MAX_DRAFT_CASES } from './catalog/draft.js';
 import { loadConfig, loadDotEnv, type WowlidatorConfig } from './config.js';
 import { VIDEO_MODES, parseVideoMode } from './engine/video.js';
 import { DEFAULT_MUTATION_POLICY, MUTATION_POLICIES, type MutationPolicy } from './generator/test-generator.js';
+import { narrationEnabled } from './generator/step-narration.js';
+import { caseNarrativeEnabled } from './generator/case-narrative.js';
+import { REPORT_LANGS } from './engine/proof-bundle.js';
 import { LaunchPresets, formatPresetLine } from './history/launch-presets.js';
 import { main as mcpMain } from './mcp/server.js';
 import { closeClaudeSessions } from './providers/claude-cli-session.js';
@@ -35,6 +38,7 @@ import {
   SCREENSHOT_MODES,
   parseCaptureDelay,
   parseCaseTimeout,
+  parseReportLang,
   parseContextBudget,
   parseScope,
   parseCredentials,
@@ -158,6 +162,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       // than relying on a default the two surfaces disagree about.
       backend: { type: 'boolean', default: false },
       'no-agent-capture': { type: 'boolean', default: false },
+      narrate: { type: 'boolean', default: false },
+      'report-lang': { type: 'string' },
+      'no-case-narrative': { type: 'boolean', default: false },
+      'case-narrative': { type: 'boolean', default: false },
       'no-target-highlight': { type: 'boolean', default: false },
       'db-baseline': { type: 'string' },
       'db-baseline-tables': { type: 'string' },
@@ -362,6 +370,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   // typo'd delay would otherwise be discovered as a filmstrip of blank frames.
   const captureDelayMs = parseCaptureDelay(values['capture-delay'], config.captureDelayMs);
   const caseTimeoutMs = parseCaseTimeout(values['case-timeout']);
+  const reportLang = parseReportLang(values['report-lang']);
   const stepDelayRaw = values['step-delay'] ?? process.env['WOWLIDATOR_STEP_DELAY'];
   const stepDelayMs =
     stepDelayRaw === undefined || stepDelayRaw === ''
@@ -375,6 +384,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
   if (caseTimeoutMs === null) {
     process.stderr.write('wowlidator: --case-timeout must be a non-negative integer number of seconds, or off\n');
+    return 2;
+  }
+  if (reportLang === null) {
+    process.stderr.write(`wowlidator: --report-lang must be one of ${REPORT_LANGS.join(', ')}\n`);
     return 2;
   }
 
@@ -392,6 +405,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     humanize,
     agentAssist: values['agent-assist'] === true || config.agentAssist,
     agentCapture: values['no-agent-capture'] !== true,
+    narrate: values['narrate'] === true || narrationEnabled(),
+    reportLang,
+    caseNarrative: values['no-case-narrative'] !== true && caseNarrativeEnabled(),
+    caseNarrativeBackfill: values['case-narrative'] === true,
     highlightTarget: values['no-target-highlight'] !== true,
     dbBaseline: values['db-baseline'],
     dbBaselineTables: (values['db-baseline-tables'] ?? process.env['WOWLIDATOR_DB_BASELINE_TABLES'] ?? '')
