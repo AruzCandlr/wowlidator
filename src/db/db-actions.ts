@@ -453,6 +453,46 @@ export class DbActions {
     return this.#countRows(client, declared.name, this.#variables.interpolateDeep({ ...where }));
   }
 
+  /**
+   * Count rows for a CORROBORATION, and hand back the statement that did it.
+   *
+   * `probeCount` answers the number; a proof page has to be able to show the
+   * QUERY as well (2026-09-11, asked for after HIR-EC-029: the page counted
+   * four options where the sheet claimed three, and no surface could say what
+   * had been counted or what the data actually held). Same gate as every other
+   * read here — the table and every filter column must be in the introspected
+   * schema before anything reaches the database, and the values travel as
+   * parameters — so this adds a reader, never a new way in.
+   */
+  async corroborateCount(
+    table: string,
+    where: Record<string, string>,
+  ): Promise<{ count: number; record: DbCheckRecord }> {
+    const client = await this.#ensureClient();
+    const declared = await this.#requireTable(table);
+    this.#requireColumns(declared, Object.keys(where));
+    const log = new StatementLog();
+    const started = Date.now();
+    const count = await this.#countRows(client, declared.name, this.#variables.interpolateDeep({ ...where }), log);
+    return {
+      count,
+      record: {
+        kind: 'row',
+        table: declared.name,
+        observed: String(count),
+        durationMs: Date.now() - started,
+        ...(log.records === undefined ? {} : { statements: log.records }),
+      },
+    };
+  }
+
+  /** The introspected schema as names only — what a corroboration model may be shown. */
+  async schemaView(): Promise<{ tables: { name: string; columns: string[] }[] }> {
+    const client = await this.#ensureClient();
+    const schema = await this.#ensureSchema(client);
+    return { tables: schema.tables.map((t) => ({ name: t.name, columns: t.columns.map((c) => c.name) })) };
+  }
+
   /** Assert row(s) matching `where` (and `values`) exist — polling through the budget. */
   async expectDbRow(spec: FlowDbRowSpec): Promise<void> {
     await this.#check('expectDbRow', spec.intent, async () => {

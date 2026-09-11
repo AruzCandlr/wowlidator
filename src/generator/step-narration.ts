@@ -39,12 +39,24 @@ import { z } from 'zod';
 import { formatStepLine, type ProofBundle, type ProofStep, type StepNarration } from '../engine/proof-bundle.js';
 import { LlmFactory, generateStructuredForModel, type ModelSource } from '../providers/llm-factory.js';
 import { DETERMINISM_RULES, procedure } from '../providers/prompt-discipline.js';
+import { clipCell } from './case-narrative.js';
 
 export const NARRATION_ENV = 'WOWLIDATOR_NARRATE';
 /** Steps per model call. A case longer than this is narrated in several calls. */
 export const NARRATION_BATCH = 40;
-/** A narration longer than this is not a summary. Clipped, never dropped. */
-export const NARRATION_MAX_CHARS = 320;
+/**
+ * A step's own verdict, in the same budget the case page's other written
+ * surfaces keep: 200 characters, 50 more when the step needs them.
+ *
+ * A step over the soft cap is sent back ONCE — only the over-long ones, by
+ * index, never the whole batch — and what comes back is kept only where it is
+ * actually shorter. What survives that is cut at the hard cap on a sentence
+ * boundary. Clipped, never dropped: a long narration is still a reading of
+ * the step, and losing it leaves the row with no plain-language line at all.
+ */
+export const NARRATION_SOFT_CHARS = 200;
+export const NARRATION_OVER_ALLOWANCE = 50;
+export const NARRATION_MAX_CHARS = NARRATION_SOFT_CHARS + NARRATION_OVER_ALLOWANCE;
 
 /**
  * Off unless asked for. The inverse of `WOWLIDATOR_DIAGNOSE`, and deliberately
@@ -68,6 +80,8 @@ export interface NarrationRequest {
   /** The sheet's own claim, so a narration can say what the step was for. */
   caseText: string;
   steps: readonly NarratableStep[];
+  /** Set only on the ONE re-ask an over-long batch earns — see `shortenStepAsk`. */
+  shorten?: string | undefined;
 }
 
 export interface NarratedStep {
@@ -124,7 +138,7 @@ export function applyNarration(
   for (const item of narrated) {
     const step = byIndex.get(item.index);
     if (step === undefined || step.narration !== undefined) continue;
-    const text = clip(item.text, NARRATION_MAX_CHARS);
+    const text = clipCell(item.text, NARRATION_MAX_CHARS);
     if (text === '') continue;
     const narration: StepNarration = { text, by, at };
     step.narration = narration;
@@ -170,7 +184,8 @@ HARD RULES:
   — a translation is a claim about evidence. Write your own sentences in English around it.
 - Never contradict the line. If the line says DEAD END, the step did not succeed.
 - Never write a credential, a password, or an email address, even if one somehow appears.
-- One or two sentences. Under 300 characters.
+- One or two sentences. ${NARRATION_SOFT_CHARS} characters; ${NARRATION_MAX_CHARS} is the most that will ever be kept. A step over
+  that is sent back to you once to be written shorter, then cut — writing it short the first time is how it stays accurate.
 
 ${DETERMINISM_RULES}
 
@@ -188,6 +203,12 @@ function clip(text: string, max: number): string {
 
 export function buildNarrationPrompt(request: NarrationRequest): string {
   const lines: string[] = [];
+  // At the top: a long step list between the ask and the answer is where it
+  // gets lost.
+  if (typeof request.shorten === 'string' && request.shorten !== '') {
+    lines.push(`REWRITE — SHORTER: ${request.shorten}`);
+    lines.push('');
+  }
   lines.push(`CASE: ${request.caseName}`);
   lines.push(clip(request.caseText, 1_200));
   lines.push('');
@@ -266,6 +287,44 @@ export interface NarrateOptions {
  * and the report renders them exactly as it did before this existed. Returns
  * the number of steps narrated.
  */
+/** The indexes whose verdict came back over the soft cap. Empty is the common case and must cost nothing. */
+export function narrationsOverSoftCap(
+  narrated: readonly { index: number; text: string }[],
+  soft: number = NARRATION_SOFT_CHARS,
+): number[] {
+  return narrated.filter((one) => clip(one.text, Number.MAX_SAFE_INTEGER).length > soft).map((one) => one.index);
+}
+
+/** The instruction the over-long step verdicts go back with. */
+export function shortenStepAsk(
+  over: readonly number[],
+  soft: number = NARRATION_SOFT_CHARS,
+  hard: number = NARRATION_MAX_CHARS,
+): string {
+  return (
+    `Steps ${over.join(', ')} were longer than the ${soft}-character budget a step's line gives them. ` +
+    `Narrate ONLY those steps again, shorter — ${soft} characters, never more than ${hard}. ` +
+    'Drop the least load-bearing clause; keep every value, status and control name exactly as you had it.'
+  );
+}
+
+/**
+ * The shorter of the two readings, per step. A step the re-ask did not answer,
+ * or answered at greater length, keeps the first — so asking again can never
+ * leave the page worse than not asking.
+ */
+export function keepShorterNarrations<T extends { index: number; text: string }>(
+  first: readonly T[],
+  second: readonly T[],
+): T[] {
+  const shorter = new Map(second.map((one) => [one.index, one.text]));
+  return first.map((one) => {
+    const other = shorter.get(one.index);
+    if (other === undefined || other.trim() === '' || other.length >= one.text.length) return one;
+    return { ...one, text: other };
+  });
+}
+
 export async function narrateBundle(
   bundle: Pick<ProofBundle, 'steps' | 'name'>,
   caseText: string,
@@ -277,7 +336,23 @@ export async function narrateBundle(
   let landed = 0;
   for (const batch of chunk(pending, options.batch ?? NARRATION_BATCH)) {
     try {
-      const narrated = await options.model.narrate({ caseName: bundle.name, caseText, steps: batch });
+      let narrated = await options.model.narrate({ caseName: bundle.name, caseText, steps: batch });
+      const over = narrationsOverSoftCap(narrated);
+      if (over.length > 0) {
+        options.log?.(`  ${over.length} step verdict(s) over the ${NARRATION_SOFT_CHARS}-character budget — asking once for shorter`);
+        try {
+          const shorter = await options.model.narrate({
+            caseName: bundle.name,
+            caseText,
+            steps: batch.filter((one) => over.includes(one.index)),
+            shorten: shortenStepAsk(over),
+          });
+          narrated = keepShorterNarrations(narrated, shorter);
+        } catch (error) {
+          const why = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);
+          options.log?.(`  ! shorter step verdicts not written for ${bundle.name}: ${why} — the first ones stand, cut at ${NARRATION_MAX_CHARS}`);
+        }
+      }
       landed += applyNarration(bundle, narrated, options.model.id, at);
     } catch (error) {
       const message = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);

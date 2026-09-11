@@ -447,7 +447,7 @@ describe('heal prompt with hints', () => {
     });
     const repoAt = prompt.indexOf('What the repository declares');
     const backgroundAt = prompt.indexOf('Background documents');
-    const treeAt = prompt.indexOf('Accessibility tree:');
+    const treeAt = prompt.indexOf('Accessibility tree');
     const rejectedAt = prompt.indexOf('Already tried and rejected');
     assert.ok(repoAt > -1 && backgroundAt > repoAt && treeAt > backgroundAt && rejectedAt > treeAt);
   });

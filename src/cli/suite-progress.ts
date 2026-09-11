@@ -76,6 +76,19 @@ export interface LedgerOutcome {
    */
   authoringRefused?: number | undefined;
   /**
+   * The MODEL LAYER turned the authoring call away — rate limit, quota,
+   * concurrency, a credential — so this case was never attempted.
+   *
+   * Kept apart from `authoringRefused` on purpose (2026-09-10). That count is
+   * a judgement about the ROW ("this row cannot be written"), and reaching
+   * `AUTHORING_REFUSAL_CAP` retires it from every later resume. A provider's
+   * busy minute is a judgement about nothing: the row is blocked for this
+   * pass and picked up again, untouched, by the next `--resume`. A BE catalog
+   * on `emmiedev:default` sealed its first row this way while three lanes
+   * were mid-call.
+   */
+  providerRefused?: boolean | undefined;
+  /**
    * The cases this one needed finished first (CG-12), as their qualified
    * ids — recorded so a resume honours the edge: a dependent whose source
    * failed or never ran in the earlier pass is blocked again with the reason,
@@ -288,6 +301,7 @@ export function recordOutcome(
     vacuous?: boolean | undefined;
     proofPath?: string | undefined;
     authoringRefused?: number | undefined;
+    providerRefused?: boolean | undefined;
     dependsOn?: readonly string[] | undefined;
     knownResult?: 'passed' | 'failed' | 'blocked' | undefined;
   } = {},
@@ -300,6 +314,7 @@ export function recordOutcome(
   }
   ledger.outcomes[caseIdOf(outcome.name)] = {
     ...(extra.authoringRefused === undefined ? {} : { authoringRefused: extra.authoringRefused }),
+    ...(extra.providerRefused === true ? { providerRefused: true } : {}),
     ...(browsers.length === 0 ? {} : { browsers }),
     ...(extra.dependsOn === undefined || extra.dependsOn.length === 0 ? {} : { dependsOn: [...extra.dependsOn] }),
     ...(extra.knownResult === undefined ? {} : { knownResult: extra.knownResult }),
@@ -483,6 +498,7 @@ export function markForRerun(
     outcome.verdict = 'blocked';
     outcome.reason = `${label}: ${outcome.reason ?? outcome.status ?? 'no reason recorded'}`;
     delete outcome.authoringRefused;
+    delete outcome.providerRefused;
     marked.push(id);
   }
   return marked;
@@ -494,7 +510,9 @@ export function isErrorOutcome(outcome: LedgerOutcome): boolean {
     outcome.status === 'error' ||
     (outcome.verdict === 'failed' && outcome.status === null) ||
     // Authoring refused to write it: the harness's gap, never the application's.
-    (outcome.authoringRefused ?? 0) > 0
+    (outcome.authoringRefused ?? 0) > 0 ||
+    // The provider refused the call: the same gap one layer down.
+    outcome.providerRefused === true
   );
 }
 

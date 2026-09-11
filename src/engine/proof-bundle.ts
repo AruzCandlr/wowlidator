@@ -1284,7 +1284,15 @@ export interface CaseNarrative {
   /** What the sheet expected, restated. */
   expected: string;
   tickets: NarrativeTicket[];
-  /** The verifier's note — what a reader should know about how this run went. Empty when there is nothing to say. */
+  /**
+   * The verifier's note — the run's own `notes` summarised for a reader: the
+   * session's origin, a risk judged before the run, cross-case interference, a
+   * diagnosed system error and its suggested fix. At most
+   * `NARRATIVE_NOTE_MAX_WORDS` (70) words, in this narrative's `lang`, and the
+   * page shows it INSTEAD of the notes themselves. Empty when `notes` is empty
+   * and there is genuinely nothing to say. Descriptive only: it sets no status
+   * and no finding reads it.
+   */
   verifierNote: string;
   questions: NarrativeQuestion[];
   /** The model that wrote it, `provider:model` — a narrative is always attributed. */
@@ -1976,6 +1984,23 @@ export class ProofBundleBuilder {
    * ran — the sibling of `reclassifyLastStep`, with the same action guard so
    * a late observation never lands on an earlier step's record.
    */
+  /**
+   * Put a database reading on the step that earned it.
+   *
+   * The Queries section of the case page and its four sidecars render from
+   * `ProofStep.db`, so a corroboration that writes here is shown with no
+   * reporter change at all — the query, the table and what it found, beside
+   * the UI reading that disagreed with it (2026-09-11).
+   */
+  attachDbRecord(record: DbCheckRecord, action?: string): void {
+    const last = this.#steps[this.#steps.length - 1];
+    if (!last) return;
+    if (action !== undefined && last.action !== action) return;
+    // Never overwrite a reading the step took itself: an authored `expectDbRow`
+    // is the claim, and a corroboration is only ever extra evidence.
+    if (last.db === undefined) last.db = record;
+  }
+
   annotateLastStep(detail: Record<string, unknown>, action?: string): void {
     const last = this.#steps[this.#steps.length - 1];
     if (!last) return;

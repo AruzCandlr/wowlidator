@@ -239,6 +239,11 @@ export class ApiActions {
    * cookie jar, and a run that switches persona (one Chrome per person) must
    * send its next `request` as the person now active, not the first one.
    */
+  /** The transport as it stands — re-pointed on a persona switch, so a reader must ask, never cache. */
+  get transport(): ApiTransport {
+    return this.#transport;
+  }
+
   setTransport(transport: ApiTransport): void {
     this.#transport = transport;
   }

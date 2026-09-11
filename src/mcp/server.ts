@@ -21,7 +21,6 @@ import { LlmHealerModel, JitHealer } from '../healer/jit-healer.js';
 import { DEFAULT_MUTATION_POLICY, MUTATION_POLICIES, LlmGeneratorModel, TestGenerator } from '../generator/test-generator.js';
 import { LlmAgentModel, WorkflowAgent } from '../orchestrator/workflow-agent.js';
 import { DATA_KINDS } from '../data/mock-data.js';
-import { LlmDataModel } from '../data/data-model.js';
 import { LlmFlowRepairModel } from '../repair/flow-repair-model.js';
 import { FlowRepairLoop } from '../repair/flow-repair-loop.js';
 import { resolveReportPath, slugify, writeHtmlReport } from '../reporter/html-reporter.js';
@@ -128,6 +127,7 @@ const flowStepSchema = z.discriminatedUnion('action', [
   // losing the state the journey was testing.
   z.object({ action: z.literal('back'), intent }),
   z.object({ action: z.literal('forward'), intent }),
+  z.object({ action: z.literal('hover'), selector: sel, intent }),
   z.object({ action: z.literal('scrollTo'), selector: sel, intent }),
   z.object({
     action: z.literal('expectScrollable'),
@@ -280,13 +280,12 @@ const flowStepSchema = z.discriminatedUnion('action', [
     kind: z
       .enum(DATA_KINDS)
       .describe(
-        "'email' | 'username' | 'name' | 'phone' | 'text' generate deterministically, no model " +
-          "call. 'custom' escalates to the data role — give a 'description' too.",
+        "'email' | 'username' | 'name' | 'phone' | 'text' — every kind generates " +
+          'deterministically, with no model call and no key.',
       ),
     failureSelector: sel.describe('Visible while the current value still conflicts.'),
     submit: sel.optional().describe('Clicked after each fill, before checking failureSelector.'),
     maxAttempts: z.number().int().min(1).max(10).optional(),
-    description: z.string().optional().describe('Field description, for the custom kind.'),
     intent,
   }),
   // Modals — dialogs/popups, detected by role="dialog"/"alertdialog" or a native <dialog open>.
@@ -487,9 +486,6 @@ export function createServer(config: ServerConfig = configFromEnv()): McpServer 
         agent: config.agent
           ? new WorkflowAgent({ model: new LlmAgentModel({ factory: config.factory }) })
           : null,
-        // Lazy like every other role: a flow with no `fillRetry(kind: 'custom')` step never
-        // resolves the `data` role or demands its key.
-        dataModel: new LlmDataModel({ factory: config.factory }),
       });
 
       let proofPath: string | null = null;
@@ -605,7 +601,6 @@ export function createServer(config: ServerConfig = configFromEnv()): McpServer 
           agent: config.agent
             ? new WorkflowAgent({ model: new LlmAgentModel({ factory: config.factory }) })
             : null,
-          dataModel: new LlmDataModel({ factory: config.factory }),
         },
       });
 

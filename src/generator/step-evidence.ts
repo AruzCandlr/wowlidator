@@ -59,8 +59,9 @@ import type { FlowStep } from '../engine/runner.js';
 import { selectorGrounded, selectorName } from '../orchestrator/agent-guards.js';
 import {
   qualifiedIdent,
+  resolveTableIn,
   schemaSummary,
-  tableIn,
+  tableLookupFailure,
   type ValueResolverModel,
 } from './value-resolution.js';
 
@@ -135,6 +136,25 @@ export interface StepEvidenceOutcome {
   declaredLines: string[];
   /** Fixtures the database shows the application already holds. */
   existingFixtures: string[];
+  /**
+   * Fixtures whose lookup COULD NOT RUN, with the reason — a connection that
+   * refused, a driver that is not installed, a table the model named that did
+   * not resolve. **Unavailable is not absent** (2026-09-11, run
+   * `be-sit-high-opus-th-20260911-174323`, case PL_09_01): the lookup threw on
+   * a table-name spelling, the fixture stayed out of `existingFixtures`, and
+   * `ungroundedFixtureAssertion` refused as though the database had answered
+   * "no such row" — twice, identically, so the row sealed `blocked` where a
+   * plain `--resume` can never pick it up again. The two facts are recorded
+   * apart so the caller can refuse one and merely note the other; this module
+   * still judges nothing, in keeping with "evidence may excuse a claim, never
+   * accuse one".
+   *
+   * Only a lookup that was ATTEMPTED and failed is listed. A row with no
+   * database configured, or one past `MAX_DB_LOOKUPS`, asks nothing and is
+   * exactly as unproven as it was before this module existed — silence there
+   * is the documented baseline, not a new fault.
+   */
+  unavailableFixtures: { fact: string; reason: string }[];
   /** One line per lookup that answered — for the flow's notes. */
   notes: string[];
   /** The names nothing answered, so the refusal that follows is still the honest one. */
@@ -145,6 +165,7 @@ const EMPTY: StepEvidenceOutcome = {
   groundedControls: [],
   declaredLines: [],
   existingFixtures: [],
+  unavailableFixtures: [],
   notes: [],
   unanswered: [],
 };
@@ -333,8 +354,9 @@ export async function fromDatabase(
     schema: schemaSummary(schema),
   });
   if (choice === null) return null;
-  const table = tableIn(schema, choice.table);
-  if (table === null) throw new Error(`the model named table "${choice.table}", which the schema does not declare`);
+  const resolved = resolveTableIn(schema, choice.table);
+  if (resolved.kind !== 'found') throw new Error(tableLookupFailure(choice.table, resolved));
+  const table = resolved.table;
   const column = table.columns.find((c) => c.name.toLowerCase() === choice.column.trim().toLowerCase());
   if (column === undefined) {
     throw new Error(`the model named column "${choice.column}" on ${table.name}, which the schema does not declare`);
@@ -385,6 +407,7 @@ export async function resolveStepEvidence(
   const groundedControls: string[] = [];
   const declaredLines: string[] = [];
   const existingFixtures: string[] = [];
+  const unavailableFixtures: { fact: string; reason: string }[] = [];
   const notes: string[] = [];
   const unanswered: string[] = [];
   const answered = new Map<string, StepEvidence>();
@@ -422,14 +445,13 @@ export async function resolveStepEvidence(
       notes.push(`${fixture}: ${found.detail}`);
       ctx.onLog?.(`  evidence for ${fixture} — ${found.detail}`);
     } catch (error) {
-      ctx.onLog?.(
-        `  evidence for ${fixture}: the database did not answer — ` +
-          `${error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error)}`,
-      );
+      const reason = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);
+      unavailableFixtures.push({ fact: fixture, reason });
+      ctx.onLog?.(`  evidence for ${fixture}: the database did not answer — ${reason}`);
     }
   }
 
-  return { groundedControls, declaredLines, existingFixtures, notes, unanswered };
+  return { groundedControls, declaredLines, existingFixtures, unavailableFixtures, notes, unanswered };
 }
 
 /** The flow's note for what the lookup found — the reader's one line about evidence that came from outside the trees. */

@@ -2199,7 +2199,7 @@ function taskRow(task) {
       /* Who spent it: authoring vs repair vs the agent, per flow. Only roles
          that actually called appear; bundles from before the split have none. */
       if (latest.session.byRole) {
-        var roleLabels = { generator: 'author', healer: 'heal', agent: 'agent', data: 'data' };
+        var roleLabels = { generator: 'author', healer: 'heal', agent: 'agent', governor: 'governor', data: 'data' };  /* the last two label a bundle recorded before those roles were retired */
         var parts = [];
         for (var roleName in latest.session.byRole) {
           var spend = latest.session.byRole[roleName];
@@ -3044,19 +3044,44 @@ function claimsSummary(bundle) {
    leads with, served alongside the bundle so the two surfaces cannot disagree
    about the same run. Rendered only for failed / error / dead-end: a green
    run's why is the table itself. */
-/* Everything the run wrote onto bundle.notes, verbatim: the pre-run risk
-   line, the system-error diagnosis, an auto-review ruling, the session note,
-   an authoring coverage warning ("Expected line(s) … have no assertion").
-   These were reachable only in the run log before; the card is where a
-   person actually reads a run. */
+/* What a reader should know about how this run went — a summary, not the
+   record. The run writes bundle.notes verbatim (the pre-run risk line, the
+   system-error diagnosis with the agent click trail and its suggested fix,
+   an auto-review ruling, the session note, a cross-case interference stamp,
+   an authoring coverage warning), and together they reached ~300 words for
+   one case and stopped being read. The notes stay in the proof bundle JSON
+   and are no longer DRAWN: what shows is the model-written summary of them,
+   bundle.narrative.verifierNote (at most 70 words, in the run report
+   language), attributed to the model that wrote it the way the review block
+   attributes an automatic ruling.
+
+   THE VERBATIM FALLBACK IS NOT DEAD CODE, do not simplify it away:
+   --no-case-narrative, WOWLIDATOR_CASE_NARRATIVE=off and a role with no key
+   each produce a bundle that has notes and no narrative, and drawing nothing
+   there would delete the only evidence the reader has.
+
+   The reporter surfaces apply the SAME rule from a TypeScript projection.
+   This is client script composed into a string and cannot import it, so the
+   two are kept in agreement by hand — change one, change the other. */
 function notesBlock(bundle) {
+  var narrative = bundle.narrative || null;
+  var note = narrative && typeof narrative.verifierNote === 'string' ? narrative.verifierNote.trim() : '';
   var notes = bundle.notes || [];
-  if (notes.length === 0) return null;
+  if (note === '') {
+    if (notes.length === 0) return null;
+    var raw = el('div', { class: 'why-block notes-block' });
+    raw.appendChild(el('div', { class: 'cap', text: 'Run notes (' + notes.length + ')' }));
+    notes.forEach(function (line) {
+      raw.appendChild(el('div', { class: 'why-line muted2', text: line }));
+    });
+    return raw;
+  }
   var box = el('div', { class: 'why-block notes-block' });
-  box.appendChild(el('div', { class: 'cap', text: 'Run notes (' + notes.length + ')' }));
-  notes.forEach(function (line) {
-    box.appendChild(el('div', { class: 'why-line muted2', text: line }));
-  });
+  box.appendChild(el('div', { class: 'cap', text: 'Run notes, summarised' }));
+  box.appendChild(el('div', { class: 'why-line', text: note }));
+  box.appendChild(el('div', { class: 'why-line muted2', text: 'Written by ' + (narrative.by || 'the model') +
+    ' from this run’s notes' + (narrative.at ? ' · ' + timeAgo(narrative.at) : '') +
+    '. It explains; it decides nothing — the notes stay in the proof file.' }));
   return box;
 }
 
@@ -4298,7 +4323,6 @@ function roleBlurb(role) {
   if (role === 'healer') return 'repairs a selector that already failed';
   if (role === 'generator') return 'writes the tests, and repairs whole flows';
   if (role === 'agent') return 'drives the browser through unknown pages';
-  if (role === 'data') return 'regenerates a field value that was rejected';
   return '';
 }
 
@@ -4720,8 +4744,7 @@ function untilTime(iso) {
  * that evaporates on restart is not a setting) and apply from the next run.
  */
 /* The machinery gates: every on/off that shapes a run — the scenario gate,
-   data sections, the governor, the risk judge, diagnosis, the auto-review
-   judge. A flip persists to .env and the panel's own env, so the NEXT run
+   data sections, the risk judge, diagnosis, the auto-review judge. A flip persists to .env and the panel's own env, so the NEXT run
    inherits it; the run already in flight keeps the gates it started with,
    and the card says so. The allowlist is the server's (ui/gates.ts). */
 function renderGatesBlock(card) {
@@ -4910,7 +4933,7 @@ function renderClaudeSection(main) {
   /* --- the usage cap: a hard stop at N% of any window ---------------------- */
   renderUsageCapBlock(card, claude.usageCap);
 
-  /* --- the run gates: scenario gate, sections, governor, judges ------------ */
+  /* --- the run gates: scenario gate, sections, judges ---------------------- */
   renderGatesBlock(card);
 
   /* --- the claude -p ledger: every claude-cli call, across processes ------- */

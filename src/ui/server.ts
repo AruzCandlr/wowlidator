@@ -55,6 +55,7 @@ import {
   personasValueToMap,
   type CommandSpec,
 } from './commands.js';
+import { MonitorPageMissingError, monitorPage, panelRunStateScript } from './monitor.js';
 import { PersonaAccountStore, type PersonaAccountRef } from './persona-accounts.js';
 import { JobRunner } from './jobs.js';
 import { FAILED_RUNS_FILE, FailedRunLog } from './failed-runs.js';
@@ -375,6 +376,38 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: ServerCont
   // layout — kept for side-by-side comparison until it is retired.
   if ((path === '/wow' || path === '/wow/') && req.method === 'GET') {
     text(res, renderWowUi(), 200, 'text/html; charset=utf-8');
+    return;
+  }
+
+  // The live monitor — the SAME page the `/wowlidate` skill opens from a run
+  // folder, served here with its state built by the same projector
+  // (`src/monitor/run-state.ts`). Two surfaces, one reading: a panel that drew
+  // its own version of this would be a second thing to keep true about a run.
+  //
+  // View-only by construction. Both routes are GETs that read; there is no
+  // control on the page, and none here, that can touch a run.
+  if ((path === '/monitor' || path === '/monitor/') && req.method === 'GET') {
+    try {
+      const wanted = url.searchParams.get('ledger');
+      text(res, await monitorPage(wanted ?? undefined), 200, 'text/html; charset=utf-8');
+    } catch (error) {
+      if (!(error instanceof MonitorPageMissingError)) throw error;
+      text(res, error.message, 404);
+    }
+    return;
+  }
+
+  // The state the page re-injects every few seconds. JS, not JSON, because
+  // the same file has to load from a `file://` page in a run folder, where a
+  // fetch of a sibling is blocked and a `<script src>` is not.
+  if (path === '/monitor/run-state.js' && req.method === 'GET') {
+    const wanted = url.searchParams.get('ledger');
+    text(
+      res,
+      await panelRunStateScript(ctx.config.reportDir, wanted),
+      200,
+      'application/javascript; charset=utf-8',
+    );
     return;
   }
 

@@ -957,3 +957,72 @@ describe('an open-question id beside a value is a reference (HIR-EC-001)', () =>
     assert.equal(unconfirmedCell('TBC'), true);
   });
 });
+
+// --- a table name resolves in both spellings, and an ambiguous one in neither
+// (2026-09-11, run be-sit-high-opus-th-20260911-174323, case PL_09_01) ---
+//
+// `DbClient.introspect` spells a table of `current_schema()` BARE and every
+// other table `schema.table`. The live SIT DSN carries
+// `options=-csearch_path=benefit_management,public`, so the table the run
+// needed came back as `benefit_plan` — while the authoring inventory showed the
+// model `benefit_management.benefit_plan`, the spelling the context graph holds
+// because that schema was indexed from `sit-benefit-schema.sql`. The fallback
+// resolved only the other direction, so the lookup threw about a table the
+// connection holds, the fixture went unproven and the row sealed `blocked`.
+
+import { resolveTableIn, tableIn, tableLookupFailure } from '../src/generator/value-resolution.js';
+
+const tableNamed = (name: string): DbSchema['tables'][number] => ({
+  name,
+  columns: [{ name: 'benefit_plan_id', type: 'text', nullable: false, pk: true }],
+  pk: ['benefit_plan_id'],
+  references: [],
+});
+
+const schemaOf = (...names: string[]): DbSchema => ({ source: 'introspection', tables: names.map(tableNamed) });
+
+describe('a table name is matched in both spellings (PL_09_01)', () => {
+  it('the four combinations of bare/qualified want against bare/qualified schema', () => {
+    const qualified = schemaOf('benefit_management.benefit_plan');
+    const bare = schemaOf('benefit_plan');
+    assert.equal(tableIn(qualified, 'benefit_management.benefit_plan')?.name, 'benefit_management.benefit_plan');
+    assert.equal(tableIn(qualified, 'benefit_plan')?.name, 'benefit_management.benefit_plan');
+    assert.equal(tableIn(bare, 'benefit_plan')?.name, 'benefit_plan');
+    // The regression: the model's qualified name against the search_path
+    // connection's bare introspection — null before this, and the one that
+    // cost the row.
+    assert.equal(tableIn(bare, 'benefit_management.benefit_plan')?.name, 'benefit_plan');
+    assert.equal(tableIn(bare, '  BENEFIT_MANAGEMENT.Benefit_Plan ')?.name, 'benefit_plan');
+  });
+
+  it('a prefix the introspection itself spells out is one it would have spelled here too', () => {
+    // `public.` is written all over this schema, so `public.benefit_plan` being
+    // absent means absent — the bare entry belongs to some OTHER schema (the
+    // current one), and reading it would answer about the wrong table.
+    const live = schemaOf('benefit_plan', 'public.employee', 'public.company');
+    assert.equal(resolveTableIn(live, 'public.benefit_plan').kind, 'undeclared');
+    assert.equal(tableIn(live, 'benefit_management.benefit_plan')?.name, 'benefit_plan');
+  });
+
+  it('a bare name several schemas declare is refused, with both candidates named', () => {
+    const both = schemaOf('public.benefit_plan', 'benefit_management.benefit_plan');
+    const resolved = resolveTableIn(both, 'benefit_plan');
+    assert.equal(resolved.kind, 'ambiguous');
+    assert.equal(tableIn(both, 'benefit_plan'), null);
+    assert.match(
+      resolved.kind === 'ambiguous' ? tableLookupFailure('benefit_plan', resolved) : '',
+      /public\.benefit_plan, benefit_management\.benefit_plan/,
+    );
+    // Qualifying it resolves it — the remedy the message names.
+    assert.equal(tableIn(both, 'benefit_management.benefit_plan')?.name, 'benefit_management.benefit_plan');
+  });
+
+  it('a table nothing declares is the sentence both lookups always threw', () => {
+    const resolved = resolveTableIn(schemaOf('benefit_plan'), 'not_indexed');
+    assert.equal(resolved.kind, 'undeclared');
+    assert.match(
+      resolved.kind === 'undeclared' ? tableLookupFailure('not_indexed', resolved) : '',
+      /the model named table "not_indexed", which the schema does not declare/,
+    );
+  });
+});

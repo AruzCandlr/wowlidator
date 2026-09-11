@@ -228,7 +228,7 @@ export interface LlmFlowRepairModelOptions {
  * the `generator` role points at.
  *
  * `id` is resolved lazily, on first read, not in the constructor — the same
- * fix applied to `LlmDataModel` after it caused a real bug (constructing the
+ * fix applied to the retired `LlmDataModel` after it caused a real bug (constructing the
  * class must never, by itself, demand an API key).
  */
 export class LlmFlowRepairModel implements FlowRepairModel {

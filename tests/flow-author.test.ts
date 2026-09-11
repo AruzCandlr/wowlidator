@@ -12,6 +12,11 @@ import assert from 'node:assert/strict';
 import { zodSchema } from 'ai';
 
 import {
+  AUTHOR_ACTIONS,
+  settleUnpinnedDate,
+  containerOf,
+  scopeCountedSets,
+  staleFixturePremises,
   AUTHOR_ATTEMPTS,
   AuthoredFlowSchema,
   AuthoringError,
@@ -40,6 +45,11 @@ import {
   ungroundedCountRole,
   ungroundedTextExpectation,
   ungroundedSelectorRole,
+  rolePerforms,
+  treeLineRole,
+  treeLineName,
+  tooltipRoleSelector,
+  TOOLTIP_GUIDANCE,
   admitsUngroundedSelector,
   unanchoredHoverAssertion,
   settleHoverAnchor,
@@ -5088,6 +5098,48 @@ describe('a fixture the database holds is not a fixture the lint can doubt (2026
     const author = new FlowAuthor({ model: stubModel({ name: 'RU_09_51', steps: steps() }), attempts: 1 });
     await assert.rejects(author.author(caseText, undefined, { caseText }), /as if it already existed/);
   });
+
+  // **A lookup that could not RUN is not the database answering "no row"**
+  // (2026-09-11, run be-sit-high-opus-th-20260911-174323, case PL_09_01). The
+  // lookup threw on a table-name spelling the connection held; the lint refused
+  // as though the row were absent, the model answered identically twice, and
+  // the row sealed `blocked` where a plain `--resume` can never pick it up.
+  const unavailableDb = () => ({
+    ...dbResolution([]),
+    db: async () => {
+      throw new Error('database unavailable: could not connect to postgres://***@10.179.72.9:5432/HRCenter-SIT');
+    },
+  });
+
+  it('a database that could not be asked hands the flow over with the reason, never blocks the row', async () => {
+    const log: string[] = [];
+    const author = new FlowAuthor({
+      model: stubModel({ name: 'RU_09_51', steps: steps() }),
+      valueResolution: unavailableDb() as unknown as FlowAuthorOptions['valueResolution'],
+      attempts: 1,
+      onLog: (l) => log.push(l),
+    });
+    const authored = await author.author(caseText, undefined, { caseText });
+    assert.equal(authored.flow.steps.length, 2);
+    assert.match(authored.notes, /the database could not be asked/);
+    assert.match(authored.notes, /could not connect/);
+    assert.ok(log.some((l) => /weak claim, accepted with a note/.test(l)));
+  });
+
+  it('and the two outcomes are different: absent still refuses, unavailable does not', async () => {
+    const absent = new FlowAuthor({
+      model: stubModel({ name: 'RU_09_51', steps: steps() }),
+      valueResolution: dbResolution([]) as unknown as FlowAuthorOptions['valueResolution'],
+      attempts: 1,
+    });
+    await assert.rejects(absent.author(caseText, undefined, { caseText }), /as if it already existed/);
+    const unavailable = new FlowAuthor({
+      model: stubModel({ name: 'RU_09_51', steps: steps() }),
+      valueResolution: unavailableDb() as unknown as FlowAuthorOptions['valueResolution'],
+      attempts: 1,
+    });
+    await unavailable.author(caseText, undefined, { caseText });
+  });
 });
 
 describe('a truncated tree does not license the sheet\'s vocabulary (RU_06_12, 2026-09-09)', () => {
@@ -5190,5 +5242,623 @@ describe('a tree line is not a selector (PL_08_01, 2026-09-09)', () => {
       fromTreeNotation('button "Insert" >> nth=7'),
       'role=button[name="Insert" i] >> nth=7',
     );
+  });
+});
+
+/**
+ * A gesture the vocabulary did not spell used to end the case.
+ *
+ * 2026-09-11, PL_09_01 of BE_SIT_20260908_priority-high: script step 2 is
+ * "นำเมาส์ไปวางที่ไอคอนถังขยะ (Delete)" — hover the row's trash icon. There
+ * was no `hover` in AUTHOR_ACTIONS, so the step could not be authored; the
+ * coverage lint then refused the flow for stopping at step 1 of 3, twice, and
+ * the case was sealed blocked with no flow on disk. A missing verb is a gap in
+ * this list, never a verdict about the case.
+ */
+describe('a script gesture is performed, never a reason to stop', () => {
+  it('hover is authorable, and the schema takes it', () => {
+    assert.ok(
+      (AUTHOR_ACTIONS as readonly string[]).includes('hover'),
+      'the sheet asks a tester to hover far more often than it asks for most of this list',
+    );
+    const parsed = AuthoredFlowSchema.safeParse({
+      name: 'PL_09_01_delete_confirm_popup',
+      rationale: 'hovers the row Delete icon, then clicks it',
+      setup: [],
+      teardown: [],
+      notes: '',
+      steps: [
+        {
+          action: 'hover',
+          case: null,
+          selector: 'role=button[name="Delete" i]',
+          value: '',
+          url: '',
+          key: '',
+          name: '',
+          timeoutMs: '',
+          intent: 'Step 2: hover the row Delete icon',
+        },
+      ],
+    });
+    assert.ok(parsed.success, 'a hover the model writes must survive the output schema');
+    assert.equal(parsed.data?.steps[0]?.action, 'hover');
+  });
+
+  it('a workflow leg naming the step satisfies the coverage lint, so the gap has a door', () => {
+    const script = ['Steps:', '  1. open the page', '  2. hover the trash icon', '  3. click the trash icon'].join('\n');
+    const viaWorkflow = [
+      { action: 'goto', url: '/plans', intent: 'Step 1: open the page' },
+      { action: 'workflow', goal: 'Step 2: hover the row Delete icon, then Step 3: click it' },
+    ] as unknown as FlowStep[];
+    assert.equal(
+      unperformedScriptSteps(script, viaWorkflow),
+      null,
+      'handing an unspellable gesture to the agent must not read as stopping early',
+    );
+    // The floor still holds: a flow that simply stops is still refused.
+    const stops = [{ action: 'goto', url: '/plans', intent: 'Step 1: open the page' }] as unknown as FlowStep[];
+    assert.equal(unperformedScriptSteps(script, stops)?.performedThrough, 1);
+  });
+});
+
+/**
+ * The sheet's premise about a fixture can go stale, and the page is the
+ * authority (2026-09-11, be-sit-high-sonnetlow PL_09_01).
+ *
+ * That row's Test Data says "This ID is absent from SIT at validation time; do
+ * not present it as an existing row" — and the tree handed to the author
+ * rendered `cell "QA260908_BE_137"`, created by an earlier QA pass and never
+ * cleaned up. The model asserted a value its evidence proved true, the fixture
+ * lint refused it, and the row sealed blocked twice: a verdict about the
+ * CATALOG delivered as a verdict about the author, which no re-author could
+ * ever settle.
+ */
+describe('a fixture the page already renders is a stale premise, not a refusal', () => {
+  const FACT = 'QA260908_BE_137';
+
+  it('names the fact and the tree line that contradicts the sheet', () => {
+    const tree = [
+      'heading "Benefit Plans"',
+      `cell "${FACT}"`,
+      'button "Delete"',
+    ].join('\n');
+    assert.deepEqual(staleFixturePremises([FACT], tree), [
+      { fact: FACT, rendered: `cell "${FACT}"` },
+    ]);
+  });
+
+  it('folds case and whitespace, because a rendering is not a spelling', () => {
+    assert.equal(staleFixturePremises([FACT], `cell "  ${FACT.toLowerCase()}  "`).length, 1);
+  });
+
+  it('refuses to read containment as presence — it may only ever excuse', () => {
+    // The one direction that matters: a loose match here would switch the
+    // fixture lint off for every id that appears inside a longer string.
+    assert.deepEqual(staleFixturePremises([FACT], `cell "${FACT}_OLD"`), []);
+    assert.deepEqual(staleFixturePremises([FACT], `cell "the plan ${FACT} was deleted"`), []);
+  });
+
+  it('says nothing when there is no tree, no fact, or no match', () => {
+    assert.deepEqual(staleFixturePremises([FACT], undefined), []);
+    assert.deepEqual(staleFixturePremises([FACT], '   '), []);
+    assert.deepEqual(staleFixturePremises([], `cell "${FACT}"`), []);
+    assert.deepEqual(staleFixturePremises([FACT], 'heading "Benefit Plans"'), []);
+  });
+
+  it('reads a truncated capture — absence needs a full tree, presence does not', () => {
+    const tree = `cell "${FACT}"\n[TREE TRUNCATED: showing 120 of 900 nodes.]`;
+    assert.equal(staleFixturePremises([FACT], tree).length, 1);
+  });
+});
+
+/**
+ * Two ways the wording lint refused cases that were not about wording
+ * (2026-09-11, run `ec-ready-failed-20260910-162031`: HIR-EC-012 and
+ * HIR-EC-044, both sixteen-step `ตรวจสอบการจ้างพนักงาน…` hiring cases, both
+ * blocked with the refusal naming a `{{…}}` placeholder).
+ */
+describe('a wording claim is an Expected line, and a placeholder is not a literal', () => {
+  const tree = ['heading "Add New Employee"', 'cell "20004512"'].join('\n');
+
+  it('a {{placeholder}} is a reference the run resolves, never the sheet\'s word', () => {
+    // The flow saved the id the APPLICATION generated and asserts its own
+    // saved value — the pattern the prompt asks for. At authoring time there
+    // is no value to check against anything.
+    const steps = [
+      { action: 'expectVisible', selector: 'text={{new_employee_id}}', intent: 'Step 16: the new employee appears' },
+    ] as unknown as FlowStep[];
+    assert.equal(
+      wordingClaimAssertsDataValue('p', steps, tree, undefined, 'Expected output:\n  3.1 แสดงข้อความ สำเร็จ'),
+      null,
+    );
+  });
+
+  it('still refuses a literal the page never renders', () => {
+    // The rule the lint exists for is untouched: a quoted string that is
+    // neither the case's words nor any label in the tree.
+    const steps = [
+      { action: 'expectVisible', selector: 'text="Medical Reimbursement"', intent: 'x' },
+    ] as unknown as FlowStep[];
+    const hit = wordingClaimAssertsDataValue('p', steps, tree, undefined, 'Expected output:\n  3.1 แสดงข้อความ สำเร็จ');
+    assert.equal(hit?.value, 'Medical Reimbursement');
+  });
+
+  it('a marker in the Steps column does not make the case a wording claim', () => {
+    // HIR-EC-044's shape: the script says "ตรวจสอบข้อความ…" while the Expected
+    // block claims something else entirely. The row is a hiring case.
+    const caseText = [
+      'Test Script / Steps:',
+      '  1. ตรวจสอบข้อความบนหน้าจอก่อนเริ่ม',
+      'Expected output:',
+      '  3.1 ระบบสร้างพนักงานใหม่สำเร็จ',
+    ].join('\n');
+    const steps = [
+      { action: 'expectVisible', selector: 'text="Medical Reimbursement"', intent: 'x' },
+    ] as unknown as FlowStep[];
+    assert.equal(wordingClaimAssertsDataValue('p', steps, tree, undefined, caseText), null);
+  });
+
+  it('still fires when the EXPECTED block is the one claiming wording', () => {
+    const caseText = [
+      'Test Script / Steps:',
+      '  1. เปิดหน้าแผนสวัสดิการ',
+      'Expected output:',
+      '  3.1 ข้อความสะกดถูกต้องตรงตาม Spec',
+    ].join('\n');
+    const steps = [
+      { action: 'expectVisible', selector: 'text="Medical Reimbursement"', intent: 'x' },
+    ] as unknown as FlowStep[];
+    assert.equal(wordingClaimAssertsDataValue('p', steps, tree, undefined, caseText)?.value, 'Medical Reimbursement');
+  });
+});
+
+/**
+ * The settle `src/generator/CLAUDE.md` recorded as owed, delivered after
+ * HIR-EC-059 of `ec-ready-fresh` (2026-09-11): the sheet states no Hire Date,
+ * the model wrote the run's own day as a literal, and the lint refused the
+ * whole sixteen-step case. The refusal is right — that flow types the same
+ * fixed day tomorrow — but the harness can settle it from the flow's own value.
+ */
+describe('an unpinned date pins the clock rather than blocking the row', () => {
+  it('pins setClock to the date the flow already typed, at midday', () => {
+    const flow = {
+      steps: [{ action: 'fill', selector: 'role=textbox[name="Hire Date" i]', value: '2026-09-11' }],
+      setup: [{ action: 'goto', url: '/login' }],
+    } as unknown as Parameters<typeof settleUnpinnedDate>[0];
+    const note = settleUnpinnedDate(flow, { index: 0, value: '2026-09-11' });
+    assert.match(note ?? '', /clock pinned to 2026-09-11T12:00:00/);
+    const first = (flow.setup ?? [])[0] as { action: string; time?: string; intent?: string };
+    assert.equal(first.action, 'setClock', 'the clock is pinned BEFORE the first goto, or it pins nothing');
+    // Midday, not midnight: 00:00 is the previous day west of the runner.
+    assert.equal(first.time, '2026-09-11T12:00:00');
+    assert.match(first.intent ?? '', /\[generated:/);
+  });
+
+  it('does nothing when a clock is already pinned', () => {
+    const flow = {
+      steps: [{ action: 'fill', selector: 'x', value: '2026-09-11' }],
+      setup: [{ action: 'setClock', time: '2026-01-01T12:00:00' }],
+    } as unknown as Parameters<typeof settleUnpinnedDate>[0];
+    assert.equal(settleUnpinnedDate(flow, { index: 0, value: '2026-09-11' }), null);
+  });
+
+  it('declines anything that is not a plain calendar date, so the refusal stands', () => {
+    const flow = { steps: [], setup: [] } as unknown as Parameters<typeof settleUnpinnedDate>[0];
+    assert.equal(settleUnpinnedDate(flow, { index: 0, value: 'next Tuesday' }), null);
+  });
+
+  it('leaves the lint itself untouched — a literal date with no clock is still a violation', () => {
+    assert.deepEqual(
+      unpinnedDateEntry([], [{ action: 'fill', selector: 'x', value: '2026-09-11' } as never]),
+      { index: 0, value: '2026-09-11' },
+    );
+  });
+});
+
+/**
+ * A closed-set count is a count of ONE control (2026-09-11, HIR-EC-029).
+ *
+ * The harness inserts this step itself, so the defect repeated identically on
+ * every run: `expectCount role=option = 3` counted the page, the Event Reason
+ * list held exactly the three the sheet names, and a native `<select>`
+ * elsewhere on the form contributed its placeholder `<option>` — invisible on
+ * screen, present in the accessibility tree whether or not its select is open.
+ * Found 4, expected 3, filed against a correct application.
+ */
+describe('the inserted exclusivity count is scoped to its own control', () => {
+  it('pairs an item role with the container ARIA says owns it', () => {
+    assert.equal(containerOf('option', ['listbox', 'option "A"']), 'listbox');
+    assert.equal(containerOf('menuitem', ['menu "x"']), 'menu');
+    assert.equal(containerOf('radio', ['radiogroup "x"']), 'radiogroup');
+  });
+
+  it('invents no scope the evidence does not show — a missing container counts zero', () => {
+    assert.equal(containerOf('option', ['button "Event Reason"', 'option "A"']), null);
+    // A role that owns no container is left bare, as it always was.
+    assert.equal(containerOf('button', ['listbox "x"']), null);
+  });
+
+  it("scopes HIR-EC-029's count so the foreign postal option cannot be swept in", () => {
+    const evidence = [
+      'button "Event Reason"',
+      'listbox',
+      'option "HIREDM — HIRE - DATA MIGRATION"',
+      'option "H_NEWHIRE — New Hire"',
+      'option "H_RPLMENT — Replacement"',
+      // The other select's placeholder, in the tree and invisible on screen.
+      'option "— Select Postal code —"',
+    ].join('\n');
+    const flow = {
+      steps: [
+        { action: 'expectVisible', selector: 'role=option[name="H_NEWHIRE — New Hire" i]', intent: '3.1' },
+      ],
+    } as unknown as Parameters<typeof settleExclusivity>[0];
+    const note = settleExclusivity(
+      flow,
+      { line: 'dropdown แสดง 3 ค่า : HIREDM — HIRE - DATA MIGRATION / H_NEWHIRE — New Hire / H_RPLMENT — Replacement', marker: 'เฉพาะ', count: 3 },
+      'Expected output:\n  3.1 dropdown แสดง 3 ค่า : HIREDM — HIRE - DATA MIGRATION / H_NEWHIRE — New Hire / H_RPLMENT — Replacement',
+      evidence,
+    );
+    assert.notEqual(note, null, 'the settle must still fire');
+    const inserted = flow.steps.find((s) => s.action === 'expectCount') as { selector: string; count: number };
+    assert.equal(inserted.selector, 'role=listbox >> role=option');
+    assert.equal(inserted.count, 3);
+  });
+});
+
+/**
+ * The count the MODEL writes, not only the one the harness inserts
+ * (2026-09-11, HIR-EC-029 — three runs running).
+ *
+ * The first cut of this fix scoped only `settleExclusivity`'s own insertion.
+ * The live flows carry no `[generated:` marker on that step: the model authors
+ * it, so the fix never fired on the case that prompted it.
+ */
+describe('a counted set is scoped to its own control, whoever wrote it', () => {
+  const evidence = [
+    'button "Event Reason"',
+    'listbox',
+    'option "HIREDM — HIRE - DATA MIGRATION"',
+    'option "H_NEWHIRE — New Hire"',
+    'option "H_RPLMENT — Replacement"',
+    'option "— Select Postal code —"',
+  ].join('\n');
+
+  it("rewrites the model's own bare count to the container that owns the options", () => {
+    const steps = [{ action: 'expectCount', selector: 'role=option', count: 3, intent: 'Expected 3.1: dropdown แสดง 3 ค่า.' }] as unknown as FlowStep[];
+    const note = scopeCountedSets(steps, evidence);
+    assert.match(note ?? '', /role=option → role=listbox >> role=option/);
+    assert.equal((steps[0] as { selector: string }).selector, 'role=listbox >> role=option');
+    assert.match(String((steps[0] as { intent?: string }).intent), /\[generated:/);
+  });
+
+  it('invents no scope the evidence does not show', () => {
+    const steps = [{ action: 'expectCount', selector: 'role=option', count: 3 }] as unknown as FlowStep[];
+    // No listbox in the tree: a scope the page lacks would count zero.
+    assert.equal(scopeCountedSets(steps, 'button "Event Reason"\noption "A"'), null);
+    assert.equal((steps[0] as { selector: string }).selector, 'role=option');
+  });
+
+  it("never touches a selector the author already scoped", () => {
+    const steps = [{ action: 'expectCount', selector: 'role=listbox >> role=option', count: 3 }] as unknown as FlowStep[];
+    assert.equal(scopeCountedSets(steps, evidence), null);
+  });
+
+  it('leaves a zero count alone — that is an absence claim', () => {
+    const steps = [{ action: 'expectCount', selector: 'role=option', count: 0 }] as unknown as FlowStep[];
+    assert.equal(scopeCountedSets(steps, evidence), null);
+  });
+
+  it('says nothing without evidence', () => {
+    const steps = [{ action: 'expectCount', selector: 'role=option', count: 3 }] as unknown as FlowStep[];
+    assert.equal(scopeCountedSets(steps, undefined), null);
+  });
+});
+
+describe('a click-to-open list is scoped even though the capture never saw it', () => {
+  // Verified on the live page (2026-09-11): Event Reason is a custom
+  // ul[role=listbox] holding exactly three li[role=option]; the page's only
+  // native <select> is #addr-postal with the single option
+  // "— Select Postal code —". Playwright computes roles, so a bare
+  // role=option matches that fourth one too. The listbox does not exist until
+  // the button is clicked, and authoring captures the page closed.
+  const closedCapture = [
+    'button "Select Event Reason"',
+    'button "Expand all"',
+    'heading "Add New Employee"',
+  ].join('\n');
+
+  it('scopes the count HIR-EC-029 authored, on a capture holding no listbox', () => {
+    const steps = [
+      { action: 'click', selector: 'role=button[name="Expand all" i]' },
+      { action: 'click', selector: 'role=button[name="Event Reason" i]' },
+      { action: 'expectCount', selector: 'role=option', count: 3, intent: '3.1 dropdown shows 3 values.' },
+    ] as unknown as FlowStep[];
+    const note = scopeCountedSets(steps, closedCapture);
+    assert.equal((steps[2] as { selector: string }).selector, 'role=listbox >> role=option');
+    assert.match(String((steps[2] as { intent?: string }).intent), /\[generated:/);
+    assert.match(String(note), /role=option → role=listbox >> role=option/);
+  });
+
+  it('looks past claims to find the opener — they change nothing on the page', () => {
+    const steps = [
+      { action: 'click', selector: 'role=button[name="Event Reason" i]' },
+      { action: 'expectVisible', selector: 'text=Search' },
+      { action: 'expectCount', selector: 'role=option', count: 3 },
+    ] as unknown as FlowStep[];
+    scopeCountedSets(steps, closedCapture);
+    assert.equal((steps[2] as { selector: string }).selector, 'role=listbox >> role=option');
+  });
+
+  it('a fill is not an opener — nothing says a list is open', () => {
+    const steps = [
+      { action: 'fill', selector: 'role=textbox[name="Search" i]', value: 'New' },
+      { action: 'expectCount', selector: 'role=option', count: 3 },
+    ] as unknown as FlowStep[];
+    assert.equal(scopeCountedSets(steps, closedCapture), null);
+    assert.equal((steps[1] as { selector: string }).selector, 'role=option');
+  });
+
+  it('a count with no acting step before it is left alone', () => {
+    const steps = [
+      { action: 'expectVisible', selector: 'text=HIRING PROCESS' },
+      { action: 'expectCount', selector: 'role=option', count: 3 },
+    ] as unknown as FlowStep[];
+    assert.equal(scopeCountedSets(steps, closedCapture), null);
+  });
+
+  it('still refuses a role ARIA gives no owner, whatever opened it', () => {
+    const steps = [
+      { action: 'click', selector: 'role=button[name="Open" i]' },
+      { action: 'expectCount', selector: 'role=paragraph', count: 3 },
+    ] as unknown as FlowStep[];
+    assert.equal(scopeCountedSets(steps, closedCapture), null);
+  });
+
+  it('a zero count stays unscoped behind the click door too — absence is absence', () => {
+    const steps = [
+      { action: 'click', selector: 'role=button[name="Event Reason" i]' },
+      { action: 'expectCount', selector: 'role=option', count: 0 },
+    ] as unknown as FlowStep[];
+    assert.equal(scopeCountedSets(steps, closedCapture), null);
+  });
+});
+
+// be-sit-high-sonnet-th-20260911-162004, 15 cases against HUMI SIT. Of 93
+// failure events only 5 were "resolved, but the claim did not hold"; 57 were
+// "could not resolve", and four cases (PL_07_01, PL_07_02, RU_06_08,
+// RU_08_01) died on ONE selector shape. HUMI's English-locale page carries a
+// Thai-named global ⌘K search whose only tree nodes are two ARIA LANDMARKS —
+// `search "ค้นหา"` — while the table's own filter is a separate English
+// `button "Search"`. The model authored `role=searchbox[name="ค้นหา"]`;
+// `ungroundedSelectorRole` correctly found no searchbox and then told it, in
+// the imperative, to use `search "ค้นหา"` verbatim — and `settleSelectorRole`
+// wrote that role onto the step. You cannot fill a landmark.
+describe('a candidate must be able to satisfy the step (be-sit-high-sonnet-th, the Thai ⌘K search)', () => {
+  const HUMI = [
+    'search "ค้นหา"',
+    'search "ค้นหา"',
+    'button "ค้นหาพนักงาน เอกสาร…⌘K"',
+    'button "Search"',
+    'table "Benefit plan catalog"',
+  ].join('\n');
+
+  describe('rolePerforms — the action→role table, read off the harness\'s own entry table', () => {
+    it('a fill needs something fillable; a landmark never is', () => {
+      for (const role of ['textbox', 'searchbox', 'combobox', 'spinbutton']) {
+        assert.equal(rolePerforms('fill', role), true, role);
+      }
+      for (const role of ['search', 'form', 'region', 'navigation', 'main', 'banner', 'group', 'table', 'list', 'dialog', 'button']) {
+        assert.equal(rolePerforms('fill', role), false, role);
+      }
+      assert.equal(rolePerforms('type', 'search'), false);
+      assert.equal(rolePerforms('fillRetry', 'textbox'), true);
+    });
+
+    it('a check needs a tickable control, a selectOption a chooser', () => {
+      assert.equal(rolePerforms('check', 'checkbox'), true);
+      assert.equal(rolePerforms('check', 'switch'), true);
+      assert.equal(rolePerforms('check', 'radio'), true);
+      assert.equal(rolePerforms('check', 'search'), false);
+      assert.equal(rolePerforms('check', 'textbox'), false);
+      // The engine drives a custom-select TRIGGER (a button) with selectOption.
+      assert.equal(rolePerforms('selectOption', 'button'), true);
+      assert.equal(rolePerforms('selectOption', 'combobox'), true);
+      assert.equal(rolePerforms('selectOption', 'listbox'), true);
+      assert.equal(rolePerforms('selectOption', 'form'), false);
+      assert.equal(rolePerforms('selectOption', 'textbox'), false);
+    });
+
+    it('a click is refused only on a container — a row, a cell or a heading is an ordinary click target', () => {
+      assert.equal(rolePerforms('click', 'search'), false);
+      assert.equal(rolePerforms('click', 'navigation'), false);
+      assert.equal(rolePerforms('click', 'dialog'), false);
+      for (const role of ['button', 'link', 'row', 'cell', 'gridcell', 'listitem', 'heading', 'img', 'option', 'tab']) {
+        assert.equal(rolePerforms('click', role), true, role);
+      }
+    });
+
+    it('says yes to anything for an action it has no opinion about — it narrows candidates, it never refuses', () => {
+      assert.equal(rolePerforms('expectVisible', 'search'), true);
+      assert.equal(rolePerforms('expectText', 'region'), true);
+      assert.equal(rolePerforms('goto', 'main'), true);
+    });
+  });
+
+  it('does NOT offer the landmark as a candidate for a fill, and says so in the container register', () => {
+    const step = { action: 'fill', selector: 'role=searchbox[name="ค้นหา" i]', value: 'QA-Plan' } as unknown as FlowStep;
+    const hit = ungroundedSelectorRole([step], HUMI);
+    assert.equal(hit?.role, 'searchbox');
+    assert.deepEqual(hit?.nearest, [], 'a search landmark can never satisfy a fill');
+    assert.equal(hit?.container, 'search "ค้นหา"', 'named so the refusal can change its register');
+  });
+
+  it('never SETTLES the step onto the landmark — the last word may not write an unrunnable step', () => {
+    const step = { action: 'fill', selector: 'role=searchbox[name="ค้นหา" i]', value: 'QA-Plan' } as unknown as FlowStep;
+    assert.equal(
+      settleSelectorRole(step, { role: 'searchbox', name: 'ค้นหา', nearest: ['search "ค้นหา"'], disabled: false }),
+      null,
+    );
+    assert.equal((step as { selector: string }).selector, 'role=searchbox[name="ค้นหา" i]', 'left exactly as authored');
+  });
+
+  it('still offers a genuine actionable alternative, verbatim, as it always did', () => {
+    const tree = ['button "Benefit Category:"', 'searchbox "Search benefit name"'].join('\n');
+    const step = { action: 'selectOption', selector: 'role=combobox[name="Benefit Category" i]', value: 'Medical' } as unknown as FlowStep;
+    const hit = ungroundedSelectorRole([step], tree);
+    assert.deepEqual(hit?.nearest, ['button "Benefit Category:"']);
+    assert.equal(hit?.container, null);
+    assert.equal(settleSelectorRole(step, hit!)?.includes('role=button'), true);
+    assert.equal((step as { selector: string }).selector, 'role=button[name="Benefit Category" i]');
+  });
+
+  it('withholds entirely past a leg when the only same-name node is a container — a control may be inside it', () => {
+    const body = [
+      { action: 'workflow', goal: 'open the plan list' },
+      { action: 'fill', selector: 'role=searchbox[name="ค้นหา" i]', value: 'QA-Plan' },
+    ] as unknown as FlowStep[];
+    assert.equal(ungroundedSelectorRole(body, HUMI), null, 'after a leg');
+    assert.equal(
+      ungroundedSelectorRole([body[1]!], `${HUMI}\n[TREE TRUNCATED: showing 200 of 640 nodes.]`),
+      null,
+      'on a truncated tree',
+    );
+  });
+
+  it('the refusal the author composes names the container and forbids copying it', async () => {
+    const author = new FlowAuthor({
+      model: stubModel({
+        name: 'search the plan',
+        steps: [
+          { action: 'fill', selector: 'role=searchbox[name="ค้นหา" i]', value: 'QA-Plan', intent: 'Step 1: ค้นหา plan' },
+          { action: 'expectVisible', selector: 'role=button[name="Search" i]', intent: 'Step 2: Expected: the row shows' },
+        ],
+      }),
+      journeyTree: HUMI,
+      attempts: 1,
+    });
+    let refusal = '';
+    try {
+      await author.author('search the plan', undefined, { caseText: 'Steps\n1. ค้นหา plan\nExpected\n1. the plan row shows' });
+    } catch (error) {
+      refusal = error instanceof Error ? error.message : String(error);
+    }
+    assert.match(refusal, /search "ค้นหา"/);
+    assert.match(refusal, /CONTAINER/);
+    assert.match(refusal, /Do NOT copy that role and name/);
+    assert.doesNotMatch(refusal, /use that role and name verbatim/);
+  });
+});
+
+// Same run: `role=tooltip[name="Make Correction" i]` reached EXECUTION 16
+// times and RU_06_01 / RU_07_01 both dead-ended on it, because
+// `ungroundedSelectorRole`'s two guards (a leg at step 0, a truncated plans
+// tree) silence it and the hover paragraph was gated on the CASE TEXT
+// matching a hover pattern rather than on the selector itself.
+describe('tooltipRoleSelector — a role no capture can ever ground', () => {
+  const s = (action: string, selector: string) => ({ action, selector }) as unknown as FlowStep;
+
+  it('catches the role on its own terms, with no tree at all', () => {
+    const hit = tooltipRoleSelector([s('expectVisible', 'role=tooltip[name="Make Correction" i]')]);
+    assert.deepEqual(hit, { index: 0, action: 'expectVisible', name: 'Make Correction' });
+    assert.equal(tooltipRoleSelector([s('expectText', 'main [role="tooltip"]')])?.index, 0);
+    assert.equal(tooltipRoleSelector([s('expectVisible', 'role=tooltip')])?.name, null);
+  });
+
+  it('is silent on an absence claim and on a workflow goal that merely says the word', () => {
+    assert.equal(tooltipRoleSelector([s('expectHidden', 'role=tooltip[name="Make Correction" i]')]), null);
+    assert.equal(tooltipRoleSelector([{ action: 'workflow', goal: 'hover until the tooltip shows' } as unknown as FlowStep]), null);
+    assert.equal(tooltipRoleSelector([s('expectVisible', 'role=button[name="Make Correction" i]')]), null);
+  });
+
+  it('refuses with the control-name guidance whether or not the case text speaks of hovering', async () => {
+    const body = [
+      { action: 'workflow', goal: 'Hover the pencil (Make Correction) icon of a Plan row' },
+      { action: 'expectVisible', selector: 'role=tooltip[name="Make Correction" i]', intent: 'step 2: the tooltip shows' },
+    ];
+    const PLANS = [
+      'heading "Benefit plan catalog"',
+      '[TREE TRUNCATED: showing 200 of 640 nodes. Elements may exist that are not listed.]',
+    ].join('\n');
+    // The first case text speaks of hovering (AUTHORING.hoverClaim matches);
+    // the second says nothing about hover at all, which is the shape that
+    // used to ship the selector straight to the browser.
+    for (const caseText of ['Steps\n1. นำเมาส์ไปวาง\nExpected\n1. แสดง Tooltip', 'Steps\n1. open the plan list\nExpected\n1. the Make Correction control is offered']) {
+      const log: string[] = [];
+      const author = new FlowAuthor({
+        model: stubModel({ name: 'make correction tooltip', steps: body as never }),
+        journeyTree: PLANS,
+        attempts: 2,
+        onLog: (line) => log.push(line),
+      });
+      const authored = await author.author('check the tooltip', undefined, { caseText });
+      const refusal = log.join('\n');
+      // The log wraps at the terminal width, so the sentences are matched
+      // word-wise rather than as one line.
+      const flat = refusal.replace(/\s+/g, ' ');
+      assert.match(flat, /No accessibility tree can ever contain a tooltip/, caseText);
+      assert.match(flat, /accessible NAME of the control that shows it/, caseText);
+      // The last word never guesses: with no tree line naming the control,
+      // the step is marked and handed over, exactly as it shipped before.
+      assert.match(authored.notes, /which no tree can hold/, caseText);
+    }
+  });
+
+  it('settles onto the tree\'s own line for the same name when a capture holds one', async () => {
+    const log: string[] = [];
+    const author = new FlowAuthor({
+      model: stubModel({
+        name: 'make correction tooltip',
+        steps: [
+          { action: 'workflow', goal: 'Hover the pencil (Make Correction) icon of a Plan row' },
+          { action: 'expectVisible', selector: 'role=tooltip[name="Make Correction" i]', intent: 'Step 2: the tooltip shows' },
+        ] as never,
+      }),
+      journeyTree: 'button "Make Correction" · 30×30\n[TREE TRUNCATED: showing 200 of 640 nodes.]',
+      attempts: 2,
+      onLog: (line) => log.push(line),
+    });
+    const authored = await author.author('check the tooltip', undefined, { caseText: 'Expected\n1. แสดง Tooltip' });
+    assert.equal((authored.flow.steps[1] as { selector: string }).selector, 'role=button[name="Make Correction" i]');
+  });
+
+  it('is the same sentence the ungroundedSelectorRole refusal appends — one definition', () => {
+    assert.match(TOOLTIP_GUIDANCE, /^A tooltip is in no tree/);
+    assert.match(TOOLTIP_GUIDANCE, /expectAttribute/);
+  });
+});
+
+// The capture may gain indentation to show containment; every read of a tree
+// line trims first, so a lint cannot silently stop matching.
+describe('a tree line is read whatever its indentation', () => {
+  const INDENTED = [
+    'main "Benefit plans"',
+    '  search "ค้นหา"',
+    '    button "Benefit Category:"',
+    '    radio "Medical"',
+  ].join('\n');
+
+  it('treeLineRole and treeLineName trim', () => {
+    assert.equal(treeLineRole('    button "Benefit Category:"'), 'button');
+    assert.equal(treeLineName('    button "Benefit Category:"'), 'benefit category');
+    assert.equal(treeLineRole('a prose line about the page'), 'a');
+    assert.equal(treeLineRole('  '), '');
+  });
+
+  it('ungroundedCountRole sees a nested role — the one multiline anchor in the file', () => {
+    const counts = [{ action: 'expectCount', selector: 'role=radio', count: 3 }] as unknown as FlowStep[];
+    assert.equal(ungroundedCountRole(counts, INDENTED), null, 'the nested radio grounds the count');
+    const phantom = [{ action: 'expectCount', selector: 'role=option', count: 3 }] as unknown as FlowStep[];
+    assert.deepEqual(ungroundedCountRole(phantom, INDENTED), { index: 0, role: 'option' });
+  });
+
+  it('ungroundedSelectorRole reads nested roles and nested names', () => {
+    assert.equal(ungroundedSelectorRole([{ action: 'click', selector: 'role=radio[name="Medical" i]' } as unknown as FlowStep], INDENTED), null);
+    const hit = ungroundedSelectorRole(
+      [{ action: 'selectOption', selector: 'role=combobox[name="Benefit Category" i]', value: 'Medical' } as unknown as FlowStep],
+      INDENTED,
+    );
+    assert.deepEqual(hit?.nearest, ['button "Benefit Category:"']);
   });
 });

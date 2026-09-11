@@ -301,6 +301,26 @@
     <div class="calls" id="calls"></div>
   </div>
 
+  <!-- The same two questions as the Claude panel, for a run on an HTTP API
+       provider: what has the model layer done, and can it keep going. An API
+       key has no window to read, so the readings are the calls themselves
+       (the ledger every call appends to) and the holds a refusal bought. -->
+  <div class="panel" id="apiPanel" hidden>
+    <div class="panel-h">
+      <span class="t">API providers</span>
+      <span class="n" id="apiMeta">&mdash;</span>
+    </div>
+    <div id="apiHolds"></div>
+    <div class="claude-body">
+      <div><div class="roles" id="apiProviders"></div><div class="roles" id="apiRoles"></div></div>
+      <div class="ctiles" id="apiTiles"></div>
+    </div>
+    <div class="panel-h" style="border-top:1px solid var(--line)">
+      <span class="t">Recent API calls</span><span class="n" id="apiCallsMeta">&mdash;</span>
+    </div>
+    <div class="calls" id="apiCalls"></div>
+  </div>
+
   <div class="cols">
     <div class="panel">
       <div class="panel-h"><span class="t">Live activity</span><span class="n" id="feedCount">&mdash;</span></div>
@@ -655,6 +675,75 @@
     return { session: session, hold: hold, note: cl.note };
   }
 
+  // The API half of the model layer. Shown only when the ledger has something
+  // to say — a claude-only run must not grow an empty card, and an API run
+  // must not have an empty Claude card stand in for its own.
+  function renderApi(api) {
+    var panel = $('apiPanel');
+    var holds = (api && Array.isArray(api.holds)) ? api.holds : [];
+    var total = api && api.total;
+    if (!api || (!holds.length && !(total && num(total.calls)))) { panel.hidden = true; return null; }
+    panel.hidden = false;
+
+    $('apiHolds').innerHTML = holds.map(function (h) {
+      return '<div class="qrow bad" style="padding:8px 14px">' +
+        '<span class="ql">' + esc(h.provider) + ' held</span>' +
+        '<span class="qmeta" style="grid-column:2/-1;margin:0">~' + num(h.seconds) + 's &mdash; ' +
+        esc(h.reason) + (h.stated ? ' (the provider asked for this wait)' : ' (refusal ' + num(h.refusals) + ', backing off)') +
+        '</span></div>';
+    }).join('');
+
+    var today = (api.today) || {};
+    var calls = num(today.calls);
+    $('apiTiles').innerHTML = [
+      [calls ? String(calls) : '0', 'calls today'],
+      [num(today.refusals) ? String(num(today.refusals)) : '0', 'refused today'],
+      [toks(today.outputTokens), 'out tokens'],
+      [calls ? dur(num(today.wallMs) / calls) : '\u2014', 'avg call']
+    ].map(function (t) {
+      return '<div class="ctile"><span class="n">' + esc(t[0]) +
+             '</span><span class="lbl">' + esc(t[1]) + '</span></div>';
+    }).join('');
+
+    function bars(el, rows, label) {
+      var top = rows.length ? num(rows[0].calls) : 0;
+      $(el).innerHTML = rows.map(function (r) {
+        var w = top > 0 ? (num(r.calls) / top) * 100 : 0;
+        return '<div class="role-row">' +
+          '<span class="rn">' + esc(r[label]) + '</span>' +
+          '<span class="rb"><i style="width:' + w + '%"></i></span>' +
+          '<span class="rv">' + num(r.calls) + (num(r.refusals) ? ' \u00b7 ' + num(r.refusals) + ' refused' : '') +
+          '</span></div>';
+      }).join('');
+    }
+    bars('apiProviders', Array.isArray(api.byProvider) ? api.byProvider : [], 'provider');
+    bars('apiRoles', Array.isArray(api.byRole) ? api.byRole : [], 'role');
+
+    var list = $('apiCalls');
+    var rc = Array.isArray(api.recentCalls) ? api.recentCalls : [];
+    if (!rc.length) {
+      list.innerHTML = '<div class="empty">The API usage ledger has no calls yet.</div>';
+    } else {
+      list.innerHTML = rc.map(function (c) {
+        return '<div class="call-row' + (c.finish ? ' err' : '') + '">' +
+          '<span class="ct">' + esc(clockOnly(c.ts)) + '</span>' +
+          '<span class="cr">' + esc(c.role) + '</span>' +
+          '<span class="cm">' + esc(c.provider + ':' + c.modelId) +
+            (c.finish ? ' \u00b7 ' + esc(c.finish) + (c.detail ? ' \u00b7 ' + esc(c.detail) : '') : '') + '</span>' +
+          '<span class="cw">' + dur(c.wallMs) + '</span></div>';
+      }).join('');
+    }
+    var meta = [];
+    if (api.lastCallAt) meta.push('last ' + relTime(api.lastCallAt));
+    if (total && num(total.refusals)) meta.push(num(total.refusals) + ' refusals all-time');
+    if (api.note) meta.push(api.note);
+    $('apiCallsMeta').textContent = meta.join(' \u00b7 ') || '\u2014';
+    $('apiMeta').textContent = (Array.isArray(api.byProvider) ? api.byProvider : [])
+      .map(function (p) { return p.provider + ' ' + num(p.calls); }).join('  \u00b7  ') || '';
+
+    return { holds: holds };
+  }
+
   function render(s) {
     if (!s) return;
     var c = s.counts || {};
@@ -719,6 +808,14 @@
     }
     if (num(s.claude && s.claude.warmFailures) > 0) {
       chips.push('<span class="chip warn">' + num(s.claude.warmFailures) + ' warm drops</span>');
+    }
+    // A provider hold sits with the run's status chips for the same reason
+    // the session chip does: a run that stopped starting work because a
+    // provider said no is not broken, and reading it as wedged is the error.
+    var apiState = renderApi(s.api);
+    if (apiState && apiState.holds.length) {
+      chips.push('<span class="chip warn">' + esc(apiState.holds[0].provider) + ' held ~' +
+        num(apiState.holds[0].seconds) + 's</span>');
     }
     $('statusChips').innerHTML = chips.join('');
 

@@ -46,15 +46,6 @@ export const GATES: readonly GateSpec[] = [
     onValue: 'on',
   },
   {
-    env: 'WOWLIDATOR_GOVERNOR',
-    label: 'Queue governor',
-    help:
-      'Watches the parallel lanes: diagnoses blockages, shrinks the pool under timeout load. On = the deterministic rules governor ($0, no model). ' +
-      'Setting the env var to "model" by hand restores the LLM governor, which can additionally seed a starved fixture. Off, the scheduler runs alone.',
-    defaultOn: true,
-    onValue: 'rules',
-  },
-  {
     env: 'WOWLIDATOR_RISK',
     label: 'Pre-run risk judge',
     help: 'Judges each authored case for dead-end/expected-fail risk; above the threshold it runs once with no rerun paths.',
@@ -189,20 +180,6 @@ export const SELECTS: readonly SelectSpec[] = [
     env: 'WOWLIDATOR_AGENT_EFFORT',
     label: 'Agent effort',
     help: 'Reasoning effort for the agent role on a CLI provider that supports it. One small structured decision per turn — the loop owns the reasoning, so low is the default.',
-    options: EFFORT_OPTIONS,
-    defaultValue: 'low',
-  },
-  {
-    env: 'WOWLIDATOR_DATA_EFFORT',
-    label: 'Data effort',
-    help: 'Reasoning effort for the data role on a CLI provider that supports it — regenerating one rejected field value. Low is the default.',
-    options: EFFORT_OPTIONS,
-    defaultValue: 'low',
-  },
-  {
-    env: 'WOWLIDATOR_GOVERNOR_EFFORT',
-    label: 'Governor effort',
-    help: 'Reasoning effort for the queue governor when it runs as a model (WOWLIDATOR_GOVERNOR=model) on a CLI provider that supports it. Low is the default.',
     options: EFFORT_OPTIONS,
     defaultValue: 'low',
   },

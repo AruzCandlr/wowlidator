@@ -32,7 +32,6 @@ function configWith(keys: string[], extra: Record<string, string> = {}): Wowlida
     GROQ_API_KEY: keys.join(','),
     WOWLIDATOR_HEALER_PROVIDER: 'groq',
     WOWLIDATOR_HEALER_MODEL: 'llama-3.3-70b-versatile',
-    WOWLIDATOR_DATA_PROVIDER: 'groq',
     ...extra,
   });
 }

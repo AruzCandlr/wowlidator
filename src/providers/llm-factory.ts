@@ -27,6 +27,7 @@ import {
   PROVIDERS,
   SERIAL_PROVIDERS,
   loadConfig,
+  providerConcurrency,
   localLlmBaseUrl,
   type LlmRole,
   type ProviderName,
@@ -40,6 +41,8 @@ import { createCodexCli } from './codex-cli.js';
 import { createClaudeCloud, createClaudeTty } from './claude-tty.js';
 import { maybeLogClaudeQuota } from './claude-quota.js';
 import { dedupeKeyFor, serialGateFor } from './serial-gate.js';
+import { noteApiRefusal, noteApiSuccess } from './api-pressure.js';
+import { recordApiCall } from './api-usage-log.js';
 import { logLlmFailure, logLlmRequest, logLlmResponse } from './llm-log.js';
 import {
   PACED_PROVIDERS,
@@ -545,11 +548,32 @@ export function resetStructuredBreaker(): void {
  */
 export class StructuredOutputUnavailableError extends Error {
   readonly modelLabel: string;
+  /**
+   * True when the PROVIDER turned the call away — rate limit, quota,
+   * concurrency, credential — as opposed to the model answering something
+   * the schema rejected.
+   *
+   * The difference is not cosmetic: a model that cannot emit the shape will
+   * not emit it next time either, and a row refused for that reason is worth
+   * giving up on (`AUTHORING_REFUSAL_CAP`). A provider that was busy says
+   * nothing at all about the row, and counting it toward the same cap is how
+   * a run loses cases it never actually attempted — 2026-09-10, a BE catalog
+   * whose first row sealed on `too_many_concurrent`.
+   *
+   * **An open circuit is the same fact in a different coat** (2026-09-11):
+   * the breaker refuses the call before the model is reached, so it too is a
+   * judgement about the ANSWERS THAT OPENED IT, never about the row now in
+   * front of it. Only the rows whose own re-ask budget was exhausted earned
+   * their refusal; the ones the open circuit turned away never had a call
+   * spent on them at all.
+   */
+  readonly providerRefused: boolean;
 
-  constructor(message: string, modelLabel: string, cause?: unknown) {
+  constructor(message: string, modelLabel: string, cause?: unknown, providerRefused = false) {
     super(message);
     this.name = 'StructuredOutputUnavailableError';
     this.modelLabel = modelLabel;
+    this.providerRefused = providerRefused;
     if (cause !== undefined) this.cause = cause;
   }
 }
@@ -628,6 +652,17 @@ export async function generateStructured<T>(
         `do JSON-schema output — run \`wowlidator doctor\`, or set the role's ` +
         `WOWLIDATOR_*_PROVIDER / WOWLIDATOR_*_MODEL.`,
       request.modelLabel,
+      undefined,
+      // **This row was never asked.** The breaker is evidence about the six
+      // answers that opened it, not about the row in front of it now — the
+      // call is refused before the model is reached, so it says exactly as
+      // much about this row as a busy minute does: nothing. Counting it
+      // toward `AUTHORING_REFUSAL_CAP` retires rows the run never attempted
+      // (2026-09-11: an EC catalog sealed 138 rows this way, one open
+      // circuit on `generator@claude-cli:sonnet`, every one charged
+      // `authoringRefused: 1` and a second resume away from being dropped
+      // from `remaining()` for good).
+      true,
     );
   }
 
@@ -755,16 +790,45 @@ function describeStructuredFailure<T>(request: StructuredRequest<T>, error: unkn
     `${headline.trimEnd()}${evidence === '' ? '' : ` ${evidence}`}\n${advice}`,
     request.modelLabel,
     error,
+    isKeyExhaustedError(error),
   );
 }
 
 /** How many times one request may wait out a 429 before the failover sees it. */
 const RATE_LIMIT_RETRIES = 3;
 
+/**
+ * The provider and role behind a request, from what the request already
+ * carries. `modelLabel` is `provider:modelId` and `task` is `role` or
+ * `role · something`, so neither has to be threaded through every call site
+ * to reach the usage ledger.
+ */
+function attribution(request: { modelLabel: string; task?: string | undefined }): {
+  provider: string;
+  modelId: string;
+  role: string | undefined;
+} {
+  const cut = request.modelLabel.indexOf(':');
+  const provider = cut < 0 ? request.modelLabel : request.modelLabel.slice(0, cut);
+  const modelId = cut < 0 ? '' : request.modelLabel.slice(cut + 1);
+  const role = request.task?.split('·')[0]?.trim();
+  return { provider, modelId, role: role === undefined || role === '' ? undefined : role };
+}
+
+/**
+ * `claude-*` keeps its own ledger (`claude-cli-usage-log.ts`) and its own
+ * window reader; recording it here too would count every call twice and put
+ * a second, poorer number on the monitor beside the real one.
+ */
+function usesClaudeAccount(provider: string): boolean {
+  return provider.startsWith('claude-');
+}
+
 async function attemptStructured<T>(
   request: StructuredRequest<T>,
 ): Promise<StructuredResponse<T>> {
   const task = request.task ?? 'model';
+  const who = attribution(request);
   const estTokens = estimateTokens(request.system) + estimateTokens(request.prompt);
   for (let attempt = 1; ; attempt++) {
     // Pacing first: arriving under a limit costs seconds, arriving over it
@@ -791,6 +855,21 @@ async function attemptStructured<T>(
     try {
       const response = await sendStructured(request);
       request.pacer?.record(response, estTokens);
+      if (!usesClaudeAccount(who.provider)) {
+        // The limit is demonstrably open: whatever hold a refusal bought is
+        // released now rather than waited out.
+        noteApiSuccess(who.provider);
+        void recordApiCall({
+          ts: new Date().toISOString(),
+          provider: who.provider,
+          modelId: who.modelId,
+          inputTokens: response.inputTokens ?? 0,
+          outputTokens: response.outputTokens ?? 0,
+          wallMs: Date.now() - started,
+          pid: process.pid,
+          ...(who.role === undefined ? {} : { role: who.role }),
+        });
+      }
       logLlmResponse({
         task,
         modelLabel: request.modelLabel,
@@ -821,6 +900,31 @@ async function attemptStructured<T>(
       // A refused claude-* call is exactly when the account's headroom is the
       // question — say where the limits stand next to the failure.
       if (request.modelLabel.startsWith('claude-')) maybeLogClaudeQuota(task);
+      else {
+        // An API provider states its limits only here, in the body of the
+        // call it just refused. Record the refusal so the suite can stop
+        // dispatching into it (`api-pressure.ts`), and keep the row: a call
+        // that was turned away is the one that explains a run gone quiet.
+        const refused = isKeyExhaustedError(error);
+        if (refused) {
+          const held = noteApiRefusal(who.provider, error);
+          process.stderr.write(
+            `  ⏸ ${who.provider} refused the call — dispatch held ~${Math.max(1, Math.round((held.until - Date.now()) / 1000))}s: ${held.reason}\n`,
+          );
+        }
+        void recordApiCall({
+          ts: new Date().toISOString(),
+          provider: who.provider,
+          modelId: who.modelId,
+          inputTokens: 0,
+          outputTokens: 0,
+          wallMs: Date.now() - started,
+          pid: process.pid,
+          ...(who.role === undefined ? {} : { role: who.role }),
+          finish: refused ? 'refused' : 'error',
+          detail: (error instanceof Error ? error.message : String(error)).split('\n')[0]?.slice(0, 240) ?? '',
+        });
+      }
       throw error;
     }
   }
@@ -1276,8 +1380,20 @@ export async function generateStructuredForModel<T>(
   // bounded in flight, priority by who is waiting, one call per identical
   // question. Nothing else changes — the failover and every adaptation below
   // run inside the slot exactly as they would without it.
-  if (SERIAL_PROVIDERS.has(entry.provider)) {
-    const gate = serialGateFor(entry.baseUrl ?? entry.provider);
+  //
+  // A provider that states a HIGHER ceiling takes the same gate with its own
+  // number (`config.providerConcurrency`; emmiedev allows two calls per key
+  // and answers the third with `too_many_concurrent`). The large-prompt rule
+  // is a fact about a local server prefilling serially, not about an HTTP
+  // API, so an API ceiling admits large prompts up to the whole ceiling.
+  const ceiling = SERIAL_PROVIDERS.has(entry.provider)
+    ? {}
+    : (() => {
+      const limit = providerConcurrency(entry.provider);
+      return limit === undefined ? null : { maxInFlight: limit, maxLargeInFlight: limit };
+    })();
+  if (ceiling !== null) {
+    const gate = serialGateFor(entry.baseUrl ?? entry.provider, ceiling);
     const key = dedupeKeyFor([source.role, entry.provider, entry.modelId, request.system, request.prompt]);
     const { result, joined } = await gate.run(
       source.role,

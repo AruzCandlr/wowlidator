@@ -931,6 +931,20 @@ export function queryAndHash(url: string): string {
 }
 
 /**
+ * The page half of a URL — `/humi/en/admin/benefits/plans` — for a sentence a
+ * person reads. The origin is the same on both sides of every comparison this
+ * makes, so printing it twice is noise that pushes the fact out of view.
+ * Falls back to the whole string when it will not parse.
+ */
+export function pathOf(url: string): string {
+  try {
+    return new URL(url).pathname || url;
+  } catch {
+    return url;
+  }
+}
+
+/**
  * The history line's account of where an action left the page: `still at
  * URL` when nothing moved, `still on the page, now at ?step=2` when only the
  * query or hash changed, `moved A → B` when the page itself did. The middle

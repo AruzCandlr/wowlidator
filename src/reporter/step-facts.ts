@@ -1071,3 +1071,67 @@ export function describeVerdictCounts(counts: VerdictCounts, labels: Partial<Rec
   if (counts.blocked > 0) parts.push(`${counts.blocked} ${labels.blocked ?? 'never ran'}`);
   return parts.join(' · ');
 }
+
+/**
+ * What the reader is told about the run's own notes — see `runNotesSummary`.
+ */
+export interface RunNotesSummary {
+  /** The paragraph a reader sees: the model's summary, or the run's own notes joined. */
+  text: string;
+  /**
+   * The notes exactly as recorded, one per entry, for a surface that lays the
+   * degraded path out line by line. EMPTY when `text` is the model's summary —
+   * the summary replaces the notes on the page, it does not precede them.
+   */
+  lines: readonly string[];
+  /** The model that wrote `text`, or null when `text` is the run's own notes. */
+  by: string | null;
+  /** The visible attribution, or null on the unattributed degraded path. */
+  attribution: string | null;
+}
+
+/** The slice of a bundle this reading needs. Structural, so a half-built record and wowUI's own shapes fit. */
+export interface RunNotesLike {
+  notes?: readonly string[] | null | undefined;
+  narrative?: unknown;
+}
+
+/**
+ * The run's notes as a reader meets them (2026-09-11). One projection, three
+ * surfaces — the per-case page, the catalog report and the per-run report —
+ * so the same run cannot be described three ways.
+ *
+ * A live case (PL_06_10) wrote five notes that rendered as ~300 words in one
+ * `·`-joined line above the coverage bar: the session note, the sign-in POST
+ * evidence, a pre-run risk line, a cross-case interference stamp and a full
+ * system-error diagnosis with the agent's click trail. So where the run has a
+ * narrative, the reader is shown the model's own ≤70-word summary of those
+ * notes (`CaseNarrative.verifierNote`, bounded and written in
+ * `generator/case-narrative.ts` from the notes themselves) INSTEAD of the
+ * notes. Nothing is derived here and no model is called: this reads two
+ * recorded fields and picks one.
+ *
+ * The unattributed fallback is not an edge case and must not be dropped:
+ * `--no-case-narrative`, `WOWLIDATOR_CASE_NARRATIVE=off` and a generator role
+ * with no key all seal a bundle that HAS notes and no narrative, and that page
+ * degrades to the evidence alone. Rendering nothing there would delete the only
+ * account of the run a reader has.
+ *
+ * Defensive like the rest of this module: a narrative written by an older
+ * build, one whose note is an empty string, and a `narrative` that is not an
+ * object all fall through to the notes rather than to a placeholder.
+ */
+export function runNotesSummary(bundle: RunNotesLike | null | undefined): RunNotesSummary | null {
+  const notes = (bundle?.notes ?? []).map((n) => String(n ?? '').replace(/\s+/g, ' ').trim()).filter((n) => n !== '');
+  const record = bundle?.narrative;
+  const raw = record !== null && typeof record === 'object' ? (record as { verifierNote?: unknown }).verifierNote : undefined;
+  const note = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
+  if (note !== '') {
+    const attributed = (record as { by?: unknown }).by;
+    // Never unattributed: a sentence with no author reads as the harness's own.
+    const by = typeof attributed === 'string' && attributed.trim() !== '' ? attributed.trim() : 'a model';
+    return { text: note, lines: [], by, attribution: `written by ${by}` };
+  }
+  if (notes.length === 0) return null;
+  return { text: notes.join(' · '), lines: notes, by: null, attribution: null };
+}

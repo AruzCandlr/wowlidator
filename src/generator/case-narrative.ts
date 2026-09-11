@@ -3,7 +3,9 @@
  * the run and stored on the bundle (`ProofBundle.narrative`), so the per-case
  * page (`reporter/case-page.ts`) can show a lede, a pre-read summary, the
  * ticket each defect deserves, a verifier's note and the questions the case
- * leaves open without ever calling a model itself.
+ * leaves open without ever calling a model itself. The verifier's note is the
+ * run's own `notes` summarised in at most `NARRATIVE_NOTE_MAX_WORDS` words —
+ * the page shows the summary INSTEAD of the notes, not beside them.
  *
  * The sibling of `step-narration.ts`, under the same three rules:
  *
@@ -54,6 +56,65 @@ import { dbProofLines } from '../reporter/step-facts.js';
 export const CASE_NARRATIVE_ENV = 'WOWLIDATOR_CASE_NARRATIVE';
 /** A narrative field longer than this is not a summary. Clipped, never dropped. */
 export const NARRATIVE_MAX_CHARS = 600;
+/**
+ * `summary` and `testData` are read inside one table cell on the case page, so
+ * they carry a tighter bound than the fields a reader reads as prose. Clipped
+ * at the last sentence or list boundary before the bound, never dropped:
+ * `expected` keeps the sheet's own enumeration and is NOT bound here.
+ */
+export const NARRATIVE_MAX_CELL_CHARS = 320;
+/**
+ * The three surfaces a reader meets BEFORE the evidence — the coverage note,
+ * a suggested ticket's detail, and a step's own verdict — are held to 200
+ * characters, with 50 more allowed when the text needs them.
+ *
+ * Soft, not hard, and the distinction is the whole design: an over-long field
+ * is sent back to be written shorter, ONCE, rather than cut where the budget
+ * happens to land. The model is the only thing that can drop the least
+ * load-bearing clause and keep the rest true; a cut can only remove whatever
+ * was last. The hard cap is what remains after that ask, and it is a
+ * sentence-boundary cut, never a mid-word one.
+ */
+export const NARRATIVE_SOFT_CHARS = 200;
+export const NARRATIVE_OVER_ALLOWANCE = 50;
+export const NARRATIVE_HARD_CHARS = NARRATIVE_SOFT_CHARS + NARRATIVE_OVER_ALLOWANCE;
+
+/**
+ * The verifier's note is the ONE place the run's own notes reach the reader:
+ * the page shows this summary and not `bundle.notes` themselves, which join
+ * into a ~300-word paragraph (a real one, case PL_06_10: the session's origin,
+ * the sign-in evidence, the pre-run risk line, a cross-case interference
+ * stamp, and a whole system-error diagnosis with its suggested fix). Seventy
+ * words is a paragraph a person reads BEFORE the evidence; the blob was one
+ * nobody read at all.
+ *
+ * Bound in WORDS, not characters, because that is the unit the instruction to
+ * the model states and the unit a reader feels — under the same soft/hard
+ * discipline as `NARRATIVE_SOFT_CHARS` above: over-long goes back ONCE to be
+ * written shorter (only the model can drop the least load-bearing clause and
+ * keep the rest true), and what remains after that ask is cut where the text
+ * itself breaks.
+ */
+export const NARRATIVE_NOTE_MAX_WORDS = 70;
+/**
+ * Thai — the other half of `REPORT_LANGS` — writes no space between words, so
+ * a `split(/\s+/)` count of a Thai note is ONE and a word bound alone would
+ * let it run to any length, while a character bound alone would truncate an
+ * English note absurdly. A run of such characters is therefore counted as
+ * characters and converted here.
+ *
+ * 4.5 code points per orthographic word, measured on running Thai: function
+ * words run 2-3 (ว่า, ที่, ไม่), content words 4-9 (ข้อความ, แจ้งเตือน), with
+ * combining vowels and tone marks counted as the code points they are. So 70
+ * words is ~315 Thai characters against ~420 English ones — the same paragraph
+ * in both scripts. Lao, Khmer and Burmese are written the same way and are
+ * measured the same; a report language in a CJK script would need its own
+ * ratio (its words are one or two characters) and `REPORT_LANGS` holds none.
+ */
+const CONTINUOUS_CHARS_PER_WORD = 4.5;
+const CONTINUOUS_SCRIPT = /[\u0E00-\u0EFF\u1000-\u109F\u1780-\u17FF]/;
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+
 export const NARRATIVE_MAX_TICKETS = 6;
 export const NARRATIVE_MAX_QUESTIONS = 8;
 /** Step lines beyond this are summarised as a count: the prompt must stay one call. */
@@ -82,6 +143,8 @@ export interface NarrativeRequest {
   /** Masked by name before they reached the bundle. */
   variables: Readonly<Record<string, string>>;
   notes: readonly string[];
+  /** Set only on the ONE re-ask a narrative over the soft cap earns — see `shortenAsk`. */
+  shorten?: string | undefined;
 }
 
 export interface NarrativeAnswer {
@@ -129,6 +192,75 @@ function clip(text: unknown, max: number): string {
 }
 
 /**
+ * The cell bound, cut where the text itself breaks. A sentence end, then a
+ * list separator, then a space — the last one that leaves at least half the
+ * budget standing; below that the plain character clip is the honest cut. A
+ * boundary cut ends a claim rather than halving one, which is what keeps a
+ * shorter cell from becoming a vaguer one.
+ */
+export function clipCell(text: unknown, max: number = NARRATIVE_MAX_CELL_CHARS): string {
+  const folded = clip(text, Number.MAX_SAFE_INTEGER);
+  if (folded.length <= max) return folded;
+  const head = folded.slice(0, max - 1);
+  const floor = Math.floor(max / 2);
+  for (const marks of ['.!?\n。', ';；,、·', ' ']) {
+    let cut = -1;
+    for (let i = head.length - 1; i >= floor; i--) if (marks.includes(head[i] as string)) { cut = i; break; }
+    if (cut >= floor) return head.slice(0, marks === ' ' ? cut : cut + 1).trim() + '…';
+  }
+  return head + '…';
+}
+
+/**
+ * Word-equivalents in a note, and the character index at which a budget of
+ * them is reached — ONE scan, so the count that judges a note over-long and
+ * the cut that shortens it can never disagree about where 70 words end. The
+ * measure reads the TEXT, not the narrative's `lang`: a Thai note quotes the
+ * application's English wording verbatim, and both halves must be counted the
+ * way their own script is written.
+ */
+function measureNote(folded: string, budget: number = Number.POSITIVE_INFINITY): { words: number; index: number } {
+  let words = 0;
+  let index = folded.length;
+  let inToken = false;
+  for (let i = 0; i < folded.length; i++) {
+    const ch = folded[i] as string;
+    if (CONTINUOUS_SCRIPT.test(ch)) {
+      inToken = false;
+      words += 1 / CONTINUOUS_CHARS_PER_WORD;
+    } else if (/\s/.test(ch)) {
+      inToken = false;
+    } else if (!inToken && WORD_CHAR.test(ch)) {
+      words += 1;
+      inToken = true;
+    }
+    if (words > budget && index === folded.length) index = i;
+  }
+  return { words, index };
+}
+
+/** What a note is worth in words — spaced tokens, plus the converted runs of a script that writes none. */
+export function noteWords(text: unknown): number {
+  return Math.round(measureNote(clip(text, Number.MAX_SAFE_INTEGER)).words);
+}
+
+/**
+ * The note bound, cut where the text itself breaks. The word budget becomes
+ * the character index it lands on, and `clipCell` makes the cut at the last
+ * sentence end, list separator or space before it — so what a reader is left
+ * with is a claim that ended, never half a word. Thai offers fewer of those
+ * marks, and a stretch with none falls to the plain character cut: a script
+ * that writes no boundary cannot be cut on one, and inventing a segmenter to
+ * find one would be a claim about the language the harness cannot check.
+ */
+export function clipNote(text: unknown, maxWords: number = NARRATIVE_NOTE_MAX_WORDS): string {
+  const folded = clip(text, Number.MAX_SAFE_INTEGER);
+  const { words, index } = measureNote(folded, maxWords);
+  if (words <= maxWords) return folded;
+  return clipCell(folded, index + 1);
+}
+
+/**
  * Write the narrative onto the bundle, in place. The whole of the trust
  * boundary: a ticket naming a defect the run never filed loses that
  * reference, lists are capped, every field is clipped, and an answer with
@@ -157,7 +289,7 @@ export function applyNarrative(
     tickets.push({
       kind,
       title,
-      detail: clip(t.detail, NARRATIVE_MAX_CHARS),
+      detail: clipCell(t.detail, NARRATIVE_HARD_CHARS),
       owner: clip(t.owner, 60),
       ...(defectId === undefined ? {} : { defectId }),
     });
@@ -173,11 +305,11 @@ export function applyNarrative(
   const narrative: CaseNarrative = {
     lang,
     lede: clip(answer.lede, NARRATIVE_MAX_CHARS),
-    summary: clip(answer.summary, NARRATIVE_MAX_CHARS),
-    testData: clip(answer.testData, NARRATIVE_MAX_CHARS),
+    summary: clipCell(answer.summary),
+    testData: clipCell(answer.testData),
     expected: clip(answer.expected, NARRATIVE_MAX_CHARS),
     tickets,
-    verifierNote: clip(answer.verifierNote, NARRATIVE_MAX_CHARS),
+    verifierNote: clipNote(answer.verifierNote),
     questions,
     by,
     at,
@@ -191,9 +323,17 @@ export function applyNarrative(
 
 const NarrativeSchema = z.object({
   lede: z.string().describe('One sentence under the title: what was tested, with what data, and what the record holds. No verdict word the record does not carry.'),
-  summary: z.string().describe('Two or three sentences a reader reads before the results: what the case does, step by step in plain words.'),
-  testData: z.string().describe('The data the run used — ids, names, dates — exactly as the step lines and variables show them. "none recorded" when there is none.'),
-  expected: z.string().describe('What the sheet expected, restated in plain words from CASE TEXT.'),
+  summary: z.string().describe(
+    `ONE or TWO short sentences, at most ${NARRATIVE_MAX_CELL_CHARS} characters in total: this is read inside a table cell, not as a paragraph. ` +
+    'What the case set out to do and how the run ended — never a step-by-step retelling of the whole run. Drop detail; never blur what happened.',
+  ),
+  testData: z.string().describe(
+    `Only the values that DECIDE this case — the record under test and the inputs its expectation turns on — at most ${NARRATIVE_MAX_CELL_CHARS} characters, not every value recorded. ` +
+    'Each exactly as a step line or a VARIABLES line shows it. "none recorded" when there is none.',
+  ),
+  expected: z.string().describe(
+    'What the sheet expected, restated in plain words from CASE TEXT. When the Expected column enumerates its items, KEEP the enumeration: one item per line, numbered as the sheet numbers them ("1. … 2. …"). Never flatten it into one sentence.',
+  ),
   tickets: z
     .array(
       z.object({
@@ -205,7 +345,11 @@ const NarrativeSchema = z.object({
       }),
     )
     .describe('One per recorded defect at most, plus at most one test-side ticket when the record shows the test itself fell short. Empty when nothing needs a ticket.'),
-  verifierNote: z.string().describe('What a reader should know about how this run went — a step that needed healing, a check the harness could not make, data that was shared. Empty string when there is nothing to say.'),
+  verifierNote: z.string().describe(
+    `A SUMMARY OF THE NOTES block, at most ${NARRATIVE_NOTE_MAX_WORDS} words — it is the only place the run's own notes reach the reader, and they are not shown beside it. ` +
+    'Most decision-relevant first: a diagnosed system error and its suggested fix, then interference from another case, then a risk judged before the run, then how the session was obtained. ' +
+    'Empty string when NOTES is empty and there is genuinely nothing to say.',
+  ),
   questions: z
     .array(
       z.object({
@@ -240,7 +384,20 @@ HARD RULES:
   script. Never translate them — a translation is a claim about evidence.
 - Never write a credential, a password, an email address or a connection string, even if one
   somehow appears.
-- No markdown, no bullets, no headings inside a field. Plain sentences.
+- No markdown, no bullets, no headings inside a field. Plain sentences. The one exception is \`expected\`, which keeps
+  the sheet's own numbering ("1. …" on its own line, "2. …" on the next) when the Expected column enumerates items.
+
+FIELD LENGTHS — \`summary\` and \`testData\` are read inside one cell of a table:
+- \`summary\`: one or two short sentences, ${NARRATIVE_MAX_CELL_CHARS} characters at most. Say what the case set out to
+  prove and how the run ended. Do not chain the run step by step; the step list below the table already does that.
+- \`testData\`: the values the case turns on — the record under test and the inputs its expectation depends on —
+  ${NARRATIVE_MAX_CELL_CHARS} characters at most. Not every value the run recorded.
+- \`verifierNote\`: the NOTES block below, summarised in at most ${NARRATIVE_NOTE_MAX_WORDS} words. It is the ONLY place those notes
+  reach the reader — the page does not show them beside it — so say the most decision-relevant facts first: a diagnosed
+  system error and the fix it suggests, then interference from another case, then a risk judged before the run, then how
+  the session was obtained. Empty only when NOTES is empty.
+- Shorter is not vaguer: drop a detail rather than generalise it. A value you keep is quoted exactly; a value you drop
+  is simply not mentioned.
 
 ${DETERMINISM_RULES}
 
@@ -249,7 +406,9 @@ ${procedure('HOW TO WRITE', [
   'Read every STEP line: what each did, and whether it passed, failed, dead-ended, errored or was skipped.',
   'Read the DB lines: which tables were checked, what was expected against what was observed, the rows returned.',
   'Read the DEFECTS: each is one ticket, worded for the person who will fix it, with its id copied.',
-  'Write the lede and the summary from steps 1–3; the test data from the step lines and VARIABLES; the note from what the harness disclosed.',
+  'Write the lede, then the summary in one or two short sentences — what was tried and how it ended, not each step in turn.',
+  'Pick for the test data only the values the case turns on; leave the rest to the step lines. Keep the Expected enumeration numbered as the sheet numbers it.',
+  `Write the verifier's note as a summary of the NOTES block — the error diagnosis and its fix first, then interference, then risk, then session mechanics — in at most ${NARRATIVE_NOTE_MAX_WORDS} words.`,
   'Answer only the questions CASE TEXT asks that the record can answer, naming the line you read the answer off.',
 ])}
 
@@ -258,10 +417,18 @@ ${selfCheck([
   'No field holds an email address, a password, a token or a connection string.',
   'Every value, id, date and status you wrote appears in a STEP, DB, DEFECT or VARIABLES line, or in CASE TEXT.',
   'The lede and summary agree with STATUS and with each step outcome; a DEAD END or ERROR step is not described as done.',
+  `The summary is one or two sentences and the test data only the deciding values — each under ${NARRATIVE_MAX_CELL_CHARS} characters.`,
+  `The verifier's note covers every NOTES line that changes what a reader would do, and is at most ${NARRATIVE_NOTE_MAX_WORDS} words.`,
 ])}`;
 
 export function buildNarrativePrompt(request: NarrativeRequest): string {
   const lines: string[] = [];
+  // At the top, not the bottom: this is the whole reason for the second call,
+  // and a long record between the ask and the answer is where it gets lost.
+  if (typeof request.shorten === 'string' && request.shorten !== '') {
+    lines.push(`REWRITE — SHORTER: ${request.shorten}`);
+    lines.push('');
+  }
   lines.push(`LANGUAGE: write every field in ${LANGUAGE_NAMES[request.lang]}. Quoted application text and recorded values stay exactly as recorded.`);
   lines.push('');
   lines.push(`CASE: ${request.caseName}`);
@@ -353,10 +520,85 @@ export interface ComposeOptions {
  * language. Never throws: a failed call leaves the bundle as it was and the
  * page renders its evidence alone. Returns whether a narrative landed.
  */
+/**
+ * Which capped fields came back over the soft cap, named the way the re-ask
+ * addresses them. Empty when the answer is already inside its budget — which
+ * is the common case, and the one that must cost nothing.
+ */
+export function overSoftCap(
+  answer: NarrativeAnswer,
+  soft: number = NARRATIVE_SOFT_CHARS,
+  maxWords: number = NARRATIVE_NOTE_MAX_WORDS,
+): string[] {
+  const over: string[] = [];
+  const len = (v: unknown): number => (typeof v === 'string' ? clip(v, Number.MAX_SAFE_INTEGER).length : 0);
+  // The note is judged in words, in the unit its own budget is written in; a
+  // character count would bound the two report languages at different lengths.
+  const words = noteWords(answer.verifierNote);
+  if (words > maxWords) over.push(`verifierNote (${words} words)`);
+  (answer.tickets ?? []).forEach((t, i) => {
+    if (len(t.detail) > soft) over.push(`tickets[${i}].detail (${len(t.detail)} characters)`);
+  });
+  return over;
+}
+
+/** The instruction the over-long fields go back with. Names them; never rewrites them here. */
+export function shortenAsk(
+  over: readonly string[],
+  soft: number = NARRATIVE_SOFT_CHARS,
+  hard: number = NARRATIVE_HARD_CHARS,
+  maxWords: number = NARRATIVE_NOTE_MAX_WORDS,
+): string {
+  return (
+    `These fields are longer than the budget the page gives them: ${over.join('; ')}. ` +
+    `Write the SAME answer again with those fields shorter — the verifier's note at most ${maxWords} words, ` +
+    `every other field named above ${soft} characters and never more than ${hard}. ` +
+    'Drop the least load-bearing clause; do not generalise what you keep, and do not drop a value, a status or a step number. ' +
+    'Every other field stays exactly as you wrote it.'
+  );
+}
+
+/**
+ * Field by field, the shorter of two answers — and only for the fields the
+ * cap governs. Everything else is the first answer's, because the re-ask was
+ * told to leave them alone and a model that changed one anyway must not get
+ * to restate the record on a second pass.
+ */
+export function keepShorter(first: NarrativeAnswer, second: NarrativeAnswer): NarrativeAnswer {
+  const pick = (a: unknown, b: unknown): string => {
+    const one = typeof a === 'string' ? a : '';
+    const two = typeof b === 'string' ? b : '';
+    if (two.trim() === '') return one;
+    return two.length < one.length ? two : one;
+  };
+  const tickets = (first.tickets ?? []).map((t, i) => {
+    const other = (second.tickets ?? [])[i];
+    return other === undefined ? t : { ...t, detail: pick(t.detail, other.detail) };
+  });
+  return { ...first, verifierNote: pick(first.verifierNote, second.verifierNote), tickets };
+}
+
 export async function composeNarrative(bundle: NarratableBundle, caseText: string, options: ComposeOptions): Promise<boolean> {
   if (!needsNarrative(bundle, options.lang)) return false;
   try {
-    const answer = await options.model.compose(narrativeRequest(bundle, caseText, options.lang));
+    const request = narrativeRequest(bundle, caseText, options.lang);
+    let answer = await options.model.compose(request);
+    // One re-ask, never two: a second would cost a call per case to save
+    // characters a sentence-boundary cut already removes safely.
+    const over = overSoftCap(answer);
+    if (over.length > 0) {
+      options.log?.(`  narrative over its budget (${over.join('; ')}) — asking once for a shorter one`);
+      try {
+        const shorter = await options.model.compose({ ...request, shorten: shortenAsk(over) });
+        // The re-ask is kept only where it actually helped. A field that came
+        // back LONGER keeps the first answer, so a re-ask can never make the
+        // page worse than not asking.
+        answer = keepShorter(answer, shorter);
+      } catch (error) {
+        const why = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);
+        options.log?.(`  ! shorter narrative not written for ${bundle.name}: ${why} — the first answer stands, cut at its bound`);
+      }
+    }
     return applyNarrative(bundle, answer, options.model.id, options.lang);
   } catch (error) {
     const message = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);

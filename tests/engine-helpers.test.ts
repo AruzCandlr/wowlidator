@@ -42,6 +42,7 @@ import {
 } from '../src/engine/dates.js';
 import { headRoleOf, optionNamePatterns, targetsPopupContent } from '../src/engine/selector.js';
 import {
+  ListboxNotReadableError,
   ListboxOptionDisabledError,
   ListboxOptionMissingError,
   optionCandidates,
@@ -338,7 +339,7 @@ describe('healer: the prompt says what an entry step needs; the tree says requir
     assert.doesNotMatch(buildUserPrompt(request), /ENTERS a value/);
     const withEntry = buildUserPrompt({ ...request, entry: 'A - Permanent' });
     assert.match(withEntry, /This step ENTERS a value \("A - Permanent"\)/);
-    assert.ok(withEntry.indexOf('ENTERS a value') < withEntry.indexOf('Accessibility tree:'), 'before the tree');
+    assert.ok(withEntry.indexOf('ENTERS a value') < withEntry.indexOf('Accessibility tree'), 'before the tree');
     assert.doesNotMatch(buildUserPrompt({ ...request, action: 'click', entry: 'x' }), /ENTERS a value/);
   });
 
@@ -377,6 +378,17 @@ const FIXTURE_HTML = `<!doctype html>
       <li role="option"><label><input type="checkbox" value="C006"> B2S (C006)</label></li>
       <li role="option"><label><input type="checkbox" value="C009"> OfficeMate (C009)</label></li>
     </ul>
+
+    <!-- The shape measured live on humi SIT (2026-09-11, BE PL_08_01): a
+         searchable picker with NO aria-controls, NO role=listbox anywhere,
+         and a bare input[type=checkbox] per row. The fixture above it has a
+         role=listbox because it was written from what the widget was assumed
+         to be; this one is written from what the page actually serves. -->
+    <button id="roleless" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Legal entity">— Select company —</button>
+    <div id="roleless-pop" class="popup" hidden>
+      <input id="roleless-search" type="text" placeholder="Search company...">
+      <div id="roleless-rows"></div>
+    </div>
 
     <button id="gender" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Gender">Select Gender</button>
     <ul id="gender-list" role="listbox" hidden>
@@ -508,13 +520,48 @@ const FIXTURE_HTML = `<!doctype html>
       portalSelect(document.getElementById('province'), function () { return provinces; }, function (p) { chosenProvince = p; document.getElementById('district').textContent = 'Select District'; setStatus('province:' + p); }, 0);
       portalSelect(document.getElementById('district'), function () { return chosenProvince ? districts[chosenProvince] : []; }, function (d) { setStatus('district:' + d); }, 300);
       // --- multi-select
+      // The role-less picker: rows render only once the search narrows them,
+      // and the trigger shows a COUNT rather than the value — so the row's
+      // own checked state is the only proof the pick landed.
+      var roleless = document.getElementById('roleless');
+      var rolelessPop = document.getElementById('roleless-pop');
+      var rolelessSearch = document.getElementById('roleless-search');
+      var rolelessRows = document.getElementById('roleless-rows');
+      var COMPANIES = ['CDS (C001)', 'B2S (C006)', 'OfficeMate (C009)'];
+      function renderRoleless() {
+        var q = rolelessSearch.value.trim().toLowerCase();
+        rolelessRows.innerHTML = '';
+        var shown = q === '' ? COMPANIES : COMPANIES.filter(function (c) { return c.toLowerCase().indexOf(q) >= 0; });
+        if (shown.length === 0) { rolelessRows.innerHTML = '<p>No matching options</p>'; return; }
+        shown.forEach(function (name) {
+          var label = document.createElement('label');
+          var box = document.createElement('input');
+          box.type = 'checkbox';
+          box.setAttribute('aria-label', name);
+          box.addEventListener('change', function () {
+            var n = rolelessRows.querySelectorAll('input:checked').length;
+            roleless.textContent = n ? n + ' selected' : '— Select company —';
+          });
+          label.appendChild(box);
+          label.appendChild(document.createTextNode(' ' + name));
+          rolelessRows.appendChild(label);
+        });
+      }
+      roleless.addEventListener('click', function () {
+        var open = rolelessPop.hidden;
+        rolelessPop.hidden = !open;
+        roleless.setAttribute('aria-expanded', String(open));
+        if (open) { rolelessSearch.value = ''; renderRoleless(); }
+      });
+      rolelessSearch.addEventListener('input', renderRoleless);
+
       var company = document.getElementById('company'), companyList = document.getElementById('company-list');
       company.addEventListener('click', function () { var open = companyList.hidden; companyList.hidden = !open; company.setAttribute('aria-expanded', String(open)); });
       companyList.addEventListener('change', function () {
         var picked = Array.prototype.map.call(companyList.querySelectorAll('input:checked'), function (c) { return c.parentElement.textContent.trim(); });
         company.textContent = picked.length ? picked.join(', ') : 'Select companies';
       });
-      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { companyList.hidden = true; company.setAttribute('aria-expanded', 'false'); genderList.hidden = true; gender.setAttribute('aria-expanded', 'false'); grpPop.hidden = true; grp.setAttribute('aria-expanded', 'false'); } });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { rolelessPop.hidden = true; roleless.setAttribute('aria-expanded', 'false'); companyList.hidden = true; company.setAttribute('aria-expanded', 'false'); genderList.hidden = true; gender.setAttribute('aria-expanded', 'false'); grpPop.hidden = true; grp.setAttribute('aria-expanded', 'false'); } });
       // --- gender
       var gender = document.getElementById('gender'), genderList = document.getElementById('gender-list');
       gender.addEventListener('click', function () { var open = genderList.hidden; genderList.hidden = !open; gender.setAttribute('aria-expanded', String(open)); });
@@ -704,6 +751,45 @@ describe('engine helpers against a real page (CDP)', { skip: skipBrowser }, () =
     await withPage(async (page) => {
       const result = await selectFromListbox(page, page.locator('#grp'), 'A');
       assert.deepEqual(result.picked, ['A — Permanent']);
+    });
+  });
+
+  it('listbox: reads a picker that carries no list role at all (humi Company, 2026-09-11)', async () => {
+    await withPage(async (page) => {
+      // Nothing here has role=listbox/option and the trigger has no
+      // aria-controls — the exact shape that made PL_08_01 report
+      // "no option named CDS (C001) appeared" about a control offering it.
+      const result = await selectFromListbox(page, page.locator('#roleless'), 'CDS (C001)');
+      assert.deepEqual(result.picked, ['CDS (C001)']);
+      assert.equal(result.via, 'checkbox', 'a checkbox row is ticked, not clicked through as an option');
+      assert.ok(result.confirmed, `the ticked row is the proof; trigger read back ${result.readBack}`);
+      assert.ok(
+        await page.locator('#roleless-rows input[aria-label="CDS (C001)"]').isChecked(),
+        'the row the value names is the one that ended up ticked',
+      );
+      assert.equal(await page.locator('#roleless').getAttribute('aria-expanded'), 'false', 'Escape closed the panel');
+    });
+  });
+
+  it('listbox: a role-less picker that offers nothing says the list was UNREADABLE, never that the option is absent', async () => {
+    await withPage(async (page) => {
+      // Remove the rows CONTAINER, so the panel can never hold a row at any
+      // search — the click handler re-renders into it otherwise, and a panel
+      // that renders rows and then filters them empty is the OTHER case
+      // (read, and the option is not there), which keeps its own wording.
+      await page.evaluate("document.getElementById('roleless-rows').remove()");
+      // With no rows to find at any search, there is no panel to read — and
+      // the error must not claim anything about what the control offers.
+      await assert.rejects(
+        selectFromListbox(page, page.locator('#roleless'), 'Nowhere Ltd (C999)', { timeout: 1_000 }),
+        (error: unknown) => {
+          assert.ok(error instanceof ListboxNotReadableError, `got ${(error as Error).name}`);
+          assert.match((error as Error).message, /could not read its list/);
+          assert.match((error as Error).message, /nothing is known about whether/);
+          assert.doesNotMatch((error as Error).message, /no option named/);
+          return true;
+        },
+      );
     });
   });
 

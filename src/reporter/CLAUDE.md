@@ -140,7 +140,8 @@ planned case is a row — never-ran included — grouped by scenario with
 passed-of-N counts and the two-family chips. A case opens into a two-pane
 view: LEFT expandable steps (intent, selector, resolution, error, heal, agent
 turns, screenshot) plus history explanations (`analyseTrend`/`formatTrend`
-over `RunHistory.forFlow` + heal pressure) and the bundle's run notes; RIGHT
+over `RunHistory.forFlow` + heal pressure) and the run's notes as
+`runNotesSummary` gives them; RIGHT
 the time record — a bar per step against the 2s fast-path budget, slowest
 named. Screenshots embed as data URIs: failure stills take priority, routine
 stills until `SCREENSHOT_BUDGET_BYTES` (15MB) is spent. Past that budget the
@@ -753,3 +754,91 @@ page, byte-identical rendering), `tests/catalog-live-report.test.ts` ("each
 case with a bundle gets its own page" — the files on disk, the index link, the
 language off the ledger, the stale page removed), `tests/case-narrative.test.ts`
 (the model seam).
+
+## The pre-read table says each thing once, and a list reads as one (2026-09-11)
+
+Measured on a real page (`PRB-EC-053`, the EC spot run of 2026-09-11): the
+Test case row read `<code>PRB-EC-053</code> · PRB-EC-053 พนักงานกลุ่ม C …`,
+the id printed twice, while the mast one screen above had already stripped it.
+The mast's own derivation is now `caseTitle` and `preRead`, the mast and the
+blocked-case page all call it: the sheet's own id through `displayCaseId`, and
+the name with a leading repeat of **either** id removed (the qualified one and
+the shown one — a name that repeats the sheet's spelling was the same bug from
+the other side). The qualified id keeps its one place, the mast's id line.
+
+**An enumerated narrative field renders as an ordered list.** The same page's
+Expected result was one run-on paragraph over a source text the model wrote as
+`1. … 2. … 3. … 4. …`. `enumeratedItems` splits it, and the rules exist so that
+restructuring can never become rewriting: the run must START at `1.`/`1)` with
+nothing before it, the numbers must ascend by one (a mark that does not is left
+inside the item it sits in, never dropped), an empty item or fewer than two
+items means "not a list", and the marker needs trailing whitespace — which is
+what keeps `120,000 THB`, `2026-10-08` and `1.5s` out of it. Text with no
+enumeration renders exactly the bytes it did before. `narrative()` is the one
+reader of a model-written field on this page and marks `ai` on either shape:
+the words stay the model's, the layout is ours.
+
+**An absent value is a note, not a value.** Test data with no recorded
+variables rendered `<code>none recorded</code>` — a label dressed as evidence.
+It is a `span.det` now, the same shape Expected result already used for the
+same absence; a recorded value still sits in `code`.
+
+Tests: `tests/case-page.test.ts` — "the pre-read table names the case exactly
+as the mast does" (the qualified id, the stripped name, the name that is only
+an id) and "an enumerated narrative field becomes a real list" (the `<ol>`, the
+one-sentence field left alone, three shapes that must not split, a `det` field,
+and the escaping inside a list item).
+
+## The run's notes are summarised, not recited (`runNotesSummary`, 2026-09-11)
+
+A reader opened PL_06_10's case page and found the paragraph under the coverage
+bar unreadable: roughly 300 words in ONE `·`-joined line — the session note, the
+sign-in POST evidence, a pre-run dead-end/expected-fail risk line, a three-case
+cross-case-interference stamp and a full system-error diagnosis with the agent's
+click trail and a suggested `--repair-investigate`. Decided by the person
+running this: **the reader is shown a summary of at most 70 words and the
+verbatim notes are dropped from the page** — not behind a disclosure, not in a
+tooltip. `bundle.notes` is untouched in the JSON; it stops being rendered.
+
+**`runNotesSummary` in `step-facts.ts` is the ONE reading**, and the per-case
+page, the catalog report and the per-run report all ask it — the same rule as
+`stepNarration` and `inconsequentialAgentLeg`: a surface that decides on its own
+how to describe the run's notes is a surface that will describe them
+differently. It reads two recorded fields and picks one; it derives nothing and
+calls no model. The summary itself is `CaseNarrative.verifierNote`, written and
+bounded in `generator/case-narrative.ts` from the notes it is already given, so
+this costs no extra model call.
+
+- narrative with a non-empty `verifierNote` → that text, `by`/`attribution`
+  set, `lines` EMPTY (the summary replaces the notes, it never precedes them).
+- notes with no narrative → the notes, joined for `text` and per-entry in
+  `lines`, unattributed. **This degraded path is not an edge case and must not
+  be deleted**: `--no-case-narrative`, `WOWLIDATOR_CASE_NARRATIVE=off` and a
+  generator role with no key all seal a bundle with notes and no narrative, and
+  that page already degrades "to the evidence alone". Rendering nothing there
+  would delete the only account of the run a reader has.
+- neither → null, and no block is rendered at all.
+
+Defensive like the rest of the module: an empty or whitespace note, a narrative
+from an older build and a `narrative` that is not an object all fall through to
+the notes rather than to a placeholder; a summary with no `by` is attributed to
+`a model`, never left reading as the harness's own sentence.
+
+**Attribution stays with the sentence, in each file's own idiom** — `ai(…, 'p',
+'caveat')` on the case page (whose mast already says once whose words the violet
+bars are), `— written by <provider:model>` in a `span.narr-by` in the per-run
+report's callout and an `em.narr-by` on the catalog report's `hline`. The
+per-run callout keeps its `(N)` count only on the raw-notes path, where there is
+a count to give.
+
+**Site 3 is the per-run report's `Run notes` callout inside `<details
+class="diagnostics">`** — collapsed, and its section is by charter the raw
+material a person debugs from. It was changed with the other two on instruction,
+and it is the one worth re-deciding: reverting it is one call site
+(`runNotes()` in `html-reporter.ts`) and its test.
+
+Tests: `tests/reporter-wave2.test.ts` ("the run notes a reader is shown" — the
+projection's exact shape, the callout, no raw note text on the summarised path,
+the `(2)` count on the degraded one, the fall-throughs, and escaping on both
+paths), `tests/catalog-report.test.ts` and `tests/case-page.test.ts` (same
+section name, each surface's own markup).

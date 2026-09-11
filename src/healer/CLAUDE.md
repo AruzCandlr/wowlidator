@@ -38,7 +38,7 @@ numbers, because a saving proposed without them is a guess:
 
 | Stage | Cost |
 |---|---|
-| `captureAxTree` | `DEFAULT_MAX_AX_NODES` 120, rendered to `HEAL_TREE_MAX_LINES` 60 after relevance ranking |
+| `captureAxTree` | `DEFAULT_MAX_AX_NODES` 120, rendered to `HEAL_TREE_MAX_LINES` 60 after relevance ranking; indented, which costs ~1 token per indented line (see below) |
 | `probeInteractions` | disclosure probing upfront, `MAX_POPUP_VALUE_READS` 60 — failures swallowed, because a probe must never abort a repair |
 | model calls | up to `HEAL_ATTEMPTS` (3) |
 | `#verify`, per attempt reaching it | up to `verifyTimeoutMs`, **default 5,000 ms** |
@@ -57,6 +57,74 @@ re-asks so the provider's prompt cache hits. Moving the capture inside the loop
 looks harmless — fresher, even — and silently destroys caching, making a "more
 accurate" healer several times more expensive. Same invariant as the memoised
 agent contract in `src/orchestrator/CLAUDE.md`.
+
+## The tree carries containment (2026-09-11)
+
+**A Playwright selector is hierarchical; the tree it was written from was
+flat.** `captureAxNodes` walked the CDP tree and pushed into an array;
+`formatAxNode` printed `role "name" value=… url=…` with no indentation, no
+parent, no child list. So `role=search[name="ค้นหา" i] >> role=textbox` and
+`role=row[name="…" i] >> role=button[name="Delete" i]` were authored — and
+repaired — by GUESSING which node sat inside which.
+
+Measured on `be-sit-high-sonnet-th-20260911-162004` (15 BE_SIT cases, HUMI
+SIT): of 93 failure events, 56 were "could not resolve", 26 "the text is not on
+the page", 5 "resolved, but the claim did not hold". 20 of the unresolved
+selectors were scoped with `>>`. The healer's own reasoning gave the tell — *"the
+search landmark 'ค้นหา' does not contain a child with role=textbox **in the
+tree**"* — a model reasoning about containment from a rendering that had none.
+The two cheaper explanations were ruled out first and neither held: the prune
+keeps unnamed interactive nodes (`textbox`, `searchbox` are both in
+`INTERACTIVE_ROLES`), and the whole 731 KB log holds exactly one `TREE
+TRUNCATED`. `NAME_FROM_CONTENT_ROLES` was the same defect fixed for one role.
+
+- **`AxNode.depth` counts PRINTED ancestors, taken from CDP `childIds`, never
+  from document order.** A pruned `generic` or an ignored node contributes no
+  level, so a child reattaches to the nearest ancestor the tree shows. An
+  indent that lies about containment is worse than no indent, because it reads
+  as authority.
+- **`formatAxTree` renders two spaces per level; `formatAxNode` still emits no
+  leading whitespace.** Indentation was chosen over an explicit `parent=#id`
+  marker (several tokens a line plus an indirection) and over an
+  `in=row "…"` scope hint (which repeats a long row name once per control — on
+  a 25-row table that costs more than the rest of the tree). Rendering stays
+  relative to the lines actually present, so a hand-built node list with no
+  depths is byte-identical to what this always emitted.
+- **Every subset of a tree is closed under containment.** Both places a subset
+  is chosen — the node budget (`captureAxTreeDetailed`) and the relevance
+  narrowing (`focusTreeText`, which the heal prompt and the author's journey
+  tree both run through) — take a candidate WITH its containers or not at all
+  (`keepWithAncestors`). A control kept while its row was ranked away would be
+  printed under whatever line happened to precede it, which is exactly the
+  reading a scoped selector is written from.
+- **The prompt says what the indentation means**, in the tree's own label and
+  in a CONTAINMENT block of `SELECTOR_SYNTAX_RULES` (shared, so the generator
+  authors from the same rule): a landmark is a container, and a control not
+  indented beneath it gets its own selector rather than a `>>`.
+
+What it costs, on a hand-built capture shaped like the failing pages (154
+printed nodes, 100 of them at depth 4 — a deliberately deep, short-named worst
+case; a real page is shallower):
+
+| Tree | Before | After |
+|---|---|---|
+| full capture, chars | 3,744 | 4,820 (+29%) |
+| at the 120-node cap, est. tokens | 611 | 853 (+40%) |
+| heal prompt tree, 60 lines, est. tokens | 432 | 577 (+34%) |
+| interactive controls at the 120-node cap | 96 | 90 |
+
+Against the ~3.2k input tokens a heal actually bills, the narrowed tree's +145
+tokens is about +4.5% per repair. The rest of the cost is the budget now buying
+containers as well as controls: six fewer controls per capture, and the
+containers are what make the remaining ones addressable. Estimated with one
+token per line's leading space run (BPE vocabularies hold whitespace runs), so
+the indent costs ~1 token per indented line whatever its depth — which is why
+two spaces was not worth shaving to one.
+
+Pinned by `tests/ax-tree-containment.test.ts` (hand-built CDP payloads — a
+pruned `generic`, an ignored node, a parent listed after its child, a parent
+cycle): depth from real parentage, no phantom level, no orphaned indent under a
+cut container at either subset site, and `formatAxNode` still whitespace-free.
 
 ## The gate order is the design
 
@@ -109,11 +177,14 @@ is usually a better move than making a heal cheaper:
 
 ## What is not pinned yet (2026-09-09)
 
-`HEAL_ATTEMPTS` was module-private until the economy assertions landed, and
-there is still **no dedicated healer test file** — coverage is indirect, through
-`tests/smoke.test.ts` (healer contract, `jitHeals` counters),
-`tests/model-fence.test.ts` and `tests/role-statelessness.test.ts`, plus
-`tests/healer-economy.test.ts` for the attempt budget and gate order.
+`HEAL_ATTEMPTS` was module-private until the economy assertions landed. The
+only dedicated healer test file is `tests/ax-tree-containment.test.ts`
+(2026-09-11), and it covers the CAPTURE, not the gates: the attempt budget, the
+echo check and the gate order are still pinned nowhere directly — coverage is
+indirect, through `tests/smoke.test.ts` (healer contract, `jitHeals` counters),
+`tests/model-fence.test.ts` and `tests/role-statelessness.test.ts`. A
+`tests/healer-economy.test.ts` is named in older notes and **does not exist**;
+check before citing it.
 
 Anything not asserted in those is unprotected: a later change can restore the
 cost and nothing goes red. Before optimising this plane, write the assertion

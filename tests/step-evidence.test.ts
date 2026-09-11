@@ -82,7 +82,12 @@ const SCHEMA: DbSchema = {
 class StubDb implements DbClient {
   readonly id = 'stub';
   readonly queries: { sql: string; params: readonly unknown[] }[] = [];
-  existing = new Set<string>(['BE-MED-001']);
+  existing = new Set<string>(['BE-MED-001', 'QA260908_BE_137']);
+  /** The spelling the connection's own `current_schema()` produces — bare under a `search_path` DSN. */
+  readonly #schema: DbSchema;
+  constructor(schema: DbSchema = SCHEMA) {
+    this.#schema = schema;
+  }
   async query(sql: string, params: readonly unknown[]): Promise<DbResult> {
     this.queries.push({ sql, params });
     return {
@@ -92,7 +97,7 @@ class StubDb implements DbClient {
     };
   }
   async introspect(): Promise<DbSchema> {
-    return SCHEMA;
+    return this.#schema;
   }
   async close(): Promise<void> {}
 }
@@ -310,6 +315,43 @@ describe('a fixture the application already holds', () => {
     );
     assert.deepEqual(outcome.existingFixtures, []);
     assert.ok(log.some((l) => /the database did not answer/.test(l)));
+    // **Unavailable is not absent** (PL_09_01): the lookup that could not run
+    // is recorded apart, so the caller can note it instead of refusing as
+    // though the application had answered "no such row".
+    assert.deepEqual(outcome.unavailableFixtures, [{ fact: 'BE-MED-001', reason: 'connection refused' }]);
+  });
+
+  it('a database that answers "no row" is NOT recorded as unavailable', async () => {
+    const db = new StubDb();
+    const outcome = await resolveStepEvidence(
+      [],
+      [{ action: 'expectVisible', selector: 'text="BE-XXX-999"' }] as FlowStep[],
+      {
+        trees: START_TREE,
+        fixtures: ['BE-XXX-999'],
+        db: async () => db,
+        model: lookupModel({ table: 'benefit_management.benefit_plan', column: 'plan_code', where: {} }),
+      },
+    );
+    assert.deepEqual(outcome.existingFixtures, []);
+    assert.deepEqual(outcome.unavailableFixtures, []);
+  });
+
+  it('the PL_09_01 spelling: a qualified name resolves against a bare introspection', async () => {
+    // The live DSN sets `search_path=benefit_management,public`, so
+    // `introspect` spells that schema's tables bare while the authoring
+    // inventory shows the model the graph's `benefit_management.benefit_plan`.
+    const bare = new StubDb({
+      source: 'introspection',
+      tables: [{ ...SCHEMA.tables[0]!, name: 'benefit_plan' }],
+    });
+    const found = await fromDatabase('QA260908_BE_137', {
+      db: async () => bare,
+      model: lookupModel({ table: 'benefit_management.benefit_plan', column: 'plan_code', where: {} }),
+      caseText: 'PL_09_01',
+    });
+    assert.equal(found?.kind, 'database');
+    assert.match(bare.queries[0]!.sql, /FROM "benefit_plan"/);
   });
 
   it('bounded: a row asserting many fixtures asks at most MAX_DB_LOOKUPS times', async () => {

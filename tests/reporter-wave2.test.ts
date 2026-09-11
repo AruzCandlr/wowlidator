@@ -39,6 +39,7 @@ import {
   provenanceExtras,
   recordOnlyCase,
   recordedCaptures,
+  runNotesSummary,
   sheetLabel,
   stepKindFacts,
   stepNarration,
@@ -1226,5 +1227,75 @@ describe('a step that broke without deciding the outcome', () => {
     for (const action of ['click', 'goto', 'workflow', 'fill', 'signIn', 'upload', 'request', 'dbSnapshot', 'saveText', undefined]) {
       assert.equal(isAssertionStepAction(action), false, String(action));
     }
+  });
+});
+
+/* ------------------------------------------- the run's notes, summarised */
+
+/**
+ * A live case (PL_06_10) put five notes on one page as ~300 words in a single
+ * `·`-joined line. The reader is now shown the model's own bounded summary of
+ * them (`CaseNarrative.verifierNote`) instead — and the notes themselves only
+ * when the run has no narrative to summarise them, which is every run made
+ * with `--no-case-narrative` or with no key for the generator role.
+ */
+describe('the run notes a reader is shown', () => {
+  const NOTES = ['the session was seeded from the vault', 'pre-run dead-end risk 20%'];
+  const NARRATIVE: NonNullable<ProofBundle['narrative']> = {
+    lang: 'en', by: 'claude-cli:opus', at: '2026-09-11T00:00:00.000Z',
+    lede: '', summary: '', testData: '', expected: '', tickets: [], questions: [],
+    verifierNote: 'The run reused a seeded session and the agent recovered a consent gate.',
+  };
+
+  it('summarises: the model note is shown, attributed, and no raw note text reaches the page', () => {
+    const summary = runNotesSummary({ notes: NOTES, narrative: NARRATIVE });
+    assert.deepEqual(summary, {
+      text: 'The run reused a seeded session and the agent recovered a consent gate.',
+      lines: [],
+      by: 'claude-cli:opus',
+      attribution: 'written by claude-cli:opus',
+    });
+    const html = renderReport(newKindsBundle({ notes: NOTES, narrative: NARRATIVE }));
+    assert.match(html, /Run notes<\/div>/);
+    assert.match(html, /The run reused a seeded session and the agent recovered a consent gate\./);
+    assert.match(html, /written by claude-cli:opus/);
+    assert.doesNotMatch(html, /pre-run dead-end risk/);
+    assert.doesNotMatch(html, /seeded from the vault/);
+  });
+
+  it('degrades to the notes themselves when the run has no narrative — the only account a reader has', () => {
+    const summary = runNotesSummary({ notes: NOTES });
+    assert.equal(summary?.by, null);
+    assert.equal(summary?.attribution, null);
+    assert.deepEqual(summary?.lines, NOTES);
+    assert.equal(summary?.text, 'the session was seeded from the vault · pre-run dead-end risk 20%');
+    const html = renderReport(newKindsBundle({ notes: NOTES }));
+    assert.match(html, /Run notes \(2\)<\/div>/);
+    assert.match(html, /pre-run dead-end risk 20%/);
+    assert.doesNotMatch(html, /written by/);
+  });
+
+  it('an empty note, a narrative from an older build and a narrative that is not an object all fall through', () => {
+    assert.equal(runNotesSummary({ notes: NOTES, narrative: { ...NARRATIVE, verifierNote: '   ' } })?.by, null);
+    assert.equal(runNotesSummary({ notes: NOTES, narrative: undefined })?.by, null);
+    assert.equal(runNotesSummary({ notes: NOTES, narrative: 'a note' as unknown })?.by, null);
+    assert.equal(runNotesSummary({ notes: [], narrative: { ...NARRATIVE, verifierNote: 'still said' } })?.text, 'still said');
+    assert.equal(runNotesSummary({ notes: [' ', ''] }), null);
+    assert.equal(runNotesSummary({}), null);
+    assert.equal(runNotesSummary(null), null);
+  });
+
+  it('a bundle with neither notes nor a narrative renders no callout at all', () => {
+    assert.doesNotMatch(renderReport(newKindsBundle()), /Run notes/);
+  });
+
+  it('escapes both paths — a note and a summary are application-adjacent text', () => {
+    const probe = '<b>a & b</b>';
+    const notesOnly = renderReport(newKindsBundle({ notes: [probe] }));
+    assert.doesNotMatch(notesOnly, /<b>a & b<\/b>/);
+    assert.match(notesOnly, /&lt;b&gt;a &amp; b&lt;\/b&gt;/);
+    const narrated = renderReport(newKindsBundle({ notes: ['x'], narrative: { ...NARRATIVE, verifierNote: probe, by: probe } }));
+    assert.doesNotMatch(narrated, /<b>a & b<\/b>/);
+    assert.equal((narrated.match(/&lt;b&gt;a &amp; b&lt;\/b&gt;/g) ?? []).length >= 2, true);
   });
 });

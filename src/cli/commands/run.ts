@@ -51,7 +51,6 @@ import { runCases, type SuiteCase } from '../run-cases.js';
 import {
   assertRolesResolvable,
   buildAgent,
-  buildDataModel,
   buildHealer,
   buildStepRepair,
   buildReviewJudge,
@@ -114,7 +113,6 @@ export async function cmdRun(flowPaths: readonly string[], options: CliOptions):
       reviewJudge: buildReviewJudge(options),
     healer: options.heal ? undefined : null,
     agent: buildAgent(options),
-    dataModel: buildDataModel(options),
     updateBaselines: options.updateBaselines,
     network: options.network,
     // Carried for masking only: a password the person supplied must not
@@ -304,7 +302,6 @@ async function cmdRunWithRepair(flowPath: string, flow: Flow, options: CliOption
       reviewJudge: buildReviewJudge(options),
       healer: options.heal ? undefined : null,
       agent: buildAgent(options),
-      dataModel: buildDataModel(options),
       updateBaselines: options.updateBaselines,
       network: options.network,
       // Carried for masking only: a password the person supplied must not
@@ -550,7 +547,6 @@ export async function cmdWatch(flowPath: string | undefined, options: CliOptions
       reviewJudge: buildReviewJudge(options),
       healer: options.heal ? undefined : null,
       agent: buildAgent(options),
-      dataModel: buildDataModel(options),
       network: options.network,
       // Carried for masking only: a password the person supplied must not
       // reach the proof bundle or the emailable report in cleartext.

@@ -70,8 +70,23 @@ const LEDGER_SUFFIX = '.progress.json';
 const MAX_LISTED = 50;
 
 /** The directories catalog ledgers land in, for one report dir. */
-function catalogRunRoots(reportDir: string): string[] {
-  return [...new Set([resolve(CATALOG_DIR), join(resolve(reportDir), 'catalogs')])];
+/**
+ * Where a catalog run's ledger can be: the panel's own uploads, the report
+ * directory's `catalogs/`, and — since 2026-09-11 — every per-run folder the
+ * `/wowlidate` skill stamps under `<report-dir>/runs/<slug>-<stamp>/`.
+ *
+ * That last root is what makes the two surfaces see one set of runs. A run
+ * launched from the skill writes its ledger inside its own folder, so the
+ * panel listed nothing for it: Continue, Rerun and the monitor were all blind
+ * to a run the terminal could see perfectly well.
+ */
+async function catalogRunRoots(reportDir: string): Promise<string[]> {
+  const roots = [resolve(CATALOG_DIR), join(resolve(reportDir), 'catalogs')];
+  const runs = join(resolve(reportDir), 'runs');
+  for (const name of await readdir(runs).catch(() => [] as string[])) {
+    roots.push(join(runs, name, 'catalogs'));
+  }
+  return [...new Set(roots)];
 }
 
 async function toEntry(ledgerPath: string, ledger: SuiteLedger): Promise<CatalogRunEntry> {
@@ -106,7 +121,7 @@ async function toEntry(ledgerPath: string, ledger: SuiteLedger): Promise<Catalog
 export async function listCatalogRuns(reportDir: string): Promise<CatalogRunEntry[]> {
   const entries: CatalogRunEntry[] = [];
   const seen = new Set<string>();
-  for (const root of catalogRunRoots(reportDir)) {
+  for (const root of await catalogRunRoots(reportDir)) {
     const names = await readdir(root).catch(() => [] as string[]);
     for (const name of names) {
       if (!name.endsWith(LEDGER_SUFFIX)) continue;

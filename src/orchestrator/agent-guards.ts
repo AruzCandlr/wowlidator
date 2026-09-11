@@ -16,7 +16,7 @@
  * Everything here is pure, so it is tested without a browser or a model.
  */
 
-import { formatAxNode, INTERACTIVE_ROLES, type AxNode } from '../healer/jit-healer.js';
+import { formatAxTree, INTERACTIVE_ROLES, keepWithAncestors, type AxNode } from '../healer/jit-healer.js';
 import { tokenize } from '../context/relevance.js';
 import { foldValue, goalOutcomes, valueShownIn } from './goal-evidence.js';
 
@@ -124,13 +124,22 @@ export function focusTree(nodes: readonly AxNode[], goal: string, maxNodes: numb
       if (near !== undefined && kept.size < maxNodes) kept.add(near);
     }
   }
-  return [...kept].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
+  // Ranked nodes arrive with the containers they sit inside. A kept control
+  // whose row or dialog was ranked away would be rendered indented under
+  // whatever line happened to precede it, and the agent scopes its clicks by
+  // exactly that reading — see `AxNode.depth`.
+  const chosen = keepWithAncestors(
+    nodes,
+    [...kept].map((n) => order.get(n) ?? 0),
+    maxNodes,
+  );
+  return chosen.map((i) => nodes[i] as AxNode);
 }
 
 /** Render a focused tree the same way the healer renders its own. */
 export function renderTree(nodes: readonly AxNode[], total: number): string {
   if (nodes.length === 0) return '(no accessible elements found)';
-  const body = nodes.map(formatAxNode).join('\n');
+  const body = formatAxTree(nodes);
   if (nodes.length >= total) return body;
   return (
     `${body}\n[TREE TRUNCATED: showing ${nodes.length} of ${total} nodes, the ones closest to the ` +
@@ -266,6 +275,47 @@ export function unscopedDestructiveClick(decision: DecisionLike, goal: string): 
  * three), and the page-changed guard already lets those through — the
  * pathology this exists for starts at the fourth.
  */
+/**
+ * A credential field the agent has no business typing into.
+ *
+ * The harness owns sign-in. `signIn` resolves a persona to an account the run
+ * was given, and the agent is handed a page it is already authenticated on —
+ * so an agent that reaches for a username or password box is not completing
+ * its goal, it is guessing at one.
+ *
+ * **And the guess is not harmless.** PRB-EC-053, 2026-09-11: `signIn` as
+ * MANAGER_ACCOUNT succeeded (1.4 s, persona resolved, browser 9334), HUMI
+ * returned its sign-in page anyway, and the agent typed
+ * the OPERATOR'S OWN EMAIL into the Username box — an address in no catalog
+ * row, no persona and no `.env` line. It came from the `claude-cli`
+ * provider's own process context, which names the signed-in account of the
+ * machine running the suite. The agent then spent three turns failing for
+ * want of a password it was never going to have, and the case sealed with no
+ * verdict.
+ *
+ * So this refuses on the FIELD, never on the value: where the string came
+ * from is unknowable from inside the loop, and a rail that tried to
+ * recognise a leaked identity would have to be told every identity worth
+ * leaking. A credential box is the harness's, whatever is typed into it.
+ *
+ * Returns the refusal to put in front of the model, or null.
+ */
+export function inventedCredentialFill(decision: DecisionLike, persona: string | null): string | null {
+  if (decision.action !== 'fill' && decision.action !== 'type') return null;
+  const field = `${decision.selector} ${targetName(decision.selector) ?? ''}`;
+  if (!CREDENTIAL_FIELD.test(field)) return null;
+  const who = persona === null ? 'the persona the step names' : persona;
+  return `"${decision.selector}" is a credential field, and signing in is the harness's job, not yours — the run holds ${who}'s account and you do not. If the page is asking you to sign in, the session did not take: call fail and say the page returned to sign-in.`;
+}
+
+/**
+ * Username, email and password boxes, in the languages these catalogs use.
+ * Matched against the selector AND the accessible name, because an agent may
+ * name either.
+ */
+export const CREDENTIAL_FIELD =
+  /\b(?:password|passwd|pwd|username|user[\s_-]?name|userid|user[\s_-]?id|login|email|e-mail)\b|รหัสผ่าน|ชื่อผู้ใช้|อีเมล/i;
+
 export const TOGGLE_CLICK_LIMIT = 3;
 
 /**

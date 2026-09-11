@@ -1464,14 +1464,91 @@ export async function fromRepo(need: ValueNeed, ctx: ValueResolutionContext): Pr
   return { need, value, source: { kind: 'repo', detail: `from the documents/repository: ${answer.evidence.slice(0, 120) || value}` } };
 }
 
-/** `schema.table` or `table` → the introspected table, case-insensitively. Shared with `step-evidence.ts`. */
-export function tableIn(schema: DbSchema, name: string): DbSchema['tables'][number] | null {
+/**
+ * What a table name the model wrote resolves to in the introspected schema.
+ * `ambiguous` is a deliberate outcome, not an error path — see `resolveTableIn`.
+ */
+export type TableResolution =
+  | { kind: 'found'; table: DbSchema['tables'][number] }
+  | { kind: 'ambiguous'; candidates: string[] }
+  | { kind: 'undeclared' };
+
+/**
+ * `schema.table` or `table` → the introspected table, case-insensitively, in
+ * BOTH directions — because both spellings are the harness's own.
+ *
+ * Live (2026-09-11, run `be-sit-high-opus-th-20260911-174323`, case PL_09_01):
+ * `DbClient.introspect` spells a table of `current_schema()` bare and every
+ * other table `schema.table` (`qualifiedName`, `src/db/client.ts`), so a DSN
+ * carrying `options=-csearch_path=benefit_management,public` returns
+ * `benefit_plan` — while the authoring inventory shows the model
+ * `benefit_management.benefit_plan`, the spelling the context graph holds
+ * because that schema was indexed from a `.sql` file. The model named the
+ * table the way the prompt spelled it, the old one-directional fallback
+ * (bare want → qualified entry) resolved to null, `fromDb` threw "the schema
+ * does not declare", the fixture went unproven and the row sealed `blocked`.
+ *
+ * Precedence is ordered and total: exact, then bare-want against a qualified
+ * entry, then qualified-want against a bare entry. Each tier is judged before
+ * the next is consulted, so widening the match can never move a name that
+ * already resolved.
+ */
+export function resolveTableIn(schema: DbSchema, name: string): TableResolution {
   const want = name.trim().toLowerCase();
-  return (
-    schema.tables.find((t) => t.name.toLowerCase() === want) ??
-    schema.tables.find((t) => t.name.toLowerCase().endsWith(`.${want}`)) ??
-    null
-  );
+
+  const exact = schema.tables.find((t) => t.name.toLowerCase() === want);
+  if (exact !== undefined) return { kind: 'found', table: exact };
+
+  // The model named a bare table the introspection qualified. **Ambiguity is
+  // refused, never resolved by position**: `public.benefit_plan` and
+  // `benefit_management.benefit_plan` are different tables, and reading a real
+  // value off whichever the introspection listed first would produce a lookup
+  // that LOOKS grounded — strictly worse than the miss this function was
+  // widened to fix, since nothing downstream can tell the two apart.
+  const qualified = schema.tables.filter((t) => t.name.toLowerCase().endsWith(`.${want}`));
+  if (qualified.length > 1) return { kind: 'ambiguous', candidates: qualified.map((t) => t.name) };
+  if (qualified[0] !== undefined) return { kind: 'found', table: qualified[0] };
+
+  // The model named a qualified table the introspection spelled bare — the
+  // PL_09_01 direction. A bare entry means "in `current_schema()`", which
+  // `DbSchema` does not carry, so the prefix is judged by the introspection's
+  // OWN usage: a schema prefix it writes anywhere is one it would have written
+  // here too, and the table really is undeclared then. Only a prefix it never
+  // writes can be the current schema whose tables it left bare. So on the live
+  // connection `benefit_management.benefit_plan` finds `benefit_plan` (no
+  // entry is spelled `benefit_management.`), while `public.benefit_plan` stays
+  // undeclared (`public.` is spelled out all over the same schema).
+  const dot = want.lastIndexOf('.');
+  const prefix = want.slice(0, dot + 1);
+  const bare = want.slice(dot + 1);
+  if (dot > 0 && !schema.tables.some((t) => t.name.toLowerCase().startsWith(prefix))) {
+    const unqualified = schema.tables.find((t) => t.name.toLowerCase() === bare);
+    if (unqualified !== undefined) return { kind: 'found', table: unqualified };
+  }
+
+  return { kind: 'undeclared' };
+}
+
+/** The resolution as the callers before it existed read it. Shared with `step-evidence.ts`. */
+export function tableIn(schema: DbSchema, name: string): DbSchema['tables'][number] | null {
+  const resolved = resolveTableIn(schema, name);
+  return resolved.kind === 'found' ? resolved.table : null;
+}
+
+/**
+ * The one wording for a table that did not resolve — `fromDb` here and
+ * `fromDatabase` in `step-evidence.ts` both throw it, so a reader of either
+ * log line is told the same thing about the same fact. The undeclared
+ * sentence is verbatim what both threw before this existed.
+ */
+export function tableLookupFailure(name: string, resolved: Exclude<TableResolution, { kind: 'found' }>): string {
+  if (resolved.kind === 'ambiguous') {
+    return (
+      `the model named table "${name}", which ${resolved.candidates.length} schemas declare ` +
+      `(${resolved.candidates.join(', ')}) — name it with the schema it means`
+    );
+  }
+  return `the model named table "${name}", which the schema does not declare`;
 }
 
 export function qualifiedIdent(table: string): string {
@@ -1549,8 +1626,9 @@ export async function fromDb(need: ValueNeed, ctx: ValueResolutionContext): Prom
   const schema = await client.introspect();
   const choice = await ctx.model.chooseDbLookup({ field: need.field, token: need.token, caseText: ctx.caseText.slice(0, 3000), schema: schemaSummary(schema) });
   if (choice === null) return null;
-  const table = tableIn(schema, choice.table);
-  if (table === null) throw new Error(`the model named table "${choice.table}", which the schema does not declare`);
+  const resolved = resolveTableIn(schema, choice.table);
+  if (resolved.kind !== 'found') throw new Error(tableLookupFailure(choice.table, resolved));
+  const table = resolved.table;
   const columns = new Set(table.columns.map((c) => c.name.toLowerCase()));
   const column = table.columns.find((c) => c.name.toLowerCase() === choice.column.trim().toLowerCase());
   if (column === undefined) throw new Error(`the model named column "${choice.column}" on ${table.name}, which the schema does not declare`);

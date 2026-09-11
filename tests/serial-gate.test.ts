@@ -84,14 +84,17 @@ describe('SerialGate', () => {
     await tick();
     const rest = [
       gate.run('generator', 10, async () => { order.push('gen-a'); }),
-      gate.run('data', 10, async () => { order.push('data'); }),
+      // A role the table does not list queues behind every role it does —
+      // `data` was one such role until it was retired, and the rule it
+      // exercised (unlisted goes last) is the one being pinned here.
+      gate.run('unlisted', 10, async () => { order.push('unlisted'); }),
       gate.run('healer', 10, async () => { order.push('healer'); }),
       gate.run('generator', 10, async () => { order.push('gen-b'); }),
       gate.run('agent', 10, async () => { order.push('agent'); }),
     ];
     hold.resolve();
     await Promise.all([first, ...rest]);
-    assert.deepEqual(order, ['agent', 'healer', 'data', 'gen-a', 'gen-b']);
+    assert.deepEqual(order, ['agent', 'healer', 'gen-a', 'gen-b', 'unlisted']);
   });
 
   it('asks an identical in-flight question once and tells the joiner so', async () => {

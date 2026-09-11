@@ -49,6 +49,7 @@ import {
   multiPersonaGoal,
   multiPersonaSummary,
   renderTree,
+  inventedCredentialFill,
   repeatedToggleClick,
   activationKey,
   reactivation,
@@ -1923,9 +1924,7 @@ export class WorkflowAgent {
         if (refusedTurn) {
           turnsWithoutProgress += 1;
           if (turnsWithoutProgress >= this.#noProgressTurns) {
-            summary =
-              `agent stalled: nothing advanced in ${turnsWithoutProgress} consecutive turns` +
-              ` (last refusal: ${actions[actions.length - 1]?.error ?? ''})`;
+            summary = `${stallSummary(actions, turnsWithoutProgress)} (the last turn was refused)`;
             this.#endedBy = 'no-progress';
             break;
           }
@@ -2403,10 +2402,7 @@ export class WorkflowAgent {
           break;
         }
         if (turnsWithoutProgress >= this.#noProgressTurns) {
-          const lastFailed = [...actions].reverse().find((a) => !a.ok);
-          summary =
-            `agent stalled: nothing advanced in ${turnsWithoutProgress} consecutive turns` +
-            (lastFailed?.error === undefined ? '' : ` (last failure: ${lastFailed.error})`);
+          summary = stallSummary(actions, turnsWithoutProgress);
           this.#endedBy = 'no-progress';
           break;
         }
@@ -2837,6 +2833,10 @@ export class WorkflowAgent {
       return null;
     }
     if (decision.action === 'fail') return null;
+    // Signing in is the harness's job. Refused before grounding, because the
+    // box IS in the tree — that is exactly the trap (PRB-EC-053).
+    const credential = inventedCredentialFill(decision, null);
+    if (credential !== null) return credential;
     // A delete aimed at "whatever row comes first" is refused before any
     // grounding question: the control exists, and that is the problem.
     const destructive = unscopedDestructiveClick(decision, goal);
@@ -3633,6 +3633,47 @@ function describe(error: unknown): string {
 
 /** How many options a listbox record keeps verbatim — the same head the error message prints. */
 export const LISTBOX_HEAD = 8;
+
+/**
+ * Why a stalled leg stalled, in one sentence a person can act on.
+ *
+ * The old wording was `agent stalled: nothing advanced in 5 consecutive
+ * turns (last failure: <the last error>)`. Two problems, both measured on
+ * humi BE PL_08_01 (2026-09-11): the turn count is a fact about the harness
+ * and says nothing about the page, and the LAST failure is usually the
+ * agent's improvised workaround, not the thing that broke. That case's line
+ * quoted `no element matches "text="CDS""` — a selector the agent invented
+ * on turn 21 — while the actual failure was turn 20, the Company dropdown
+ * the harness could not read. A reader chasing the quoted error looks at the
+ * wrong turn entirely.
+ *
+ * So: report the FIRST failure inside the stalled window — the one the later
+ * turns were reacting to — and name the last only when it differs, briefly.
+ * Pure, so the wording is testable without a browser.
+ */
+export function stallSummary(
+  actions: readonly { ok: boolean; error?: string | undefined; action?: string | undefined; selector?: string | null | undefined }[],
+  turnsWithoutProgress: number,
+): string {
+  const window = actions.slice(-Math.max(1, turnsWithoutProgress));
+  const failures = window.filter((a) => !a.ok && a.error !== undefined && a.error !== '');
+  const head = `agent stalled after ${turnsWithoutProgress} turn(s) with nothing advancing`;
+  const first = failures[0];
+  if (first === undefined) return `${head} — every turn was accepted but none changed the page`;
+  const where = first.action === undefined ? '' : ` on ${first.action}${first.selector ? ` ${first.selector}` : ''}`;
+  const last = failures[failures.length - 1];
+  const also =
+    last !== undefined && last !== first && last.error !== first.error
+      ? `; it then tried ${failures.length - 1} more way(s), last: ${oneLine(last.error!)}`
+      : '';
+  return `${head} — it began${where}: ${oneLine(first.error)}${also}`;
+}
+
+/** The first line, capped — a report row is not a stack trace. */
+function oneLine(text: string | undefined): string {
+  const line = (text ?? '').split('\n')[0] ?? '';
+  return line.length > 200 ? `${line.slice(0, 197)}…` : line;
+}
 
 /**
  * The listbox facts an action record keeps when a `selectOption` missed

@@ -25,6 +25,8 @@
  */
 import type { WowlidatorConfig } from '../config.js';
 import { sessionQuotaPoint } from '../providers/claude-quota.js';
+import { apiPressureHolding, describeApiPressure } from '../providers/api-pressure.js';
+import { providerConcurrency } from '../config.js';
 
 export const QUOTA_HOLD_ENV = 'WOWLIDATOR_QUOTA_HOLD_PERCENT';
 /** Percent of the session window at which dispatch stops. Measured 1.4 pt/min at full speed; ~12 pt of headroom lets 8 in-flight lanes finish. */
@@ -88,13 +90,26 @@ interface HoldState {
 
 let state: HoldState | null = null;
 
-/** Is dispatch held right now? False when no hold is running. */
+/**
+ * Is dispatch held right now?
+ *
+ * Two sources, one answer. The claude-* half is a WINDOW the account reports
+ * and this module polls. The API half is a REFUSAL a provider has already
+ * given (`providers/api-pressure.ts`) — there is no endpoint to poll, so the
+ * reading is the thing that went wrong, held for as long as the provider
+ * asked. Either one stops new work; neither touches a call already in flight.
+ *
+ * The API half needs no arming: a refusal can only be recorded by a call that
+ * was actually made, so a suite with no API provider never sees one.
+ */
 export function quotaHolding(): boolean {
-  return state?.holding ?? false;
+  return (state?.holding ?? false) || apiPressureHolding();
 }
 
 /** One line for a log or a report: what the hold knows. */
 export function describeQuotaHold(): string {
+  const pressure = describeApiPressure();
+  if (pressure !== null) return `provider hold ON — ${pressure}`;
   if (state === null) return 'quota hold off';
   const pct = state.percent === null ? 'unknown' : `${Math.round(state.percent)}%`;
   const reset = state.resetsAt === null ? '' : ` · resets ${new Date(state.resetsAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`;
@@ -133,7 +148,10 @@ export function ensureQuotaHold(
 ): boolean {
   if (state !== null) return true;
   const threshold = quotaHoldPercent(env);
-  if (threshold === null || !spendsClaudeWindow(config)) return false;
+  if (threshold === null || !spendsClaudeWindow(config)) {
+    announceApiCeilings(config, log, env);
+    return false;
+  }
   state = { holding: false, percent: null, resetsAt: null, threshold, since: null, timer: null, log };
   void poll(true);
   state.timer = setInterval(() => void poll(true), QUOTA_POLL_MS);
@@ -142,10 +160,39 @@ export function ensureQuotaHold(
   return true;
 }
 
+let announced = false;
+
+/**
+ * Say, once, which providers will make a lane WAIT rather than be refused.
+ * A ceiling that is invisible reads as a slow run; a ceiling that is stated
+ * reads as the run obeying a limit, which is what it is doing.
+ */
+function announceApiCeilings(
+  config: WowlidatorConfig,
+  log?: (line: string) => void,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (announced || log === undefined) return;
+  announced = true;
+  const seen = new Map<string, number>();
+  for (const role of Object.values(config.roles)) {
+    const limit = providerConcurrency(role.provider, env);
+    if (limit !== undefined) seen.set(role.provider, limit);
+  }
+  for (const [provider, limit] of seen) {
+    log(
+      `  ⏸ ${provider} takes ${limit} call(s) at once from one key — a lane past that waits ` +
+      `(WOWLIDATOR_${provider.replace(/-/g, '_').toUpperCase()}_CONCURRENCY=off removes the ceiling); ` +
+      'a refusal holds dispatch until the provider reopens',
+    );
+  }
+}
+
 /** Stop polling and forget the state. Safe to call twice. */
 export function stopQuotaHold(): void {
   if (state?.timer) clearInterval(state.timer);
   state = null;
+  announced = false;
 }
 
 /** Wait here while the hold is on — for a loop with no `waitWhile` of its own (the authoring pool). */

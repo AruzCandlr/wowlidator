@@ -156,7 +156,7 @@ export class LlmDiagramTranscriber implements DiagramTranscriberModel {
   }
 
   /**
-   * Lazy, like LlmFlowRepairModel's and LlmDataModel's: constructing the class
+   * Lazy, like LlmFlowRepairModel's: constructing the class
    * must never itself demand an API key — a process that never transcribes
    * never needs one resolvable.
    */

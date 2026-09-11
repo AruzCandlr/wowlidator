@@ -19,9 +19,26 @@
 import { readFileSync, writeFileSync, renameSync, existsSync, statSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, dirname, resolve, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execSync } from 'node:child_process';
+
 
 import { catalogDirs, runDirs } from '../paths.mjs';
+
+// The projector lives in the project, not here: the panel serves the SAME
+// function at /monitor/run-state.js, and two monitors that disagree about one
+// run is the failure this module exists to avoid. It is TypeScript, which is
+// the other reason this script wants `npx tsx` — under plain node the import
+// fails outright and says so, rather than showing a page computed differently.
+let runState;
+try {
+  runState = await import(new URL('../../../../src/monitor/run-state.ts', import.meta.url).href);
+} catch (err) {
+  console.error(
+    'watch.mjs could not load src/monitor/run-state.ts (' +
+      String(err && err.message ? err.message.split('\n')[0] : err) +
+      ') — start it with `npx tsx`, not `node`',
+  );
+  process.exit(1);
+}
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '../../../..');
@@ -76,19 +93,6 @@ function reportDir() {
     if (m) return resolve(m[1].trim().replace(/^['"]|['"]$/g, '').replace(/^~/, process.env.HOME ?? '~'));
   }
   return join(REPO, '.wowlidator', 'reports');
-}
-
-// Only ever offer a link the page can actually open. A file:// navigation to a
-// report that was never written lands on a blank page with no error, which
-// reads as the monitor being broken rather than the report being absent — so a
-// missing report is no link at all. Once a path exists it keeps existing, so
-// the stat is remembered rather than repeated every three seconds.
-const reportSeen = new Set();
-function reportIfPresent(p) {
-  if (typeof p !== 'string' || !p) return null;
-  if (reportSeen.has(p)) return p;
-  if (existsSync(p)) { reportSeen.add(p); return p; }
-  return null;
 }
 
 const newestIn = (dir, suffix) => {
@@ -192,130 +196,6 @@ function resolvePaths() {
   ledgerPath = fixedLedger ?? ledgerFromLog(logPath) ?? fallbackLedger();
 }
 
-// Read only the tail; a catalog log reaches hundreds of MB and re-reading it
-// whole every few seconds would cost more than the run. The byte offset the
-// window starts at comes back with it, because the terminal on the page
-// appends by absolute offset — that is what lets the page accumulate far past
-// this window while never re-printing a line it already holds.
-function tailAt(path, bytes = 262144) {
-  try {
-    const size = statSync(path).size;
-    const start = Math.max(0, size - bytes);
-    const len = size - start;
-    const buf = Buffer.alloc(len);
-    const fd = openSync(path, 'r');
-    try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-    return { text: buf.toString('utf8'), start, size };
-  } catch { return { text: '', start: 0, size: 0 }; }
-}
-
-const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
-
-/** The last line of the log that names a fatal condition, when the runner is gone; null while it lives. */
-function lastFatalLine(path) {
-  // A log still being written is a run still going, whatever its tail says.
-  if (!path || !existsSync(path) || Date.now() - statSync(path).mtimeMs < 30_000) return null;
-  const { text } = tailAt(path, 16384);
-  const lines = text.split('\n').map((l) => l.replace(ANSI, '').trim()).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (/^wowlidator: |did not open port|ERR_CONNECTION_REFUSED|ECONNREFUSED|EADDRINUSE|out of memory|No space left/i.test(lines[i])) return lines[i].slice(0, 240);
-  }
-  return null;
-}
-
-// The log as the run wrote it, one entry per complete line, tagged with the
-// absolute offset of its end. The window rarely starts on a line boundary, so
-// the first line is dropped, and so is the trailing one still being written —
-// a half-written line shown once and completed later would print twice.
-function logLinesFrom(text, start, max) {
-  const parts = text.split('\n');
-  const out = [];
-  let off = start;
-  for (let i = 0; i < parts.length; i++) {
-    const raw = parts[i];
-    const end = off + Buffer.byteLength(raw, 'utf8') + 1;
-    if (i < parts.length - 1 && !(i === 0 && start > 0)) {
-      const t = raw.replace(ANSI, '').replace(/\r/g, '').replace(/\s+$/, '');
-      out.push({ o: end, t: t.length > 600 ? t.slice(0, 600) + '…' : t });
-    }
-    off = end;
-  }
-  return out.slice(-max);
-}
-
-const NOISE = /^\s*(ask|response|prompt):/i;
-function activityFrom(text) {
-  const out = [];
-  for (const raw of text.split('\n')) {
-    const m = raw.match(/^\[([^\]\s]+)\]\s+(.*)$/);
-    if (!m) continue;
-    const [, who, restRaw] = m;
-    const rest = restRaw.trim();
-    if (!rest || NOISE.test(rest)) continue;
-    if (/^\[llm /.test(rest) || /^→|^←/.test(rest)) continue;
-    if (who === 'wowlidator' && /warm session|re-asking/.test(rest)) {
-      out.push({ caseId: 'system', text: rest.slice(0, 200) });
-      continue;
-    }
-    if (/^──|^─/.test(rest)) continue;
-    out.push({ caseId: who.slice(0, 16), text: rest.replace(/\s+/g, ' ').slice(0, 220) });
-  }
-  return out.slice(-40).reverse();
-}
-
-// Is the run still a process? The log answers "did it write recently", which a
-// run sitting on a four-minute model call fails while perfectly healthy. Only
-// the process table answers "is it there at all" — and a run that was killed
-// seals no `ended`, so without this reading the page calls a corpse idle.
-//
-// `ps` rather than `pgrep`, so the scan cannot match its own command line, and
-// so the elapsed time arrives in the same reading.
-function runnerProcs() {
-  try {
-    const out = execSync('ps -Ao pid=,etime=,command=', {
-      encoding: 'utf8',
-      maxBuffer: 32 * 1024 * 1024,
-    });
-    const procs = [];
-    for (const line of out.split('\n')) {
-      const m = line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/);
-      if (!m) continue;
-      const cmd = m[3];
-      if (!/\bcatalog\b/.test(cmd)) continue;
-      if (!/(cli\.ts|cli\.js|bin\/wow|wowlidator)/.test(cmd)) continue;
-      if (/\bps\s+-Ao\b/.test(cmd)) continue;
-      procs.push({ pid: Number(m[1]), seconds: etimeSeconds(m[2]) });
-    }
-    return procs.sort((a, b) => b.seconds - a.seconds);
-  } catch { return []; }
-}
-
-// ps prints elapsed time as [[dd-]hh:]mm:ss.
-function etimeSeconds(s) {
-  const dash = s.indexOf('-');
-  const days = dash > 0 ? Number(s.slice(0, dash)) : 0;
-  const parts = (dash > 0 ? s.slice(dash + 1) : s).split(':').map(Number);
-  let sec = 0;
-  if (parts.length === 3) sec = parts[0] * 3600 + parts[1] * 60 + parts[2];
-  else if (parts.length === 2) sec = parts[0] * 60 + parts[1];
-  else sec = parts[0] || 0;
-  return (Number.isFinite(days) ? days : 0) * 86400 + (Number.isFinite(sec) ? sec : 0);
-}
-
-function humanUptime(sec) {
-  if (!Number.isFinite(sec) || sec <= 0) return '0s';
-  if (sec < 60) return Math.round(sec) + 's';
-  const m = Math.floor(sec / 60);
-  if (m < 60) return m + 'm';
-  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
-}
-
-function chromeCount() {
-  try {
-    return execSync('pgrep -f "remote-debugging-port=93" 2>/dev/null | wc -l', { encoding: 'utf8' }).trim() | 0;
-  } catch { return 0; }
-}
-
 // ── The Claude half ────────────────────────────────────────────────────────
 // Two questions the run's own ledger cannot answer: how much of the account's
 // window is left (the thing that decides whether a catalog survives the
@@ -378,7 +258,7 @@ async function claudeSection(logText) {
   // The run's log says what it actually dispatched to, every call — so the log
   // wins wherever it has spoken. A monitor may be silent; it may not disagree.
   const roles = {};
-  for (const role of ['generator', 'agent', 'healer', 'data', 'governor']) {
+  for (const role of ['generator', 'agent', 'healer']) {
     const provider = process.env['WOWLIDATOR_' + role.toUpperCase() + '_PROVIDER'];
     const model = process.env['WOWLIDATOR_' + role.toUpperCase() + '_MODEL'];
     if (provider || model) roles[role] = [provider, model].filter(Boolean).join(':');
@@ -445,150 +325,22 @@ async function claudeSection(logText) {
   return out;
 }
 
+// The state itself is built by the project's own projector
+// (`src/monitor/run-state.ts`) — the SAME function the panel serves at
+// /monitor/run-state.js. This file resolves which run to watch and writes the
+// file; it computes nothing the panel would then have to agree with.
 async function build() {
-  const state = {
-    updatedAt: new Date().toISOString(),
-    ledgerFile: ledgerPath ?? null,
-    logFile: logPath ?? null,
-    counts: { planned: 0, passed: 0, failed: 0, review: 0, blocked: 0 },
-    outcomes: [],
-    recentActivity: [],
-    chromeAlive: chromeCount(),
-    runner: { alive: false, pid: null, count: 0, uptime: null, uptimeSec: 0 },
-    logLines: [],
-    logBytes: null,
-    phase: 'waiting',
-    ended: null,
-    runKey: null,
-    startedAt: null,
-    title: null,
-    logMtime: null,
-    authored: 0,
-    requestsSeenThisWindow: 0,
-    note: null,
-  };
-
-  const procs = runnerProcs();
-  if (procs.length) {
-    state.runner = {
-      alive: true,
-      pid: procs[0].pid,
-      count: procs.length,
-      uptime: humanUptime(procs[0].seconds),
-      uptimeSec: procs[0].seconds,
-    };
-  }
-
-  if (!ledgerPath || !existsSync(ledgerPath)) {
-    // A folder with a log and no ledger is one of two things, and the log's
-    // own last fatal line tells them apart: a run still authoring its first
-    // case, or one that died before sealing any — a stale Chrome on the pool's
-    // ports is the usual way (2026-09-10: "browser 1 of 4: Chrome did not open
-    // port 9333 within the boot timeout", read as "no ledger" for an hour).
-    const fatal = lastFatalLine(logPath);
-    state.note = fatal
-      ? `no ledger — the run ended before sealing a case: ${fatal}`
-      : `no ledger at ${ledgerPath ?? catalogsDir} — the run has not sealed its first case yet`;
-  } else {
-    let led;
-    try {
-      led = JSON.parse(readFileSync(ledgerPath, 'utf8'));
-    } catch {
-      // A ledger caught mid-write is normal, not an error. Keep the last good
-      // reading rather than blanking the page on a torn read.
-      state.note = 'ledger was mid-write at this reading; showing what parsed';
-      led = null;
-    }
-    if (led) {
-      const planned = Array.isArray(led.planned) ? led.planned : [];
-      const outcomes = led.outcomes && typeof led.outcomes === 'object' ? led.outcomes : {};
-      const entries = Object.entries(outcomes);
-      state.counts.planned = planned.length;
-      for (const [, o] of entries) {
-        const v = String(o?.verdict ?? '').toLowerCase();
-        if (v === 'passed') state.counts.passed++;
-        else if (v === 'failed') state.counts.failed++;
-        else if (v === 'blocked') state.counts.blocked++;
-        else state.counts.review++;
-      }
-      // Every sealed verdict, not the newest forty. A search box over forty
-      // rows answers "is it recent", which is not the question anyone types
-      // into one. At ~380 bytes a row a full catalog costs well under 200KB,
-      // and the page repaints only when the set actually changes.
-      const authored = led.authored && typeof led.authored === 'object' ? led.authored : {};
-      state.outcomes = entries
-        .filter(([, o]) => o?.at)
-        .sort((a, b) => Date.parse(b[1].at) - Date.parse(a[1].at))
-        .slice(0, 2000)
-        .map(([id, o]) => ({
-          id,
-          name: o.name || id,
-          verdict: ['passed', 'failed', 'blocked'].includes(String(o.verdict).toLowerCase())
-            ? String(o.verdict).toLowerCase()
-            : 'review',
-          at: o.at,
-          status: o.status ? String(o.status).slice(0, 48) : null,
-          scenario: authored[id]?.scenarioId ?? null,
-          reportPath: reportIfPresent(o.reportPath),
-          reason: String(o.reason ?? '').replace(/\s+/g, ' ').slice(0, 240),
-        }));
-      state.runKey = led.runKey ?? null;
-      state.startedAt = led.startedAt ?? null;
-      state.title = led.title ?? null;
-      state.authored = Object.keys(led.authored ?? {}).length;
-      state.ended = led.ended ?? null;
-      state.launch = led.launch
-        ? { url: led.launch.url ?? null, catalog: led.launch.catalog ? basename(led.launch.catalog) : null }
-        : null;
-    }
-  }
-
-  // The newest log is not always THIS run's log. A run launched in a terminal
-  // redirects nowhere, so the newest file on disk can belong to a run that
-  // ended hours ago — and pairing it with a live ledger is the exact lie the
-  // two clocks exist to prevent: a healthy run reading as wedged. A log that
-  // predates the run's own start is not evidence about it.
-  let logText = '';
-  const startedMs = state.startedAt ? Date.parse(state.startedAt) : NaN;
-  const logMs = logPath && existsSync(logPath) ? statSync(logPath).mtimeMs : NaN;
-  const logIsOurs =
-    Number.isFinite(logMs) && (!Number.isFinite(startedMs) || logMs >= startedMs - 60_000);
-  if (logPath && !logIsOurs) {
-    state.logFile = null;
-    state.note =
-      'this run writes no log file — the newest one on disk (' +
-      basename(logPath) +
-      ') predates it, so the activity feed is empty and the ledger is the only reading';
-  }
-  if (logPath && logIsOurs) {
-    state.logMtime = new Date(statSync(logPath).mtimeMs).toISOString();
-    const win = tailAt(logPath);
-    logText = win.text;
-    state.logLines = logLinesFrom(win.text, win.start, tailLines);
-    state.logBytes = win.size;
-    state.recentActivity = activityFrom(logText);
-    state.requestsSeenThisWindow = (logText.match(/→ (generator|agent|healer|data|governor) /g) ?? []).length;
-  }
-
-  state.claude = await claudeSection(logText);
-
-  // A fresh log outranks the process scan: something is plainly writing, so a
-  // pattern that failed to match is the scan's problem, not the run's. Only
-  // when the log has also gone silent is the absence of a process evidence,
-  // and then it is the strongest evidence there is — a killed run seals no
-  // `ended`, and that is exactly the state this reading exists to name.
-  const logAgeMs = state.logMtime ? Date.now() - Date.parse(state.logMtime) : Infinity;
-  if (state.ended) state.phase = state.ended.complete ? 'finished' : 'stopped';
-  else if (logAgeMs < 90000) state.phase = 'running';
-  else if (state.runner.alive) state.phase = 'quiet';
-  else if (state.counts.planned && logAgeMs > 120000) state.phase = 'gone';
-  else if (state.counts.planned) state.phase = 'idle';
-
-  return state;
+  return runState.buildRunState({
+    ledgerPath: ledgerPath ?? null,
+    logPath: logPath ?? null,
+    catalogsDir,
+    tailLines,
+    claude: claudeSection,
+  });
 }
 
 function write(state) {
-  const body = 'window.__WOW_STATE__ = ' + JSON.stringify(state, null, 1) + ';\n';
+  const body = runState.runStateScript(state);
   const tmp = OUT + '.tmp';
   writeFileSync(tmp, body);
   renameSync(tmp, OUT); // atomic, so the page never loads a half-written file

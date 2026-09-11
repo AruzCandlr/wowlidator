@@ -77,6 +77,7 @@ import {
   provenanceExtras,
   recordOnlyCase,
   recordedCaptures,
+  runNotesSummary,
   sheetLabel,
   stepKindFacts,
   stepNarration,
@@ -563,7 +564,16 @@ function caseSection(c: CatalogReportCase, input: CatalogReportInput, budget: Me
             );
           })
           .join('');
-  const notes = (bundle?.notes ?? []).map((n) => `<div class="hline">${esc(n)}</div>`).join('');
+  // The model's bounded summary of the run's notes where there is one, and the
+  // notes themselves only when the run has no narrative to summarise them —
+  // the same reading the per-case page and the per-run report make.
+  const noteSummary = runNotesSummary(bundle);
+  const notes =
+    noteSummary === null
+      ? ''
+      : noteSummary.by === null
+        ? noteSummary.lines.map((n) => `<div class="hline">${esc(n)}</div>`).join('')
+        : `<div class="hline">${esc(noteSummary.text)}<em class="narr-by"> — ${esc(noteSummary.attribution)}</em></div>`;
   // The sheet's own id when the run qualified it (`BE:PL_03_01` on the row,
   // `PL_03_01` in the sheet), and the sheet/category the row came from — so
   // a reader holding the workbook finds the row, and a `--rerun-case` still
@@ -887,6 +897,8 @@ details.step > summary { display: flex; gap: 8px; align-items: baseline; padding
   flex: none; width: 82px; cursor: help; }
 .narration .narr-t { flex: 1; min-width: 0; }
 .narration .narr-by { font-style: normal; font-size: 11px; opacity: .8; white-space: nowrap; }
+/* The same attribution on the run-notes summary, which is one line, not a step. */
+.hline .narr-by { font-style: normal; font-size: 11px; opacity: .8; white-space: nowrap; }
 .muted { color: var(--muted); }
 .shot img { max-width: 100%; border: 1px solid var(--line); border-radius: 6px; margin-top: 6px; }
 .history { background: color-mix(in srgb, var(--muted) 7%, transparent); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }

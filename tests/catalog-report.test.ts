@@ -932,3 +932,51 @@ describe('a step that broke without deciding the outcome', () => {
     }
   });
 });
+
+/**
+ * The same reading of the run's notes as the per-run report and the per-case
+ * page make (`runNotesSummary`): the model's bounded summary where there is
+ * one, the notes themselves when the run has no narrative.
+ */
+describe('the run notes a reader is shown', () => {
+  const NARRATIVE: NonNullable<ProofBundle['narrative']> = {
+    lang: 'en', by: 'claude-cli:opus', at: '2026-09-11T00:00:00.000Z',
+    lede: '', summary: '', testData: '', expected: '', tickets: [], questions: [],
+    verifierNote: 'The agent cleared a consent gate before the first assertion.',
+  };
+
+  function report(over: Partial<ProofBundle>): string {
+    return renderCatalogReport({
+      title: 't', runKey: null, generatedAt: null,
+      cases: [kase({ bundle: bundle([step({})], over) })],
+    });
+  }
+
+  it('shows the model summary, attributed, and not one word of the raw notes', () => {
+    const html = report({ notes: ['pre-run dead-end risk 20%', 'shared data with PL_02_02'], narrative: NARRATIVE });
+    assert.match(html, /Run notes/);
+    assert.match(html, /The agent cleared a consent gate before the first assertion\./);
+    assert.match(html, /written by claude-cli:opus/);
+    assert.doesNotMatch(html, /pre-run dead-end risk/);
+    assert.doesNotMatch(html, /shared data with/);
+  });
+
+  it('falls back to the notes, one per line and unattributed, when the run has no narrative', () => {
+    const html = report({ notes: ['pre-run dead-end risk 20%', 'shared data with PL_02_02'] });
+    assert.match(html, /<div class="hline">pre-run dead-end risk 20%<\/div><div class="hline">shared data with PL_02_02<\/div>/);
+    assert.doesNotMatch(html, /written by/);
+  });
+
+  it('renders no notes block at all when the run recorded neither', () => {
+    assert.doesNotMatch(report({}), /Run notes/);
+  });
+
+  it('escapes both paths', () => {
+    const probe = '<b>a & b</b>';
+    assert.match(report({ notes: [probe] }), /&lt;b&gt;a &amp; b&lt;\/b&gt;/);
+    assert.doesNotMatch(report({ notes: [probe] }), /<b>a & b<\/b>/);
+    const narrated = report({ notes: ['x'], narrative: { ...NARRATIVE, verifierNote: probe } });
+    assert.match(narrated, /&lt;b&gt;a &amp; b&lt;\/b&gt;/);
+    assert.doesNotMatch(narrated, /<b>a & b<\/b>/);
+  });
+});

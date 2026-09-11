@@ -41,6 +41,7 @@ import {
   observedEvidence,
   provenanceExtras,
   recordedCaptures,
+  runNotesSummary,
   sheetLabel,
   stepKindFacts,
   stepNarration,
@@ -1220,6 +1221,23 @@ function expectedActualLine(step: ProofStep): string {
  *   marked `lang=""` exactly like the same string in a selector or a
  *   comparison.
  */
+/**
+ * The run's notes in the diagnostics callout: the model's bounded summary of
+ * them where the run has a narrative, the notes themselves when it has none.
+ * One reading (`runNotesSummary`), shared with the per-case page and the
+ * catalog report, so the same run is not described three ways.
+ */
+function runNotes(bundle: ProofBundle): string {
+  const summary = runNotesSummary(bundle);
+  if (summary === null) return '';
+  const body =
+    summary.by === null
+      ? summary.lines.map((n) => `<p class="reason">${esc(n)}</p>`).join('')
+      : `<p class="reason">${captured(summary.text)} <span class="narr-by">&mdash; ${esc(summary.attribution)}</span></p>`;
+  const count = summary.by === null ? ` (${summary.lines.length})` : '';
+  return `<div class="prov"><div class="callout-title">Run notes${count}</div>${body}</div>`;
+}
+
 function narrationLine(step: ProofStep): string {
   const narration = stepNarration(step);
   if (narration === null) return '';
@@ -1492,6 +1510,8 @@ h1{font-size:21px;margin:0;font-weight:650;letter-spacing:-.01em}
   margin-right:6px;opacity:.85}
 .step-narration .narr-k abbr{text-decoration:none;border-bottom:1px dotted var(--line);cursor:help}
 .step-narration .narr-by{font-style:normal;font-size:11px;white-space:nowrap;opacity:.8}
+/* The same attribution on the run-notes summary in diagnostics. */
+.prov .narr-by{font-size:11px;white-space:nowrap;opacity:.8}
 .step-facts{margin:-4px 0 0;padding:0 16px 8px 46px;font-size:12px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap}
 .step-facts .fact-k{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin-right:4px}
 .callout.observed{background:var(--agent-bg);border:1px solid color-mix(in srgb,var(--agent) 30%,transparent)}
@@ -2202,10 +2222,7 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
         : ''
     }
     ${
-      bundle.notes && bundle.notes.length > 0
-        ? `<div class="prov"><div class="callout-title">Run notes (${bundle.notes.length})</div>
-           ${bundle.notes.map(n => `<p class="reason">${esc(n)}</p>`).join('')}</div>`
-        : ''
+      runNotes(bundle)
     }
     ${
       bundle.status === 'needs-review'

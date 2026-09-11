@@ -130,7 +130,7 @@ export class LlmReviewJudge implements ReviewJudge {
     }
   }
 
-  // Lazy, the `LlmDataModel` rule: constructing the judge must never itself
+  // Lazy, the `LlmFlowRepairModel` rule: constructing the judge must never itself
   // demand an API key — most runs never reach proved-?.
   get id(): string {
     if (this.#explicitId !== undefined) return this.#explicitId;

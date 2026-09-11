@@ -253,7 +253,7 @@ export class LlmApiGeneratorModel implements ApiGeneratorModel {
   }
 
   /**
-   * Lazy, like `LlmDataModel.id` and `LlmFlowRepairModel.id`.
+   * Lazy, like `LlmFlowRepairModel.id`.
    *
    * Constructing this class must never itself demand an API key — a run that
    * never generates anything should never be asked for one.

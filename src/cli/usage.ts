@@ -512,8 +512,6 @@ LLM routing (verify with: wowlidator doctor):
   generator  writes tests from a page,    WOWLIDATOR_GENERATOR_PROVIDER / WOWLIDATOR_GENERATOR_MODEL
              and rewrites a flow for --repair
   agent      crosses unknown pages        WOWLIDATOR_AGENT_PROVIDER / WOWLIDATOR_AGENT_MODEL
-  data       regenerates a fillRetry's    WOWLIDATOR_DATA_PROVIDER / WOWLIDATOR_DATA_MODEL
-             "custom" kind (rare)
   keys       GOOGLE_GENERATIVE_AI_API_KEY | GROQ_API_KEY | OPENROUTER_API_KEY
 
 Start a browser first:

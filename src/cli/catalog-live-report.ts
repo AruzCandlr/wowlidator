@@ -39,7 +39,7 @@ import {
   type CatalogReportCase,
   type CatalogReportInput,
 } from '../reporter/catalog-report.js';
-import { caseSidecarName, caseSidecars, renderCasePage } from '../reporter/case-page.js';
+import { caseSidecarName, caseSidecars, renderBlockedCasePage, renderCasePage } from '../reporter/case-page.js';
 import { caseVideoFile, writePassedCasesExcel, type ExcelExportResult } from '../reporter/excel-export.js';
 import { writeFindingsExports, type FindingsExportResult } from '../reporter/findings-export.js';
 import { caseIdOf, type SuiteLedger } from './suite-progress.js';
@@ -143,8 +143,13 @@ export async function writeCatalogArtifacts(input: CatalogReportInput, cwd?: str
       return null;
     }
   };
+  // **Every case is routed to a page of its own** (2026-09-11). A case with no
+  // bundle used to get no page and no link, so the only trace of a blocked row
+  // was one truncated line in this index — and a reader who clicked its name
+  // got nowhere. A bundle-less case now links to a page that states why it did
+  // not run; see `renderBlockedCasePage`.
   const casePageHref = (c: CatalogReportCase): string | null =>
-    c.bundle === null ? null : relative(dirname(htmlPath), casePageTarget(htmlPath, input, c));
+    relative(dirname(htmlPath), casePageTarget(htmlPath, input, c));
   await writeCatalogReport(htmlPath, renderCatalogReport({ ...input, spillScreenshot, spillRecording, casePageHref }));
   const excel = await writePassedCasesExcel(htmlPath, input, spilledRecordingCases);
   const findings = await writeFindingsExports(htmlPath, input);
@@ -220,7 +225,32 @@ export async function writeCasePages(
     const mediaPage = join(mediaDir, casePageName(c.id));
     const mediaSidecars = (['query', 'before', 'after', 'evidence'] as const).map((kind) => join(mediaDir, caseSidecarName(c.id, kind)));
     if (c.bundle === null) {
-      for (const stale of [mediaPage, ...mediaSidecars]) await rm(stale, { force: true }).catch(() => undefined);
+      // No bundle means no run: the DB sidecars belong to a run and would be
+      // stale here, so they are still removed. The PAGE is not — a blocked
+      // case says why on its own page, which is the whole point of routing
+      // every case to one.
+      for (const stale of mediaSidecars) await rm(stale, { force: true }).catch(() => undefined);
+      const target = casePageTarget(htmlPath, input, c);
+      try {
+        await mkdir(dirname(target), { recursive: true });
+        await writeFile(
+          target,
+          renderBlockedCasePage({
+            case: c,
+            title: input.title,
+            runKey: input.runKey,
+            lang,
+            indexHref: relative(dirname(target), htmlPath),
+            sidecars: { query: null, before: null, after: null, evidence: null },
+            videoHref: null,
+          }),
+          'utf8',
+        );
+        written.push(target);
+      } catch {
+        // Never fatal, the rule this whole function already follows: a page
+        // that cannot be written is reported by its absence from the list.
+      }
       continue;
     }
     const target = casePageTarget(htmlPath, input, c);

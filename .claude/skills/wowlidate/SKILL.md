@@ -59,6 +59,46 @@ questions is a run the user abandons.
 | Application URL | `--url` | **yes** for `--run` | A named target supplies it (step 0). Otherwise ask — there is no sensible default; `CLAUDE.local.md` says targets vary per run. |
 | Credentials | `--as`, `--persona`, `WOWLIDATOR_PERSONAS` | **yes** in practice | Step 2 measures the damage exactly. Never invent an account. |
 | Lanes | `--concurrency`, `--browsers` | no | 8/8 is the measured working shape for a large catalog; 1/1 is the A/B test when a parallel result looks wrong. |
+| `persona-switch` | `--context-doc persona-switch.md` | no | **HUMI only.** Off unless asked for. Teaches the authoring model to change roles inside the session instead of signing out and in again — see §1a. |
+
+### 1a. `persona-switch` — HUMI's in-session role change
+
+Pass `persona-switch` (`/wowlidate <catalog> humi-sit persona-switch`) and the
+launch gains one flag:
+
+```
+--context-doc .claude/skills/wowlidate/persona-switch.md
+```
+
+That is the whole mechanism. `--context-doc` is background for the authoring
+model and **never a source of claims**, which is exactly the right shape: it
+describes a control the application has, so a flow uses it instead of inventing
+one. No new code, no new flag, nothing to keep in step with the CLI.
+
+**What it teaches.** The first persona of a case is a login and stays the
+harness's job. Every LATER line saying to act as, access as, or "log in as"
+another `<PERSONA>` is authored as a switch in the same session: the
+`Account menu` button top right → the `Take Action on Behalf of…` menu item →
+the person's row in the picker dialog. Controls and their exact accessible
+names are in the document, verified against the live page on 2026-09-11.
+
+**Only offer it for HUMI.** `targets.json` resolves `humi-sit`; another
+application's role switch, if it has one, looks nothing like this and the
+document would be background that is simply false. If the user asks for it on
+a different target, say so and leave it off rather than passing it anyway.
+
+**What it is for.** Without it a second persona line authors as
+`signOut` + `signIn`, which on HUMI lands back on the sign-in page with the
+session's own POST accepted — and an agent handed that page tries to sign
+itself in. PRB-EC-026 and PRB-EC-053 both sealed `error` that way on
+2026-09-11.
+
+**One measured trap, which the document states and you should repeat if
+asked.** The picker's search box says *"Search by name, email, or role"* and
+does **not** search by role: `HRBP` and `Human Resources` both return "No
+employees match that search", while a name or an employee id matches. A case
+naming only a role must pick from the unfiltered list, never type the role.
+That placeholder is worth a ticket of its own.
 
 Read the catalog path and URL out of the user's message when they are there.
 `/wowlidate <file>` with nothing else is the common case and is exactly when you
@@ -138,8 +178,40 @@ forty minutes in on a retired model id is the failure this prevents.
 
 Providers are chosen **per run, by environment, not by editing config** — every
 role reads `WOWLIDATOR_<ROLE>_PROVIDER` / `_MODEL` / `_EFFORT`, where role is one
-of `healer`, `generator`, `agent`, `data`, `governor`. Put them on the command's
+of `healer`, `generator`, `agent`. Put them on the command's
 own environment.
+
+**An HTTP API provider now runs under the same machinery `claude-cli` has**
+(2026-09-11) — there is nothing to choose and nothing extra to pass:
+
+- **A stated concurrency ceiling is obeyed.** `emmiedev` takes two calls at
+  once from one key and answers the third with
+  `{"type":"rate_limit_error","code":"too_many_concurrent"}`. The third call
+  now WAITS in the same admission gate a local server uses, so eight lanes on
+  a two-call key are slow, not refused. `PROVIDER_CONCURRENCY` in
+  `src/config.ts` is the list; `WOWLIDATOR_<PROVIDER>_CONCURRENCY` overrides
+  one and `=off` removes it. Raise it only with a refusal-free run to show.
+- **A refusal holds dispatch instead of spending the catalog.** There is no
+  endpoint that states an API key's limits, so the reading is the refusal
+  itself: the provider is held for as long as its `retry-after` asked, or a
+  doubling backoff when it said nothing, and a single success reopens it at
+  once (`src/providers/api-pressure.ts`). Same suite-wide `quotaHolding()` the
+  claude window hold feeds, so the lanes and the authoring pool both see it.
+- **A provider refusal no longer seals the row.** It is recorded as
+  `providerRefused` on the ledger, kept apart from `authoringRefused`: the row
+  is blocked for this pass and the next plain `--resume` authors it again. On
+  2026-09-10 a BE catalog's first row sealed at the refusal cap because
+  emmiedev was busy with three other lanes — the row was never attempted and
+  a resume could no longer pick it up.
+- **Every call is on a ledger.** `.wowlidator/api-usage.jsonl`
+  (`WOWLIDATOR_API_USAGE_PATH`, `=off` disables) — provider, model, role,
+  tokens, wall time, and a row for every refusal, which is what explains a run
+  that went quiet. `claude-*` keeps its own ledger and is never written here.
+  The monitor's **API providers** card reads it.
+
+Sizing the lanes for a ceiling is still yours: `--concurrency 8` against a
+two-call key authors correctly and slowly. Two to four lanes is the honest
+shape there, and the launch prints the ceiling it found.
 
 **A running suite cannot be re-pointed.** `loadConfig()` is called once, at
 `src/cli.ts:318`; the resulting config is frozen into the `LlmFactory` and
@@ -196,11 +268,14 @@ is stamped only when there is nothing to resume; `--fresh` forces one. Each
 launch still gets its own log — the ledger is the run's memory and must be one
 file, but a log is what a single launch said.
 
-Then launch into it. `$WOW_RUN_LOG` is already inside the run's folder:
+Then launch into it. `$WOW_RUN_LOG` is already inside the run's folder, and
+`PERSONA_SWITCH=1` in front of the launch adds the `persona-switch` document
+(§1a) — set it only when the user asked for it and the target is HUMI:
 
 ```bash
 npm run cli -- catalog "$CATALOG" --url "$APP_URL" --run --resume \
   --concurrency 8 --browsers 8 --headless --video on \
+  ${PERSONA_SWITCH:+--context-doc .claude/skills/wowlidate/persona-switch.md} \
   > "$WOW_RUN_LOG" 2>&1 &
 ```
 
@@ -232,6 +307,14 @@ two runs sharing one monitor:
 npx tsx .claude/skills/wowlidate/monitor/watch.mjs --out "$WOW_RUN_STATE" &
 open "$WOW_RUN_PAGE"       # macOS; xdg-open elsewhere
 ```
+
+**The panel serves the same monitor.** `npm run ui` carries a **Monitor** link
+to `/monitor`, which is this page — read from the same file — with its state
+built by the same projector (`src/monitor/run-state.ts`, which `watch.mjs`
+imports rather than duplicating). It watches the newest run it can find, or the
+one a `?ledger=` names, and needs no watcher process. Use it when the panel is
+already open; use the file page above when the run has its own folder and you
+want the monitor to travel with it.
 
 The watcher inherits the run's `WOWLIDATOR_REPORT_DIR` from the same `eval`, so
 it looks for the ledger and log inside the run's folder and cannot pick up a
@@ -317,8 +400,16 @@ it is there to answer "where is PL_04_13", which a list of forty cannot. Search
 matches the case id, its scenario, its status and its reason; the chips beside
 it filter by verdict and carry their own counts.
 
-The **Claude panel** answers the other half — not "what has the run proved" but
-"can it keep going". Three things sit there: the account's quota windows
+The **API providers panel** answers this for a run on an HTTP provider: calls
+and refusals today, the split by provider and by role, the last calls with
+their wall time and any refusal's own words, and — in red at the top, and as a
+chip in the header — any provider dispatch is currently held for. It appears
+only when the ledger has something to say, so a `claude-*` run does not grow an
+empty card. Before it existed, a run on `emmiedev` showed an empty Claude panel
+that was indistinguishable from a run making no model calls at all.
+
+The **Claude panel** answers the other half for a `claude-*` run — not "what has
+the run proved" but "can it keep going". Three things sit there: the account's quota windows
 (session, week, and the week scoped to a model) with the **hold line drawn on
 the session bar**, because dispatch stops at `WOWLIDATOR_QUOTA_HOLD_PERCENT`
 and that, not exhaustion, is the line a long run actually meets; today's calls,
@@ -373,6 +464,11 @@ What to look for, in the order it usually bites:
 - **quota holds** — with a `claude-*` provider, dispatch stops at
   `WOWLIDATOR_QUOTA_HOLD_PERCENT` of the session window (default 85) and resumes
   when it reopens. A pause here is the system working, not stalling.
+- **`⏸ <provider> refused the call — dispatch held ~Ns`** — the same thing one
+  layer down, for an API provider: a rate limit, a quota or a concurrency
+  ceiling. The first success reopens it. A run that keeps printing this is a
+  run whose lanes are wider than the key allows — lower `--concurrency` rather
+  than waiting it out.
 
 `/monitor` attributes wall-clock time to authoring, agent legs or the ladder when
 the question is "why is this slow" rather than "what broke".
@@ -393,7 +489,17 @@ case's own page** at the path the ledger names (the per-case report inside the
 run folder is the case page since 2026-09-10) — so a run launched before a
 reporter change gets the new page at the same address it always had. Add
 `--case-narrative` to back-fill the model-written narrative on those pages;
-without it the rebuild spends no model call. Re-export the run's
+without it the rebuild spends no model call.
+
+**A layout fix reaches an old run; a shorter sentence does not** (2026-09-11).
+The pre-read table's three cells (`Test case`, `Test data`, `Expected result`)
+are model-written, and the length bound lives where they are *written*
+(`NARRATIVE_MAX_CELL_CHARS`, clipped at a sentence or list boundary in
+`applyNarrative`), not where they are drawn. So a plain rebuild picks up the
+render changes — the case id no longer printed twice, an enumerated
+`Expected result` drawn as a real list — while the stored 90-word summary stays
+90 words. `--case-narrative` is what re-writes the cells, at one generator call
+per case. Re-export the run's
 `WOWLIDATOR_REPORT_DIR` first (re-run the `newrun.mjs` eval, which reuses the
 folder) or the rebuilt report is written outside the run it describes.
 

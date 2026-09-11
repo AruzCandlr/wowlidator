@@ -1601,3 +1601,268 @@ the case card back from the outcome's flow file, in the language the ledger
 recorded (`report` cannot change it). `needsNarrative(bundle, lang)` keeps a
 narrative already in that language, so a rebuild costs nothing twice. Tests:
 `tests/case-narrative.test.ts`.
+
+### The pre-read table's cells are cells, not paragraphs (2026-09-11)
+
+Read off the live ec-spot3 page for PRB-EC-053 (`…/02-catalog-prb-ec-053-c-expat-inbound-work-permit.html`, section
+*สรุปก่อนอ่านผล*): `summary` was ONE ~700-character Thai sentence chaining the whole run ("การรันเปิดแอป แล้ว… จากนั้น…
+ต่อมา… ในการตรวจสอบ พบ… แต่ไม่พบ…") and `testData` a comma-run of every value the run recorded, from the employee id to
+both URLs to "ไม่มีตัวแปรที่บันทึกไว้". Both sit inside one table cell, beside a step list that already tells the run
+step by step. The schema asked for "two or three sentences … step by step in plain words", so the model wrote exactly
+what it was asked for; the bound was `NARRATIVE_MAX_CHARS` (600) shared with the prose fields.
+
+`NARRATIVE_MAX_CELL_CHARS` (320) is the cell bound, on `summary` and `testData` only. **`expected` is deliberately NOT
+bound by it and keeps the sheet's own numbering** ("1. … 2. …", one item per line) — the reporter renders an enumerated
+field as a real list, and flattening it would lose the Expected column's own structure. The prompt states the bound
+(FIELD LENGTHS), the schema descriptions state it per field, the procedure and the self-check repeat it, and the one
+exception to "no bullets, no headings" is written next to the rule it excepts: a prompt rule alone is a request, a
+bound in `applyNarrative` alone is a cut sentence, so both.
+
+`clipCell` cuts at the last boundary the text itself carries — a sentence end, then a list separator, then a space —
+that leaves at least half the budget standing, else the plain character clip. A boundary cut ends a claim rather than
+halving one. Nothing else moved: the narrative is still written from the bundle alone, still decides nothing, and a
+field inside the bound is stored exactly as written.
+
+Why it cannot make the result worse: the bound only ever removes text from the tail of a field the model wrote too
+long, never rewords one, never generalises one — the prompt's own rule is "drop a detail rather than generalise it" —
+and no field gains content. Both report languages are unaffected: the bound is a character count on a field whose
+language the LANGUAGE line still sets. Tests: `tests/case-narrative.test.ts` ("the cell bound on summary and
+testData" — the live PRB-EC-053 summary as the fixture, the enumerated `expected` untouched, the three boundary tiers;
+"what the model is asked for" — the bound and the enumeration rule pinned in the system prompt and in the schema the
+model receives, captured through `MockLanguageModelV4`).
+
+### The verifier's note is the notes, summarised in 70 words (2026-09-11)
+
+The case page rendered `bundle.notes.join(' · ')` verbatim as one `<p class="caveat">` and `narrative.verifierNote`
+right after it. The blob is what nobody reads: a real one (PL_06_10) runs to ~300 words in a single paragraph — the
+session note, the sign-in POST evidence, the pre-run dead-end/expected-fail risk line, a three-case cross-case
+interference stamp, and a whole system-error diagnosis with the agent's trail and a suggested fix. `verifierNote` is
+now the ONE place those notes reach a reader: the model summarises the NOTES block it already receives
+(`buildNarrativePrompt`, `NOTES (n):`), most decision-relevant first — a diagnosed system error and its fix, then
+interference, then risk judged before the run, then session mechanics — in at most `NARRATIVE_NOTE_MAX_WORDS` (70)
+words, in the narrative's own `lang`, and empty only when `notes` is empty. Still ONE `generator`-role call per case:
+no second field, no second call, no second role.
+
+**Bound in words, under the existing soft/hard discipline.** `overSoftCap` measures the note in WORDS against 70
+(the tickets keep `NARRATIVE_SOFT_CHARS`), so an over-long note earns the same single re-ask — only the model can drop
+the least load-bearing clause and keep the rest true — and what comes back is cut by `clipNote`, which turns the word
+budget into the character index it lands on and hands that to `clipCell`, so the cut is at a sentence end, a list
+separator or a space, never mid-word.
+
+**Thai is measured in characters, and that is why the two paths differ.** `REPORT_LANGS` is `en` and `th`, and Thai
+writes no space between words: `split(/\s+/)` reads a whole Thai note as ONE word, so a word bound alone would let it
+run unbounded, while a character bound alone would truncate an English note absurdly. `measureNote` (one scan, so the
+count that judges and the cut that shortens can never disagree) counts spaced tokens as words and converts runs of a
+no-separator script at `CONTINUOUS_CHARS_PER_WORD` = 4.5 code points per orthographic word — measured on running Thai,
+function words 2–3 (`ว่า`, `ที่`, `ไม่`), content words 4–9 (`ข้อความ`, `แจ้งเตือน`), combining vowels and tone marks
+counted as the code points they are. So 70 words is ~315 Thai characters against ~420 English ones: the same
+paragraph in both. It reads the TEXT, not `lang`, because a Thai note quotes the application's English wording
+verbatim and both halves must be counted the way their own script is written. Lao, Khmer and Burmese fall under the
+same ratio; a CJK report language would need its own (its words are one or two characters) and `REPORT_LANGS` holds
+none. Where Thai offers no sentence mark to cut on, the plain character cut stands — a script that writes no boundary
+cannot be cut on one, and a segmenter would be a claim about the language the harness cannot check.
+
+Rule 2 is untouched: the note sets no status, files no defect, is read by no finding, and a run's verdict is
+identical with the narrative on and off. Why it cannot make the result worse: the bound only ever removes text from
+the tail of a field the model wrote too long — the prompt's own rule is still "drop a detail rather than generalise
+it" — and the re-ask is kept only where it helped (`keepShorter`). Tests: `tests/case-narrative.test.ts` ("the
+verifier's note is a 70-word summary of the run's notes": the English re-ask threshold, the boundary cut, the Thai
+measure and its paragraph length, a Thai note inside the bound stored verbatim, English quoted inside Thai, and an
+empty `notes` still yielding an empty note; plus the prompt/schema pin in "what the model is asked for"). The four
+render sites are a separate change.
+
+## A candidate must be able to perform the step, and a tooltip is caught on its own terms (2026-09-11, be-sit-high-sonnet-th-20260911-162004)
+
+**Incident.** 15 BE_SIT priority-high cases against HUMI SIT. Of 93 failure
+events only **5** were `resolved, but the claim did not hold` — a real statement
+about the application; **57** were `could not resolve`, and four cases
+(PL_07_01, PL_07_02, RU_06_08, RU_08_01) died on ONE selector shape.
+
+HUMI's English-locale page carries a Thai-named global search — a ⌘K command
+palette for employees and documents — and the captured tree exposes it as two
+ARIA **landmarks**: `search "ค้นหา"`, `search "ค้นหา"`. The table's own filter is
+a separate English `button "Search"`; it appears once in the whole run and
+worked on the one occasion a case reached it. A case needed the table filter.
+The model authored `role=searchbox[name="ค้นหา"]`. `ungroundedSelectorRole`
+correctly found no `searchbox` in the tree — and then said, **in the
+imperative**: *"The page exposes it as: `search "ค้นหา"` — use that role and
+name verbatim."* You cannot `fill` a landmark. Worse, `settleSelectorRole` — *the
+last word: the tree's own role for the same name* — then **wrote that role onto
+the step**, so the wrong control was not merely suggested, it was certified. The
+healer spent dozens of model calls elaborating it.
+
+The rail built to stop an invented selector was directing the model at a
+container that can never satisfy the step. **A refusal that redirects the model
+to a control it cannot use is worse than staying silent**, which is premise 3
+exactly. What changed, all in `flow-author.ts`:
+
+- **`rolePerforms(action, role)`** — one predicate, derived from the harness's
+  own entry table rather than a parallel one. `ENTRY_ACTION_BY_ROLE` is the map
+  `entryStepFor` has always switched on (textbox/searchbox/spinbutton → fill,
+  button/combobox/listbox → selectOption, checkbox/switch → check,
+  radio/option/tab/menuitem* → click; `button` is a chooser because the engine
+  drives a custom-select trigger with `selectOption`, `engine/listbox.ts`), and
+  `entryStepFor` now READS it, so the forwards and backwards readings cannot
+  drift. A `fill` also accepts `combobox` — the engine's own listbox driver
+  types into one to filter it. `CONTAINER_ROLES` (the landmarks and structural
+  roles) is what a `click`/`press` is refused on, and it is **deliberately
+  narrow**: `row`, `cell`, `gridcell`, `listitem`, `heading`, `img` and `link`
+  are NOT in it, because clicking a table row to open it is an ordinary step and
+  a rule that can refuse a true claim is the wrong rule. Permissive by default —
+  an action the table has no opinion about (every assertion, `goto`, `waitFor`)
+  reads any node, so this can only narrow the candidates a refusal offers and
+  can never raise a refusal of its own.
+- **`ungroundedSelectorRole` filters its candidates by the step's action, and
+  returns `container`.** `nearest` now holds only lines whose role could perform
+  the step; when none can and the same-name node is a container, that line comes
+  back as `container` instead. **The contradiction tier needs positive evidence
+  that could stand in for the step**: a container holding the same name
+  contradicts nothing — the control may be inside it, unnamed by this capture or
+  cut past the node budget — so past a `workflow` leg or on a truncated tree the
+  lint now stays silent where it used to name the landmark.
+- **The register changes when the only same-name node is a container.** The
+  refusal says the name belongs to a region, not to a control, that the step's
+  own action can never be performed on it, **"Do NOT copy that role and name"**,
+  and that the control is a different node with a name of its own — else a
+  `workflow` goal in the case's own words. Where the tree holds a real
+  actionable alternative the old verbatim sentence is unchanged.
+- **`settleSelectorRole` refuses to write a role that cannot perform the
+  action.** `nearest` is already filtered, so this is the guarantee for the
+  exported settle's other callers: the last word is a REWRITE, and a rewrite
+  onto a landmark is a step that can never run.
+- **`tooltipRoleSelector`** — a rail in its own right (fatal, settles).
+  `role=tooltip` reached EXECUTION **16 times** in this run, RU_06_01 and
+  RU_07_01 dead-ending on it, because `ungroundedSelectorRole` is silenced by a
+  leg at step 0 and a truncated plans tree, and the tooltip paragraph was gated
+  on `AUTHORING.hoverClaim` matching the CASE TEXT — which is prose, not
+  evidence. Nothing hovers while a capture reads a tree, so absence of a tooltip
+  line is not absence of evidence, it is **the shape of every tree there will
+  ever be**: this is the one role judgeable with no tree at all, which is exactly
+  what a step past a leg needs. `expectHidden` is exempt on the usual rule, and a
+  `workflow` goal that merely says the word is untouched. Reported only where
+  `ungroundedSelectorRole` has not already spoken about the same step, so one
+  wrong selector earns one refusal. `TOOLTIP_GUIDANCE` is the single definition
+  both refusals carry. Its settle repoints to the tree's own line for the same
+  name when a capture holds one; with none it annotates and hands the step over
+  exactly as it shipped before the lint existed — a dead-end is no worse than
+  today's, and the note tells the reader why.
+- **`treeLineRole`, and the one multiline anchor that would have broken.** The
+  capture is gaining indentation to show containment (`tree-containment`,
+  `healer/jit-healer.ts`). Every tree-line read in this file was audited:
+  `treeLineName`, `ungroundedSelectorRole`, `treeSections`, `ambiguousRepeated
+  Control`, `unanchoredHoverAssertion`, `settleSelectorRole`, `scopeCountedSets`,
+  `settleExclusivity`, `treeControlNamed`, `fillsReadOnlyNode`,
+  `ungroundedOnTruncatedTree`, `ungroundedTextExpectation`,
+  `wordingClaimAssertsDataValue` and `staleFixtureFacts` already trim or use
+  `^\s*`. **One did not**: `ungroundedCountRole` tested
+  `new RegExp('^' + role + '\\b', 'im')` against the whole tree, which would have
+  reported every nested role as a phantom the day indentation landed. It is
+  `^[ \t]*` now. The four inline `/^([a-z]+)\b/` copies are one exported
+  `treeLineRole`, which trims.
+
+**Why none of it can make a result worse.** Filtering only ever removes a
+candidate the step could not have used, so a refusal offers strictly fewer
+wrong answers and never fewer right ones; the container branch replaces an
+instruction no flow could follow with a description of what the evidence
+actually says; the settle guard only ever declines to write a step that could
+not run, leaving the model's own selector for the run to settle; the tooltip
+lint's own last word is either the tree's grounded line or the status quo; and
+`rolePerforms` defaults to true, so no action it does not model can be refused
+by it.
+
+Tests: `tests/flow-author.test.ts` — "a candidate must be able to satisfy the
+step (be-sit-high-sonnet-th, the Thai ⌘K search)" (`rolePerforms`'s four action
+classes, the landmark not offered for a `fill`, the settle refusing it, a
+genuine alternative still offered verbatim and still settled, the withholding
+past a leg and on a truncated tree, and the composed refusal's own wording);
+"tooltipRoleSelector — a role no capture can ever ground" (no tree needed, the
+exemptions, the refusal with and without a hover-matching case text, the settle
+both ways, one guidance sentence); "a tree line is read whatever its
+indentation" (`treeLineRole`/`treeLineName` trim, `ungroundedCountRole` sees a
+nested role, `ungroundedSelectorRole` reads nested roles and names).
+
+## A table name is the harness's own, in two spellings — and a lookup that could not run is not an answer (2026-09-11, be-sit-high-opus-th-20260911-174323 PL_09_01)
+
+PL_09_01's Test Data calls its fixture a *"Create fixture (new proposed ID, not
+yet persisted)"*, so `ungroundedFixtureAssertion` rightly refuses an
+`expectVisible` on `QA260908_BE_137` unless evidence shows the application
+already holds it. The evidence was there and never arrived: the run log reads
+*the database did not answer — the model named table "benefit_management.
+benefit_plan", which the schema does not declare* — about a table the
+connection holds. The fixture went unproven, the same refusal came back twice,
+and the row sealed `blocked`, where a plain `--resume` can never pick it up.
+
+**Both spellings are the harness's own, and it validated one against the
+other.** `DbClient.introspect` spells a table of `current_schema()` BARE and
+every other table `schema.table` (`qualifiedName`, `src/db/client.ts`) — and
+this run's DSN carries `options=-csearch_path=benefit_management,public`, which
+`pg` passes in the startup packet, so `current_schema()` is
+`benefit_management` and its 14 tables come back as `benefit_plan`. Meanwhile
+`tableInventory` (`cli/commands/authoring.ts`) showed the model
+`benefit_management.benefit_plan`, because the context graph's schema nodes
+were indexed from `sit-benefit-schema.sql`, where every name is qualified. The
+model used the spelling the prompt gave it. `tableIn`'s fallback ran one way
+only — bare want → qualified entry — so the reverse resolved to null.
+
+- **`resolveTableIn` is the one resolver** (`value-resolution.ts`); `tableIn`
+  is the view over it every caller kept, and `tableLookupFailure` is the one
+  wording both `fromDb` and `step-evidence.ts`'s `fromDatabase` throw.
+  Precedence is ordered and total — exact, then bare-want against a qualified
+  entry, then qualified-want against a bare entry — so widening the match can
+  never move a name that already resolved. `qualifiedIdent` still quotes
+  `table.name`, the schema's OWN spelling, so a name resolved through the new
+  tier queries the bare identifier the same connection's `search_path`
+  resolves: the lookup and the validation now agree by construction.
+- **An ambiguous bare name is refused, never resolved by position.**
+  `public.benefit_plan` and `benefit_management.benefit_plan` are different
+  tables; returning whichever the introspection listed first would read a real
+  value off the wrong one and produce a lookup that LOOKS grounded — strictly
+  worse than the miss this was widened to fix, because nothing downstream can
+  tell the two apart. The message names both candidates and the remedy
+  (qualify it).
+- **The reverse tier is gated on the introspection's own usage.** `DbSchema`
+  carries no `current_schema()`, so a bare entry cannot be attributed to a
+  schema by reading it. A schema prefix the introspection WRITES anywhere is
+  one it would have written here too, and the table really is undeclared then;
+  only a prefix it never writes can be the current schema whose tables it left
+  bare. So `benefit_management.benefit_plan` finds `benefit_plan` on the live
+  connection, and `public.benefit_plan` stays undeclared beside it.
+
+**And unavailable is not absent.** `resolveStepEvidence` caught the throw,
+logged it and returned the fixture unproven — which is byte-for-byte what it
+returns when the database answers "no such row", so a fault in the harness's
+own plumbing hardened into a claim about the application. `StepEvidenceOutcome.
+unavailableFixtures` records the fact and the reason apart from
+`existingFixtures`, and `FlowAuthor` judges the two in separate passes: a
+fixture the database answered "absent" about keeps its FATAL refusal, and one
+whose lookup could not run is a `weak` complaint — the flow ships, the note
+names the fixture and the failure, and the RUN settles the claim against the
+real page. The module still judges nothing: this is `step-evidence.ts`'s own
+asymmetry, evidence may excuse a claim and never accuse one. Only a lookup
+ATTEMPTED and failed counts; a row with no database configured, or one past
+`MAX_DB_LOOKUPS`, is exactly as unproven as it was before the lookup existed.
+
+Why it cannot make the result worse: the resolver only ever adds a tier below
+the ones that already matched, refuses where it cannot tell two tables apart,
+and hands `qualifiedIdent` the schema's own name as before; the weak tier turns
+a blocked row into a runnable flow carrying its own disclosure, and takes
+nothing away from a database that genuinely answered.
+
+**Reported, not fixed — `schemaSummary` at 497 tables.** It is `slice(0, 80)`
+over an introspection ordered by `(table_schema, table_name)`, and it is the
+ONLY schema `chooseDbLookup` sees: on this connection 417 tables are never
+shown to the model that must name one, and which 80 survive is decided by
+schema name alphabetically, not by the row's words. The precedent for the fix
+is `TABLE_INVENTORY_MAX`'s BM25 narrowing (386 → 9 tables, 56k → 7k tokens);
+applying it here would change which table every DB lookup in the suite picks,
+so it is a measured change of its own, not a contained one.
+
+Tests: `tests/value-resolution.test.ts` ("a table name is matched in both
+spellings (PL_09_01)": the four bare/qualified combinations, the spelled-prefix
+guard, the ambiguous pair with both candidates named, and the undeclared
+sentence both lookups always threw), `tests/step-evidence.test.ts` (the
+unavailable lookup recorded apart, "no row" NOT recorded as unavailable, and
+the PL_09_01 spelling resolving against a bare introspection),
+`tests/flow-author.test.ts` (the pipeline: a database that could not be asked
+hands the flow over with the reason, and absent still refuses where unavailable
+does not).

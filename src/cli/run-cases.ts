@@ -35,16 +35,6 @@ import {
   type CaseScheduleMeta,
 } from './sections.js';
 import { SectionLocks, dataGateFor, dataLocksEnabled, dataWindows } from './data-locks.js';
-import {
-  LlmGovernorModel,
-  QueueGovernor,
-  RuleGovernorModel,
-  governorMode,
-  validateGovernorRead,
-  validateGovernorWrite,
-  type GovernorCaseFact,
-  type GovernorObservation,
-} from '../orchestrator/queue-governor.js';
 import { raiseSessionCapFor } from '../providers/claude-cli-session.js';
 import { ensureQuotaHold, quotaHolding, stopQuotaHold } from './quota-hold.js';
 import { describeDiagnosis, diagnoseError } from '../generator/error-diagnosis.js';
@@ -135,7 +125,7 @@ import { clearPauseFile, pauseFileFor, pauseRequested, requestPause, resetPause 
 import {
   assertRolesResolvable,
   buildAgent,
-  buildDataModel,
+  buildCorroboration,
   buildDiagnosisModel,
   buildCaseNarrativeModel,
   buildNarrationModel,
@@ -207,7 +197,7 @@ export function caseCeilingReason(timeoutMs: number, elapsedMs: number): string 
   return `stopped at the ${formatElapsed(timeoutMs)} case ceiling (WOWLIDATOR_CASE_TIMEOUT_MS) — no verdict; --resume runs it again (elapsed ${formatElapsed(elapsedMs)})`;
 }
 
-const PROVIDER_FAILURE_ORDER: readonly LlmRole[] = ['generator', 'healer', 'agent', 'data', 'governor'];
+const PROVIDER_FAILURE_ORDER: readonly LlmRole[] = ['generator', 'healer', 'agent'];
 
 export function providerFailureLine(failures: ReadonlyMap<LlmRole, number>): string | null {
   const parts = PROVIDER_FAILURE_ORDER.flatMap((role) => {
@@ -260,7 +250,7 @@ export interface SuiteCase {
    * reason and the attempt count, so the ledger and the report carry it and a
    * resume can decide whether to author it again. See `suite-progress.ts`.
    */
-  refused?: { reason: string; attempt: number } | undefined;
+  refused?: { reason: string; attempt: number; providerRefused?: boolean | undefined } | undefined;
   /**
    * Cases this one continues from (CG-12), as the ids their names start
    * with. The lane waits for each to finish and runs only if every one
@@ -359,8 +349,7 @@ export async function runCases(
     /**
      * Schedule facts from the indexed repository, when the caller holds a
      * graph: FK pairs (a section is a JOIN FAMILY, not a table) and the
-     * declared tables (the governor's db-tool allowlist). Absent = table
-     * sections stay unexpanded and the governor's db tools refuse.
+     * declared tables. Absent = table sections stay unexpanded.
      */
     graphFacts?: { fkPairs: readonly (readonly [string, string])[]; tables: readonly string[] } | undefined;
     /**
@@ -504,6 +493,7 @@ export async function runCases(
       vacuous?: boolean | undefined;
       proofPath?: string | undefined;
       authoringRefused?: number | undefined;
+      providerRefused?: boolean | undefined;
       dependsOn?: readonly string[] | undefined;
       knownResult?: KnownResult | undefined;
     } = {},
@@ -861,14 +851,10 @@ export async function runCases(
     return exclusive[index]!;
   };
 
-  // ---- interference registry + governor state ------------------------------
+  // ---- interference registry ------------------------------------------------
   /** Every case's window and sections, for the interference detector. */
   const windows = new Map<number, { name: string; meta: CaseScheduleMeta; startedMs: number; endedMs: number }>();
   const inFlightMeta = new Map<number, { name: string; meta: CaseScheduleMeta; startedMs: number }>();
-  const heldCases = new Set<string>();
-  /** Governor pool override; null = the ordinary sizing. Never above ceiling. */
-  let poolOverride: number | null = null;
-  let governorHold = false;
   // The account's session window: stop dispatching before it is full and
   // resume when it reopens (`quota-hold.ts`). Idempotent — the authoring
   // pool may already have armed it.
@@ -884,19 +870,11 @@ export async function runCases(
    */
   const pendingSoloReruns: { name: string; run: () => Promise<void> }[] = [];
 
-  /** Set once the governor is built below; canRunWith fires blocked events through it. */
-  let governorRef: QueueGovernor | null = null;
-  const blockedPolls = new Map<number, number>();
-
-  const heldBlocks = (name: string): boolean =>
-    [...heldCases].some((id) => name === id || name.startsWith(`${id} `) || name.startsWith(id));
-
   /**
    * Where a case's sources stand (CG-12) — `dependencyStanding` in
-   * `case-plan.ts` owns the answer; this only supplies the lookups. The gate
-   * lives in the deterministic scheduler, never the governor: a dependent's
-   * verdict is correctness, and the governor is an optimiser that may be
-   * absent, off, or out of budget without changing any verdict.
+   * `case-plan.ts` owns the answer; this only supplies the lookups. A
+   * dependent's verdict is correctness, so the gate is deterministic by
+   * construction: no advisory layer has ever been allowed to move it.
    */
   const dependencyStatus = (testCase: SuiteCase, index: number): DependencyStanding =>
     dependencyStanding(caseIdOf(testCase.name), testCase.dependsOn ?? [], index, {
@@ -919,161 +897,29 @@ export async function runCases(
     // answer is `'defer'`, not `false`: the loop parks the dependent and
     // goes on dispatching the cases behind it (2026-09-04 — `false` held the
     // head of the queue, and a ten-lane pool drained to the one lane running
-    // the prerequisite). The wait still counts toward the governor's
-    // queue-blocked event, so a long one is explained, not mistaken for a
-    // scheduler fault — see `waitingOn` on the observation.
+    // the prerequisite).
     const dependency = dependencyStatus(testCase, index);
     if (dependency.kind === 'wait') {
       if (!dependencyWaitLogged.has(index)) {
         dependencyWaitLogged.add(index);
         process.stdout.write(`  [c${index + 1}]      waits for ${dependency.on} — ${testCase.name} continues from it\n`);
       }
-      const polls = (blockedPolls.get(index) ?? 0) + 1;
-      blockedPolls.set(index, polls);
-      if (polls === 25 && governorRef !== null) void governorRef.onEvent(observe('queue-blocked'));
       return 'defer';
     }
-    const held = heldBlocks(testCase.name);
-    // Under data locks the only thing that can refuse a dispatch is an
-    // explicit hold: two cases that touch the same section are no longer kept
-    // apart here, they queue at the step that changes the data. That also
-    // ends the head-of-line blocking this check used to cause — the loop
-    // takes cases in order, so one un-dispatchable case stalled every
-    // compatible case behind it.
-    const compatible =
-      !held &&
-      (useLocks ||
-        !useSections ||
-        inflight.every(({ item, index: otherIndex }) =>
-          compatibleCases(metaOf(testCase, index), metaOf(item, otherIndex)),
-        ));
-    if (compatible) {
-      blockedPolls.delete(index);
-      return true;
-    }
-    // A dispatch refused ~25 polls (~5s of lanes finishing nothing) is the
-    // governor's queue-blocked event — once per case, fire-and-forget, and
-    // only when a governor exists at all.
-    const polls = (blockedPolls.get(index) ?? 0) + 1;
-    blockedPolls.set(index, polls);
-    if (polls === 25 && governorRef !== null) void governorRef.onEvent(observe('queue-blocked'));
-    return false;
-  };
-
-  // ---- the queue governor (docs/parallel-run-spec.md §2.4) -----------------
-  // Advisory and event-driven: absent, off, or out of budget, everything
-  // above runs exactly as the deterministic scheduler alone. Built only for
-  // a parallel suite — a serial run has no queue to govern.
-  const poolCeiling = (): number => Math.max(concurrencyOf(), 2);
-  // `rules` (the default) is a pure function — no model, no budget pressure,
-  // so it may speak on every event; `model` restores the LLM governor with
-  // its hard turn budget. See `governorMode`.
-  const govMode = governorMode();
-  const recentFailures: string[] = [];
-  const governor: QueueGovernor | null =
-    parallel && govMode !== 'off' && (govMode === 'rules' || options.agent)
-      ? new QueueGovernor({
-          model: govMode === 'rules' ? new RuleGovernorModel() : new LlmGovernorModel({ factory: options.factory }),
-          ...(govMode === 'rules' ? { budget: 10_000 } : {}),
-          hooks: {
-            hold: (caseId) => {
-              if (caseId === '') return false;
-              heldCases.add(caseId);
-              return true;
-            },
-            release: (caseId) => heldCases.delete(caseId),
-            resizePool: (size) => {
-              poolOverride = Math.max(1, Math.min(poolCeiling(), size));
-              return poolOverride;
-            },
-            rerunAlone: () => false, // granted only at case end, through the detector's own path
-            dbRead: async (sql) => {
-              const gate = validateGovernorRead(sql);
-              if (!gate.ok) return `refused: ${gate.reason}`;
-              return runGovernorSql(sql, process.env['WOWLIDATOR_DB_URL'], 'read');
-            },
-            dbWrite: async (sql) => {
-              const admin = process.env['WOWLIDATOR_DB_ADMIN_URL'];
-              if (admin === undefined || admin.trim() === '') {
-                return 'refused: WOWLIDATOR_DB_ADMIN_URL is not set — the governor may not write without an operator-supplied admin credential';
-              }
-              const gate = validateGovernorWrite(sql, where.graphFacts?.tables ?? []);
-              if (!gate.ok) return `refused: ${gate.reason}`;
-              return runGovernorSql(sql, admin, 'write');
-            },
-          },
-          log: (line) => process.stderr.write(`  ${line}\n`),
-        })
-      : null;
-  governorRef = governor;
-
-  /** One statement through a short-lived client. Lazy import: a suite with no governor DB use never demands the driver. */
-  async function runGovernorSql(sql: string, url: string | undefined, kind: 'read' | 'write'): Promise<string> {
-    if (url === undefined || url.trim() === '') return `refused: no ${kind === 'read' ? 'WOWLIDATOR_DB_URL' : 'admin'} connection configured`;
-    try {
-      const { connectDb } = await import('../db/client.js');
-      const client = await connectDb({ url });
-      try {
-        const result = await client.query(sql, []);
-        return `${result.rowCount} row(s) in ${result.durationMs}ms` + (kind === 'read' ? `: ${JSON.stringify(result.rows.slice(0, 3)).slice(0, 300)}` : '');
-      } finally {
-        await client.close();
-      }
-    } catch (error) {
-      return `failed: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`;
-    }
-  }
-
-  /** The compact observation a governor turn reads — bounded on purpose. */
-  const observe = (event: GovernorObservation['event']): GovernorObservation => {
-    const now = Date.now();
-    const pending: string[] = [];
-    /** The prerequisite a pending case is parked on, if any — the observation's, not a guess. */
-    const waitingOn = (c: SuiteCase, i: number): string | undefined => {
-      if (c.dependsOn === undefined || c.dependsOn.length === 0) return undefined;
-      const standing = dependencyStatus(c, i);
-      return standing.kind === 'wait' ? standing.on : undefined;
-    };
-    queue.items.forEach((c, i) => {
-      if (collected[i] !== undefined || inFlightMeta.has(i)) return;
-      const m = metaOf(c, i);
-      const on = waitingOn(c, i);
-      pending.push(`${c.name.slice(0, 60)} [${m.writes ? 'writer' : 'reader'}${m.deletes ? ' deletes' : ''} ${m.sections.join(' ') || 'no-sections'}]${heldBlocks(c.name) ? ' HELD' : ''}${on === undefined ? '' : ` waits-for:${on}`}`);
-    });
-    const lanes = [...inFlightMeta.values()].map(
-      (l) => `${l.name.slice(0, 60)} [${l.meta.writes ? 'writer' : 'reader'} ${l.meta.sections.join(' ') || 'no-sections'}] ${Math.round((now - l.startedMs) / 1000)}s`,
+    // Under data locks nothing here refuses a dispatch: two cases that touch
+    // the same section are no longer kept apart here, they queue at the step
+    // that changes the data. That also ends the head-of-line blocking this
+    // check used to cause — the loop takes cases in order, so one
+    // un-dispatchable case stalled every compatible case behind it.
+    return (
+      useLocks ||
+      !useSections ||
+      inflight.every(({ item, index: otherIndex }) =>
+        compatibleCases(metaOf(testCase, index), metaOf(item, otherIndex)),
+      )
     );
-    const done = collected.filter((c) => c !== undefined);
-    const tally = `passed ${done.filter((c) => c!.verdict === 'passed').length} · failed ${done.filter((c) => c!.verdict === 'failed').length} · blocked ${done.filter((c) => c!.verdict === 'blocked').length} · left ${queue.items.length - done.length}`;
-    const interfered = [...windows.values()].filter((w) => w.name.includes('interference')).length;
-    const fact = (name: string, meta: CaseScheduleMeta, on?: string): GovernorCaseFact => ({
-      name,
-      writes: meta.writes,
-      sections: meta.sections,
-      ...(on === undefined ? {} : { waitingOn: on }),
-    });
-    const pendingFacts = queue.items
-      .map((c, i) => ({ c, i }))
-      .filter(({ i }) => collected[i] === undefined && !inFlightMeta.has(i))
-      .slice(0, 30)
-      .map(({ c, i }) => fact(c.name, metaOf(c, i), waitingOn(c, i)));
-    const flyingFacts = [...inFlightMeta.values()].map((l) => fact(l.name, l.meta));
-    return {
-      event,
-      pendingFacts,
-      flyingFacts,
-      recentFailures: recentFailures.slice(-6),
-      queue: pending.slice(0, 20),
-      lanes,
-      tally,
-      health: [
-        `pool ${poolOverride ?? concurrencyOf()} (ceiling ${poolCeiling()})`,
-        `held cases: ${heldCases.size === 0 ? 'none' : [...heldCases].join(', ')}`,
-        `interference stamps so far: ${interfered}`,
-      ],
-      pool: { current: poolOverride ?? concurrencyOf(), max: poolCeiling() },
-    };
   };
+
   process.stdout.write(
     `  case ceiling ${caseTimeoutMs === 0 ? 'off' : formatElapsed(caseTimeoutMs)} ` +
       '(WOWLIDATOR_CASE_TIMEOUT_MS; --case-timeout overrides)\n',
@@ -1114,10 +960,9 @@ export async function runCases(
   if (parallel && browsers.size > 1) {
     process.stdout.write(`  browsers   ${browsers.size}, each case on the least-busy one\n`);
   }
-  if (governor !== null && !streaming && queue.length > 1) void governor.onEvent(observe('suite-start'));
   await runQueue(
     queue,
-    () => Math.min(poolOverride ?? concurrencyOf(), Math.max(concurrencyOf(), poolOverride ?? 1)),
+    () => concurrencyOf(),
     (testCase, index) => scheduleOf(testCase, index),
     // The lane's tag on the async context: every line written on this
     // case's behalf without an explicit tag — the repair loop's, the llm
@@ -1141,11 +986,20 @@ export async function runCases(
     // says why instead of "never ran", and so the next resume knows how many
     // times this row has been refused (see `AUTHORING_REFUSAL_CAP`).
     if (testCase.refused !== undefined) {
-      const reason = `authoring refused (attempt ${testCase.refused.attempt}): ${testCase.refused.reason}`;
+      // A provider that turned the call away is the machinery, not the row:
+      // the case is blocked for this pass and its refusal count stands still,
+      // so a resume authors it again rather than finding it at the cap.
+      const byProvider = testCase.refused.providerRefused === true;
+      const reason = byProvider
+        ? `the provider refused the call, so this case was never authored: ${testCase.refused.reason}`
+        : `authoring refused (attempt ${testCase.refused.attempt}): ${testCase.refused.reason}`;
       emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
       if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
       collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
-      await noteOutcome(collected[index]!, { authoringRefused: testCase.refused.attempt, ...caseFacts(testCase) });
+      await noteOutcome(collected[index]!, {
+        ...(byProvider ? { providerRefused: true } : { authoringRefused: testCase.refused.attempt }),
+        ...caseFacts(testCase),
+      });
       where.onCaseDone?.(testCase, collected[index]!);
       return;
     }
@@ -1269,7 +1123,7 @@ export async function runCases(
       reviewJudge: buildReviewJudge(options),
         healer: options.heal ? undefined : null,
         agent: buildAgent(options, tag, runReversible),
-        dataModel: buildDataModel(options),
+        corroboration: buildCorroboration(options),
         updateBaselines: options.updateBaselines,
         network: options.network,
         // Carried for masking only: a password the person supplied must not
@@ -1302,14 +1156,6 @@ export async function runCases(
         bundle: ProofBundle,
         { notify, blockedReason }: { notify: boolean; blockedReason?: string | undefined },
       ): Promise<void> => {
-        // The governor hears about a case that still did not pass — it may
-        // hold a sibling, shrink the pool, or seed the fixture the section is
-        // starved on. Fire-and-forget: a verdict never waits on advice.
-        if (!isPassing(bundle.status)) {
-          recentFailures.push(bundle.error ?? bundle.status);
-          if (recentFailures.length > 20) recentFailures.shift();
-        }
-        if (governor !== null && !isPassing(bundle.status)) void governor.onEvent(observe('case-ended'));
         // A SYSTEM ERROR gets one healer-role call saying which layer broke —
         // the test catalog, the generator, the agent, the environment or the
         // application — and the fix when one exists. Written into the bundle
@@ -1644,7 +1490,7 @@ export async function runCases(
     }),
     () => pauseRequested(pauseFile),
     canRunWith,
-    () => governorHold || quotaHolding(),
+    () => quotaHolding(),
   ).catch(async (error: unknown) => {
     if (ledger !== null && where.ledger !== undefined) {
       ledger.ended = {

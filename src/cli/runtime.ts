@@ -15,7 +15,6 @@ import { LlmNarrationModel, type NarrationModel } from '../generator/step-narrat
 import { LlmCaseNarrativeModel, type CaseNarrativeModel } from '../generator/case-narrative.js';
 import type { CacheManager } from '../cache/cache-manager.js';
 import { describeRouting } from '../config.js';
-import { LlmDataModel } from '../data/data-model.js';
 import { formatAgentAction, formatStepLine, type ProofStep } from '../engine/proof-bundle.js';
 import type { RunPlan } from '../engine/runner.js';
 import { CAPTURE_PILOT_MAX_STEPS } from '../context/capture-pilot.js';
@@ -24,6 +23,7 @@ import { LlmFlowRepairModel, type FlowRepairModel } from '../repair/flow-repair-
 import { LlmReviewJudge, type ReviewJudge } from '../engine/review-judge.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
 import { JitHealer, LlmHealerModel } from '../healer/jit-healer.js';
+import { LlmCorroborationModel } from '../engine/backend-corroboration.js';
 import { LlmAgentModel, WorkflowAgent } from '../orchestrator/workflow-agent.js';
 import {
   mutationPolicyFromEnv,
@@ -31,6 +31,16 @@ import {
   type MutationReversibility,
 } from '../orchestrator/mutation-policy.js';
 import type { CliOptions } from './options.js';
+
+/**
+ * The verdict model for backend corroboration — the AGENT role's own config,
+ * asked for as `verdict-agent` (2026-09-11). Null when the run has no agent
+ * (`--no-agent`): a corroboration nobody can map is simply not attempted, and
+ * every assertion keeps exactly the verdict it has today.
+ */
+export function buildCorroboration(options: CliOptions): LlmCorroborationModel | null {
+  return options.agent ? new LlmCorroborationModel({ factory: options.factory }) : null;
+}
 
 export function buildHealer(options: CliOptions, hints?: HealHintsProvider | undefined) {
   return options.heal
@@ -253,10 +263,6 @@ export function buildCapturePilot(options: CliOptions): WorkflowAgent | null {
   });
 }
 
-// Lazy like every other role: a flow with no `fillRetry(kind: 'custom')` step
-// never resolves the `data` role or demands its key. No `--no-data` flag —
-// the deterministic kinds cost nothing to leave enabled, and `custom` is
-// opt-in per step by construction.
 /**
  * The authoring review (`src/generator/flow-review.ts`), on the agent role.
  * Default on; `--no-author-review` disables; no agent key degrades silently
@@ -346,10 +352,6 @@ export function runPersonas(
     ...(extra ?? {}),
   };
   return Object.keys(map).length === 0 ? undefined : map;
-}
-
-export function buildDataModel(options: CliOptions): LlmDataModel {
-  return new LlmDataModel({ factory: options.factory });
 }
 
 /**

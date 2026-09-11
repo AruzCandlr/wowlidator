@@ -44,6 +44,7 @@ import {
   isAssertionStepAction,
   observedEvidence,
   provenanceExtras,
+  runNotesSummary,
   sheetLabel,
   signInPersona,
   stepNarration,
@@ -124,6 +125,12 @@ interface Labels {
   stillsLede: string;
   footer: string;
   backToIndex: string;
+  /** The blocked-case page: a case that never ran still says why, on a page of its own. */
+  blockedSub: string;
+  blockedWhy: string;
+  blockedEvidence: string;
+  blockedNoRun: string;
+  blockedNoReason: string;
   verdict: Record<string, string>;
   pill: Record<string, string>;
 }
@@ -199,6 +206,11 @@ const EN: Labels = {
   stillsLede: 'One still per step that kept one; the red rectangle marks what the step acted on.',
   footer: 'Files',
   backToIndex: 'Back to the catalog report',
+  blockedSub: 'This case was not run, so nothing here is a verdict about the application.',
+  blockedWhy: 'Why this case did not run',
+  blockedEvidence: 'Evidence',
+  blockedNoRun: 'No run took place, so there are no steps, no screenshots, no recording and no defects. Nothing on this page is a finding about the application under test.',
+  blockedNoReason: 'The ledger recorded no reason for this case.',
   verdict: { passed: 'passed', 'pass**': 'passed with issues', 'test failed': 'test failed', 'test failed (dead-end)': 'test failed (dead-end)', 'system error': 'system error', 'needs review': 'needs review', 'recorded only': 'recorded only', blocked: 'blocked', 'never ran': 'never ran' },
   pill: { passed: 'passed', failed: 'failed', 'dead-end': 'dead end', error: 'error', skipped: 'skipped' },
 };
@@ -274,6 +286,11 @@ const TH: Labels = {
   stillsLede: 'หนึ่งภาพต่อ step ที่เก็บภาพไว้ กรอบสีแดงคือสิ่งที่ step กระทำ',
   footer: 'ไฟล์',
   backToIndex: 'กลับไปหน้ารายงาน catalog',
+  blockedSub: 'เคสนี้ไม่ได้ถูกรัน ข้อมูลในหน้านี้จึงไม่ใช่ผลตัดสินเกี่ยวกับแอปพลิเคชัน',
+  blockedWhy: 'เหตุผลที่เคสนี้ไม่ได้รัน',
+  blockedEvidence: 'หลักฐาน',
+  blockedNoRun: 'ไม่มีการรันเกิดขึ้น จึงไม่มีขั้นตอน ภาพหน้าจอ วิดีโอ หรือข้อบกพร่องใด ๆ ไม่มีสิ่งใดในหน้านี้เป็นข้อค้นพบเกี่ยวกับแอปพลิเคชันที่ทดสอบ',
+  blockedNoReason: 'ledger ไม่ได้บันทึกเหตุผลของเคสนี้',
   verdict: { passed: 'ผ่าน', 'pass**': 'ผ่านแบบมีข้อสังเกต', 'test failed': 'ตก', 'test failed (dead-end)': 'ตก (ไปไม่ถึง)', 'system error': 'ระบบผิดพลาด', 'needs review': 'รอตรวจ', 'recorded only': 'บันทึกอย่างเดียว', blocked: 'ถูกกั้น', 'never ran': 'ไม่ได้รัน' },
   pill: { passed: 'ผ่าน', failed: 'ตก', 'dead-end': 'ไปไม่ถึง', error: 'ผิดพลาด', skipped: 'ข้าม' },
 };
@@ -444,6 +461,56 @@ function pct(n: number, total: number): string {
   return total === 0 ? '0' : ((n / total) * 100).toFixed(2);
 }
 
+/**
+ * How the case is titled — the sheet's own id when the run qualified it, and
+ * the name with a leading repeat of either id removed. One derivation, so the
+ * mast and the pre-read table cannot print the id once and twice.
+ */
+function caseTitle(c: CatalogReportCase, stamped: { sheetCaseId: string | null }): { shown: string; qualified: string | null; name: string } {
+  const id = displayCaseId(c.id, c.sheetCaseId ?? stamped.sheetCaseId);
+  let name = c.name;
+  for (const lead of [c.id, id.shown]) {
+    if (lead !== '' && name.startsWith(lead)) name = name.slice(lead.length).replace(/^[\s—–:-]+/, '');
+  }
+  return { ...id, name };
+}
+
+/**
+ * The items of a narrative field the model itself enumerated ("1. … 2. …"),
+ * or null for text that is not a list. The run is taken only from a leading
+ * `1.`/`1)` and only while the numbers ascend by one, so a date, a decimal or
+ * a stray "2)" mid-sentence cannot split a paragraph; text before the first
+ * marker, an empty item, or fewer than two items all mean "not a list", and
+ * such text renders exactly as it did before this existed. Nothing is
+ * dropped: every character after the first marker belongs to some item.
+ */
+function enumeratedItems(text: string): string[] | null {
+  const marker = /(^|\s)(\d{1,2})[.)]\s+/g;
+  const marks: { start: number; body: number; n: number }[] = [];
+  for (let m = marker.exec(text); m !== null; m = marker.exec(text)) {
+    marks.push({ start: m.index + m[1]!.length, body: m.index + m[0].length, n: Number(m[2]) });
+  }
+  if (marks.length < 2 || marks[0]!.n !== 1 || text.slice(0, marks[0]!.start).trim() !== '') return null;
+  const run = [marks[0]!];
+  for (const mark of marks.slice(1)) if (mark.n === run.length + 1) run.push(mark);
+  if (run.length < 2) return null;
+  const items = run.map((mark, i) => text.slice(mark.body, i + 1 < run.length ? run[i + 1]!.start : undefined).trim());
+  return items.some((item) => item === '') ? null : items;
+}
+
+/**
+ * A model-written field: an ordered list when its own text is enumerated, the
+ * single element otherwise. Marked `ai` either way — restructuring what was
+ * recorded is layout, and the words stay the model's.
+ */
+function narrative(text: string | undefined, tag: 'strong' | 'span' = 'span', cls = ''): string {
+  if (text === undefined || text === '') return '';
+  const klass = cls === '' ? 'ai' : `${cls} ai`;
+  const items = enumeratedItems(text);
+  if (items === null) return `<${tag} class="${klass}">${esc(text)}</${tag}>`;
+  return `<ol class="${klass} enum">${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ol>`;
+}
+
 function pillOf(step: ProofStep, L: Labels): string {
   const cls = step.status === 'passed' ? 'pass' : step.status === 'skipped' ? 'na' : 'fail';
   return `<span class="pill ${cls}">${esc(L.pill[step.status] ?? step.status)}</span>`;
@@ -478,15 +545,14 @@ function mast(input: CasePageInput, L: Labels, bundle: ProofBundle | null): stri
   const chip = verdictChipOf(c);
   const stamped = provenanceExtras(bundle);
   const label = sheetLabel({ sheet: c.sheet ?? stamped.sheet, category: c.category ?? stamped.category });
-  const shown = displayCaseId(c.id, c.sheetCaseId ?? stamped.sheetCaseId);
-  const name = c.name.startsWith(c.id) ? c.name.slice(c.id.length).replace(/^[\s—–:-]+/, '') : c.name;
+  const { shown, name } = caseTitle(c, stamped);
   const when = bundle?.finishedAt ?? bundle?.startedAt ?? null;
   const narrative = bundle?.narrative;
   const verdictColour = chip.cls === 'pass' ? 'var(--pass)' : chip.cls === 'fail' || chip.cls === 'error' ? 'var(--app)' : 'var(--case)';
   return (
     `<header class="mast">` +
     `<p class="eyebrow">${esc(L.eyebrow)} · ${esc(input.title)}${when === null ? '' : ` · ${esc(when)}`}</p>` +
-    `<h1>${esc(shown.shown)}${name === '' ? '' : ` — ${esc(name)}`}</h1>` +
+    `<h1>${esc(shown)}${name === '' ? '' : ` — ${esc(name)}`}</h1>` +
     (narrative?.lede ? `<p class="sub ai">${esc(narrative.lede)}</p>` : `<p class="sub">${esc(L.sub)}</p>`) +
     `<p class="idline">` +
     `<span>${esc(L.idCase)} <b>${esc(c.id)}</b></span>` +
@@ -503,15 +569,20 @@ function mast(input: CasePageInput, L: Labels, bundle: ProofBundle | null): stri
 function preRead(input: CasePageInput, L: Labels, bundle: ProofBundle | null): string {
   const c = input.case;
   const n = bundle?.narrative;
+  const { shown, name } = caseTitle(c, provenanceExtras(bundle));
   const variables = Object.entries(bundle?.variables ?? {});
-  const dataStrong = variables.length === 0 ? L.noneRecorded : variables.map(([k, v]) => `${k} = ${v}`).join(' · ');
-  const expectedText = n?.expected ?? '';
-  const summary = n?.summary ?? '';
+  // A recorded value is evidence and stays in `code`; "none recorded" is the
+  // absence of one, so it reads as the note it is rather than as a value.
+  const data =
+    variables.length === 0
+      ? `<span class="det">${esc(L.noneRecorded)}</span>`
+      : `<strong><code>${esc(variables.map(([k, v]) => `${k} = ${v}`).join(' · '))}</code></strong>`;
+  const expected = narrative(n?.expected, 'strong');
   return (
-    `<h2 class="sec">${esc(L.preRead)}</h2><div class="tw"><table><thead><tr><th>${esc(L.thTopic)}</th><th>${esc(L.thDetail)}</th></tr></thead><tbody>` +
-    `<tr><td class="fld">${esc(L.testCase)}</td><td><strong><code>${esc(c.id)}</code> · ${esc(c.name)}</strong>${summary === '' ? '' : `<span class="det${n?.summary ? ' ai' : ''}">${esc(summary)}</span>`}</td></tr>` +
-    `<tr><td class="fld">${esc(L.testData)}</td><td><strong><code>${esc(dataStrong)}</code></strong>${ai(n?.testData, 'span', 'det')}</td></tr>` +
-    `<tr><td class="fld">${esc(L.expected)}</td><td>${expectedText === '' ? `<span class="det">${esc(L.noneRecorded)}</span>` : `<strong class="ai">${esc(expectedText)}</strong>`}</td></tr>` +
+    `<h2 class="sec">${esc(L.preRead)}</h2><div class="tw"><table class="pre"><thead><tr><th>${esc(L.thTopic)}</th><th>${esc(L.thDetail)}</th></tr></thead><tbody>` +
+    `<tr><td class="fld">${esc(L.testCase)}</td><td><strong><code>${esc(shown)}</code>${name === '' ? '' : ` · ${esc(name)}`}</strong>${narrative(n?.summary, 'span', 'det')}</td></tr>` +
+    `<tr><td class="fld">${esc(L.testData)}</td><td>${data}${narrative(n?.testData, 'span', 'det')}</td></tr>` +
+    `<tr><td class="fld">${esc(L.expected)}</td><td>${expected === '' ? `<span class="det">${esc(L.noneRecorded)}</span>` : expected}</td></tr>` +
     `</tbody></table></div>`
   );
 }
@@ -525,9 +596,16 @@ function coverage(L: Labels, bundle: ProofBundle | null): string {
   const obs = steps.filter((s) => s.status === 'passed' && !isAssertionStepAction(s.action)).length;
   const fail = steps.filter((s) => s.status === 'failed' || s.status === 'dead-end' || s.status === 'error').length;
   const na = steps.filter((s) => s.status === 'skipped').length;
-  // The run's own notes first; the model's note after them, marked.
-  const notes = (bundle.notes ?? []).length === 0 ? '' : `<p class="caveat">${esc((bundle.notes ?? []).join(' · '))}</p>`;
-  const caveat = notes + (bundle.narrative?.verifierNote ? ai(bundle.narrative.verifierNote, 'p', 'caveat') : '');
+  // One paragraph, not the verbatim notes: the model's bounded summary of them
+  // where there is one, and the notes themselves only when the run has no
+  // narrative to summarise them (`--no-case-narrative`, or a role with no key).
+  const summary = runNotesSummary(bundle);
+  const caveat =
+    summary === null
+      ? ''
+      : summary.by === null
+        ? `<p class="caveat">${esc(summary.text)}</p>`
+        : ai(summary.text, 'p', 'caveat');
   return (
     `<section class="cov"><h2>${esc(L.coverage(steps.length))}</h2>` +
     `<div class="bar" role="img" aria-label="${esc(`${L.covPass} ${pass} ${L.covObs} ${obs} ${L.covFail} ${fail} ${L.covNa} ${na}`)}">` +
@@ -801,6 +879,8 @@ th{text-align:left;font-family:var(--mono);font-size:.68rem;letter-spacing:.09em
 td{padding:10px 14px;border-bottom:1px solid var(--line-soft);vertical-align:top}tr:last-child td{border-bottom:none}
 td.num{font-family:var(--mono);font-weight:600;white-space:nowrap}td.fld{font-weight:500;white-space:nowrap}td.lab{font-family:var(--mono);font-size:.83rem}td.note{color:var(--ink-2);font-size:.86rem}
 td .det,.qhead .det{display:block;color:var(--ink-2);font-size:.85rem;margin-top:3px}td.own{white-space:nowrap;font-family:var(--mono);font-size:.78rem;color:var(--ink-2)}
+ol.enum{display:block;margin:0;padding:0 0 0 9px;font-weight:600;list-style-position:inside}ol.enum li{margin:0 0 5px;padding-left:2px;text-indent:-1.5em;margin-left:1.5em}ol.enum li:last-child{margin-bottom:0}ol.enum.det{font-weight:400}
+table.pre td{padding:13px 14px;line-height:1.62}table.pre td:last-child{max-width:82ch}table.pre .det{margin-top:6px}
 .tag,.pill{font-family:var(--mono);font-size:.68rem;letter-spacing:.05em;padding:2px 8px;border-radius:2px;font-weight:600;white-space:nowrap}
 .tag.app,.pill.fail{background:var(--app-bg);color:var(--app)}.tag.test,.pill.obs{background:var(--test-bg);color:var(--test)}.pill.pass{background:var(--pass-bg);color:var(--pass)}.pill.na{background:var(--sunk);color:var(--ink-3)}
 tr.na td:not(.num){color:var(--ink-3)}
@@ -818,6 +898,63 @@ pre.sql{margin:0 0 10px;padding:18px 22px;background:var(--surface);border:1px s
 `;
 
 /** The page. Pure: the same case and language render byte-identically. */
+/**
+ * The page a case gets when it never produced a bundle.
+ *
+ * Enforced 2026-09-11, asked for after a run whose 12 rows sealed 9 blocked:
+ * **every case is routed to a page of its own**, and a case that never ran
+ * says on that page WHY. Before this, `writeCasePages` deleted any stale page
+ * for a bundle-less case and `casePageHref` returned null, so the only trace
+ * of a blocked row was one line in the catalog index — a reader who clicked
+ * the case name got nowhere, and the refusal text (often five separate lint
+ * complaints, each naming a step) was truncated to whatever fitted the index
+ * cell.
+ *
+ * Two honesty rules it inherits from every other surface here:
+ *
+ * - **It states an absence, never a verdict.** There was no run, so there is
+ *   no evidence from the application: no steps, no film, no defects. The page
+ *   says that in those words rather than leaving a reader to infer it from
+ *   empty sections.
+ * - **Every sentence is still a pure function of the record.** The reason is
+ *   the ledger's own, escaped and split on the refusal's own `·` separator so
+ *   five complaints read as five lines instead of one paragraph. Nothing is
+ *   summarised and nothing is added.
+ */
+export function renderBlockedCasePage(input: CasePageInput): string {
+  const L = caseLabels(input.lang);
+  const c = input.case;
+  const title = `${c.id} — ${input.title}`;
+  const chip = verdictChipOf(c);
+  const { shown, name } = caseTitle(c, { sheetCaseId: null });
+  // The refusal's own separator: `composeRefusal` joins its complaints with
+  // " · ", so splitting on it restores the list the model was given.
+  const parts = (c.reason ?? '').split(' · ').map((one) => one.trim()).filter((one) => one !== '');
+  const head = parts.shift() ?? L.blockedNoReason;
+  return (
+    `<!doctype html><html lang="${esc(input.lang)}"><head><meta charset="utf-8"/>` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1"/>` +
+    `<title>${esc(title)}</title><style>${STYLE}</style></head><body><main>` +
+    `<header class="mast">` +
+    `<p class="eyebrow">${esc(L.eyebrow)} · ${esc(input.title)}</p>` +
+    `<h1>${esc(shown)}${name === '' ? '' : ` — ${esc(name)}`}</h1>` +
+    `<p class="sub">${esc(L.blockedSub)}</p>` +
+    `<p class="idline">` +
+    `<span>${esc(L.idCase)} <b>${esc(c.id)}</b></span>` +
+    (c.scenario === '' ? '' : `<span>${esc(L.idScenario)} <b>${esc(c.scenario)}</b></span>`) +
+    `<span>${esc(L.idVerdict)} <b style="color:var(--case)">${esc(L.verdict[chip.label] ?? chip.label)}</b></span>` +
+    `<span><a href="${esc(input.indexHref)}">${esc(L.backToIndex)}</a></span>` +
+    `</p></header>` +
+    `<section><h2>${esc(L.blockedWhy)}</h2>` +
+    `<p>${esc(head)}</p>` +
+    (parts.length === 0 ? '' : `<ul>${parts.map((one) => `<li>${esc(one)}</li>`).join('')}</ul>`) +
+    `</section>` +
+    `<section><h2>${esc(L.blockedEvidence)}</h2><p>${esc(L.blockedNoRun)}</p></section>` +
+    `<footer><p><a href="${esc(input.indexHref)}">${esc(L.backToIndex)}</a></p></footer>` +
+    `</main></body></html>`
+  );
+}
+
 export function renderCasePage(input: CasePageInput): string {
   const L = caseLabels(input.lang);
   const c = input.case;

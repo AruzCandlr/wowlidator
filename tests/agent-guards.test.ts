@@ -26,6 +26,7 @@ import {
   activationKey,
   reactivation,
   reactivationAdvanced,
+  inventedCredentialFill,
   unscopedDestructiveClick,
   goalIdentifiers,
   DESTRUCTIVE_NAME,
@@ -53,6 +54,7 @@ import {
   parseWherePairs,
   type AgentDecision,
   type AgentObservation,
+  stallSummary,
 } from '../src/orchestrator/workflow-agent.js';
 import { withPage } from '../src/engine/runner.js';
 import { ListboxOptionMissingError } from '../src/engine/listbox.js';
@@ -556,7 +558,7 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
       return agent.run(page, 'reach the reporting screen');
     });
     assert.equal(result.success, false);
-    assert.match(result.summary, new RegExp(`stalled: nothing advanced in ${AGENT_NO_PROGRESS_TURNS} consecutive turns`));
+    assert.match(result.summary, new RegExp(`stalled after ${AGENT_NO_PROGRESS_TURNS} turn\\(s\\) with nothing advancing`));
     assert.equal(result.turns, AGENT_NO_PROGRESS_TURNS, 'stopped by the judge, not a ceiling');
     assert.equal(seen.length, AGENT_NO_PROGRESS_TURNS, 'one ask per turn — a goto is refused in the act, never re-asked');
     assert.equal(result.maxSteps, DEFAULT_AGENT_MAX_STEPS, 'the backstop ceiling is recorded, but the judge stopped the leg first');
@@ -652,7 +654,7 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
       return agent.run(page, 'reach the reporting screen');
     });
     assert.equal(result.lookedOnly ?? false, false, 'not a reading-question handoff');
-    assert.match(result.summary, /stalled: nothing advanced/);
+    assert.match(result.summary, /stalled after \d+ turn\(s\) with nothing advancing/);
     assert.equal(result.turns, AGENT_NO_PROGRESS_TURNS);
   });
 
@@ -934,7 +936,7 @@ describe('a stall made only of looking (CDP)', { skip: skipBrowser }, () => {
 
     assert.equal(result.success, false);
     assert.match(result.summary, /looked and found nothing to act on/);
-    assert.doesNotMatch(result.summary, /stalled: nothing advanced/, 'never falls through to the 5-turn judge');
+    assert.doesNotMatch(result.summary, /stalled after \d+ turn\(s\)/, 'never falls through to the 5-turn judge');
     assert.equal(result.lookedOnly, true);
     assert.equal(result.turns, AGENT_LOOK_ONLY_TURNS, 'ends at 3 turns, not 5');
     assert.ok(result.turns < AGENT_NO_PROGRESS_TURNS, 'the handoff pre-empts the ordinary stall judge');
@@ -968,7 +970,7 @@ describe('a stall made only of looking (CDP)', { skip: skipBrowser }, () => {
     // Turn 1's click is a real action and resets the no-progress counter, so
     // it takes AGENT_NO_PROGRESS_TURNS more turns after it — not instead of
     // it — to reach the stall.
-    assert.match(result.summary, new RegExp(`stalled: nothing advanced in ${AGENT_NO_PROGRESS_TURNS} consecutive turns`));
+    assert.match(result.summary, new RegExp(`stalled after ${AGENT_NO_PROGRESS_TURNS} turn\\(s\\) with nothing advancing`));
     assert.equal(result.turns, AGENT_NO_PROGRESS_TURNS + 1);
   });
 });
@@ -1588,5 +1590,97 @@ describe('the typed stop reason on the record (no browser)', () => {
       ] as unknown as AxNode[]),
       ['One', 'Three'],
     );
+  });
+});
+
+describe('a stalled leg names what broke, not what it tried last', () => {
+  // From humi BE PL_08_01, 2026-09-11. The old wording quoted turn 21's
+  // improvised `text="CDS"` selector — the agent's own workaround — while
+  // the failure that started the stall was turn 20, the Company dropdown the
+  // harness could not read. A reader chasing the quoted error looked at the
+  // wrong turn.
+  const window = [
+    {
+      ok: false,
+      action: 'selectOption',
+      selector: 'role=button[name="Company" i]',
+      error: 'opened "— Select company —" but could not read its list within 5000 ms',
+    },
+    { ok: false, action: 'click', selector: 'text="CDS"', error: 'no element matches "text="CDS"" (waited 1500 ms)' },
+    { ok: true, action: 'wait', selector: null },
+    { ok: true, action: 'fill', selector: 'role=textbox[name="Search company..." i]' },
+    { ok: true, action: 'type', selector: 'role=textbox[name="Search company..." i]' },
+  ];
+
+  it('leads with the first failure in the stalled window and names the control', () => {
+    const summary = stallSummary(window, 5);
+    assert.match(summary, /it began on selectOption role=button\[name="Company" i\]/);
+    assert.match(summary, /could not read its list/);
+    assert.ok(
+      summary.indexOf('could not read its list') < summary.indexOf('text="CDS"'),
+      `the cause must precede the workaround: ${summary}`,
+    );
+  });
+
+  it('mentions the later attempts without letting them take the sentence', () => {
+    assert.match(stallSummary(window, 5), /it then tried 1 more way\(s\), last: no element matches/);
+  });
+
+  it('says so plainly when every turn was accepted and nothing moved', () => {
+    const idle = [
+      { ok: true, action: 'wait', selector: null },
+      { ok: true, action: 'scroll', selector: null },
+    ];
+    assert.equal(
+      stallSummary(idle, 2),
+      'agent stalled after 2 turn(s) with nothing advancing — every turn was accepted but none changed the page',
+    );
+  });
+
+  it('caps a long error at one line, because a report row is not a stack trace', () => {
+    const long = [{ ok: false, action: 'click', selector: 'x', error: `${'y'.repeat(400)}\nsecond line` }];
+    const summary = stallSummary(long, 1);
+    assert.ok(!summary.includes('second line'), 'only the first line survives');
+    assert.ok(summary.length < 300, `kept short: ${summary.length}`);
+  });
+
+  it('reads only the stalled window, never the whole leg', () => {
+    const earlier = [{ ok: false, action: 'click', selector: 'old', error: 'a failure from before the stall' }, ...window];
+    assert.doesNotMatch(stallSummary(earlier, 5), /before the stall/);
+  });
+});
+
+describe('the agent may not sign anyone in', () => {
+  const fill = (selector: string, value = 'someone@example.com') =>
+    ({ action: 'fill', selector, value, url: '', reasoning: '', next: [] }) as never;
+
+  it('refuses the fill that leaked the operator\'s own address (PRB-EC-053)', () => {
+    const why = inventedCredentialFill(fill('textbox[name="Username"]', 'operator@example.com'), 'MANAGER_ACCOUNT');
+    assert.notEqual(why, null);
+    assert.match(String(why), /credential field/);
+    assert.match(String(why), /MANAGER_ACCOUNT/);
+    // It must tell the agent what to do instead, or it just burns turns.
+    assert.match(String(why), /call fail/);
+  });
+
+  it('refuses on the field, never on the value — a real account is refused too', () => {
+    assert.notEqual(inventedCredentialFill(fill('textbox[name="Password"]', 'automate01'), null), null);
+    assert.notEqual(inventedCredentialFill(fill('textbox[name="รหัสผ่าน"]'), null), null);
+    assert.notEqual(inventedCredentialFill(fill('textbox[name="Email"]'), null), null);
+  });
+
+  it('names the step\'s persona when the run did not give one', () => {
+    assert.match(String(inventedCredentialFill(fill('textbox[name="Username"]'), null)), /the persona the step names/);
+  });
+
+  it('lets every ordinary field through', () => {
+    assert.equal(inventedCredentialFill(fill('textbox[name="First Name (EN)"]'), null), null);
+    assert.equal(inventedCredentialFill(fill('textbox[name="Employee ID"]'), null), null);
+    assert.equal(inventedCredentialFill(fill('textbox[name="Postal code"]'), null), null);
+  });
+
+  it('is about typing, not about clicking — a Sign in BUTTON is the harness\'s own flow', () => {
+    const click = { action: 'click', selector: 'role=button[name="Sign in"]', value: '', url: '', reasoning: '', next: [] } as never;
+    assert.equal(inventedCredentialFill(click, null), null);
   });
 });

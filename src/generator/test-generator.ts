@@ -95,6 +95,7 @@ export const GENERATOR_ACTIONS = [
   'check',
   'uncheck',
   'type',
+  'hover',
   'waitFor',
   'expectText',
   'expectVisible',
@@ -514,6 +515,8 @@ export function toFlowStep(raw: z.infer<typeof GeneratedStepSchema>): FlowStep |
       return raw.url === '' ? null : { action: 'goto', url: raw.url };
     case 'click':
       return selector === '' ? null : { action: 'click', selector, intent };
+    case 'hover':
+      return selector === '' ? null : { action: 'hover', selector, intent };
     case 'waitFor':
       return selector === '' ? null : { action: 'waitFor', selector, intent };
     case 'fill':

@@ -228,6 +228,11 @@ export const AUTHOR_ACTIONS = [
   'upload',
   'back',
   'forward',
+  // The gesture a sheet asks for and the vocabulary used to lack: hovering
+  // a row action to reveal its tooltip. It performs the move only — the
+  // tooltip's words are proved by the control's own name or its `title`,
+  // because nothing hovers while an accessibility tree is read.
+  'hover',
   'scrollTo',
   'expectScrollable',
   // Read a COUNT of matching elements / an element's TEXT into a named
@@ -995,6 +1000,7 @@ Navigation and input
 - press           key name in "key" (Enter, Escape, Tab); optional "selector"
                   focuses first.
 - waitFor         wait for an element to be visible.
+- hover           put the pointer on a control (a row's trash icon) and leave it there.
 - scrollTo        scroll a control into view.
 - back / forward  history.
 - upload          "selector" is the file input, dropzone or opener ("Attach",
@@ -1911,6 +1917,8 @@ function toFlowStep(
       return { action: 'back', intent };
     case 'forward':
       return { action: 'forward', intent };
+    case 'hover':
+      return needsSelector ? null : { action: 'hover', selector, intent };
     case 'scrollTo':
       return needsSelector ? null : { action: 'scrollTo', selector, intent };
     case 'expectScrollable':
@@ -3388,8 +3396,11 @@ export class FlowAuthor {
               unperformed.missing.map((m) => `${m.n}. ${m.text}`).join(' · ') +
               ". The case's claim lives in its LAST steps (Submit, then the profile check); a flow that " +
               'stops early has verified a form and proved nothing about the outcome. Author every numbered ' +
-              'step, citing it in the intent ("Step 5: …"); a step that truly cannot be performed here gets a ' +
-              'step whose intent says "skipped step N: <why>", so the gap is visible.',
+              'step, citing it in the intent ("Step 5: …"). A gesture no action of yours names — anything ' +
+              'the vocabulary above does not spell — is NOT a reason to stop: hand it to a `workflow` step ' +
+              'whose goal names it and the script step it performs ("Step 2: hover the row\'s Delete icon"), ' +
+              'and the agent performs it live. Only a step the APPLICATION cannot perform at all gets a step ' +
+              'whose intent says "skipped step N: <why>", so the gap is visible.',
             {
               // The last word: the missing numbered steps are PERFORMED from
               // the evidence — the tree's own control for a `Field = value`
@@ -3519,6 +3530,20 @@ export class FlowAuthor {
         // same way — an application may return to its sign-in page after
         // creating the session (HUMI SIT, 2026-09-10), so that claim is false
         // on a successful login.
+        // **A counted set is counted inside its own control.** Applied to the
+        // flow AS WRITTEN, before any lint: the model authors this step far
+        // more often than the harness inserts it, and a bare `role=option`
+        // counts every option on the page (HIR-EC-029). Mechanical, disclosed,
+        // never a re-ask — the `groundLoginProof` move.
+        const scopedCounts = scopeCountedSets(
+          [...(result.setup ?? []), ...result.steps],
+          [evidenceTree, interactions].filter((t): t is string => typeof t === 'string').join('\n'),
+        );
+        if (scopedCounts !== null) {
+          this.#onLog?.(scopedCounts);
+          result.notes = result.notes === '' ? scopedCounts : `${result.notes}; ${scopedCounts}`;
+        }
+
         const grounded = groundLoginProof(
           result.setup ?? [],
           result.steps,
@@ -3722,6 +3747,12 @@ export class FlowAuthor {
               'this flow passes now and fails on the day the window moves past the date, ' +
               'blaming the field. Add setClock in setup, before the first goto, and choose a ' +
               'date consistent with it.',
+            {
+              // The last word pins the clock to the date the flow already
+              // typed, rather than blocking a row over a date the sheet never
+              // stated. The flow's own value; nothing invented.
+              settle: () => settleUnpinnedDate(result, unpinnedDate),
+            },
           );
         }
 
@@ -4010,13 +4041,59 @@ export class FlowAuthor {
         // zero — the shape of a `BE-XXX-999` mask the sheet writes for a value
         // that must NOT exist — leaves the refusal untouched.
         const proven = new Set(stepEvidence?.existingFixtures ?? []);
+        // **The sheet's premise about a fixture can go stale, and the page is
+        // the authority** (2026-09-11, be-sit-high-sonnetlow PL_09_01). That
+        // row's Test Data says "This ID is absent from SIT at validation time;
+        // do not present it as an existing row" — and the captured tree
+        // rendered `cell "QA260908_BE_137"`, because an earlier QA pass had
+        // created it and nothing cleaned it up. The model asserted a value the
+        // evidence proved true and was refused for it; the row was sealed
+        // blocked, and re-authoring can never fix it, because the flow was
+        // never the thing that was wrong.
+        //
+        // So a fixture the CAPTURE shows the application already renders is
+        // excused exactly as one the database shows, and the mismatch is
+        // disclosed against the CATALOG — the sheet's premise, not the app's
+        // behaviour and not the author's work. The asymmetry that keeps this
+        // honest is the one `step-evidence.ts` already states: evidence may
+        // excuse a claim, never accuse one. A fixture the tree does NOT render
+        // leaves the refusal exactly where it was.
+        const stale = staleFixturePremises(fixtureFacts(trimmed), evidenceTree);
+        for (const premise of stale) {
+          proven.add(premise.fact);
+          const line =
+            `fixture premise stale — the case's Test Data presents ${JSON.stringify(premise.fact)} as a value this ` +
+            `flow must create, and the captured page already renders it as ${premise.rendered}. The sheet's premise ` +
+            'no longer matches the environment; the assertion stands, and the catalog row is what needs updating.';
+          this.#onLog?.(line);
+          result.notes = result.notes === '' ? line : `${result.notes}; ${line}`;
+        }
         // The case's own `<control> … "<value>"` claims: what the sheet asks
         // to be READ off a control, which is never the same question as
         // whether a record exists in a listing.
         const statedValues = statedValuesIn(extra.caseText ?? trimmed);
+        // **A lookup that could not RUN is not the database answering "no
+        // row"** (2026-09-11, run `be-sit-high-opus-th-20260911-174323`, case
+        // PL_09_01). The fixture lookup threw on a table-name spelling the
+        // connection holds; the fixture stayed unproven, this lint refused it
+        // as though the row were absent, the model answered the same refusal
+        // twice and the row sealed `blocked` — where a plain `--resume` can
+        // never pick it up again, for a fault in the harness's own plumbing.
+        //
+        // "Absent" is a fact about the application and keeps its fatal
+        // refusal; "the database did not answer" is a fact about this run, so
+        // the claim is handed over with the reason on `notes` and the RUN
+        // settles it against the real page — the same trade `lenientGrounding`
+        // and every other `weak` complaint make, and the one premise 3 asks
+        // for. The two are judged in separate passes so an unanswerable
+        // fixture can neither hide nor rescue a genuinely ungrounded one.
+        const unavailable = new Map(
+          (stepEvidence?.unavailableFixtures ?? []).map((lookup) => [lookup.fact, lookup.reason]),
+        );
+        const unprovenFacts = fixtureFacts(trimmed).filter((fact) => !proven.has(fact));
         const fixture = ungroundedFixtureAssertion(
           result.steps,
-          fixtureFacts(trimmed).filter((fact) => !proven.has(fact)),
+          unprovenFacts.filter((fact) => !unavailable.has(fact)),
           statedValues,
         );
         if (fixture !== null) {
@@ -4026,6 +4103,27 @@ export class FlowAuthor {
               'or creates, not a fact about the app. Nothing earlier in this flow creates it. Either author the creation ' +
               '(the fill/insert steps that put it there) before asserting on it, or assert the SHAPE of the result ' +
               '(a row exists, a count is a number) without naming the fixture value.',
+          );
+        }
+
+        const unchecked = ungroundedFixtureAssertion(
+          result.steps,
+          unprovenFacts.filter((fact) => unavailable.has(fact)),
+          statedValues,
+        );
+        if (unchecked !== null) {
+          refuse(
+            `the authored flow "${result.name}" ${unchecked.action}s on ${JSON.stringify(unchecked.fact)} (step ${unchecked.index}) as if it ` +
+              "already existed in the application, and that value is the case's TEST DATA. Whether the application holds it " +
+              `could not be established: the database lookup did not run (${unavailable.get(unchecked.fact) ?? 'no reason recorded'}). ` +
+              'Author the creation before asserting on it where the case does create it; where it must already exist, the run ' +
+              'itself is what settles the claim against the real page.',
+            {
+              severity: 'weak',
+              note:
+                `fixture ${unchecked.fact} is asserted as pre-existing and the database could not be asked ` +
+                `(${unavailable.get(unchecked.fact) ?? 'no reason recorded'}) — the claim is unverified evidence, not a proven one`,
+            },
           );
         }
 
@@ -4117,22 +4215,77 @@ export class FlowAuthor {
                 'nothing on every run. ' +
                 (wrongRole.nearest.length > 0
                   ? `The page exposes it as: ${wrongRole.nearest.map((l) => `\`${l}\``).join(', ')} — use that role and name verbatim.`
-                  : 'Take the role and name from a line of the tree, never from what such a control usually is.') +
+                  : wrongRole.container !== null
+                    ? // **The register changes when the only same-name node is
+                      // a container** (2026-09-11): commanding "use that role
+                      // verbatim" here is what sent four cases to the same
+                      // dead end. There is no candidate to name, so the
+                      // truthful thing to say is that this name is the
+                      // region's, not the control's.
+                      `The only node the tree gives that name is \`${wrongRole.container}\` — a CONTAINER (a landmark or region), not a ` +
+                      `control: a "${result.steps[wrongRole.index]?.action ?? 'act'}" can never be performed on it, and its name belongs to ` +
+                      'the region, not to the thing inside it. Do NOT copy that role and name. The control you want is a different node with ' +
+                      'a name of its own — find that line in the tree (it is often named by the field\'s own label, in the page\'s own ' +
+                      'language), or, when no line names it, hand that leg to a workflow goal in the case\'s own words and let a later ' +
+                      'assertion settle the claim.'
+                    : 'Take the role and name from a line of the tree, never from what such a control usually is.') +
                 // The one role no capture can ever ground (2026-09-09,
                 // PL_07_01): nothing hovers while a tree is read, so the
                 // remedy is not "find the tooltip in the tree" — it is the
-                // control the tooltip belongs to.
-                (AUTHORING.hoverClaim.test(extra.caseText ?? '')
-                  ? ' A tooltip is in no tree: nothing hovers while the page is read, so on the page at rest the tooltip\'s words are the ' +
-                    'accessible NAME of the control that shows it. Assert that control by the role and name the tree gives it, and cite the ' +
-                    'Expected line; expectAttribute on the same control ("name": "title", else "aria-label") with the text quoted from the case ' +
-                    'is the stronger form where the app carries it there.'
+                // control the tooltip belongs to. Said whenever the step
+                // names that role, whatever the case's own words are
+                // (2026-09-11) — the selector is the evidence, not the prose.
+                (AUTHORING.hoverClaim.test(extra.caseText ?? '') || wrongRole.role === 'tooltip'
+                  ? ` ${TOOLTIP_GUIDANCE}`
                   : ''),
             {
               // The last word: the tree's own role for the same name, or nothing.
               settle: () => {
                 const step = result.steps[wrongRole.index];
                 return step === undefined ? null : settleSelectorRole(step, wrongRole);
+              },
+            },
+          );
+        }
+
+        // **A `tooltip`-role selector is refused on its own terms**
+        // (2026-09-11): no capture can ever hold a tooltip, so this needs no
+        // tree and neither the truncation nor the workflow guard applies.
+        // Reported only where `ungroundedSelectorRole` has not already spoken
+        // about the same step, so one wrong selector earns one refusal.
+        const tooltipStep = tooltipRoleSelector(result.steps);
+        if (tooltipStep !== null && (wrongRole === null || wrongRole.index !== tooltipStep.index)) {
+          refuse(
+            `the authored flow "${result.name}" ${tooltipStep.action}s role "tooltip"` +
+              `${tooltipStep.name === null ? '' : ` for ${JSON.stringify(tooltipStep.name)}`} (step ${tooltipStep.index}). ` +
+              'No accessibility tree can ever contain a tooltip — nothing hovers while a page is read — so that selector resolves nothing ' +
+              `on every run, whatever the page does. ${TOOLTIP_GUIDANCE}`,
+            {
+              // The last word: the tree's own role for the same name, when a
+              // line carries it. With none there is nothing grounded to
+              // repoint to, so the step is marked and handed over exactly as
+              // written — a run that dead-ends is what shipped before this
+              // lint existed, and the note tells the reader why.
+              settle: () => {
+                const step = result.steps[tooltipStep.index];
+                if (step === undefined) return null;
+                const lines = (evidenceTree ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+                const needle = tooltipStep.name?.toLowerCase().replace(/\s*:$/, '') ?? null;
+                const line = needle === null ? undefined : lines.find((l) => treeLineName(l) === needle);
+                const repointed =
+                  line === undefined || tooltipStep.name === null
+                    ? null
+                    : settleSelectorRole(step, { role: 'tooltip', name: tooltipStep.name, nearest: [line], disabled: false });
+                if (repointed !== null) return repointed;
+                annotateStep(
+                  step,
+                  'names role "tooltip", which no capture can ever ground — nothing hovers while a tree is read; no captured line names ' +
+                    'the control that shows it, so the run settles it',
+                );
+                return (
+                  `step ${tooltipStep.index} names role "tooltip", which no tree can hold — ` +
+                  'handed over marked [generated: …] for the run to prove or dead-end'
+                );
               },
             },
           );
@@ -5398,7 +5551,18 @@ export function wordingClaimAssertsDataValue(
    */
   caseText?: string | undefined,
 ): { index: number; value: string } | null {
-  if (!WORDING_CLAIM.test(caseText ?? prompt)) return null;
+  // **Wording is a property of an Expected LINE, not of the whole row**
+  // (2026-09-11). `WORDING_CLAIM` matches the Thai `ข้อความ` — "message" — and
+  // a sixteen-step hiring case whose Expected happens to include one line
+  // "…แสดงข้อความ…" was classified a wording claim for all thirty-seven of its
+  // steps (HIR-EC-012, HIR-EC-044: both `ตรวจสอบการจ้างพนักงาน…`, neither about
+  // wording). This is the 2026-09-02 over-firing one level finer: that fix
+  // narrowed the haystack from the whole PROMPT to the case; the case's own
+  // Steps and Test data still carry the word. Only the Expected block states
+  // what the case CLAIMS, so only the Expected block decides this.
+  const source = caseText ?? prompt;
+  const expectedBlock = sectionOf(source, 'expected');
+  if (!WORDING_CLAIM.test(expectedBlock ?? source)) return null;
   // No tree, no opinion. Ungrounded authoring has nothing to tell a label
   // from a row with, and a lint that refuses on absent evidence refuses
   // every honest wording flow too (caught by the echo-pipeline test, whose
@@ -5418,6 +5582,17 @@ export function wordingClaimAssertsDataValue(
   for (const [index, step] of steps.entries()) {
     const text = assertedText(step);
     if (text === null) continue;
+    // **A `{{placeholder}}` is a reference, never a literal** (2026-09-11,
+    // ec-ready-failed HIR-EC-012 and HIR-EC-044). Both flows asserted a value
+    // the flow ITSELF had saved earlier — `{{new_employee_id}}`, the id the
+    // application generated when the hire was submitted — which is exactly the
+    // "identify a record this flow created by a value this flow typed" shape
+    // the authoring prompt asks for. At authoring time such a step has no
+    // value at all, so it cannot be "the sheet's word for the thing" and
+    // cannot be checked against the tree either: what the run will assert is
+    // decided at run time by `interpolateStep`. Refusing it lost two
+    // sixteen-step hiring cases to a rule about wording.
+    if (/\{\{[^}]+\}\}/.test(text)) continue;
     const needle = fold(text);
     if (needle.length < 3 || claim.includes(needle)) continue;
     if (labelLines.some((line) => line.includes(needle))) continue;
@@ -6302,6 +6477,112 @@ export function treeLineName(line: string): string | null {
 }
 
 /**
+ * The ROLE a tree line starts with, folded, or `''` for a line that starts
+ * with no role word.
+ *
+ * One definition, because the tree's line format is not this module's to
+ * assume: the capture may indent a line to show containment, so every read of
+ * a line's role trims first. Four inline copies of this regex existed and one
+ * of them (`ungroundedCountRole`'s multiline `^${role}\b` over the whole
+ * tree) would have stopped matching the day indentation landed.
+ */
+export function treeLineRole(line: string): string {
+  return (/^([a-z]+)\b/i.exec(line.trim())?.[1] ?? '').toLowerCase();
+}
+
+/**
+ * The action the harness enters a value with, per the role the TREE shows.
+ *
+ * The harness's own table, read two ways so the two readings cannot drift:
+ * forwards by `entryStepFor` to WRITE the step a control of this role takes,
+ * and backwards by `rolePerforms` to ask whether a candidate the tree offers
+ * could ever satisfy a step already written. `button` is the custom-select
+ * trigger the engine drives with `selectOption` (`engine/listbox.ts`), which
+ * is why it is a choosing role and not a typing one.
+ */
+const ENTRY_ACTION_BY_ROLE: ReadonlyMap<string, 'fill' | 'selectOption' | 'check' | 'click'> = new Map([
+  ['textbox', 'fill'],
+  ['searchbox', 'fill'],
+  ['spinbutton', 'fill'],
+  ['button', 'selectOption'],
+  ['combobox', 'selectOption'],
+  ['listbox', 'selectOption'],
+  ['checkbox', 'check'],
+  ['switch', 'check'],
+  ['radio', 'click'],
+  ['option', 'click'],
+  ['tab', 'click'],
+  ['menuitem', 'click'],
+  ['menuitemradio', 'click'],
+  ['menuitemcheckbox', 'click'],
+]);
+
+/**
+ * ARIA roles that HOLD controls rather than being one.
+ *
+ * A landmark or a structural container is never what a `fill`, a `check`, a
+ * `selectOption` or a click acts on: its accessible name belongs to the
+ * region, not to the thing inside it. Deliberately narrow — `row`, `cell`,
+ * `listitem`, `heading`, `img` and `link` are NOT here, because clicking a
+ * table row to open it, or a cell, is an ordinary step in a real application
+ * and a rule that can refuse a true claim is the wrong rule.
+ */
+const CONTAINER_ROLES: ReadonlySet<string> = new Set([
+  'search', 'form', 'region', 'navigation', 'main', 'banner', 'contentinfo',
+  'complementary', 'article', 'group', 'radiogroup', 'table', 'grid', 'rowgroup',
+  'list', 'dialog', 'alertdialog', 'document', 'application', 'tablist', 'menu',
+  'menubar', 'toolbar', 'tree', 'treegrid', 'feed', 'none', 'presentation', 'generic',
+]);
+
+/**
+ * Could a node of this role ever satisfy a step of this action?
+ *
+ * The rail this answers (2026-09-11, be-sit-high-sonnet-th PL_07_01 /
+ * PL_07_02 / RU_06_08 / RU_08_01). HUMI's English page carries a Thai-named
+ * global search, and the captured tree exposes it as two ARIA LANDMARKS:
+ * `search "ค้นหา"`, `search "ค้นหา"`. A case needed the table's own English
+ * `button "Search"`; the model authored `role=searchbox[name="ค้นหา"]`;
+ * `ungroundedSelectorRole` correctly found no `searchbox` — and then told it,
+ * in the imperative, *"The page exposes it as: `search "ค้นหา"` — use that
+ * role and name verbatim"*, and `settleSelectorRole` wrote that role onto the
+ * step. You cannot `fill` a landmark. The rail built to stop an invented
+ * selector had certified a control that can never perform the step, and the
+ * healer then spent dozens of calls elaborating it.
+ *
+ * Permissive by default: an action this table says nothing about (every
+ * assertion, `goto`, `waitFor`) reads any node, so this can only ever narrow
+ * the candidates a refusal offers — never raise a refusal of its own.
+ */
+export function rolePerforms(action: string, role: string): boolean {
+  const folded = role.toLowerCase();
+  if (folded === '') return false;
+  const entry = ENTRY_ACTION_BY_ROLE.get(folded) ?? null;
+  switch (action) {
+    case 'fill':
+    case 'fillRetry':
+    case 'type':
+    case 'setValue':
+      // A typed value goes into what the entry table fills, and into the
+      // combobox the engine's own listbox driver types into to filter it
+      // (`engine/listbox.ts`'s SEARCH_INPUT).
+      return entry === 'fill' || folded === 'combobox';
+    case 'check':
+    case 'uncheck':
+      return entry === 'check' || folded === 'radio' || folded === 'menuitemcheckbox' || folded === 'menuitemradio';
+    case 'selectOption':
+      return entry === 'selectOption';
+    case 'upload':
+      return entry === 'fill' || folded === 'button';
+    case 'click':
+    case 'clickIfVisible':
+    case 'press':
+      return !CONTAINER_ROLES.has(folded);
+    default:
+      return true;
+  }
+}
+
+/**
  * A selector whose ROLE the tree never exposes, on ANY action — the
  * generalisation of `ungroundedCountRole` (S4 of the 2026-08-28 agent-flaw
  * audit). Sixteen dead-ends on one page: the author wrote `role=combobox`,
@@ -6343,11 +6624,23 @@ export function treeLineName(line: string): string | null {
 export function ungroundedSelectorRole(
   steps: readonly FlowStep[],
   axTree: string | undefined,
-): { index: number; role: string; name: string | null; nearest: string[]; disabled: boolean } | null {
+): {
+  index: number;
+  role: string;
+  name: string | null;
+  nearest: string[];
+  disabled: boolean;
+  /**
+   * The same-name line that is a CONTAINER — offered only when no candidate
+   * could perform the step, so the refusal can change its register from
+   * "use this verbatim" to "this name belongs to a region, not a control".
+   */
+  container: string | null;
+} | null {
   if (!axTree) return null;
   const truncated = axTree.includes('TREE TRUNCATED');
   const lines = axTree.split('\n').map((l) => l.trim()).filter(Boolean);
-  const roles = new Set(lines.map((l) => (/^([a-z]+)\b/i.exec(l)?.[1] ?? '').toLowerCase()).filter(Boolean));
+  const roles = new Set(lines.map((l) => treeLineRole(l)).filter(Boolean));
   let afterLeg = false;
   for (let i = 0; i < steps.length; i += 1) {
     const step = steps[i]!;
@@ -6390,7 +6683,7 @@ export function ungroundedSelectorRole(
       if (silenceIsEvidence && needle !== null && (step.action === 'fill' || step.action === 'click' || step.action === 'type' || step.action === 'selectOption')) {
         const line = lines.find((l) => new RegExp(`^${role}\\s+"[^"]*${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^"]*"`, 'i').test(l));
         if (line !== undefined && /\bdisabled\b/.test(line)) {
-          return { index: i, role, name, nearest: [line], disabled: true };
+          return { index: i, role, name, nearest: [line], disabled: true, container: null };
         }
       }
       continue;
@@ -6400,11 +6693,22 @@ export function ungroundedSelectorRole(
     // first so `settleSelectorRole` (which needs `nearest[0]`'s name to equal
     // the step's) has the repointing line to hand.
     const sameName = needle === null ? [] : lines.filter((l) => treeLineName(l) === needle);
-    const nearest = needle === null
+    const offered = needle === null
       ? []
-      : [...sameName, ...lines.filter((l) => !sameName.includes(l) && l.toLowerCase().includes(needle))].slice(0, 3);
-    if (!silenceIsEvidence && sameName.length === 0) continue;
-    return { index: i, role, name, nearest, disabled: false };
+      : [...sameName, ...lines.filter((l) => !sameName.includes(l) && l.toLowerCase().includes(needle))];
+    // **A candidate must be able to satisfy the step's own action**
+    // (2026-09-11): a `search` landmark named "ค้นหา" is not a control a
+    // `fill` can be repointed at, and naming it verbatim sent four cases to
+    // the same dead end. The filtered list is what the refusal offers AND
+    // what `settleSelectorRole` writes, so neither can certify a container.
+    const nearest = offered.filter((l) => rolePerforms(step.action, treeLineRole(l))).slice(0, 3);
+    const container = nearest.length > 0 ? null : (sameName[0] ?? null);
+    // The CONTRADICTION tier needs positive evidence that could stand in for
+    // the step. A container holding the same name contradicts nothing: the
+    // control the flow wants may be inside it, unnamed by this capture or cut
+    // past the node budget — so past a leg or a truncation this stays silent.
+    if (!silenceIsEvidence && nearest.length === 0) continue;
+    return { index: i, role, name, nearest, disabled: false, container };
     }
   }
   return null;
@@ -6488,7 +6792,7 @@ export function ambiguousRepeatedControl(
     for (const line of section) {
       const name = treeLineName(line);
       if (name === null) continue;
-      const role = (/^([a-z]+)\b/i.exec(line)?.[1] ?? '').toLowerCase();
+      const role = treeLineRole(line);
       if (role === '') continue;
       const key = `${role}|${name}`;
       here.set(key, (here.get(key) ?? 0) + 1);
@@ -6558,6 +6862,55 @@ export function admitsUngroundedSelector(
 }
 
 /**
+ * The one remedy for a claim about a hover surface, said in one place so the
+ * two refusals that carry it cannot say different things.
+ */
+export const TOOLTIP_GUIDANCE =
+  'A tooltip is in no tree: nothing hovers while the page is read, so on the page at rest the tooltip\'s words are the ' +
+  'accessible NAME of the control that shows it. Assert that control by the role and name the tree gives it, and cite the ' +
+  'Expected line; expectAttribute on the same control ("name": "title", else "aria-label") with the text quoted from the case ' +
+  'is the stronger form where the app carries it there.';
+
+/**
+ * A selector naming the `tooltip` role — invented by construction, on any
+ * tree and on no tree at all.
+ *
+ * `ungroundedSelectorRole` refuses it only where it can speak: a complete
+ * tree with no agent leg before the step, or a same-name line to contradict
+ * it with. Measured on run `be-sit-high-sonnet-th-20260911-162004`,
+ * `role=tooltip[name="Make Correction" i]` reached EXECUTION 16 times —
+ * RU_06_01 and RU_07_01 both dead-ended on it — because the journey capture
+ * puts a `workflow` leg at step 0 of most rows and the plans table blows the
+ * node budget, so both of that lint's guards were in its way. And the hover
+ * paragraph that names the remedy was gated on the CASE's wording matching a
+ * hover pattern, which is prose, not evidence.
+ *
+ * Nothing hovers while a capture reads a tree, so no capture can EVER ground
+ * this role: absence of a tooltip line is not absence of evidence, it is the
+ * shape of every tree there will ever be. That makes this the one role
+ * judgeable with no tree at all, which is exactly what a step past a leg
+ * needs. `expectHidden` is exempt on the same rule as everywhere else —
+ * asserting that a tooltip is NOT shown needs no tooltip.
+ */
+export function tooltipRoleSelector(
+  steps: readonly FlowStep[],
+): { index: number; action: string; name: string | null } | null {
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!;
+    if (step.action === 'workflow' || step.action === 'expectHidden') continue;
+    for (const one of selectorsOf(step)) {
+      const head = (one.split('>>')[0] ?? '').trim();
+      const engine = /^role=tooltip\b(?:\s*\[name=(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'))?/i.exec(head);
+      const attr = /\[role="tooltip"\]/i.test(head);
+      if (engine === null && !attr) continue;
+      const name = (engine?.[1] ?? engine?.[2] ?? null)?.replace(/\\(.)/g, '$1') ?? null;
+      return { index: i, action: step.action, name };
+    }
+  }
+  return null;
+}
+
+/**
  * A hover claim proved by a presence assertion that names no role.
  *
  * A tooltip is the one surface a capture can never hold: nothing hovers
@@ -6601,7 +6954,7 @@ export function unanchoredHoverAssertion(
       const named = lines.filter((l) => treeLineName(l) === needle);
       const line = named[0];
       if (line === undefined) continue;
-      const role = (/^([a-z]+)/i.exec(line)?.[1] ?? '').toLowerCase();
+      const role = treeLineRole(line);
       if (role === '') continue;
       return { index: i, text, role, nearest: named.slice(0, 3) };
     }
@@ -6662,6 +7015,8 @@ export function unboundedExclusivityClaim(
 export interface SettleableFlow {
   steps: FlowStep[];
   cases?: AuthoredCase[] | undefined;
+  /** Setup, when the settle needs it — `settleUnpinnedDate` pins a clock there. */
+  setup?: FlowStep[] | undefined;
 }
 
 /** Append the `[generated: …]` marker to a step's intent, in place. */
@@ -6703,6 +7058,166 @@ export function insertStepBefore(flow: SettleableFlow, anchor: FlowStep, step: F
  * count, and null keeps the refusal: a count of a role the page never
  * exposes is exactly the phantom `ungroundedCountRole` refuses.
  */
+/**
+ * Pin the clock to the date the flow already typed.
+ *
+ * The settle `src/generator/CLAUDE.md` records as owed, delivered 2026-09-11
+ * after HIR-EC-059 of `ec-ready-fresh`: the sheet states no Hire Date at all,
+ * so the model wrote the run's own day as a literal (`2026-09-11`) and the
+ * lint refused a sixteen-step hiring case for it. The refusal was RIGHT — that
+ * flow types the same fixed day tomorrow, when the application's hire-date
+ * window has moved past it, and the report blames the field. What was missing
+ * is that the harness can settle it without asking anyone.
+ *
+ * `setClock` in setup, at midday on the date the flow itself typed, makes the
+ * answer the same every run: the window the application computes from "today"
+ * is the window that date sits in, on every future run, by construction. It is
+ * the flow's own value — nothing is invented and no claim moves.
+ *
+ * Midday, not midnight, on purpose: a date pinned at `00:00` is the previous
+ * day in any timezone west of the runner, and the greeting rung already
+ * records what a midnight clock does to a page that renders "Good morning".
+ *
+ * Returns null when the flow already pins a clock (nothing to do) or when the
+ * value is not a plain calendar date — the caller then keeps the refusal.
+ */
+export function settleUnpinnedDate(
+  flow: SettleableFlow,
+  unpinned: { index: number; value: string },
+): string | null {
+  const setup: FlowStep[] = flow.setup ?? (flow.setup = []);
+  if (setup.some((step: FlowStep) => step.action === 'setClock')) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(unpinned.value)) return null;
+  const time = `${unpinned.value}T12:00:00`;
+  // Before the first `goto`: the application reads the clock as it loads, so a
+  // clock pinned after the navigation pins nothing.
+  setup.unshift({
+    action: 'setClock',
+    time,
+    intent: markGenerated(
+      `Pin the clock to ${unpinned.value}`,
+      `the flow types the date ${unpinned.value} and the sheet states none, so the clock is pinned to it — ` +
+        'without this the same literal is typed on a day the application\'s window has moved past',
+    ),
+  } as FlowStep);
+  return `clock pinned to ${time}: step ${unpinned.index} types the date ${unpinned.value} and the case states none`;
+}
+
+/**
+ * The container role a set's members live in, when the evidence shows one.
+ *
+ * ARIA pairs an item role with the container that owns it, so this is a fact
+ * about the role vocabulary rather than about any one application: an `option`
+ * belongs to a `listbox`, a `menuitem` to a `menu`, a `treeitem` to a `tree`,
+ * a `radio` to a `radiogroup`, a `tab` to a `tablist`. Returns null when the
+ * role owns no container or the captured evidence does not show one — never a
+ * guess, because a scope the page does not have counts zero.
+ */
+/**
+ * Scope a bare item-role `expectCount` to the container it counts inside.
+ *
+ * A mechanical repair, applied to the flow AS WRITTEN — the model authors this
+ * step far more often than the harness inserts it, and the first cut of this
+ * fix only scoped the harness's own insertion, so it never fired on the case
+ * that prompted it (2026-09-11, HIR-EC-029, three runs running).
+ *
+ * `expectCount role=option = 3` counts the whole PAGE. The Event Reason list
+ * holds exactly the three values the sheet names, and a native `<select>`
+ * elsewhere on the form contributes its placeholder `<option>` — in the
+ * accessibility tree whether or not that select is open, invisible on screen.
+ * Found 4, expected 3, a `medium` defect filed against a correct application,
+ * identically on every run because nothing about it is random.
+ *
+ * Strictly narrower, and it invents nothing. The container must be the one
+ * ARIA says owns that item role, and it must be grounded by ONE OF TWO doors:
+ *
+ * - **The evidence shows it.** A container already in the captured tree.
+ * - **A click immediately before opened it.** Verified live on HIR-EC-029
+ *   (2026-09-11): Event Reason is a custom `ul[role=listbox]` holding exactly
+ *   the three `li[role=option]` the sheet names, opened by a button carrying
+ *   `aria-expanded` and no `aria-controls`. The listbox does not exist while
+ *   the dropdown is closed — and authoring captures the page CLOSED, so the
+ *   evidence door can never open for a click-to-open control. The first door
+ *   alone left this case unrepaired through four runs.
+ *
+ * With neither door the selector is left exactly as written, because a scope
+ * the page does not have would count zero and fail the case the other way. A
+ * selector that is already chained (`>>`) is never touched — the author has
+ * scoped it themselves.
+ *
+ * Returns a disclosure line per rewrite, for `notes`, or null when nothing
+ * changed. Same shape as `groundLoginProof`: a string replacement must never
+ * cost an authoring call.
+ */
+export function scopeCountedSets(steps: readonly FlowStep[], evidence: string | undefined): string | null {
+  const lines = (evidence ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+  const done: string[] = [];
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i]!;
+    if (step.action !== 'expectCount') continue;
+    const selector = String((step as { selector?: unknown }).selector ?? '').trim();
+    // A zero count is an ABSENCE claim: scoping it to a container the page may
+    // not be showing would make it pass for the wrong reason.
+    if ((step as { count?: unknown }).count === 0) continue;
+    if (selector === '' || selector.includes('>>')) continue;
+    const role = /^role=([a-z]+)\s*$/i.exec(selector)?.[1];
+    if (role === undefined) continue;
+    const owner = ownerOfItemRole(role.toLowerCase());
+    if (owner === null) continue;
+    // Door one: the captured tree already shows the container. Door two: the
+    // step is counting what a click just opened, and a control that opens on
+    // click is closed — and therefore absent — in every authoring capture.
+    const container = containerOf(role.toLowerCase(), lines) ?? (openedByClickBefore(steps, i) ? owner : null);
+    if (container === null) continue;
+    const scoped = `${withQualifiedRole(`role=${container}`)} >> ${withQualifiedRole(`role=${role}`)}`;
+    (step as { selector: string }).selector = scoped;
+    annotateStep(step, `scoped the count to the ${container} that owns the ${role}s — a bare role=${role} counts every one on the page`);
+    done.push(`${selector} → ${scoped}`);
+  }
+  return done.length === 0 ? null : `counted sets scoped to their own control: ${done.join('; ')}`;
+}
+
+/** The container ARIA says owns this item role, whether or not a page shows one. */
+export function ownerOfItemRole(role: string): string | null {
+  const OWNED_BY: Readonly<Record<string, string>> = {
+    option: 'listbox',
+    menuitem: 'menu',
+    menuitemradio: 'menu',
+    menuitemcheckbox: 'menu',
+    treeitem: 'tree',
+    radio: 'radiogroup',
+    tab: 'tablist',
+    row: 'table',
+    listitem: 'list',
+  };
+  return OWNED_BY[role.toLowerCase()] ?? null;
+}
+
+export function containerOf(role: string, lines: readonly string[]): string | null {
+  const owner = ownerOfItemRole(role);
+  if (owner === null) return null;
+  const shown = lines.some((line) => new RegExp(`^${owner}\\b`, 'i').test(line.trim()));
+  return shown ? owner : null;
+}
+
+/**
+ * Is the step at `index` counting what a click immediately before it opened?
+ *
+ * Scans back over claims and waits — which change nothing on the page — to the
+ * nearest step that ACTS. Only a `click` counts as an opener: a `fill` or a
+ * `goto` before a count says nothing about a list being open, and treating
+ * them as openers would invent a scope on a page that never had one.
+ */
+export function openedByClickBefore(steps: readonly FlowStep[], index: number): boolean {
+  for (let i = index - 1; i >= 0; i--) {
+    const action = steps[i]!.action;
+    if (action.startsWith('expect') || action === 'waitFor') continue;
+    return action === 'click';
+  }
+  return false;
+}
+
 export function settleExclusivity(
   flow: SettleableFlow,
   claim: { line: string; marker: string; count: number | null },
@@ -6723,7 +7238,7 @@ export function settleExclusivity(
       return m !== null && (m[2] ?? '').replace(/\\(.)/g, '$1').trim().toLowerCase() === needle;
     });
     if (line === undefined) return null;
-    roles.add((/^([a-z]+)/i.exec(line)?.[1] ?? '').toLowerCase());
+    roles.add(treeLineRole(line));
   }
   if (roles.size !== 1) return null;
   const role = [...roles][0]!;
@@ -6735,9 +7250,28 @@ export function settleExclusivity(
   );
   if (anchor === undefined) return null;
   const count = claim.count ?? set.members.length;
+  // **A page-wide count is not a count of THIS control** (2026-09-11,
+  // ec-ready-failed HIR-EC-029). The inserted step was `expectCount role=option
+  // = 3`; the page's Event Reason list holds exactly the three the sheet names,
+  // and a native `<select>` elsewhere on the same form contributes its
+  // placeholder `<option>` ("— Select Postal code —", recorded as that step's
+  // own target) — whose options are in the accessibility tree whether or not
+  // their select is open, and which nobody can see. Found 4, expected 3, a
+  // `medium` defect filed against a correct application, identically on every
+  // run, because the harness writes this selector rather than the model.
+  //
+  // So the count is scoped to the container the members live in when the
+  // evidence names one. Strictly narrower than the bare role: it can only stop
+  // counting elements that were never part of the set. When no container is
+  // grounded the bare role stands exactly as before — this may not invent a
+  // scope, and a container the evidence does not show would count zero.
+  const container = containerOf(role, lines);
+  const selector = container === null
+    ? withQualifiedRole(`role=${role}`)
+    : `${withQualifiedRole(`role=${container}`)} >> ${withQualifiedRole(`role=${role}`)}`;
   const step: FlowStep = {
     action: 'expectCount',
-    selector: withQualifiedRole(`role=${role}`),
+    selector,
     count,
     intent: markGenerated(
       claim.line.slice(0, 100),
@@ -6766,6 +7300,12 @@ export function settleSelectorRole(
   const treeRole = (m[1] ?? '').toLowerCase();
   const treeName = (m[2] ?? '').replace(/\\(.)/g, '$1').trim().toLowerCase().replace(/\s*:$/, '');
   if (treeRole === '' || treeName !== found.name.trim().toLowerCase().replace(/\s*:$/, '')) return null;
+  // **Never settle a step onto a role that cannot perform its action**
+  // (2026-09-11): the last word is a REWRITE, and a rewrite onto a landmark
+  // is a step that can never run — worse than the one the model wrote, which
+  // premise 3 forbids. `ungroundedSelectorRole` already filters `nearest`;
+  // this is the guarantee for every other caller of an exported settle.
+  if (!rolePerforms(step.action, treeRole)) return null;
   const selector = (step as { selector?: string }).selector;
   if (typeof selector !== 'string' || !new RegExp(`^role=${found.role}\\b`, 'i').test(selector.trim())) return null;
   const repointed = selector.trim().replace(new RegExp(`^role=${found.role}\\b`, 'i'), `role=${treeRole}`);
@@ -6932,24 +7472,14 @@ function treeControlNamed(field: string, evidence: string | undefined): { role: 
 /** The deterministic step that enters `value` into a control of `role`, by the role the tree shows — or null for a role nothing enters. */
 function entryStepFor(control: { role: string; name: string }, value: string, intent: string): FlowStep | null {
   const selector = `role=${control.role}[name=${JSON.stringify(control.name)} i]`;
-  switch (control.role) {
-    case 'textbox':
-    case 'searchbox':
-    case 'spinbutton':
+  switch (ENTRY_ACTION_BY_ROLE.get(control.role.toLowerCase()) ?? null) {
+    case 'fill':
       return { action: 'fill', selector, value, intent };
-    case 'button':
-    case 'combobox':
-    case 'listbox':
+    case 'selectOption':
       return { action: 'selectOption', selector, value, intent };
-    case 'checkbox':
-    case 'switch':
+    case 'check':
       return { action: 'check', selector, intent };
-    case 'radio':
-    case 'option':
-    case 'tab':
-    case 'menuitem':
-    case 'menuitemradio':
-    case 'menuitemcheckbox':
+    case 'click':
       return { action: 'click', selector, intent };
     default:
       return null;
@@ -7375,6 +7905,54 @@ export function fixtureFacts(caseText: string): string[] {
 }
 
 /**
+ * Fixture values the sheet presents as absent that the captured page already
+ * renders — a stale premise in the CATALOG, not a fault in the flow.
+ *
+ * Live driver (2026-09-11, be-sit-high-sonnetlow PL_09_01): the Test Data says
+ * "This ID is absent from SIT at validation time; do not present it as an
+ * existing row", and the tree the author was handed rendered
+ * `cell "QA260908_BE_137"` — created by an earlier QA pass and never cleaned
+ * up. Refusing the flow there blamed the author for reading its evidence
+ * correctly, and no re-author could ever settle it.
+ *
+ * A fact counts as stale only when a tree line's own NAME is exactly the
+ * fixture value, folded for case and surrounding whitespace. Containment is
+ * deliberately not enough: a fixture id that happens to appear inside a longer
+ * rendered string ("QA260908_BE_137_OLD", a sentence quoting it) is not the
+ * page presenting that record, and this may only ever EXCUSE a refusal — so a
+ * loose match here would silently switch the lint off.
+ *
+ * Returns the fact with the tree line that contradicts the sheet, so the
+ * disclosure can quote its evidence rather than assert it.
+ */
+export function staleFixturePremises(
+  facts: readonly string[],
+  evidenceTree: string | undefined,
+): { fact: string; rendered: string }[] {
+  if (facts.length === 0 || evidenceTree === undefined || evidenceTree.trim() === '') return [];
+  // Absence past the node budget is not evidence of absence — the rule every
+  // grounding lint here follows — but PRESENCE in a truncated tree is still
+  // presence, so a truncated capture is read, not declined.
+  const rendered = new Map<string, string>();
+  for (const raw of evidenceTree.split('\n')) {
+    const line = raw.trim();
+    if (line === '') continue;
+    const named = /^([A-Za-z]+)\s+"((?:[^"\\]|\\.)*)"/.exec(line);
+    if (named === null) continue;
+    const name = (named[2] ?? '').replace(/\\(.)/g, '$1').trim();
+    if (name === '') continue;
+    const key = name.toLowerCase();
+    if (!rendered.has(key)) rendered.set(key, `${named[1]} ${JSON.stringify(name)}`);
+  }
+  const stale: { fact: string; rendered: string }[] = [];
+  for (const fact of facts) {
+    const hit = rendered.get(fact.trim().toLowerCase());
+    if (hit !== undefined) stale.push({ fact, rendered: hit });
+  }
+  return stale;
+}
+
+/**
  * A fixture value asserted to PRE-EXIST — as a DB where-clause, a row the
  * flow clicks, an exact count — with nothing earlier in the flow creating it.
  * A fixture may be TYPED (fill, selectOption) freely; it may be asserted
@@ -7487,7 +8065,9 @@ export function ungroundedCountRole(
     const match = /^role=([a-z]+)/i.exec(selector) ?? /^\[role="([a-z]+)"\]$/i.exec(selector);
     if (!match) continue;
     const role = match[1]!.toLowerCase();
-    if (!new RegExp(`^${role}\\b`, 'im').test(axTree)) return { index: i, role };
+    // `^\\s*` on purpose: the capture may indent a line to show containment,
+    // and a bare `^` would stop matching every nested node the day it does.
+    if (!new RegExp(`^[ \\t]*${role}\\b`, 'im').test(axTree)) return { index: i, role };
   }
   return null;
 }

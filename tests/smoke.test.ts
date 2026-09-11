@@ -52,6 +52,8 @@ import { dialogIsIntendedContextGiven } from '../src/engine/modal.js';
 import { isClickCatcher, type ClickCatcherFacts } from '../src/engine/click-catcher.js';
 import { WorkflowAgent, looksLikeNoVision, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
 import {
+  CONTENT_NAME_MAX_CHARS,
+  captureAxNodes,
   LlmHealerModel,
   JitHealer,
   type HealRequest,
@@ -2321,5 +2323,79 @@ describe('a StepResolutionError carrying a verdict classifies as content-only', 
     // Without the option the same lines are a dead end — the ladder's own
     // classification is untouched.
     assert.equal(new StepResolutionError('text=Employee Profile', attempts).contentOnly, false);
+  });
+});
+
+/**
+ * A row is in the page, and it must be in the capture.
+ *
+ * Measured on a live Chrome (2026-09-11): Chrome reports every `row` with
+ * `name: ""`, so the capture's prune — which drops an unnamed non-interactive
+ * node — deleted every row from every tree. Playwright names the same row from
+ * its cells, so the row WAS addressable the whole time; only the evidence was
+ * missing. The cost was a false refusal and a dead end in one run
+ * (be-sit-high-sonnetlow, 2026-09-11): the authoring lint saw no `row` anywhere
+ * and refused `role=row[name="QA260908_BE_137"] >> role=button[name="Delete"]`
+ * as ungrounded (PL_09_01), leaving the bare selector that Playwright answered
+ * with `strict mode violation: resolved to 25 elements` (RU_08_01).
+ *
+ * The load-bearing assertion is the second one: what the tree PRINTS must be
+ * what Playwright MATCHES. A name assembled differently from Playwright's own
+ * would be worse than no row at all — a selector that looks grounded and
+ * resolves nothing. That is a browser fact about two independent accessible-name
+ * implementations, so it is CDP-gated and asserted against a real page.
+ */
+describe('a row survives the capture, named the way Playwright names it (CDP)', { skip: skipBrowser }, () => {
+  const TABLE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>t</title></head><body>
+    <table><thead><tr><th>Plan ID</th><th>Name</th><th>Actions</th></tr></thead><tbody>
+      <tr><td>QA260908_BE_137</td><td>QA-Delete</td><td><button aria-label="Delete" title="Delete">x</button></td></tr>
+      <tr><td>QA260908_BE_138</td><td>QA-Other</td><td><button aria-label="Delete" title="Delete">x</button></td></tr>
+    </tbody></table></body></html>`;
+
+  it('prints every row, and every printed name resolves to exactly that row', async () => {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(CDP_URL);
+    const context = await browser.newContext();
+    try {
+      const page = await context.newPage();
+      await page.setContent(TABLE);
+
+      const rows = (await captureAxNodes(page, 300)).filter((node) => node.role === 'row');
+      assert.equal(rows.length, 3, 'the header row and both body rows must reach the capture');
+
+      for (const row of rows) {
+        assert.notEqual(row.name, '', 'a row printed with no name grounds nothing');
+        const selector = `role=row[name=${JSON.stringify(row.name)}]`;
+        assert.equal(
+          await page.locator(selector).count(),
+          1,
+          `the capture printed ${selector}, which Playwright must match exactly once`,
+        );
+      }
+
+      // The point of having rows at all: scoping a repeated control to one row.
+      const scoped = 'role=row[name="QA260908_BE_137 QA-Delete Delete"] >> role=button[name="Delete" i]';
+      assert.equal(await page.locator(scoped).count(), 1, 'the row scopes the ambiguous Delete');
+      assert.equal(await page.locator('role=button[name="Delete" i]').count(), 2, 'unscoped, it is still ambiguous');
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+  });
+
+  it('drops a row it cannot name exactly, rather than printing a name that cannot match', async () => {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(CDP_URL);
+    const context = await browser.newContext();
+    try {
+      const page = await context.newPage();
+      const long = 'x'.repeat(CONTENT_NAME_MAX_CHARS + 50);
+      await page.setContent(`<table><tbody><tr><td>${long}</td></tr></tbody></table>`);
+      const rows = (await captureAxNodes(page, 300)).filter((node) => node.role === 'row');
+      assert.equal(rows.length, 0, 'a name over the cap is dropped, never truncated into a selector that cannot match');
+    } finally {
+      await context.close();
+      await browser.close();
+    }
   });
 });

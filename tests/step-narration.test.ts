@@ -10,6 +10,10 @@ import { describe, it } from 'node:test';
 
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 import {
+  NARRATION_SOFT_CHARS,
+  keepShorterNarrations,
+  narrationsOverSoftCap,
+  shortenStepAsk,
   NARRATION_MAX_CHARS,
   applyNarration,
   buildNarrationPrompt,
@@ -192,5 +196,34 @@ describe('narrateBundle', () => {
     assert.equal(await narrateBundle(bundle(steps), 'x', { model, batch: 2 }), 2);
     assert.equal(steps[0]!.narration?.text, 'step 1 ran.');
     assert.equal(steps[2]!.narration, undefined);
+  });
+});
+
+describe('a step verdict is held to the same budget', () => {
+  const n = (index: number, text: string) => ({ index, text });
+
+  it('finds only the steps over the soft cap', () => {
+    const over = narrationsOverSoftCap([n(1, 'x'.repeat(NARRATION_SOFT_CHARS)), n(2, 'y'.repeat(NARRATION_SOFT_CHARS + 1))]);
+    assert.deepEqual(over, [2]);
+  });
+
+  it('the re-ask names the step indexes and both numbers', () => {
+    const ask = shortenStepAsk([3, 7]);
+    assert.match(ask, /Steps 3, 7/);
+    assert.match(ask, new RegExp(String(NARRATION_SOFT_CHARS)));
+    assert.match(ask, new RegExp(String(NARRATION_MAX_CHARS)));
+  });
+
+  it('keeps the shorter reading per step and leaves unanswered steps alone', () => {
+    const first = [n(1, 'x'.repeat(300)), n(2, 'kept as written')];
+    const kept = keepShorterNarrations(first, [n(1, 'much shorter')]);
+    assert.equal(kept[0]?.text, 'much shorter');
+    assert.equal(kept[1]?.text, 'kept as written');
+  });
+
+  it('a longer or empty re-ask changes nothing', () => {
+    const first = [n(1, 'x'.repeat(220))];
+    assert.equal(keepShorterNarrations(first, [n(1, 'y'.repeat(900))])[0]?.text.length, 220);
+    assert.equal(keepShorterNarrations(first, [n(1, '  ')])[0]?.text.length, 220);
   });
 });

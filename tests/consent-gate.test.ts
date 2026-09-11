@@ -314,9 +314,12 @@ describe('consent-gate recovery (CDP)', { skip: skipBrowser }, () => {
     const step = bundle.steps.find((s) => s.action === 'workflow');
     // A failed workflow classifies as `error` (an agent leg is not an assertion).
     assert.equal(step?.status, 'error');
-    assert.match(step?.error ?? '', /the agent ended on .*\/other, not the page this step began on/);
+    // PATHS, not full URLs (2026-09-11): the origin is identical on both
+    // sides and printing it twice buried the one fact that matters.
+    assert.match(step?.error ?? '', /it ended on \/other, not the \/home this step began on/);
+    assert.doesNotMatch(step?.error ?? '', /http:\/\/127\.0\.0\.1/, 'no origin in the sentence');
     const defect = bundle.defects.find((d) => /Workflow goal not reached/.test(d.title));
-    assert.match(defect?.detail ?? '', /not the page this step began on/);
+    assert.match(defect?.detail ?? '', /not the \/home this step began on/);
   });
 });
 

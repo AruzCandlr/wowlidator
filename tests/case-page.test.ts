@@ -9,7 +9,9 @@ import { describe, it } from 'node:test';
 
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 import { casePageName, type CatalogReportCase } from '../src/reporter/catalog-report.js';
-import { caseSidecarName, caseSidecars, renderCasePage, type CasePageInput } from '../src/reporter/case-page.js';
+import { caseSidecarName, caseSidecars, renderCasePage, type CasePageInput,
+  renderBlockedCasePage,
+} from '../src/reporter/case-page.js';
 
 function step(over: Partial<ProofStep>): ProofStep {
   return {
@@ -147,7 +149,23 @@ describe('evidence sections', () => {
     assert.match(html, /Verdict <b style="color:var\(--app\)">test failed<\/b>/);
     assert.match(html, /Sheet <b>EC · Probation<\/b>/);
     assert.match(html, /<a href="\.\.\/ec-2026-09-10\.html">Back to the catalog report<\/a>/);
-    assert.match(html, /<td class="fld">Test data<\/td><td><strong><code>none recorded<\/code><\/strong><\/td>/);
+    // The id is the mast's own derivation, printed once; an absent value is a note, not a value in `code`.
+    assert.match(html, /<td class="fld">Test case<\/td><td><strong><code>PRB-EC-026<\/code> · ต่อทดลองงาน 2 รอบ<\/strong><\/td>/);
+    assert.match(html, /<td class="fld">Test data<\/td><td><span class="det">none recorded<\/span><\/td>/);
+    assert.match(html, /<td class="fld">Expected result<\/td><td><span class="det">none recorded<\/span><\/td>/);
+  });
+
+  it('the pre-read table names the case exactly as the mast does: the sheet\'s own id, and the name with the leading id removed', () => {
+    // Two sheets carry PL_03_01, so the run qualified the id; the sheet's spelling leads both.
+    const c = kase({ id: 'EC#PL_03_01', sheetCaseId: 'PL_03_01', name: 'PL_03_01 — โอนย้ายพนักงาน' });
+    const html = page({ sidecars: caseSidecars(c) }, c);
+    assert.match(html, /<h1>PL_03_01 — โอนย้ายพนักงาน<\/h1>/);
+    assert.match(html, /<td class="fld">Test case<\/td><td><strong><code>PL_03_01<\/code> · โอนย้ายพนักงาน<\/strong><\/td>/);
+    // The qualified id still has its one place on the page, in the mast's id line.
+    assert.match(html, /Case <b>EC#PL_03_01<\/b>/);
+    // A name that is only the id leaves no dangling separator.
+    const bare = kase({ id: 'PRB-EC-026', name: 'PRB-EC-026' });
+    assert.match(page({ sidecars: caseSidecars(bare) }, bare), /<td class="fld">Test case<\/td><td><strong><code>PRB-EC-026<\/code><\/strong><\/td>/);
   });
 
   it('the coverage bar counts passed, observed, failed and not reached from the steps', () => {
@@ -250,6 +268,38 @@ describe('the narrative', () => {
     assert.match(html, /<span class="tag test">test<\/span><\/td><td><strong class="ai">PRB-EC-026 · cover notifications<\/strong>/);
   });
 
+  it('an enumerated narrative field becomes a real list, and un-enumerated text is untouched', () => {
+    const narrated = (over: Record<string, string>): CatalogReportCase =>
+      kase({ bundle: bundle([DB_STEP], { narrative: { lang: 'en', by: 'm', at: 'z', ...over } as ProofBundle['narrative'] }) });
+    const c = narrated({
+      expected: '1. Probation End = 2026-10-08, Hire+120 days 2) probation_result is PASS_NORMAL 3. The page names สิทธิชัย เจริญสุข',
+      summary: 'The run signed in and read the queue back.',
+    });
+    const html = page({ sidecars: caseSidecars(c) }, c);
+    assert.match(html, /<td><ol class="ai enum"><li>Probation End = 2026-10-08, Hire\+120 days<\/li><li>probation_result is PASS_NORMAL<\/li><li>The page names สิทธิชัย เจริญสุข<\/li><\/ol><\/td>/);
+    // One short sentence stays the single element it was, marked the same way.
+    assert.match(html, /<span class="det ai">The run signed in and read the queue back\.<\/span>/);
+
+    // Only a genuine leading-number run splits: a date, a decimal, a lone marker and mid-text numbering do not.
+    const notLists = [
+      'Hire 2026-06-10, Probation End 2026-10-08, Amount 120,000 THB. Took 1.5s.',
+      'The page showed 1. the queue and nothing else',
+      'Reads the row. 2. then the page',
+    ];
+    for (const text of notLists) {
+      const one = narrated({ expected: text });
+      const out = page({ sidecars: caseSidecars(one) }, one);
+      assert.doesNotMatch(out, /ol class="ai enum"/);
+      assert.match(out, new RegExp(`<strong class="ai">${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/,/g, ',')}</strong>`));
+    }
+
+    // A det field enumerates the same way, and the enumeration is escaped like everything else.
+    const detList = narrated({ testData: '1. <b>id</b> = 20600506 2. persona MANAGER_ACCOUNT' });
+    const detHtml = page({ sidecars: caseSidecars(detList) }, detList);
+    assert.match(detHtml, /<ol class="det ai enum"><li>&lt;b&gt;id&lt;\/b&gt; = 20600506<\/li><li>persona MANAGER_ACCOUNT<\/li><\/ol>/);
+    assert.doesNotMatch(detHtml, /<b>id<\/b>/);
+  });
+
   it('without a narrative the page has no ai class and no attribution line', () => {
     const html = page();
     assert.doesNotMatch(html, /class="[^"]*\bai\b/);
@@ -315,5 +365,133 @@ describe('language and safety', () => {
 
   it('renders byte-identically for the same input', () => {
     assert.equal(page(), page());
+  });
+});
+
+/**
+ * Every case is routed to a page of its own, and a blocked one says why there.
+ *
+ * 2026-09-11, run `ec-ready-failed-20260910-162031`: 9 of 12 rows sealed
+ * blocked, and not one of them had a page. The refusal — often five separate
+ * lint complaints, each naming a step — existed only as one truncated line in
+ * the catalog index, and clicking the case name went nowhere.
+ */
+describe('a blocked case gets a page that says why', () => {
+  const blocked = {
+    id: 'HIR-EC-012',
+    name: 'HIR-EC-012 ตรวจสอบการจ้างพนักงานแบบ Replacement',
+    scenario: 'E2E-12',
+    verdict: 'blocked',
+    status: null,
+    reason:
+      'authoring refused (attempt 1): 5 problems with the authored flow — fix all of them, not just the first: · ' +
+      'the authored flow asserts "{{replaced_employee_id}}" — a value the test case never states · ' +
+      'the authored flow performs the case\'s script only through step 15 of 16',
+    bundle: null,
+    history: [],
+  } as unknown as Parameters<typeof renderBlockedCasePage>[0]['case'];
+
+  const page = renderBlockedCasePage({
+    case: blocked,
+    title: 'EC ready/failed',
+    runKey: 'ec-ready-failed-csv@2026-09-10',
+    lang: 'en',
+    indexHref: '../index.html',
+    sidecars: { query: null, before: null, after: null, evidence: null },
+    videoHref: null,
+  });
+
+  it('names the case and its verdict', () => {
+    assert.match(page, /HIR-EC-012/);
+    assert.match(page, /E2E-12/);
+  });
+
+  it('splits the refusal into one line per complaint, not one paragraph', () => {
+    // `composeRefusal` joins with " · "; the index cell truncated the lot.
+    const items = [...page.matchAll(/<li>(.*?)<\/li>/g)].map((m) => m[1] ?? '');
+    assert.equal(items.length, 2, 'two complaints, two lines');
+    assert.match(items[0] ?? '', /replaced_employee_id/);
+    assert.match(items[1] ?? '', /step 15 of 16/);
+    // The head stays a paragraph above them, not an item.
+    assert.match(page, /<p>authoring refused \(attempt 1\): 5 problems/);
+  });
+
+  it('states the absence rather than leaving empty sections to be read as evidence', () => {
+    assert.match(page, /No run took place/);
+    assert.match(page, /Nothing on this page is a finding about the application under test/);
+  });
+
+  it('offers no film, no steps and no defects — there was no run to have them', () => {
+    assert.doesNotMatch(page, /<video/);
+    assert.doesNotMatch(page, /data-webm/);
+  });
+
+  it('escapes the ledger reason rather than trusting it as markup', () => {
+    const nasty = renderBlockedCasePage({
+      case: { ...blocked, reason: 'refused: <img src=x onerror=alert(1)> · and more' } as typeof blocked,
+      title: 't',
+      runKey: null,
+      lang: 'en',
+      indexHref: '../i.html',
+      sidecars: { query: null, before: null, after: null, evidence: null },
+      videoHref: null,
+    });
+    assert.doesNotMatch(nasty, /<img src=x/);
+    assert.match(nasty, /&lt;img src=x/);
+  });
+
+  it('says so in Thai when the run asked for Thai', () => {
+    const th = renderBlockedCasePage({
+      case: blocked,
+      title: 't',
+      runKey: null,
+      lang: 'th',
+      indexHref: '../i.html',
+      sidecars: { query: null, before: null, after: null, evidence: null },
+      videoHref: null,
+    });
+    assert.match(th, /ไม่มีการรันเกิดขึ้น/);
+  });
+});
+
+/**
+ * The paragraph under the coverage bar. A live case (PL_06_10) rendered five
+ * notes there as ~300 words in one `·`-joined line; the reader now gets the
+ * model's bounded summary of them instead, and the notes only when the run
+ * has no narrative to summarise them.
+ */
+describe('the run notes under the coverage bar', () => {
+  const NARRATIVE: NonNullable<ProofBundle['narrative']> = {
+    lang: 'en', by: 'claude-cli:opus', at: '2026-09-11T00:00:00.000Z',
+    lede: '', summary: '', testData: '', expected: '', tickets: [], questions: [],
+    verifierNote: 'The agent cleared a consent gate before the first assertion.',
+  };
+
+  function html(over: Partial<ProofBundle>): string {
+    const c = kase({ bundle: bundle([step({ index: 1 })], over) });
+    return page({ sidecars: caseSidecars(c) }, c);
+  }
+
+  it('shows the model summary, marked as the model\'s words, and not one word of the raw notes', () => {
+    const out = html({ notes: ['pre-run dead-end risk 20%', 'shared data with PRB-EC-027'], narrative: NARRATIVE });
+    assert.match(out, /<p class="ai caveat">The agent cleared a consent gate before the first assertion\.<\/p>/);
+    assert.doesNotMatch(out, /pre-run dead-end risk/);
+    assert.doesNotMatch(out, /shared data with/);
+  });
+
+  it('falls back to the run\'s own notes, unmarked, when the run has no narrative', () => {
+    const out = html({ notes: ['pre-run dead-end risk 20%', 'shared data with PRB-EC-027'] });
+    assert.match(out, /<p class="caveat">pre-run dead-end risk 20% · shared data with PRB-EC-027<\/p>/);
+    assert.doesNotMatch(out, /class="ai caveat"/);
+  });
+
+  it('renders no paragraph at all when the run recorded neither', () => {
+    assert.doesNotMatch(html({}), /class="caveat"/);
+  });
+
+  it('escapes both paths', () => {
+    const probe = '<b>a & b</b>';
+    assert.match(html({ notes: [probe] }), /<p class="caveat">&lt;b&gt;a &amp; b&lt;\/b&gt;<\/p>/);
+    assert.match(html({ notes: ['x'], narrative: { ...NARRATIVE, verifierNote: probe } }), /<p class="ai caveat">&lt;b&gt;a &amp; b&lt;\/b&gt;<\/p>/);
   });
 });

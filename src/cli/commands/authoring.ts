@@ -151,7 +151,6 @@ import {
   assertRolesResolvable,
   buildAgent,
   buildCapturePilot,
-  buildDataModel,
   buildFlowReviewer,
   buildAuthorRetryModel,
   buildValueResolution,
@@ -981,10 +980,10 @@ export function caseCard(row: TestCaseRow): string | undefined {
 }
 
 /**
- * Schedule facts for the section scheduler and the governor's db allowlist,
+ * Schedule facts for the section scheduler,
  * from the indexed graph: FK pairs (a section is a join family) and every
  * declared table name. Null graph → undefined, and the scheduler falls back
- * to unexpanded table sections with the governor's db tools refusing.
+ * to unexpanded table sections.
  */
 export function graphFactsOf(
   graph: { nodes: readonly { kind: string; name: string }[]; edges: readonly { from: string; to: string; kind: string }[] } | null,
@@ -1031,8 +1030,14 @@ async function authorEachRow(
      * refused on its last attempt — with the reason and how many refusals
      * this row now has. The seam that gets the refusal onto the ledger, so
      * the report says why and a resume does not re-author it forever.
+     *
+     * `providerRefused` says the MODEL LAYER turned the call away (rate
+     * limit, quota, concurrency) rather than the row being unwritable. Such a
+     * row keeps its previous refusal count: it was never actually attempted,
+     * and counting it toward `AUTHORING_REFUSAL_CAP` is how a provider's busy
+     * minute costs a catalog cases a resume can no longer pick up.
      */
-    onRefused?: ((row: TestCaseRow, reason: string, attempt: number) => Promise<void>) | undefined;
+    onRefused?: ((row: TestCaseRow, reason: string, attempt: number, providerRefused?: boolean) => Promise<void>) | undefined;
     /** Refusal counts from the prior ledger, by case id — what a resume authors leniently. */
     refusedBefore?: ReadonlyMap<string, number> | undefined;
     /**
@@ -1474,8 +1479,19 @@ async function authorEachRow(
       // stderr all carried that line and nothing a person could act on).
       const reason = refusalText(error);
       refused.push(`${row.caseId}: ${reason}`);
-      process.stderr.write(`  ! ${row.caseId} could not be written — ${reason}\n`);
-      await context.onRefused?.(row, reason, refusedBefore + 1);
+      // A provider that was busy says NOTHING about this row. It is still
+      // blocked for this pass — there is no flow to run — but its refusal
+      // count stands still, so a resume authors it again instead of finding
+      // it sealed at the cap (2026-09-10: a BE catalog's first row sealed on
+      // emmiedev's `too_many_concurrent` while three lanes were mid-call).
+      const providerRefused =
+        error instanceof StructuredOutputUnavailableError && error.providerRefused;
+      process.stderr.write(
+        `  ! ${row.caseId} could not be written — ${reason}${
+          providerRefused ? ' [the provider refused the call; this row keeps its place for a resume]' : ''
+        }\n`,
+      );
+      await context.onRefused?.(row, reason, providerRefused ? refusedBefore : refusedBefore + 1, providerRefused);
     }
   };
 
@@ -3545,7 +3561,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
       // left"). Buffered until the runner exists; flushed into its queue
       // then, or written straight to the ledger if nothing at all authored.
       const pendingRefused: SuiteCase[] = [];
-      const refusedCaseOf = (row: TestCaseRow, reason: string, attempt: number): SuiteCase => {
+      const refusedCaseOf = (row: TestCaseRow, reason: string, attempt: number, providerRefused = false): SuiteCase => {
         const known = sheetVerdict(row.actual);
         return {
           name: row.caseId,
@@ -3554,7 +3570,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           ...(row.scenarioId ? { scenarioId: row.scenarioId } : {}),
           ...(row.dependsOn === undefined || row.dependsOn.length === 0 ? {} : { dependsOn: [...row.dependsOn] }),
           ...(known === undefined ? {} : { knownResult: known }),
-          refused: { reason, attempt },
+          refused: { reason, attempt, ...(providerRefused ? { providerRefused: true } : {}) },
         };
       };
       // **A dependent is never pushed ahead of its source** (CG-12). Rows are
@@ -3696,8 +3712,8 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           refusedBefore,
           runKey: runKeyOf(),
           now: authoringNow(),
-          onRefused: async (row, reason, attempt) => {
-            const refusedCase = refusedCaseOf(row, reason, attempt);
+          onRefused: async (row, reason, attempt, providerRefused) => {
+            const refusedCase = refusedCaseOf(row, reason, attempt, providerRefused === true);
             if (queue !== null && drain.value !== null) enqueueRefused(refusedCase);
             else pendingRefused.push(refusedCase);
           },
@@ -4074,7 +4090,6 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
     stepRepair: buildStepRepair(options),
     healer: options.heal ? undefined : null,
     agent: buildAgent(options),
-    dataModel: buildDataModel(options),
     updateBaselines: options.updateBaselines,
     network: options.network,
     // Carried for masking only: a password the person supplied must not

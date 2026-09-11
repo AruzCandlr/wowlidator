@@ -45,7 +45,7 @@ describe('the Ledger page', () => {
       assert.equal((html.match(new RegExp(`function ${name}\\(`, 'g')) ?? []).length, 1, name);
     }
     // The evidence machinery ships unchanged: the checks table, the drawer, the launcher gate, the live console.
-    for (const name of ['checksTable', 'evidencePanel', 'claimsGate', 'recomputeLanes', 'agentActionLog', 'streamJob', 'outputSection', 'jobForRun', 'progressBar', 'tqdmReadout', 'renderGroup', 'taskRow', 'renderKeys', 'renderRepos', 'renderHistory', 'renderHealed', 'renderReports', 'workQueueBox', 'confirmDeleteGroup', 'personaBlock', 'personasUnanswered', 'personaValues', 'accountPicker', 'rememberedAccounts', 'personaLabelKey', 'loadPersonaAccounts']) {
+    for (const name of ['checksTable', 'evidencePanel', 'claimsGate', 'recomputeLanes', 'agentActionLog', 'streamJob', 'outputSection', 'jobForRun', 'progressBar', 'tqdmReadout', 'renderGroup', 'taskRow', 'renderKeys', 'renderRepos', 'renderHistory', 'renderHealed', 'renderReports', 'workQueueBox', 'confirmDeleteGroup', 'personaBlock', 'personasUnanswered', 'personaValues', 'accountPicker', 'rememberedAccounts', 'personaLabelKey', 'loadPersonaAccounts', 'notesBlock']) {
       assert.match(html, new RegExp(`function ${name}\\(`), name);
     }
     // And the layout is declared again, later, so the base calls land here.

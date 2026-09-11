@@ -29,7 +29,6 @@ function configWith(keys: string[]): WowlidatorConfig {
   return loadConfig({
     GROQ_API_KEY: keys.join(','),
     WOWLIDATOR_HEALER_PROVIDER: 'groq',
-    WOWLIDATOR_DATA_PROVIDER: 'groq',
   });
 }
 
@@ -129,7 +128,7 @@ describe('a run moving off a dead key', () => {
       return key;
     });
     used.length = 0;
-    await factory.callWithFailover('data', async (resolved) => resolved.model);
+    await factory.callWithFailover('agent', async (resolved) => resolved.model);
     assert.deepEqual(used, ['good-2']);
   });
 

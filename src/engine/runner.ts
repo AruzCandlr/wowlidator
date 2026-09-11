@@ -83,6 +83,17 @@ import {
 } from '../visual/baseline.js';
 import { RunHistory, analyseTrend } from '../history/run-history.js';
 import { HealFailedError, HealUnavailableError, JitHealer, captureAxTree } from '../healer/jit-healer.js';
+import type { DbCheckRecord } from '../db/db-actions.js';
+import {
+  CORROBORATION_BODY_MAX_CHARS,
+  compareToBackend,
+  corroboratedVerdict,
+  pickBackendCandidate,
+  uiReadingOf,
+  type CorroborationModel,
+  type CorroboratedVerdict,
+  type CorroborationOutcome,
+} from './backend-corroboration.js';
 import type { FlowRepairModel } from '../repair/flow-repair-model.js';
 import { MutationBlockedError, REVEAL_ACTIONS, WorkflowAgent, cacheAgentMemory, type AgentDbProbe, type PlanStep } from '../orchestrator/workflow-agent.js';
 import type { MutationPolicy, OnMutation } from '../orchestrator/mutation-policy.js';
@@ -110,6 +121,7 @@ import {
   differentPage,
   goalEvidence,
   looksLikeSignIn,
+  pathOf,
   queryAndHash,
   verificationOnlyGoal,
 } from '../orchestrator/goal-evidence.js';
@@ -127,7 +139,6 @@ import {
   CONSENT_GATE_URL_PATTERN,
 } from './consent-gate.js';
 import { generateValue, type DataKind } from '../data/mock-data.js';
-import type { DataModel } from '../data/data-model.js';
 import {
   describeDialog,
   dialogIsIntendedContextGiven,
@@ -229,6 +240,12 @@ export type ConsentPolicy = (typeof CONSENT_POLICIES)[number];
 type ConsentSettlement = 'accepted' | 'preserved' | null;
 
 export interface SmartRunnerOptions {
+  /**
+   * Corroborate a failed assertion against the backend call the PAGE itself
+   * made (`verdict-agent`, the agent role's own config). Null/omitted and an
+   * assertion keeps exactly the verdict it has today.
+   */
+  corroboration?: CorroborationModel | null | undefined;
   /** CDP endpoint of an already-running Chrome. Connect-only; never launches. */
   cdpUrl?: string | undefined;
   cache: CacheManager;
@@ -237,11 +254,6 @@ export interface SmartRunnerOptions {
   healer?: JitHealer | null | undefined;
   /** Omit or pass `null` to disable multi-page agentic navigation. */
   agent?: WorkflowAgent | null | undefined;
-  /**
-   * Consulted only by a `fillRetry` step whose `kind` is `custom`. Every
-   * other kind generates deterministically and never needs this at all.
-   */
-  dataModel?: DataModel | null | undefined;
   /**
    * `Flow.caseContext`, threaded to the runtime model roles: every heal and
    * every agent turn carries the test case the step serves. Context only —
@@ -1867,6 +1879,13 @@ type PersonaSession = {
   lastGotoPath: string | null;
   lastGotoAskedSignIn: boolean;
   lastAction: string | null;
+  /**
+   * Every action run since the last `goto`, in order — what decides
+   * whether a failed assertion may be re-checked after a reload
+   * (`reloadSafe`). Per session, because a persona hand-off is a browser
+   * switch and the other browser's page is at its own state.
+   */
+  actionsSinceNavigation: string[];
   strandedReported: boolean;
   /** See the `#signInDidNotTake` accessor. */
   signInDidNotTake: boolean;
@@ -1914,7 +1933,6 @@ export class SmartRunner {
   readonly #healer: JitHealer | null;
   readonly #agent: WorkflowAgent | null;
   readonly #caseContext: string | undefined;
-  readonly #dataModel: DataModel | null;
   readonly #fastTimeoutMs: number;
   readonly #healedTimeoutMs: number;
   readonly #screenshots: ScreenshotMode;
@@ -1956,6 +1974,12 @@ export class SmartRunner {
   readonly #mutationPolicy: MutationPolicy | null | undefined;
   /** Whether this run may exercise the backend at all — see `assertBackendAllowed`. */
   readonly #backend: boolean;
+  /**
+   * The verdict model, on the AGENT ROLE'S own config (`verdict-agent`). Null
+   * when the run has no agent — a corroboration nobody can map is simply not
+   * attempted, and the assertion keeps the verdict it already had.
+   */
+  readonly #corroboration: CorroborationModel | null;
   /** What the application's repository declares — see `RouteNotFoundError`. */
   readonly #declaredRoutes: readonly string[];
   readonly #deploymentUrl: string | undefined;
@@ -2052,6 +2076,9 @@ export class SmartRunner {
   set #lastAction(action: string | null) {
     this.#active.lastAction = action;
   }
+  get #actionsSinceNavigation(): string[] {
+    return this.#active.actionsSinceNavigation;
+  }
   get #strandedReported(): boolean {
     return this.#active.strandedReported;
   }
@@ -2133,7 +2160,6 @@ export class SmartRunner {
     this.#cache = options.cache;
     this.#healer = options.healer ?? null;
     this.#agent = options.agent ?? null;
-    this.#dataModel = options.dataModel ?? null;
     this.#caseContext = options.caseContext;
     this.#fastTimeoutMs = options.fastTimeoutMs ?? DEFAULT_FAST_TIMEOUT_MS;
     this.#healedTimeoutMs = options.healedTimeoutMs ?? DEFAULT_HEALED_TIMEOUT_MS;
@@ -2147,6 +2173,7 @@ export class SmartRunner {
     this.#agentMaxSteps = options.agentMaxSteps;
     this.#mutationPolicy = options.mutationPolicy;
     this.#backend = options.backend ?? true;
+    this.#corroboration = options.corroboration ?? null;
     this.#declaredRoutes = options.declaredRoutes ?? [];
     this.#deploymentUrl = options.deploymentUrl;
     this.stepRepair = options.stepRepair ?? null;
@@ -2381,6 +2408,7 @@ export class SmartRunner {
       lastGotoPath: null,
       lastGotoAskedSignIn: false,
       lastAction: null,
+      actionsSinceNavigation: [],
       strandedReported: false,
       signInDidNotTake: false,
       sessionBootstrapTried: false,
@@ -3156,6 +3184,35 @@ export class SmartRunner {
     });
   }
 
+  /**
+   * Put the pointer on something and leave it there.
+   *
+   * The verb a sheet asks for far more often than the vocabulary admitted
+   * (2026-09-11, PL_09_01): "นำเมาส์ไปวางที่ไอคอนถังขยะ" is script step 2 of
+   * 3, and with no `hover` an author could only drop the step — which the
+   * coverage lint then refused, so a case whose first required action had no
+   * word for it could not be written at all.
+   *
+   * Goes through the ladder for the same reason `scrollTo` does: the target
+   * is an author-supplied selector that can drift like any other. The element
+   * is brought into view first — Playwright's own `hover` does that, but a
+   * row action inside a scroll container reads better in the film when the
+   * move is visible.
+   *
+   * What it does NOT do is assert. A tooltip that appears on hover is in no
+   * accessibility tree (nothing hovers while a tree is read), so the claim
+   * about the tooltip's words belongs to the control's own name or its
+   * `title`/`aria-label` — `expectAttribute` on the same selector, authored
+   * as its own step. This action performs the gesture; the next step proves
+   * whatever the gesture was supposed to reveal.
+   */
+  async hover(selector: string, intent?: string): Promise<void> {
+    await this.#step('hover', selector, intent, async (locator, timeout) => {
+      await locator.scrollIntoViewIfNeeded({ timeout });
+      await locator.hover({ timeout });
+    });
+  }
+
   // --- Scrolling -----------------------------------------------------------
 
   /**
@@ -3503,45 +3560,28 @@ export class SmartRunner {
     options: {
       submit?: string | undefined;
       maxAttempts?: number | undefined;
-      description?: string | undefined;
       intent?: string | undefined;
     } = {},
   ): Promise<void> {
     const startedAt = new Date().toISOString();
     const started = Date.now();
     const maxAttempts = Math.max(1, options.maxAttempts ?? 3);
-    const description = options.description ?? options.intent ?? selector;
 
     const attempts: DataRetryAttempt[] = [];
-    let modelId: string | undefined;
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let previousValue: string | undefined;
-    let observedError: string | undefined;
     let succeeded = false;
     let fatalError: string | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts && !succeeded && fatalError === undefined; attempt++) {
       let value: string;
       try {
-        if (kind === 'custom') {
-          if (!this.#dataModel) {
-            throw new Error('fillRetry kind "custom" needs a DataModel, but none is configured');
-          }
-          const generated = await this.#dataModel.generate({ description, observedError, previousValue, attempt });
-          value = generated.value;
-          modelId = this.#dataModel.id;
-          inputTokens += generated.inputTokens ?? 0;
-          outputTokens += generated.outputTokens ?? 0;
-        } else {
-          value = generateValue(kind, attempt);
-        }
+        // Every kind generates deterministically and costs nothing. The
+        // `custom` kind that escalated to a `data` model role was retired on
+        // 2026-09-11, unused across every flow this repo has authored.
+        value = generateValue(kind, attempt);
       } catch (error) {
         fatalError = describe(error);
         break;
       }
-      previousValue = value;
-
       try {
         await this.page.locator(selector).first().fill(value, { timeout: this.#healedTimeoutMs });
         if (options.submit !== undefined) {
@@ -3565,17 +3605,12 @@ export class SmartRunner {
 
       succeeded = !stillConflicting;
       attempts.push({ attempt, kind, value: this.#maskSuppliedSecret(value), succeeded });
-      observedError = succeeded ? undefined : `"${failureSelector}" still visible after attempt ${attempt}`;
     }
 
-    const dataRetry: DataRetryRecord = {
-      kind,
-      attempts,
-      succeeded,
-      model: modelId,
-      inputTokens: modelId ? inputTokens : undefined,
-      outputTokens: modelId ? outputTokens : undefined,
-    };
+    // No `model` / token fields: regeneration is deterministic and spends
+    // nothing. The record keeps them optional so a bundle written before the
+    // `data` role was retired still reads.
+    const dataRetry: DataRetryRecord = { kind, attempts, succeeded };
     const failureMessage = succeeded
       ? undefined
       : (fatalError ?? `still conflicting after ${attempts.length} attempt(s)`);
@@ -5148,10 +5183,15 @@ export class SmartRunner {
     // correctly clicked Next "displaced" (ec10-3x HIR-EC-002 leg 12). Only a
     // different origin or pathname is displacement; a query or hash change
     // is named neutrally.
+    // The note names the two PATHS, not the two full URLs (2026-09-11). Both
+    // URLs written out is ~120 characters of origin repeated twice, in a
+    // sentence a person reads on a report row — it pushed the one fact that
+    // matters (WHICH page it ended on) past where anyone keeps reading. The
+    // origin is on the step's own `url` field for anyone who needs it.
     const displaced =
       failed && !providerFailed && !authoringRefused && blocked === null && differentPage(urlBefore, urlAfter)
-        ? ` — note: the agent ended on ${urlAfter}, not the page this step began on (${urlBefore}); ` +
-          'the control it reported on may exist on the original page'
+        ? ` — it ended on ${pathOf(urlAfter)}, not the ${pathOf(urlBefore)} this step began on, so a control ` +
+          'it called missing may exist on the original page'
         : failed && !providerFailed && !authoringRefused && urlAfter !== urlBefore
           ? ` — on the same page, now at ${queryAndHash(urlAfter) || urlAfter}`
           : '';
@@ -6471,9 +6511,156 @@ export class SmartRunner {
     this.#signInDidNotTake = didNotTake;
   }
 
+  /**
+   * Corroborate a failed assertion against the backend the page itself used.
+   *
+   * The last rung of an assertion, and the one HIR-EC-029 needed: that case
+   * failed `expectCount role=option` with `expected 3, found 4` while the
+   * page's own lookup — `GET …/foundation?type=picking_lists`, recorded EIGHT
+   * times on that very step — held exactly three event reasons. The report
+   * could not say what had been counted, and a correct application was filed
+   * against twice at `high`.
+   *
+   * The rules are `backend-corroboration.ts`'s and are not restated here. The
+   * two that decide what this method may do:
+   *
+   * - **Only an INCONCLUSIVE UI reading defers to the backend.** A count that
+   *   resolved and disagreed is the page speaking; the backend may explain it
+   *   (a frontend defect carrying the proof) but never overturn it.
+   * - **The query and the response are attached either way.** The operator's
+   *   complaint was not only the verdict: nothing on the page said WHAT the
+   *   four were.
+   *
+   * Returns the verdict for the caller to classify with, or null when there
+   * was nothing to ask — no backend allowed, no model, or no readable call on
+   * the step, which is the documented "validation ends at the re-check".
+   * Never throws: a corroboration that fails is a corroboration that did not
+   * happen, and the step's own verdict stands exactly as it was.
+   */
+  async corroborateFailedAssertion(
+    action: string,
+    attempts: readonly string[],
+    intent: string,
+    expected: string,
+  ): Promise<CorroboratedVerdict | null> {
+    if (!this.#backend || this.#corroboration === null) return null;
+    const pageAnswered = attempts.some((line) => isContentMiss(line) || isStateContradiction(line));
+    const ui = uiReadingOf('failed', pageAnswered);
+    const last = this.bundle.steps[this.bundle.steps.length - 1];
+    const observed = (last?.network ?? []) as NetworkCall[];
+    const candidate = pickBackendCandidate([], observed);
+    if (candidate === null) {
+      this.bundle.annotateLastStep({ corroboration: 'no readable backend call was observed on this step' }, action);
+      return corroboratedVerdict(ui, null);
+    }
+    try {
+      const response = await this.#api.transport.send({ method: 'GET', url: candidate.url });
+      const located = await this.#corroboration.locate({
+        intent,
+        action,
+        expected,
+        url: candidate.url,
+        body: response.body,
+      });
+      const outcome = compareToBackend(response.body, located, expected, candidate.url);
+      // **Both sources, never one instead of the other.** The endpoint says
+      // what the page was served; the database says what the system of record
+      // holds, and they answer different questions — a correct API over stale
+      // data agrees with the page and disagrees with the table. When the
+      // database can be asked it is, its query lands on the step through the
+      // channel the Queries section already renders, and a disagreement
+      // between the two is recorded rather than resolved by precedence.
+      const fromDb = await this.#corroborateFromDb(action, intent, expected);
+      if (fromDb !== null) {
+        this.bundle.annotateLastStep(
+          {
+            corroborationDb: fromDb.outcome.kind,
+            ...(fromDb.outcome.kind === 'unavailable'
+              ? {}
+              : { corroborationDbFound: fromDb.outcome.found, corroborationDbQuery: fromDb.outcome.query }),
+            ...(outcome.kind !== 'unavailable' && fromDb.outcome.kind !== 'unavailable' && outcome.kind !== fromDb.outcome.kind
+              ? { corroborationDisagreed: `the endpoint says ${outcome.kind}, the database says ${fromDb.outcome.kind}` }
+              : {}),
+          },
+          action,
+        );
+        this.bundle.attachDbRecord(fromDb.record, action);
+        // The database is the system of record: when it answered, it is the
+        // backend reading the verdict uses. The endpoint's reading stays on
+        // the step beside it, which is what makes a disagreement visible
+        // rather than silently discarded.
+        if (fromDb.outcome.kind !== 'unavailable') return corroboratedVerdict(ui, fromDb.outcome);
+      }
+      // The evidence goes on the step whatever the outcome — that is the half
+      // of this the report was missing entirely.
+      this.bundle.annotateLastStep(
+        {
+          corroboration: outcome.kind,
+          corroborationQuery: `GET ${candidate.url}`,
+          corroborationBecause: candidate.because,
+          corroborationStatus: response.status,
+          ...(outcome.kind === 'unavailable'
+            ? { corroborationWhy: outcome.reason }
+            : { corroborationPath: outcome.path, corroborationFound: outcome.found, corroborationExpected: outcome.expected }),
+          corroborationBody: response.body.slice(0, CORROBORATION_BODY_MAX_CHARS),
+        },
+        action,
+      );
+      return corroboratedVerdict(ui, outcome);
+    } catch (error) {
+      this.bundle.annotateLastStep(
+        { corroboration: `could not be asked: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}` },
+        action,
+      );
+      return corroboratedVerdict(ui, null);
+    }
+  }
+
+  /**
+   * The database half of a corroboration — the system of record, asked the
+   * same way `value-resolution.ts` asks it.
+   *
+   * Null when there is no client, no model, or nothing in the schema answers
+   * the claim: a corroboration that cannot be built is one that did not
+   * happen, and the step keeps the verdict it already had. Never throws.
+   */
+  async #corroborateFromDb(
+    action: string,
+    intent: string,
+    expected: string,
+  ): Promise<{ outcome: CorroborationOutcome; record: DbCheckRecord } | null> {
+    if (this.#corroboration === null || !this.#db.configured) return null;
+    try {
+      const view = await this.#db.schemaView();
+      const choice = await this.#corroboration.chooseDb({
+        action,
+        intent,
+        expected,
+        schema: view.tables.map((t) => `${t.name}(${t.columns.join(', ')})`).join('\n'),
+      });
+      if (choice === null || choice.table.trim() === '') return null;
+      // `corroborateCount` applies the schema gate itself — a table or filter
+      // column the schema does not declare throws there, and is caught below
+      // as "could not be asked" rather than reaching the database.
+      const { count, record } = await this.#db.corroborateCount(choice.table, choice.where);
+      const found = String(count);
+      const kind = found.trim() === expected.trim() ? 'confirmed' : 'contradicted';
+      return {
+        outcome: { kind, query: record.statements?.[0]?.sql ?? `count of ${choice.table}`, path: `${record.table ?? choice.table}`, found, expected },
+        record: { ...record, expected },
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /** Remember what just ran, for `assertSessionHeld`. */
   noteAction(action: string): void {
     this.#lastAction = action;
+    // The same fact a reload re-check needs, kept where every action already
+    // passes: a `goto` starts the page again, so the list restarts with it.
+    if (action === 'goto') this.#active.actionsSinceNavigation = [];
+    else this.#actionsSinceNavigation.push(action);
   }
 
   /**
@@ -7692,9 +7879,14 @@ export class SmartRunner {
     // selector headed by `option`/`menuitem`/`treeitem`, or a `selectOption`
     // whose trigger did open, is a failure the healer can only echo or
     // repair onto the trigger — HIR-EC-029 measured 70 s per such miss.
+    // `could not read its list` is the same shape one step earlier — the
+    // panel was never found, so the target is still inside a popup the
+    // healer cannot open (2026-09-11). Left out, every unreadable dropdown
+    // would pay the healer the 70 s this line exists to save.
     const popupTarget =
       targetsPopupContent(selector) ||
-      (action === 'selectOption' && attempts.some((line) => /opened .* but no option named/.test(line)));
+      (action === 'selectOption' &&
+        attempts.some((line) => /opened .* but (?:no option named|could not read its list)/.test(line)));
 
     if (!contentMiss && popupTarget) {
       attempts.push('jit: skipped — the target lives inside a listbox the healer cannot open');
@@ -8667,8 +8859,6 @@ export type FlowStep =
       /** Clicked after each fill, before checking `failureSelector`. */
       submit?: string | undefined;
       maxAttempts?: number | undefined;
-      /** Field description for the `custom` kind, e.g. "employee ID". */
-      description?: string | undefined;
       intent?: string | undefined;
     }
   // --- backend ---
@@ -8721,6 +8911,7 @@ export type FlowStep =
   /** Go back one history entry — for "open it, check it, come back". */
   | { action: 'back'; intent?: string | undefined }
   | { action: 'forward'; intent?: string | undefined }
+  | { action: 'hover'; selector: string; intent?: string | undefined }
   | { action: 'scrollTo'; selector: string; intent?: string | undefined }
   /** Assert the page, or a container, can really be scrolled by a user. */
   | { action: 'expectScrollable'; selector?: string | undefined; intent?: string | undefined }
@@ -9568,6 +9759,27 @@ async function executeSteps(
           }
         }
 
+        // **The last rung of an assertion: ask the backend the page used.**
+        // Only an assertion, and only when the run is allowed a backend and
+        // holds a verdict model — everything else falls straight through to
+        // the classification below, byte for byte as before. The verdict it
+        // returns may move a defect's PLANE (a frontend fault proved by the
+        // backend holding the right value) but never turns a failure into a
+        // pass: `corroboratedVerdict` has no path from a failed UI reading to
+        // `passed`. See `backend-corroboration.ts`.
+        if (ASSERTION_ACTIONS.includes(failedStep.action as never)) {
+          const attempts = error instanceof StepResolutionError ? error.attempts : [];
+          const verdict = await runner.corroborateFailedAssertion(
+            failedStep.action,
+            attempts,
+            (failedStep as { intent?: string }).intent ?? '',
+            String((failedStep as { value?: unknown; count?: unknown }).count ?? (failedStep as { value?: unknown }).value ?? ''),
+          );
+          if (verdict?.defect === 'frontend' || verdict?.defect === 'backend') {
+            runner.bundle.annotateLastStep({ corroboratedPlane: verdict.defect, corroboratedWhy: verdict.why }, failedStep.action);
+          }
+        }
+
         // Out of tries (or nothing to try): final classification, as ever.
         const kind = classifyStepFailure(failedStep.action, error);
         runner.bundle.reclassifyLastStep(kind, failedStep.action);
@@ -10015,6 +10227,9 @@ async function executeStep(
       case 'forward':
         await runner.forward(step.intent);
         break;
+      case 'hover':
+        await runner.hover(step.selector, step.intent);
+        break;
       case 'scrollTo':
         await runner.scrollTo(step.selector, step.intent);
         break;
@@ -10098,7 +10313,6 @@ async function executeStep(
         await runner.fillRetry(step.selector, step.kind, step.failureSelector, {
           submit: step.submit,
           maxAttempts: step.maxAttempts,
-          description: step.description,
           intent: step.intent,
         });
         break;
@@ -10197,7 +10411,8 @@ export interface RunFlowOptions {
   cachePath?: string | undefined;
   healer?: JitHealer | null | undefined;
   agent?: WorkflowAgent | null | undefined;
-  dataModel?: DataModel | null | undefined;
+  /** Corroborate a failed assertion against the page's own backend call (`verdict-agent`). */
+  corroboration?: CorroborationModel | null | undefined;
   fastTimeoutMs?: number | undefined;
   healedTimeoutMs?: number | undefined;
   /** Film the run with a drawn-in pointer. Default `on`; see `video.ts`. */
@@ -10799,7 +11014,10 @@ export async function runFlow(
       bundle,
       healer,
       agent: options.agent,
-      dataModel: options.dataModel,
+      // Field by field, the documented trap: a `RunFlowOptions` field not
+      // listed here reaches the runner as `undefined` and its guard never
+      // fires — `backend` and `declaredRoutes` were both caught that way.
+      corroboration: options.corroboration,
       // The flow's own card: the file is the artifact, so a re-run or a
       // repair still tells the runtime roles what the case proves.
       caseContext: flow.caseContext,
