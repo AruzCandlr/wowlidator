@@ -120,6 +120,64 @@ inside it ever fires.
 
 Audit of be100's latest run: 20 of 22 agent legs on PASSED cases were settled by the agent's own `finish` text — "shows 1–75 of 75, *meaning* 100 was selected"; "picked, *as confirmed by* the successful clicks" — inference presented as observation, never checked. The "what the agent claims is never the evidence" rule had been enforced on failures only. Now: `goalOutcome` (`goal-evidence.ts`, pure) reads the checkable end state a goal names (`set X to Y`, `X = "Y"`); on `finish` the loop re-reads the live tree and `outcomeShown` must find it — on one line (`button "Status: Inactive"`) or as a label→value neighbour within three lines. A miss is refused ONCE with what the tree shows; a second insistence records `claimed finish, but the page does not show X = Y` and `success: false`. A goal naming no state falls through, and the record says so: `AgentRecord.settledBy` is `observed-state` (with the evidencing line) or `agent-claim` (with the bare reasoning), so an all-claim run is visible as one in the report. New action **`read`** (idle, never progress): the harness reports a control's text/value/checked/expanded/disabled into the history at $0, so the agent learns whether a choice took instead of clicking again to find out — the repeat-guard stalls on Country and Rows-per-page were exactly that.
 
+## A separator the page pads is the same value (2026-09-11, PL_06_10)
+
+Live (`be-sit-high-opusheal-th-20260911-175757`, HUMI SIT). The agent set
+Benefit Type correctly and the re-read tree said so —
+`text "Reimbursement : Employee/HR"` — but the goal spelled the value
+`Reimbursement: Employee/HR`, without the space humi draws before the colon.
+`foldValue` folded case, dash variants and whitespace *around dashes* and
+nothing around a colon, so `shownAs`' bounded-substring test failed and the
+finish was refused twice: `agent claimed finish, but the page does not show
+Benefit Type = "Reimbursement: Employee/HR"`. The agent's own reasoning had
+already noted the two spellings were one value.
+
+What it cost, and why a false "not seen" is not a cheap error: the case sealed
+**ERROR at 14 of 20 steps**, with no verdict on the application at all;
+`closesDependentTail('workflow', …)` — correct, and not the bug — inherited the
+false premise and skipped steps 13–17, one of whose intents read *"Independent
+of the agent: the duplicate Plan ID is still the value being submitted"*; and
+the post-run diagnosis filed **the navigation agent at 72% confidence** for a
+value it had applied.
+
+**The rule.** `foldValue` now canonicalises the spacing around a colon
+(`a:b`, `a :b`, `a : b` → `a: b`) and unifies the full-width `：` a Thai or CJK
+page draws, exactly as it has folded dash spacing and dash variants since the
+ec10 reruns.
+
+**Why a fold of this shape cannot loosen the page side.** `shownAs` bounds a
+spelling on anything that is not a letter or digit, so `:` is already a word
+boundary on both of its sides; normalising whitespace next to such a mark
+cannot move a single boundary, because no letter or digit is ever brought next
+to another and nothing but whitespace changes. The only way a punctuation fold
+could join two tokens into a value the page does not hold is a canonical form
+that **deletes** a space — so both canonical forms here keep one (` - `, `: `).
+The fold also makes a padded page answer exactly as an unpadded one, no looser:
+where the whole-word rule already conceded `Reimbursement: Employee` inside
+`Reimbursement: Employee/HR`, it now concedes it for the padded spelling too —
+the same concession, not a new one.
+
+**Weighed and left out** (the reasons are in the function's comment, so the
+next person does not re-derive them): `/` — the canonical `/` would delete a
+space, and `valueAppearsAnywhere` folds the whole tree into one line, so it
+could join two lines' tokens; the alternative ` / ` would break
+`valueSpellings`' `code - label` parse, whose code class holds `/`. Both sides
+of this case write the slash tight, so it costs nothing today. `,` and
+`(`/`)` — no observed padding, and both carry meaning the number and alias
+parses read. `;` — no observed case. `%` — a unit, not a separator; number and
+currency shaping is `src/engine/normalise.ts`' job and it already does it.
+
+**The duplicate normaliser, unedited.** `src/engine/normalise.ts` has its own
+`foldValue`, documented and pinned (`tests/engine-helpers.test.ts`, "foldValue
+is a superset of goal-evidence's") as a superset of this one. Its corpus holds
+no colon, so it is still green — but the superset claim is now false for a
+padded colon, and the execution plane's comparators (`expectText`,
+`expectValue`, the entry rung's read-back, the listbox pick's read-back) still
+score `Reimbursement : Employee/HR` against `Reimbursement: Employee/HR` as a
+mismatch. Same live bug, one plane over. Left to `src/engine/`.
+
+Pinned in `tests/goal-evidence.test.ts` ("a padded colon is the same value").
+
 ## The judge may not overrule a human record (S2)
 
 `runFlow`'s auto-review: when the sheet's own Actual Result (`generation.knownResult`) exists and the judge's ruling contradicts it, the ruling is withheld with the disagreement on `notes` and the run stays `needs-review` for a person. PL_04_08: a human passed the case by hand; the judge ruled "failed" at 0.9 on "still visible contradicts hidden" without asking whether "not shown" meant hidden, disabled or inert. A machine's confident reading of two strings does not outrank a tester's hands.

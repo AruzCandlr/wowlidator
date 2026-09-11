@@ -512,6 +512,49 @@ describe('goal outcome: multi-word values and dash spellings (HIR-EC-002 leg 12)
   });
 });
 
+describe('goal outcome: a padded colon is the same value (PL_06_10, be-sit-high-opusheal-th-20260911-175757)', () => {
+  // humi drew `text "Reimbursement : Employee/HR"`; the goal spelled it
+  // "Reimbursement: Employee/HR". The agent had set the field and said so —
+  // its own reasoning read `value="Reimbursement : Employee/HR" (matching the
+  // requested "Reimbursement: Employee/HR")` — and outcomeShown refused the
+  // finish twice. The case sealed ERROR at 14/20 steps, the dependent tail
+  // skipped five steps that would have passed, and the diagnosis filed the
+  // navigation agent at 72% confidence for a value it had applied.
+  const PAGE = 'Reimbursement : Employee/HR';
+  const GOAL = 'Reimbursement: Employee/HR';
+
+  it('folds the spacing around a colon the way it folds a dash', () => {
+    assert.equal(foldValue(GOAL), foldValue(PAGE));
+    assert.equal(foldValue(GOAL), 'reimbursement: employee/hr');
+    assert.equal(foldValue('Type :Info'), foldValue('Type:Info'), 'every spacing is one spelling, not three');
+    assert.equal(foldValue('สถานะ：ใช้งาน'), foldValue('สถานะ: ใช้งาน'), 'the full-width colon a Thai page draws');
+  });
+
+  it('settles the leg on the tree the page actually rendered', () => {
+    const tree = `button "Benefit Type" value="${PAGE}"\nStaticText "Benefit Type*"`;
+    assert.ok(valueShownIn(`text "${PAGE}"`, GOAL));
+    assert.ok(outcomeShown({ control: 'Benefit Type', value: GOAL }, tree));
+    assert.ok(valueAppearsAnywhere(GOAL, tree));
+  });
+
+  it('does not make two different values equal', () => {
+    assert.equal(valueShownIn(`option "${PAGE}"`, 'Reimbursement: Employer/HR'), false, 'Employee is not Employer');
+    assert.equal(valueShownIn('option "Reimbursement : Employee/HRBP"', GOAL), false, 'HR is not HRBP — the whole-word rule stands');
+    assert.equal(valueShownIn('option "Advance : Employee/HR"', GOAL), false, 'a different benefit type with the same tail');
+    assert.equal(valueShownIn('button "Gender" value="Status: Female"', 'Status: Male'), false, 'Male is still not inside Female');
+    assert.equal(valueShownIn('StaticText "Select a type:"', 'A (Active)'), false, 'a one-character half is still only a quoted token');
+    // The fold makes a padded page behave exactly as an unpadded one, no
+    // looser: "Reimbursement: Employee" matching inside "…: Employee/HR" is
+    // the whole-word rule's long-standing concession at a non-word boundary,
+    // which already applied when the page wrote the colon tight.
+    assert.equal(
+      valueShownIn(`option "${PAGE}"`, 'Reimbursement: Employee'),
+      valueShownIn('option "Reimbursement: Employee/HR"', 'Reimbursement: Employee'),
+      'padded and unpadded pages answer alike',
+    );
+  });
+});
+
 // --- OA-13: the sheets' own language --------------------------------------------
 
 describe('goal classifiers in the sheets\' own words (OA-13, 2026-09-03)', () => {

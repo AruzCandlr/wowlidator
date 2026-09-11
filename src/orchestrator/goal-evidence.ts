@@ -667,14 +667,51 @@ export function anyValueAppears(values: readonly string[], axTree: string): bool
  */
 /**
  * A value as the page and the goal might each spell it: case-folded, every
- * dash the same dash, whitespace collapsed. "A - Permanent" in a goal and
- * "A — Permanent" on the page are one value.
+ * dash the same dash, every colon the same colon spaced one way, whitespace
+ * collapsed. "A - Permanent" in a goal and "A — Permanent" on the page are one
+ * value; so are "Reimbursement: Employee/HR" and "Reimbursement : Employee/HR".
+ *
+ * The colon half is live (PL_06_10, run `be-sit-high-opusheal-th-20260911-175757`):
+ * the agent set Benefit Type correctly, humi rendered `text "Reimbursement :
+ * Employee/HR"` and the goal spelled it `Reimbursement: Employee/HR`, so
+ * `outcomeShown` refused a finish that had already happened — the case sealed
+ * ERROR at 14/20, the dependent tail skipped five steps, and the diagnosis
+ * blamed the agent at 72% for a value it HAD applied. A separator a UI may or
+ * may not pad is the same bug class as the dash, which this function has
+ * folded since the ec10 reruns.
+ *
+ * **The rule that keeps a fold safe.** `shownAs` bounds a spelling on anything
+ * that is not a letter or digit, so a mark like `-` or `:` is ALREADY a word
+ * boundary on both sides. Normalising the whitespace next to such a mark
+ * therefore cannot move a single boundary: no letter or digit is ever brought
+ * next to another, and nothing but whitespace is added or removed. What it can
+ * do is join two tokens that were separate — but only a canonical form that
+ * DELETES a space can, so both canonical forms here keep one (` - `, `: `).
+ * That is the whole argument for why this may not turn a value the page does
+ * not hold into one it does.
+ *
+ * Weighed and left out, because the fold must earn its place on both sides:
+ * `/` (canonical `/` would delete a space, and the tree is folded whole, so it
+ * could join two lines' tokens into one value; canonical ` / ` would break
+ * `valueSpellings`' `code - label` parse, whose code class holds `/`. Both
+ * sides of the live case write the slash tight, so it costs nothing today);
+ * `,` and `(`/`)` (no observed padding, and both carry meaning the number and
+ * alias parses read — see `src/engine/normalise.ts`); `;` (no observed case);
+ * `%` (a unit, not a separator — number and currency shaping belongs to
+ * `normalise.ts`, which already owns it).
  */
 export function foldValue(text: string): string {
   return text
     .toLowerCase()
     .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, '-')
     .replace(/\s*-\s*/g, ' - ')
+    // Every colon the same colon: the full-width `：` is what a Thai or CJK
+    // page draws for the goal's `:` (the agent's own read-back parse has
+    // carried `[:：]` since 2026-09-05), and the spacing is canonicalised the
+    // way the dash above is — unconditionally, so `a:b`, `a :b` and `a : b` are
+    // one spelling rather than three.
+    .replace(/[\uFF1A\uFE55]/g, ':')
+    .replace(/\s*:\s*/g, ': ')
     .replace(/\s+/g, ' ')
     .trim();
 }
