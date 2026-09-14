@@ -399,6 +399,10 @@ const FIXTURE_HTML = `<!doctype html>
     <!-- DateField: button[aria-haspopup=dialog] → role=dialog calendar -->
     <button id="hire-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Hire Date">Select date</button>
     <button id="start-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="วันที่มีผล">เลือกวันที่</button>
+    <!-- EH-DOB: humi's REAL DateField month view — no combobox, no year
+         input, and the heading toggle's aria-label ("Choose month and year")
+         never equals its own rendered text, unlike the two fixtures above. -->
+    <button id="dob-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Date of Birth">Select date</button>
 
     <!-- FormField: label + control + aria-describedby message -->
     <div class="field">
@@ -649,6 +653,76 @@ const FIXTURE_HTML = `<!doctype html>
       }
       dateField(document.getElementById('hire-date'), 'en', new Date(2026, 8, 3), new Date(2025, 0, 1), new Date(2028, 10, 30));
       dateField(document.getElementById('start-date'), 'th', new Date(2026, 8, 3), new Date(2025, 0, 1), new Date(2028, 10, 30));
+      // --- EH-DOB: humi's real DateField month view (no select, no year
+      // input — Previous/Next-year buttons and a plain year readout; the
+      // heading toggle's accessible name is fixed copy, distinct from its
+      // own rendered text, exactly the shape that broke jumpViaMonthView).
+      (function humiDobField(btn, initial, min, max) {
+        var view = { y: initial.getFullYear(), m: initial.getMonth() }, mode = 'day', popup = null, value = null;
+        function label(d) { return d.getDate() + ' ' + ENS[d.getMonth()] + ' ' + d.getFullYear(); }
+        function disabled(d) { return d < min || d > max; }
+        function close() { if (popup) { popup.remove(); popup = null; } btn.setAttribute('aria-expanded', 'false'); }
+        function render() {
+          popup.innerHTML = '';
+          var head = document.createElement('div');
+          var prevM = document.createElement('button'); prevM.type = 'button'; prevM.setAttribute('aria-label', 'Previous month'); prevM.textContent = '‹';
+          prevM.addEventListener('click', function () { view.m -= 1; if (view.m < 0) { view.m = 11; view.y -= 1; } render(); });
+          head.appendChild(prevM);
+          var title = document.createElement('button'); title.type = 'button';
+          title.setAttribute('aria-label', 'Choose month and year');
+          title.setAttribute('aria-expanded', String(mode === 'month'));
+          title.textContent = EN[view.m] + ' ' + view.y;
+          title.addEventListener('click', function () { mode = mode === 'month' ? 'day' : 'month'; render(); });
+          head.appendChild(title);
+          var nextM = document.createElement('button'); nextM.type = 'button'; nextM.setAttribute('aria-label', 'Next month'); nextM.textContent = '›';
+          nextM.addEventListener('click', function () { view.m += 1; if (view.m > 11) { view.m = 0; view.y += 1; } render(); });
+          head.appendChild(nextM);
+          popup.appendChild(head);
+          if (mode === 'day') {
+            var grid = document.createElement('div');
+            var first = new Date(view.y, view.m, 1), days = new Date(view.y, view.m + 1, 0).getDate();
+            for (var p = 0; p < first.getDay(); p++) { var pad = document.createElement('div'); pad.setAttribute('aria-hidden', 'true'); grid.appendChild(pad); }
+            for (var d = 1; d <= days; d++) {
+              (function (day) {
+                var date = new Date(view.y, view.m, day);
+                var b = document.createElement('button'); b.type = 'button'; b.textContent = String(day);
+                b.setAttribute('aria-pressed', String(value !== null && value.getTime() === date.getTime()));
+                if (disabled(date)) b.disabled = true;
+                b.addEventListener('click', function () { if (disabled(date)) return; value = date; btn.textContent = label(date); setStatus('date:' + btn.id + ':' + date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0')); close(); });
+                grid.appendChild(b);
+              })(d);
+            }
+            popup.appendChild(grid);
+          } else {
+            var yrow = document.createElement('div');
+            var prevY = document.createElement('button'); prevY.type = 'button'; prevY.setAttribute('aria-label', 'Previous year'); prevY.textContent = '‹';
+            prevY.addEventListener('click', function () { view.y -= 1; render(); });
+            yrow.appendChild(prevY);
+            var yp = document.createElement('p'); yp.textContent = String(view.y);
+            yrow.appendChild(yp);
+            var nextY = document.createElement('button'); nextY.type = 'button'; nextY.setAttribute('aria-label', 'Next year'); nextY.textContent = '›';
+            nextY.addEventListener('click', function () { view.y += 1; render(); });
+            yrow.appendChild(nextY);
+            popup.appendChild(yrow);
+            var mgrid = document.createElement('div');
+            ENS.forEach(function (m, i) {
+              var mb = document.createElement('button'); mb.type = 'button'; mb.textContent = m;
+              mb.setAttribute('aria-pressed', String(i === view.m));
+              mb.addEventListener('click', function () { view.m = i; mode = 'day'; render(); });
+              mgrid.appendChild(mb);
+            });
+            popup.appendChild(mgrid);
+          }
+        }
+        btn.addEventListener('click', function () {
+          if (popup) { close(); return; }
+          var base = value || initial; view = { y: base.getFullYear(), m: base.getMonth() }; mode = 'day';
+          popup = document.createElement('div'); popup.setAttribute('role', 'dialog'); popup.setAttribute('aria-label', 'Calendar');
+          popup.className = 'popup'; popup.style.position = 'fixed'; popup.style.top = '40px'; popup.style.left = '40px'; popup.style.zIndex = '100';
+          document.body.appendChild(popup); btn.setAttribute('aria-expanded', 'true'); render();
+        });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+      })(document.getElementById('dob-date'), new Date(2026, 8, 3), new Date(1900, 0, 1), new Date(2030, 11, 31));
       // --- uploads
       function reportFiles(input) { input.addEventListener('change', function () { document.getElementById('upload-status').textContent = input.id + ':' + Array.prototype.map.call(input.files, function (f) { return f.name; }).join(','); }); }
       reportFiles(document.getElementById('import-file')); reportFiles(document.getElementById('cert-file')); reportFiles(document.getElementById('chooser-input'));
@@ -875,6 +949,27 @@ describe('engine helpers against a real page (CDP)', { skip: skipBrowser }, () =
       const result = await pickDateInDialog(page, page.locator('#hire-date'), '2028-06-20');
       assert.equal(result.via, 'month-view');
       assert.equal(result.shown, '20 Jun 2028');
+      assert.ok(result.confirmed);
+    });
+  });
+
+  it('calendar: a century-scale jump (Date of Birth) drives a button-grid month view, not 700+ month-nav clicks (EH-DOB)', async () => {
+    await withPage(async (page) => {
+      const result = await pickDateInDialog(page, page.locator('#dob-date'), '1968-03-01', { timeout: 3_000 });
+      assert.equal(result.via, 'month-view');
+      assert.equal(result.shown, '1 Mar 1968');
+      assert.ok(result.confirmed);
+      assert.equal(await page.locator('#status').innerText(), 'date:dob-date:1968-03-01');
+      assert.equal(await openDialogNow(page), null, 'the dialog closed');
+    });
+  });
+
+  it('calendar: the same button-grid widget still resolves a near-term date via plain month-nav (unaffected)', async () => {
+    await withPage(async (page) => {
+      const result = await pickDateInDialog(page, page.locator('#dob-date'), '2026-11-10');
+      assert.equal(result.via, 'month-nav');
+      assert.equal(result.navigated, 2);
+      assert.equal(result.shown, '10 Nov 2026');
       assert.ok(result.confirmed);
     });
   });

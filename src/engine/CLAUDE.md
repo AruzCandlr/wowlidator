@@ -1335,3 +1335,114 @@ BUTTON, a named layer, a layer with text, a 60 px sticky bar, an absolute
 layer covering only the width → not; open-at-start + click → intended,
 appeared mid-ladder + click → blocker) and the two CDP cases in
 `tests/modal.test.ts` above.
+
+## A century-scale jump goes through the month view by ASSUMED shape, and humi's is a different one (EH-DOB, 2026-09-14, e2e01-dedup-20260914-154219 hir-ec-001-key-in-60)
+
+**Incident.** Hire Date (a small delta from "now") resolves via plain
+month-nav in ~12 clicks, ~0.7 s. Date of Birth for `1968-03-01` — ~702 months
+back from ~September 2026 — spent **121,231 ms** across four ladder rungs and
+failed completely: `fast` walked `MAX_MONTH_STEPS` (240) month-by-month clicks
+and stopped at "September 2006", 240 short; `jit` was disabled; the agent's
+look correctly diagnosed nothing actionable; `agent-enter` clicked `Next
+month` until the loop's own no-progress guard stopped it, still short. The
+module's own doc comment already claimed the long-jump shortcut existed ("a
+month view behind the heading… a `select` for the month, a number input for
+the year") — so on paper this should have been unreachable.
+
+**Root cause, found live** (`humi-sit-int.central.co.th/humi/en/admin/hire`,
+the real Date of Birth `DateField`, DOM read directly, not guessed): the
+assumption behind `jumpViaMonthView` was written from a WRITER's idea of the
+widget, never from the widget — the same failure shape this file has already
+named twice (the multi-select `role=listbox` fixture, the searchable-select
+panel with no list role). Two divergences, both fatal on their own:
+
+1. **The month-view toggle's accessible name is not its visible text.** The
+   heading is `<button aria-label="Choose month and year">September 2026</button>`.
+   `jumpViaMonthView` looked up the toggle with `getByRole('button', { name:
+   <regex of the heading text> })` — an ACCESSIBLE-NAME match — which can never
+   find a button whose `aria-label` says something else entirely. The toggle
+   was never clicked; the month view never opened.
+2. **There is no `select` and no year input at all.** Once opened (confirmed
+   by driving it directly with `el.click()`), the month view renders a plain
+   grid of month BUTTONS (`Jan`…`Dec`, no `aria-label`, matched by their own
+   text) and a year row of `Previous year`/`Next year` icon buttons flanking a
+   bare, roleless `<p>2026</p>` — no `combobox`, no `spinbutton`, no
+   `textbox`. `jumpViaMonthView`'s existing combobox/year-field branch had
+   nothing to find even had the toggle been reached.
+
+Measured live before writing anything: the year-nav buttons update the `<p>`
+in ~4 ms/click with no artificial wait (53 clicks, 222 ms, no minimum-year
+bound encountered down to 1900); clicking a month button both sets the month
+AND returns to day view, with the header re-reading "March 2021" correctly —
+but that header text is FROZEN during year navigation (it kept reading
+"August 2026" through five year-back clicks), so it cannot be used to poll
+progress the way the day-view heading can.
+
+**Fix, `jumpViaMonthView` (`src/engine/calendar.ts`).** Two independent
+mechanisms, chosen by what the DOM actually renders, not by which one was
+assumed:
+
+- The heading TOGGLE is now found by `dialog.getByRole('button').filter({
+  hasText: <the heading's own rendered text> })` — Playwright's `hasText`
+  matches `textContent`, never the accessible name, so an `aria-label`
+  override can no longer hide it. This can only turn a guaranteed miss into a
+  match: a button whose accessible name already equalled its own text (every
+  existing fixture) is found exactly as before.
+- The YEAR is set through a fillable field when one is visible (unchanged,
+  Case A); otherwise `stepYearButtons()` clicks `Previous year`/`Next year` in
+  a loop, reading the displayed year off whichever ancestor of the nav button
+  (up to four levels up) carries a bare 4-digit number — no id, no testid, no
+  label assumed, the same "understate, never overstate" discipline the rest
+  of this module already uses for CSS/ARIA detection. Bounded to the actual
+  distance plus five clicks of slack (`YEAR_NAV_SLACK`), not a flat ceiling —
+  a Date of Birth ~58 years back costs ~58 clicks, not `MAX_MONTH_STEPS`'s 240
+  and not an unbounded loop either; a button that stops moving the year (a
+  min/max bound) or offers no visible nav in the needed direction stops the
+  walk and the function returns `false`, falling through to the caller's
+  existing month-nav loop exactly as a `jumpViaMonthView` failure always has.
+- The MONTH is picked from a `select` when one is visible (unchanged, Case A);
+  otherwise `findMonthButton()` scans the dialog's buttons for the one whose
+  OWN text (not accessible name) parses via `monthNumberOf` to the target
+  month, and clicks it — the same day-grid idiom (`dayButtons` matched by
+  their own rendered number) applied one level up.
+- The function's final check is untouched: it re-reads the dialog's own
+  heading and only reports success when it names the target month AND year —
+  the same "re-run the author's own read" contract every rung in this module
+  already gives, so a partial or wrong navigation still fails honestly rather
+  than "successfully" landing on the wrong month.
+
+**Why this cannot heal onto the wrong date.** Every step is either a read
+(the heading text, the year `<p>`, a button's own text) or a click on a
+control matched by what the read just found — never a guess at a day, a
+month, or a year. A stalled year walk or an unfound month button returns
+`false` and the caller's existing plain month-nav loop and its own bound
+(`MAX_MONTH_STEPS`) are the fallback, unchanged; the day-picking phase (the
+disabled-day verdict, the last/first match by day ≥ 15) is untouched entirely.
+`MAX_MONTH_STEPS` itself was not raised — a jump this month-view path cannot
+resolve still fails in the same bounded way it always did, it does not fail
+slower.
+
+**Measured, live** (`humi-sit-int.central.co.th`, the real Date of Birth
+field, VPN-connected, headless Chrome on `:9333`): before, 121,231 ms,
+`failed`, nothing entered. After, driving `pickDateInDialog` directly against
+the same live field with the fix applied: **2,192 ms**, `via: "month-view"`,
+`navigated: 0`, `confirmed: true`, trigger reads `"1 Mar 1968"`. Near-term
+Hire Date is unaffected (`MONTH_VIEW_THRESHOLD` still gates `jumpViaMonthView`
+to jumps over 13 months; the existing month-nav CDP tests still pass
+byte-for-byte, see below).
+
+**Measured, CDP fixture** (`tests/engine-helpers.test.ts`, a new `#dob-date`
+`DateField` built from the live widget's exact shape — button-grid month
+view, no combobox, no year input, a toggle whose `aria-label` differs from
+its text): a ~700-month jump (`1968-03-01`) resolves via `month-view` in
+~2.6 s, confirmed; the SAME widget's near-term date (`2026-11-10`, 2 months
+out) still resolves via plain `month-nav` with `navigated: 2`, unaffected;
+every pre-existing calendar test (the combobox+year-input Case A fixtures,
+the Buddhist heading, the disabled-day verdict) stays green, unchanged.
+
+**Pinned by** `tests/engine-helpers.test.ts`: "calendar: a century-scale jump
+(Date of Birth) drives a button-grid month view, not 700+ month-nav clicks
+(EH-DOB)" and "calendar: the same button-grid widget still resolves a
+near-term date via plain month-nav (unaffected)", both CDP-gated against the
+new fixture; the four pre-existing calendar tests (Case A: combobox+year
+input) are unchanged and still pass.
