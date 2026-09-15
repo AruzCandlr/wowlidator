@@ -46,15 +46,6 @@ export const GATES: readonly GateSpec[] = [
     onValue: 'on',
   },
   {
-    env: 'WOWLIDATOR_GOVERNOR',
-    label: 'Queue governor',
-    help:
-      'Watches the parallel lanes: diagnoses blockages, shrinks the pool under timeout load. On = the deterministic rules governor ($0, no model). ' +
-      'Setting the env var to "model" by hand restores the LLM governor, which can additionally seed a starved fixture. Off, the scheduler runs alone.',
-    defaultOn: true,
-    onValue: 'rules',
-  },
-  {
     env: 'WOWLIDATOR_RISK',
     label: 'Pre-run risk judge',
     help: 'Judges each authored case for dead-end/expected-fail risk; above the threshold it runs once with no rerun paths.',
@@ -173,36 +164,22 @@ export const SELECTS: readonly SelectSpec[] = [
     env: 'WOWLIDATOR_GENERATOR_EFFORT',
     label: 'Generator effort',
     help:
-      'Reasoning effort (--effort) for the generator role on a Claude provider — authoring is one large call per row and is where high pays off; ' +
-      'medium roughly halves the think time, low is fastest and thinnest. Non-Claude providers ignore this; an explicit --effort on a run still wins.',
+      'Reasoning effort (--effort) for the generator role on a CLI provider that supports it — authoring is one large call per row and is where high pays off; ' +
+      'medium roughly halves the think time, low is fastest and thinnest. Other providers ignore this; an explicit --effort on a run still wins.',
     options: EFFORT_OPTIONS,
     defaultValue: 'high',
   },
   {
     env: 'WOWLIDATOR_HEALER_EFFORT',
     label: 'Healer effort',
-    help: 'Reasoning effort for the healer role on a Claude provider. Repair is small and latency-sensitive — low is the default and usually right.',
+    help: 'Reasoning effort for the healer role on a CLI provider that supports it. Repair is small and latency-sensitive — low is the default and usually right.',
     options: EFFORT_OPTIONS,
     defaultValue: 'low',
   },
   {
     env: 'WOWLIDATOR_AGENT_EFFORT',
     label: 'Agent effort',
-    help: 'Reasoning effort for the agent role on a Claude provider. One small structured decision per turn — the loop owns the reasoning, so low is the default.',
-    options: EFFORT_OPTIONS,
-    defaultValue: 'low',
-  },
-  {
-    env: 'WOWLIDATOR_DATA_EFFORT',
-    label: 'Data effort',
-    help: 'Reasoning effort for the data role on a Claude provider — regenerating one rejected field value. Low is the default.',
-    options: EFFORT_OPTIONS,
-    defaultValue: 'low',
-  },
-  {
-    env: 'WOWLIDATOR_GOVERNOR_EFFORT',
-    label: 'Governor effort',
-    help: 'Reasoning effort for the queue governor when it runs as a model (WOWLIDATOR_GOVERNOR=model) on a Claude provider. Low is the default.',
+    help: 'Reasoning effort for the agent role on a CLI provider that supports it. One small structured decision per turn — the loop owns the reasoning, so low is the default.',
     options: EFFORT_OPTIONS,
     defaultValue: 'low',
   },

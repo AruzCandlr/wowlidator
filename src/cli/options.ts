@@ -3,6 +3,7 @@
  * helpers. Split out of cli.ts verbatim.
  */
 
+import { REPORT_LANGS, type ReportLang } from '../engine/proof-bundle.js';
 import { CONTEXT_BUDGET_CHARS } from '../catalog/retrieve.js';
 import type { WowlidatorConfig } from '../config.js';
 import type { ScreenshotMode, VideoMode } from '../engine/runner.js';
@@ -11,6 +12,12 @@ import type { MutationPolicy } from '../generator/test-generator.js';
 import type { LlmFactory } from '../providers/llm-factory.js';
 
 export const SCREENSHOT_MODES = ['auto', 'off', 'on-failure', 'on-event', 'all'] as const;
+
+/**
+ * Live 309-case run, 2026-09-07: 133 cases exceeded an hour; the worst ran
+ * 13h15m across 145 agent calls and 2.0M tokens, then exercised 0% of controls.
+ */
+export const DEFAULT_CASE_TIMEOUT_MS = 1_200_000;
 
 export interface CliOptions {
   config: WowlidatorConfig;
@@ -60,6 +67,38 @@ export interface CliOptions {
    * no key.
    */
   agentCapture: boolean;
+  /**
+   * Narrate every step in plain language after each case, onto the bundle so
+   * the report can show it (`--narrate`, or `WOWLIDATOR_NARRATE=on`). OFF by
+   * default, unlike the other post-run judges: this fires once per case rather
+   * than only on a system error, and a suite that spends its model window on
+   * prose finishes its remaining cases on refusals. Degrades silently when the
+   * healer role has no key. See `generator/step-narration.ts`.
+   */
+  narrate: boolean;
+  /**
+   * The language the per-case report page and the case narrative are written
+   * in (`--report-lang en|th`, or `WOWLIDATOR_REPORT_LANG`). English by
+   * default. Recorded on the suite ledger so a `wowlidator report` rebuild
+   * speaks the same language the run did. Labels only: application text is
+   * always shown as captured, never translated.
+   */
+  reportLang: ReportLang;
+  /**
+   * Write the case narrative — a model's plain-language telling of each case
+   * onto its bundle for the per-case page (`--no-case-narrative` disables).
+   * ON by default, unlike `narrate`: the page is built around it. One
+   * generator-role call per case; degrades silently to the evidence-only page
+   * when the role has no key. See `generator/case-narrative.ts`.
+   */
+  caseNarrative: boolean;
+  /**
+   * `--case-narrative` on `wowlidator report`: back-fill the narrative onto
+   * finished runs' bundles. A rebuild is "no re-run", so spending one
+   * generator call per case across every ledger on disk is asked for, never
+   * assumed — the `--narrate` rule, one flag over.
+   */
+  caseNarrativeBackfill: boolean;
   /**
    * Review each authored flow against the codebase and documents before it
    * is written (`--no-author-review` disables). On by default, like the
@@ -199,6 +238,8 @@ export interface CliOptions {
   open: boolean;
   /** Per-navigation budget for a crawl, in ms. */
   timeoutMs: number | undefined;
+  /** Whole-case ceiling for suite/catalog runs; zero disables it. */
+  caseTimeoutMs?: number | undefined;
   /** `wowlidator watch` interval, e.g. "15m". */
   every: string | undefined;
   /** Command run on a result change, fed the verdict as JSON on stdin. */
@@ -373,6 +414,35 @@ export function parseCaptureDelay(raw: string | undefined, configured: number): 
     return null;
   }
   return parsed;
+}
+
+/**
+ * `--report-lang`, then `WOWLIDATOR_REPORT_LANG`, then English. Rejects an
+ * unknown language rather than falling back: a page in the wrong language is
+ * quieter than a refusal, and the ledger will carry whatever was chosen into
+ * every rebuild.
+ */
+export function parseReportLang(raw: string | undefined, env: NodeJS.ProcessEnv = process.env): ReportLang | null {
+  const chosen = (raw ?? env['WOWLIDATOR_REPORT_LANG'] ?? 'en').trim().toLowerCase();
+  return (REPORT_LANGS as readonly string[]).includes(chosen) ? (chosen as ReportLang) : null;
+}
+
+export function parseCaseTimeout(
+  rawSeconds: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number | null {
+  if (rawSeconds !== undefined) {
+    if (rawSeconds.trim().toLowerCase() === 'off') return 0;
+    const seconds = Number(rawSeconds);
+    if (!Number.isSafeInteger(seconds) || seconds < 0 || seconds * 1_000 > 2_147_483_647) return null;
+    return seconds * 1_000;
+  }
+  const rawMs = env['WOWLIDATOR_CASE_TIMEOUT_MS'];
+  if (rawMs === undefined || rawMs.trim() === '') return DEFAULT_CASE_TIMEOUT_MS;
+  if (rawMs.trim().toLowerCase() === 'off') return 0;
+  const milliseconds = Number(rawMs);
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0 || milliseconds > 2_147_483_647) return null;
+  return milliseconds;
 }
 
 /**

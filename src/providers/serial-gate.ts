@@ -17,7 +17,7 @@
  *   authoring prompts in flight is exactly the shape that produced timeouts.
  * - **Priority by who is waiting.** `agent` first (a browser turn is blocked
  *   and the page may change under it), then `healer` (a step is mid-failure),
- *   then `data`, then `generator` (a row can be authored later; nothing is
+ *   then `generator` (a row can be authored later; nothing is
  *   held open). FIFO inside a class, so authoring keeps sheet order.
  * - **Identical in-flight questions are asked once.** Parallel cases whose
  *   login selector drifted the same way used to pay the healer N times for
@@ -40,8 +40,7 @@ export const SERIAL_LARGE_PROMPT_CHARS = 32_000;
 export const SERIAL_ROLE_PRIORITY: Readonly<Record<string, number>> = {
   agent: 0,
   healer: 1,
-  data: 2,
-  generator: 3,
+  generator: 2,
 };
 
 export interface SerialGateOptions {
@@ -183,11 +182,22 @@ export class SerialGate {
 
 const gates = new Map<string, SerialGate>();
 
-/** The gate for one server. Process-wide: every role in this process shares the server. */
-export function serialGateFor(serverKey: string): SerialGate {
+/**
+ * The gate for one server. Process-wide: every role in this process shares
+ * the server.
+ *
+ * `options` applies only when the gate is CREATED — the first caller's shape
+ * is the shape, because a ceiling that changed under calls already admitted
+ * would admit more than the server said it takes. A provider that states a
+ * concurrency limit (`config.providerConcurrency`) passes it here, and gets
+ * admission control without the large-prompt rule a serial server needs:
+ * `maxLargeInFlight` defaults to the whole ceiling, so an API provider that
+ * allows two calls allows two authoring calls.
+ */
+export function serialGateFor(serverKey: string, options?: SerialGateOptions): SerialGate {
   let gate = gates.get(serverKey);
   if (gate === undefined) {
-    gate = new SerialGate();
+    gate = new SerialGate(options);
     gates.set(serverKey, gate);
   }
   return gate;

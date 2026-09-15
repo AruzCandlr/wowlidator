@@ -16,6 +16,7 @@ import { CacheManager, type HealedSelectorEntry } from '../cache/cache-manager.j
 import type { RejectedHeal } from '../engine/proof-bundle.js';
 import { withQualifiedRole, withRelaxedRoleName } from '../engine/selector.js';
 import { DETERMINISM_RULES, procedure, selfCheck } from '../providers/prompt-discipline.js';
+import { fence, sanitizeInline } from '../providers/model-fence.js';
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
 import type { HealHints, HealHintsProvider } from '../context/heal-hints.js';
 import { focusTreeText } from '../context/retriever.js';
@@ -54,6 +55,70 @@ export const INTERACTIVE_ROLES = new Set([
 
 /** Roles that only add noise to the tree. */
 const NOISE_ROLES = new Set(['generic', 'none', 'presentation', 'InlineTextBox', 'LineBreak']);
+
+/**
+ * Roles Chrome leaves unnamed but Playwright names from their CONTENT.
+ *
+ * A `<tr>` is the one that costs real verdicts. Measured on a live Chrome
+ * (2026-09-11): Chrome reports every `row` with `name: ""`, so the prune below
+ * — which drops an unnamed non-interactive node — deleted every row from every
+ * capture. Playwright's role engine computes the same row's name from its
+ * cells, so `role=row[name="QA260908_BE_137 QA-Delete Delete"]` resolves to
+ * exactly one element and `… >> role=button[name="Delete" i]` scopes to that
+ * row's own control.
+ *
+ * The consequence of the gap was a false refusal and a dead end: the authoring
+ * lint saw no `row` anywhere and refused the row-scoped selector as ungrounded
+ * (be-sit-high PL_09_01), leaving a bare `role=button[name="Delete" i]` that
+ * Playwright answered with `strict mode violation: resolved to 25 elements`
+ * (RU_08_01, the same run). The page had rows the whole time; the capture had
+ * deleted them.
+ *
+ * Kept to `row` deliberately. Every other name-from-content role the sheets
+ * actually scope by — `cell`, `option`, `listitem`, `menuitem` — already
+ * reaches the tree named, so widening this would add lines that ground nothing
+ * new and cost a heal tokens it does not need.
+ */
+const NAME_FROM_CONTENT_ROLES = new Set(['row']);
+
+/**
+ * The longest synthesized name this capture will print.
+ *
+ * A name over the cap is DROPPED, never truncated: the whole value of
+ * synthesizing it is that what the tree prints is what Playwright matches, and
+ * a clipped name is a selector that looks grounded and resolves nothing —
+ * strictly worse than the row being absent, which is the state this fixes.
+ */
+export const CONTENT_NAME_MAX_CHARS = 200;
+
+/**
+ * A name-from-content role's accessible name, assembled the way Playwright
+ * assembles it: the descendants' own names, in document order, single-spaced.
+ *
+ * Returns `''` when nothing names it, when the result is over the cap, or when
+ * the subtree is deeper than `depth` allows — all three meaning "do not print
+ * this row", because an approximate name is not worth having.
+ */
+function nameFromContent(
+  node: CdpAxNode,
+  byId: ReadonlyMap<string, CdpAxNode>,
+  depth = 6,
+): string {
+  const parts: string[] = [];
+  const walk = (current: CdpAxNode, left: number): void => {
+    if (left < 0) return;
+    for (const id of current.childIds ?? []) {
+      const child = byId.get(id);
+      if (child === undefined || child.ignored) continue;
+      const own = asText(child.name).trim();
+      if (own !== '') parts.push(own);
+      else walk(child, left - 1);
+    }
+  };
+  walk(node, depth);
+  const name = parts.join(' ').replace(/\s+/g, ' ').trim();
+  return name.length > CONTENT_NAME_MAX_CHARS ? '' : name;
+}
 
 export const HEAL_STRATEGIES = [
   'role',
@@ -170,6 +235,16 @@ reject them outright:
   WRONG:     role=button[name="Edit"].first()   <- not a real selector, never
                                                     resolves
 
+CONTAINMENT — the tree is INDENTED, two spaces per level: a line indented
+under another is INSIDE it. That is the only thing \` >> \` scopes to:
+  row "Acme Ltd Standard Delete"
+    button "Delete"
+  => role=row[name="Acme Ltd Standard Delete" i] >> role=button[name="Delete" i]
+Never scope to a container the control is not indented under. A landmark
+(search, form, region, navigation) is a CONTAINER, not a control: if the input
+you want is not indented beneath it, write the input's own selector instead of
+scoping into it.
+
 CANONICAL FORM — one way to write each thing, so the same tree yields the same
 selector every time:
 - A control with a role and a name in the tree is ALWAYS written as
@@ -278,7 +353,13 @@ ${selfCheck([
  * is entirely in the *second* ask, which is the first one that knows what did
  * not work.
  */
-const HEAL_ATTEMPTS = 3;
+/**
+ * Repair asks per failed selector. The value is entirely in the SECOND ask —
+ * the first one that knows what did not work (`HealRequest.rejected`). One was
+ * too few for the failure that actually happens; exported so
+ * `tests/healer-economy.test.ts` can pin the budget rather than trust it.
+ */
+export const HEAL_ATTEMPTS = 3;
 
 /**
  * The healer could not repair the selector, and here is everything it tried.
@@ -340,7 +421,7 @@ const HIDDEN_OK_ACTIONS: ReadonlySet<string> = new Set(['expectCount', 'saveCoun
  * control — is not.
  */
 const ACTING_ACTIONS: ReadonlySet<string> = new Set([
-  'click', 'fill', 'type', 'paste', 'selectOption', 'check', 'uncheck', 'press', 'scrollTo', 'fillRetry', 'upload',
+  'click', 'fill', 'type', 'paste', 'selectOption', 'check', 'uncheck', 'press', 'scrollTo', 'hover', 'fillRetry', 'upload',
 ]);
 
 /** Whether two selectors are the same repair, ignoring case-flag and spacing noise. */
@@ -351,15 +432,28 @@ function sameSelector(a: string, b: string): boolean {
 }
 
 export function buildUserPrompt(request: HealRequest, hints?: HealHints): string {
+  // FENCED at assembly, never at the source: the tree, the repository hints
+  // and the background slices are all third-party text, and the one thing a
+  // repair must not do is propose a selector out of a rewritten tree. Only
+  // the prompt string is sanitised — `focusTreeText` below, `selectorGrounded`
+  // and the cache all keep reading the tree as the page wrote it. The failed
+  // selector and the action are the harness's own and go in as they are.
   const lines = [
-    `Page URL: ${request.url}`,
+    `Page URL: ${sanitizeInline(request.url)}`,
     `Attempted action: ${request.action}`,
     `Failed selector: ${request.failedSelector}`,
   ];
-  if (request.failureReason) lines.push(`Why it failed: ${request.failureReason}`);
-  if (request.intent) lines.push(`Author intent: ${request.intent}`);
+  if (request.failureReason) lines.push(`Why it failed: ${sanitizeInline(request.failureReason)}`);
+  if (request.intent) lines.push(`Author intent: ${sanitizeInline(request.intent)}`);
   if (request.caseContext) {
-    lines.push(`The test case this step serves (context, not the thing to repair): ${request.caseContext}`);
+    // A block, not a folded line: this is the same `Flow.caseContext` card the
+    // agent is shown, it runs to many lines, and an inline bound would cut a
+    // long one silently. Same source label as the agent gives it, so the
+    // fencing is one thing across the roles rather than per-prompt taste.
+    lines.push(
+      'The test case this step serves (context, not the thing to repair):',
+      fence('catalog', request.caseContext),
+    );
   }
   // Advisory context, before the tree so every re-ask of this heal keeps a
   // byte-identical prefix (`rejected` alone grows between attempts). Framing
@@ -368,14 +462,14 @@ export function buildUserPrompt(request: HealRequest, hints?: HealHints): string
     lines.push(
       '',
       'What the repository declares about this page (advisory — the accessibility tree below is the page as it stands, and your candidate must come from it):',
-      hints.repoHints,
+      fence('repository', hints.repoHints),
     );
   }
   if (hints?.background) {
     lines.push(
       '',
       'Background documents matching this step (context for intent, never candidate material):',
-      hints.background,
+      fence('repository', hints.background),
     );
   }
   if (request.action === 'expectCount') {
@@ -405,9 +499,15 @@ export function buildUserPrompt(request: HealRequest, hints?: HealHints): string
     focusQuery === ''
       ? request.axTree
       : focusTreeText(request.axTree, focusQuery, HEAL_TREE_MAX_LINES).text;
-  lines.push('', 'Accessibility tree:', tree);
+  // The label says what the indentation MEANS. Same position as it always
+  // held, so the prompt prefix a re-ask shares is unmoved.
+  lines.push(
+    '',
+    'Accessibility tree (indented: a line indented under another is inside it):',
+    fence('page', tree),
+  );
   if (request.interactions) {
-    lines.push('', 'Controls revealed by opening disclosures on page:', request.interactions);
+    lines.push('', 'Controls revealed by opening disclosures on page:', fence('page', request.interactions));
   }
   // The rejected list is the only part that grows between attempts; keeping it
   // after the tree leaves attempts 1-3 sharing a byte-identical prefix, which a
@@ -416,7 +516,7 @@ export function buildUserPrompt(request: HealRequest, hints?: HealHints): string
     lines.push(
       '',
       'Already tried and rejected — do NOT propose any of these again:',
-      ...request.rejected.map((entry) => `  - ${entry}`),
+      ...request.rejected.map((entry) => `  - ${sanitizeInline(entry)}`),
     );
   }
   return lines.join('\n');
@@ -447,26 +547,39 @@ export interface LlmHealerModelOptions {
  * right fit for the fastest free tier rather than the smartest one.
  */
 export class LlmHealerModel implements HealerModel {
-  readonly id: string;
-
   readonly #source: ModelSource;
   readonly #maxOutputTokens: number;
   readonly #maxRetries: number;
   readonly #hints: HealHintsProvider | undefined;
+  readonly #givenId: string | undefined;
 
   constructor(options: LlmHealerModelOptions = {}) {
     this.#hints = options.hints;
     if (options.model) {
       this.#source = { model: options.model };
-      this.id = options.id ?? 'custom:healer';
+      this.#givenId = options.id ?? 'custom:healer';
       this.#maxRetries = options.maxRetries ?? 2;
     } else {
       const factory = options.factory ?? new LlmFactory();
       this.#source = { factory, role: 'healer' };
-      this.id = options.id ?? factory.forRole('healer').id;
+      this.#givenId = options.id;
       this.#maxRetries = options.maxRetries ?? factory.maxRetries;
     }
     this.#maxOutputTokens = options.maxOutputTokens ?? 1024;
+  }
+
+  /**
+   * The model's label, and never a key demand. The CLI builds a healer for
+   * every run and the bundle records `healerModel` before the first step;
+   * resolving the role here demanded the healer's key on a flow that never
+   * healed — `wowlidator needs a Groq key to run the "healer" role` on a
+   * passing flow, exit 1. "A run that never heals never demands a key" is
+   * the factory's contract; the key is asked for by `suggest`, when a heal
+   * actually happens.
+   */
+  get id(): string {
+    if (this.#givenId !== undefined) return this.#givenId;
+    return 'factory' in this.#source ? this.#source.factory.labelFor('healer') : 'custom:healer';
   }
 
   async suggest(request: HealRequest): Promise<HealSuggestion> {
@@ -510,6 +623,8 @@ interface CdpAxProperty {
 
 interface CdpAxNode {
   nodeId: string;
+  /** The node's children, by id — how a name-from-content role is assembled. */
+  childIds?: string[];
   ignored?: boolean;
   role?: CdpAxValue;
   name?: CdpAxValue;
@@ -548,7 +663,7 @@ export async function captureAxTree(page: Page, maxNodes = DEFAULT_MAX_AX_NODES)
   const { nodes, truncated, total } = await captureAxTreeDetailed(page, maxNodes);
   if (nodes.length === 0) return '(no accessible elements found)';
 
-  const body = nodes.map(formatAxNode).join('\n');
+  const body = formatAxTree(nodes);
   if (!truncated) return body;
 
   // Absence of evidence is not evidence of absence. Without this notice a
@@ -585,13 +700,18 @@ async function captureAxTreeDetailed(
   const all = await captureAxNodes(page, Number.MAX_SAFE_INTEGER);
   if (all.length <= maxNodes) return { nodes: all, truncated: false, total: all.length };
 
-  const interactive = all.filter((n) => INTERACTIVE_ROLES.has(n.role));
-  const rest = all.filter((n) => !INTERACTIVE_ROLES.has(n.role));
-  const kept = [...interactive.slice(0, maxNodes), ...rest].slice(0, maxNodes);
-
-  // Restore document order so the tree still reads like the page.
   const order = new Map(all.map((n, i) => [n, i]));
-  kept.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
+  const priority = [
+    ...all.filter((n) => INTERACTIVE_ROLES.has(n.role)),
+    ...all.filter((n) => !INTERACTIVE_ROLES.has(n.role)),
+  ].map((n) => order.get(n) as number);
+
+  // A kept node brings its containers with it. Cutting a parent and keeping
+  // its child leaves a line indented under whatever happens to precede it —
+  // an indent that lies, which is worse than a flat list, because it reads as
+  // authority. `keepWithAncestors` spends the same budget and returns
+  // document order.
+  const kept = keepWithAncestors(all, priority, maxNodes).map((i) => all[i] as AxNode);
 
   return { nodes: kept, truncated: true, total: all.length };
 }
@@ -631,6 +751,26 @@ export interface AxNode {
    * `/benefits-hub/referral`. The URL was sitting in the tree the whole time.
    */
   url: string;
+  /**
+   * How many PRINTED ancestors this node has — the containment a flat listing
+   * threw away.
+   *
+   * Playwright selectors are hierarchical (`role=row[name="…"] >> role=button
+   * [name="Delete" i]`), and until 2026-09-11 the rendered tree was a flat
+   * list of lines: which node sat inside which was something the author and
+   * the healer could only GUESS. Measured on be-sit-high-sonnet-th-20260911-
+   * 162004: 56 of the run's 93 failure events were "could not resolve", 20 of
+   * them scoped selectors, and the healer's own reasoning gave the tell —
+   * "the search landmark 'ค้นหา' does not contain a child with role=textbox
+   * IN THE TREE", reasoning about containment from a rendering that had none.
+   *
+   * Counted over the nodes that SURVIVE the prune, never over the DOM: a
+   * dropped `generic` must not create a level, or the indentation would lie
+   * about containment while looking authoritative — worse than no indentation
+   * at all. Optional so hand-built nodes and older captures keep their shape;
+   * absent reads as 0 and renders flat, exactly as before.
+   */
+  depth?: number | undefined;
 }
 
 /**
@@ -648,18 +788,62 @@ export async function captureAxNodes(
   try {
     await session.send('Accessibility.enable');
     const tree = (await session.send('Accessibility.getFullAXTree')) as unknown as CdpAxTreeResponse;
+    const all = tree.nodes ?? [];
+
+    // Indexed once: a name-from-content role is assembled from its children,
+    // and the flat CDP list gives them by id only.
+    const byId = new Map<string, CdpAxNode>();
+    for (const node of all) byId.set(node.nodeId, node);
+    // Containment comes from CDP's OWN parentage, never from the order the
+    // nodes arrive in: document order cannot tell "inside" from "after", and
+    // that difference is the whole point of an indented tree. `childIds` is
+    // on every build; `parentId` is not, so the edges are inverted here.
+    const parentOf = new Map<string, string>();
+    for (const node of all) {
+      for (const id of node.childIds ?? []) if (!parentOf.has(id)) parentOf.set(id, node.nodeId);
+    }
+
+    // Pass 1 — who survives the prune, and the name each survivor prints.
+    // Separated from the emit pass below because a node's DEPTH depends on
+    // which of its ancestors survive, and an ancestor may be decided after it
+    // in a malformed tree.
+    const printed = new Map<string, string>();
+    for (const node of all) {
+      if (node.ignored) continue;
+      const role = asText(node.role);
+      if (!role || NOISE_ROLES.has(role)) continue;
+      let name = asText(node.name);
+      // Chrome leaves a row unnamed; Playwright names it from its cells. Print
+      // the name Playwright will match, so a row-scoped selector can ground.
+      if (name === '' && NAME_FROM_CONTENT_ROLES.has(role)) name = nameFromContent(node, byId);
+      if (!name && !INTERACTIVE_ROLES.has(role)) continue;
+      printed.set(node.nodeId, name);
+    }
+
+    // Pass 2 — depth as the count of PRINTED ancestors. A pruned `generic`
+    // contributes nothing, so its children reattach to the nearest ancestor
+    // the tree actually shows. The guard is for a malformed parent cycle: a
+    // capture must never hang the repair it is being spent on.
+    const depths = new Map<string, number>();
+    const depthOf = (id: string, guard = 0): number => {
+      const memo = depths.get(id);
+      if (memo !== undefined) return memo;
+      const parent = parentOf.get(id);
+      const value =
+        parent === undefined || guard > MAX_ANCESTOR_WALK
+          ? 0
+          : depthOf(parent, guard + 1) + (printed.has(parent) ? 1 : 0);
+      depths.set(id, value);
+      return value;
+    };
 
     const nodes: AxNode[] = [];
     let popupReads = 0;
-    for (const node of tree.nodes ?? []) {
+    for (const node of all) {
       if (nodes.length >= maxNodes) break;
-      if (node.ignored) continue;
-
+      const name = printed.get(node.nodeId);
+      if (name === undefined) continue;
       const role = asText(node.role);
-      if (!role || NOISE_ROLES.has(role)) continue;
-
-      const name = asText(node.name);
-      if (!name && !INTERACTIVE_ROLES.has(role)) continue;
 
       let value = asText(node.value);
       // **A popup button's visible text is its value.** A hand-rolled select
@@ -692,6 +876,7 @@ export async function captureAxNodes(
         ...(propertyFlag(node, 'readonly') ? { readonly: true } : {}),
         ...(propertyFlag(node, 'required') ? { required: true } : {}),
         url: propertyText(node, 'url'),
+        depth: depthOf(node.nodeId),
       });
     }
 
@@ -700,6 +885,9 @@ export async function captureAxNodes(
     await session.detach().catch(() => undefined);
   }
 }
+
+/** A bound on the parent walk, so a malformed cycle cannot hang a capture. */
+const MAX_ANCESTOR_WALK = 512;
 
 /** How many popup buttons one capture will read the DOM for — a bound on CDP round trips, not a feature. */
 const MAX_POPUP_VALUE_READS = 60;
@@ -749,6 +937,86 @@ export function formatAxNode(node: AxNode): string {
   return parts.join(' ');
 }
 
+/**
+ * The tree as the model reads it: one line per node, INDENTED two spaces per
+ * level of containment.
+ *
+ * Indentation was chosen over the alternatives because it is the only one that
+ * costs a bounded handful of characters per line and reads natively to a
+ * model. An explicit `parent=#id` marker on every line buys the same fact for
+ * several tokens a line and an indirection to resolve; a `in=row "…"` scope
+ * hint on every control repeats a long row name once per control, which on a
+ * 25-row table costs more than the rest of the tree put together. The tree's
+ * size is the healer's cost per repair, and hierarchy bought at a few percent
+ * is a different proposition from hierarchy bought at double.
+ *
+ * Indentation is RELATIVE to the lines actually present: a node whose parent
+ * was cut sits at the depth of the nearest ancestor that survived, so a
+ * truncated or narrowed tree still says only true things about containment.
+ * Nodes without a `depth` (hand-built, older captures) render flat — the
+ * output is then byte-identical to what this always emitted.
+ */
+export function formatAxTree(nodes: readonly AxNode[]): string {
+  const open: number[] = [];
+  const lines: string[] = [];
+  for (const node of nodes) {
+    const depth = node.depth ?? 0;
+    while (open.length > 0 && (open[open.length - 1] as number) >= depth) open.pop();
+    lines.push('  '.repeat(open.length) + formatAxNode(node));
+    open.push(depth);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * The printed ancestors of `nodes[index]`, outermost first.
+ *
+ * Reads the depths of a document-ordered capture: scanning back from a node,
+ * the first line shallower than it IS its parent, and so on up. That is a
+ * property of the pre-order the capture emits, not a guess — which is why
+ * this is the one place the chain is derived, and both subsetting sites
+ * (`captureAxTreeDetailed`, the agent's `focusTree`) use it rather than
+ * re-deriving containment from what a line happens to follow.
+ */
+export function ancestorIndexes(nodes: readonly AxNode[], index: number): number[] {
+  const chain: number[] = [];
+  let want = (nodes[index]?.depth ?? 0) - 1;
+  for (let i = index - 1; i >= 0 && want >= 0; i -= 1) {
+    const depth = nodes[i]?.depth ?? 0;
+    if (depth <= want) {
+      chain.push(i);
+      want = depth - 1;
+    }
+  }
+  return chain.reverse();
+}
+
+/**
+ * Choose nodes in priority order, and never orphan one: a candidate arrives
+ * with the containers it sits inside, or it does not arrive at all.
+ *
+ * A candidate whose missing ancestors would not fit the budget is SKIPPED
+ * rather than taken bare — the next candidate may still fit, and a line whose
+ * container is absent is exactly the case where indentation would mislead.
+ * Returns indexes in document order.
+ */
+export function keepWithAncestors(
+  nodes: readonly AxNode[],
+  priority: readonly number[],
+  maxNodes: number,
+): number[] {
+  const kept = new Set<number>();
+  for (const index of priority) {
+    if (kept.size >= maxNodes) break;
+    if (kept.has(index)) continue;
+    const missing = ancestorIndexes(nodes, index).filter((i) => !kept.has(i));
+    if (kept.size + missing.length + 1 > maxNodes) continue;
+    for (const i of missing) kept.add(i);
+    kept.add(index);
+  }
+  return [...kept].sort((a, b) => a - b);
+}
+
 // --- Healer ----------------------------------------------------------------
 
 export interface JitHealerOptions {
@@ -768,6 +1036,13 @@ export interface HealOutcome {
   entry: HealedSelectorEntry;
   /** Wall-clock time of the whole repair, including AX capture and verification. */
   latencyMs: number;
+  /**
+   * What the pre-heal disclosure probe could not put back or could not do —
+   * a popover it opened and had to close with a click rather than Escape, or
+   * one it left open. Surfaced so a run can say the page state a heal ran on
+   * was the probe's doing, not the flow's.
+   */
+  probeWarnings?: string[] | undefined;
 }
 
 export interface HealInput {
@@ -814,10 +1089,19 @@ export class JitHealer {
     // trigger is clicked. The model cannot pick a selector for something it
     // cannot see. Failures are swallowed (a probe must never abort a repair).
     let interactions: string | undefined;
+    const probeWarnings: string[] = [];
     try {
       const report = await probeInteractions(input.page);
       const formatted = formatProbeReport(report);
       if (formatted) interactions = formatted;
+      probeWarnings.push(...report.warnings);
+      for (const probe of report.probes) {
+        // A disclosure that needed a click to close is a fact about the page
+        // worth recording: Escape is the gesture every later rung reaches for.
+        if (probe.closedVia !== undefined && probe.closedVia !== 'escape') {
+          probeWarnings.push(`"${probe.trigger}" ignored Escape and was closed by ${probe.closedVia}`);
+        }
+      }
     } catch {
       // Safe to ignore — disclosure probing is a best-effort enrichment.
     }
@@ -945,7 +1229,13 @@ export class JitHealer {
       model: this.model.id,
     });
 
-    return { selector: candidate, suggestion, entry, latencyMs: Date.now() - startedMs };
+    return {
+      selector: candidate,
+      suggestion,
+      entry,
+      latencyMs: Date.now() - startedMs,
+      ...(probeWarnings.length > 0 ? { probeWarnings } : {}),
+    };
   }
 
   /**

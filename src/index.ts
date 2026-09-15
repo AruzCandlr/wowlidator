@@ -14,6 +14,7 @@ export {
   LlmHealerModel,
   captureAxNodes,
   captureAxTree,
+  formatAxTree,
   DEFAULT_MAX_AX_NODES,
   DEFAULT_MIN_CONFIDENCE,
   HEAL_STRATEGIES,
@@ -435,17 +436,8 @@ export type {
 export {
   DATA_KINDS,
   generateValue,
-  isDeterministicKind,
   type DataKind,
 } from './data/mock-data.js';
-
-export {
-  LlmDataModel,
-  type DataGenerateRequest,
-  type DataGenerateResult,
-  type DataModel,
-  type LlmDataModelOptions,
-} from './data/data-model.js';
 
 export {
   LlmFlowRepairModel,
@@ -545,6 +537,7 @@ export {
   quoteIdent,
   type DbActionsOptions,
   type DbCheckRecord,
+  type DbStatementRecord,
   type FlowDbCalledSpec,
   type FlowDbDeltaSpec,
   type FlowDbRowSpec,

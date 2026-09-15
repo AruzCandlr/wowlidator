@@ -29,3 +29,165 @@ byte-identical prefix (`rejected` alone grows). The catalog path wires it via
 to what it always was.
 
 **The prompt also now says the author's role and name are a guess.** That is the deeper half of this case: the flow wanted "the Create Leave Request button" and the page offers a *link* named "Leave request Apply for leave" — a different role and a different name. A healer that treats the failed selector as a description of the element cannot cross that gap; one that treats it as an author's guess and matches on *intent* against the tree can. It now heals to `role=link[name="Leave request Apply for leave" i]` and says why.
+
+## What one heal costs (2026-09-09)
+
+The healer is reached only after a selector has failed every free rung of the
+ladder, so every heal is pure added cost on a step already going badly. The
+numbers, because a saving proposed without them is a guess:
+
+| Stage | Cost |
+|---|---|
+| `captureAxTree` | `DEFAULT_MAX_AX_NODES` 120, rendered to `HEAL_TREE_MAX_LINES` 60 after relevance ranking; indented, which costs ~1 token per indented line (see below) |
+| `probeInteractions` | disclosure probing upfront, `MAX_POPUP_VALUE_READS` 60 — failures swallowed, because a probe must never abort a repair |
+| model calls | up to `HEAL_ATTEMPTS` (3) |
+| `#verify`, per attempt reaching it | up to `verifyTimeoutMs`, **default 5,000 ms** |
+
+**Nothing overrides `verifyTimeoutMs`.** All three construction sites —
+`cli/runtime.ts:32`, `mcp/server.ts:484`, `mcp/server.ts:602` — take the
+default, so 5 s is the real budget everywhere. Worst case for one heal is three
+model calls plus ~15 s of verification timeout.
+
+`HEAL_TREE_MAX_LINES` is deliberately half the capture cap: generous enough that
+the intent's neighbourhood survives, small enough to matter on the token bill.
+
+**The tree is captured once, before the attempt loop, and only `rejected` grows
+between attempts.** That is what keeps the prompt prefix byte-identical across
+re-asks so the provider's prompt cache hits. Moving the capture inside the loop
+looks harmless — fresher, even — and silently destroys caching, making a "more
+accurate" healer several times more expensive. Same invariant as the memoised
+agent contract in `src/orchestrator/CLAUDE.md`.
+
+## The tree carries containment (2026-09-11)
+
+**A Playwright selector is hierarchical; the tree it was written from was
+flat.** `captureAxNodes` walked the CDP tree and pushed into an array;
+`formatAxNode` printed `role "name" value=… url=…` with no indentation, no
+parent, no child list. So `role=search[name="ค้นหา" i] >> role=textbox` and
+`role=row[name="…" i] >> role=button[name="Delete" i]` were authored — and
+repaired — by GUESSING which node sat inside which.
+
+Measured on `be-sit-high-sonnet-th-20260911-162004` (15 BE_SIT cases, HUMI
+SIT): of 93 failure events, 56 were "could not resolve", 26 "the text is not on
+the page", 5 "resolved, but the claim did not hold". 20 of the unresolved
+selectors were scoped with `>>`. The healer's own reasoning gave the tell — *"the
+search landmark 'ค้นหา' does not contain a child with role=textbox **in the
+tree**"* — a model reasoning about containment from a rendering that had none.
+The two cheaper explanations were ruled out first and neither held: the prune
+keeps unnamed interactive nodes (`textbox`, `searchbox` are both in
+`INTERACTIVE_ROLES`), and the whole 731 KB log holds exactly one `TREE
+TRUNCATED`. `NAME_FROM_CONTENT_ROLES` was the same defect fixed for one role.
+
+- **`AxNode.depth` counts PRINTED ancestors, taken from CDP `childIds`, never
+  from document order.** A pruned `generic` or an ignored node contributes no
+  level, so a child reattaches to the nearest ancestor the tree shows. An
+  indent that lies about containment is worse than no indent, because it reads
+  as authority.
+- **`formatAxTree` renders two spaces per level; `formatAxNode` still emits no
+  leading whitespace.** Indentation was chosen over an explicit `parent=#id`
+  marker (several tokens a line plus an indirection) and over an
+  `in=row "…"` scope hint (which repeats a long row name once per control — on
+  a 25-row table that costs more than the rest of the tree). Rendering stays
+  relative to the lines actually present, so a hand-built node list with no
+  depths is byte-identical to what this always emitted.
+- **Every subset of a tree is closed under containment.** Both places a subset
+  is chosen — the node budget (`captureAxTreeDetailed`) and the relevance
+  narrowing (`focusTreeText`, which the heal prompt and the author's journey
+  tree both run through) — take a candidate WITH its containers or not at all
+  (`keepWithAncestors`). A control kept while its row was ranked away would be
+  printed under whatever line happened to precede it, which is exactly the
+  reading a scoped selector is written from.
+- **The prompt says what the indentation means**, in the tree's own label and
+  in a CONTAINMENT block of `SELECTOR_SYNTAX_RULES` (shared, so the generator
+  authors from the same rule): a landmark is a container, and a control not
+  indented beneath it gets its own selector rather than a `>>`.
+
+What it costs, on a hand-built capture shaped like the failing pages (154
+printed nodes, 100 of them at depth 4 — a deliberately deep, short-named worst
+case; a real page is shallower):
+
+| Tree | Before | After |
+|---|---|---|
+| full capture, chars | 3,744 | 4,820 (+29%) |
+| at the 120-node cap, est. tokens | 611 | 853 (+40%) |
+| heal prompt tree, 60 lines, est. tokens | 432 | 577 (+34%) |
+| interactive controls at the 120-node cap | 96 | 90 |
+
+Against the ~3.2k input tokens a heal actually bills, the narrowed tree's +145
+tokens is about +4.5% per repair. The rest of the cost is the budget now buying
+containers as well as controls: six fewer controls per capture, and the
+containers are what make the remaining ones addressable. Estimated with one
+token per line's leading space run (BPE vocabularies hold whitespace runs), so
+the indent costs ~1 token per indented line whatever its depth — which is why
+two spaces was not worth shaving to one.
+
+Pinned by `tests/ax-tree-containment.test.ts` (hand-built CDP payloads — a
+pruned `generic`, an ignored node, a parent listed after its child, a parent
+cycle): depth from real parentage, no phantom level, no orphaned indent under a
+cut container at either subset site, and `formatAxNode` still whitespace-free.
+
+## The gate order is the design
+
+`echo check → confidence gate → verify`, and each position was placed by an
+incident:
+
+- **The echo check is first** because an echo is the same step again for a model
+  call and a 5 s timeout. Cut it before either is spent.
+- **It precedes the confidence gate** because an echo scored on confidence
+  reports "confidence too low" and hides the actual finding — that the model had
+  nothing new to say (PB-02-01, where echoes differing only by the case flag
+  were reported as low confidence).
+- **The confidence gate throws immediately, with no retry.** The prompt tells
+  the model to answer with low confidence when nothing in the tree serves the
+  intent; re-asking would only pressure it into being less honest. An honest
+  decline is a result, not a failure to retry.
+
+A check tidied into a different position here changes what the report says
+happened, not just what it cost.
+
+## The verify contract (`#verify`)
+
+A repair is cached only if it resolves to **exactly one element** — the safety
+net for every ordinary repair — **except for `expectCount`**, where matching
+several is the entire point (see the echo section above for why that exception
+had to exist).
+
+The state required varies by action, and the distinction is load-bearing:
+`attached` for `HIDDEN_OK_ACTIONS`, `visible` for `ACTING_ACTIONS`, `rendered`
+otherwise. Attached is not enough for a step that clicks, fills or reads — a
+hidden-only match passes a naive check and then fails the re-run at the healed
+timeout, having spent both. The refusal says so explicitly ("matched N
+element(s), none visible — a hidden control cannot serve this step") so the
+re-ask knows the candidate is off-screen rather than absent.
+
+## The cheapest heal is the one that never happens
+
+Two rungs upstream exist to keep this plane out of the loop, and extending them
+is usually a better move than making a heal cheaper:
+
+- **A content-only miss skips the healer entirely** (`isContentMiss`). Measured
+  on be100 PL_03_01: asked why `text=Total plans` did not contain "75", the
+  model proposed `text="68"` — find an element containing the expected value,
+  which is circular — at 0.20 confidence. The healer reads a static tree and
+  proposes a different string: the right tool for a WRONG SELECTOR, the wrong
+  one for a CONTENT miss.
+- **The free kin rung** (`ancestorSelectors`, `MAX_KIN_CLIMB` 2) sits ahead of
+  it: a summary card is a label and a value in sibling elements, and climbing to
+  the container that holds both costs nothing.
+
+## What is not pinned yet (2026-09-09)
+
+`HEAL_ATTEMPTS` was module-private until the economy assertions landed. The
+only dedicated healer test file is `tests/ax-tree-containment.test.ts`
+(2026-09-11), and it covers the CAPTURE, not the gates: the attempt budget, the
+echo check and the gate order are still pinned nowhere directly — coverage is
+indirect, through `tests/smoke.test.ts` (healer contract, `jitHeals` counters),
+`tests/model-fence.test.ts` and `tests/role-statelessness.test.ts`. A
+`tests/healer-economy.test.ts` is named in older notes and **does not exist**;
+check before citing it.
+
+Anything not asserted in those is unprotected: a later change can restore the
+cost and nothing goes red. Before optimising this plane, write the assertion
+first — the shape to copy is `tests/agent-economy.test.ts`, which asserts the
+model was *not* called, the only assertion that catches a regression whose
+symptom is a bill rather than a failure.

@@ -186,7 +186,7 @@ describe('LlmFlowRepairModel', () => {
   });
 
   it('resolves its id lazily, without demanding a key at construction', () => {
-    // Same fix as LlmDataModel's — the bug this session started from: eager
+    // Same fix as the retired LlmDataModel's — the bug this session started from: eager
     // `.id` resolution in the constructor threw for a role the flow never uses.
     assert.doesNotThrow(() => new LlmFlowRepairModel());
   });

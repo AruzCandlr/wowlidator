@@ -859,3 +859,1010 @@ The panel's job-6 (`--author-attempts 1`, so attempt 1 IS the last word) blocked
 - `insertStepBefore` / `appendOrInsert` skip a case whose `steps` IS the body's array (the folded single case shares it) — found by the test, it would have inserted twice.
 
 Tests: `tests/flow-author.test.ts` ("a script step is performed, never read as a noun, and the last word performs it (multirole ML_01_04)"): the noun rule, the workflow-leg rule, the compound rule, `settleScriptDemand` from the tree and to an agent leg, `settleWorkflowGoal`, and the pipeline shipping the ML_01_04 shape on attempt 1 of 1.
+
+## The authored host is the deployment host (2026-09-07)
+
+`foreignAuthoredHost` is a fatal authoring lint over setup and body steps. Every
+absolute HTTP(S) URL carried by a step must use the deployment URL's exact host;
+relative URLs and `{{variable}}` placeholders remain portable. The informed
+re-ask names both the authored and expected hosts and says that the run's own
+host is the only one this catalog may reach. This runs before route grounding:
+a typo in an origin is authored evidence failure, not an application environment
+error, and applies equally to `goto`, `signIn`, `request`, and any future step
+that carries a string `url`. Tests: `tests/flow-author.test.ts` ("authored
+absolute URLs stay on the deployment host").
+
+## Every step in plain language (`src/generator/step-narration.ts`, 2026-09-07)
+
+A step reads `✗ [10] selectOption (jit, 8412ms) role=combobox[name="Condition" i]  DEAD END`.
+That is precise and unreadable to anyone who did not build the harness, so
+`--narrate` (`WOWLIDATOR_NARRATE=on` is the same switch) has the healer-role
+model write one or two plain sentences per step onto `ProofStep.narration`
+before the bundle is persisted. Every surface then renders it from the bundle;
+`src/reporter/` still calls no model.
+
+Three properties are what make it safe to put model prose beside evidence, and
+none of them is decoration:
+
+- **It narrates the step's own line and is given nothing else.** The prompt
+  carries `formatStepLine(step)` verbatim — the text the run log already prints
+  — so a narration has no second source to contradict, and nothing reaches the
+  model that the log does not already show (an account is withheld by
+  `stepTarget`/`signInPersona` before it gets there; there is a test).
+- **It is descriptive, never authoritative.** `applyNarration` is the whole
+  trust boundary: an index the run never had is dropped, a superseded attempt is
+  never narrated, an empty answer leaves the step untouched, an existing
+  narration is never overwritten, and an essay is clipped. Nothing here sets a
+  status, files a defect or reaches the findings signature — that signature is
+  computed from typed fields precisely so one cause stays one finding whatever
+  language it is worded in, and prose would split it.
+- **It is attributed.** `StepNarration.by` carries the model id. `decisionFrom`
+  in `engine/runner.ts` established that synthesised words must never wear the
+  harness's voice; this obeys that rule by wearing the model's.
+
+**One call per case, not one per step** (`NARRATION_BATCH`, 40): a 440-case
+catalog narrating every step is 440 calls, not 4,000. **Off by default**, unlike
+the error diagnosis beside it — that one fires only on a case that ended as a
+system error, this one fires on every case that runs, and a suite that spends
+its window on prose finishes the rest of its cases on refusals (2026-09-05, 243
+cases). A missing healer key degrades silently to the step lines the report has
+always shown, and `narrateBundle` never throws: a batch that fails leaves its
+steps unnarrated.
+
+`wowlidator report --narrate` back-fills finished runs from the ledgers with no
+browser and no re-run, writing the narration into the proof bundle
+(temp-file + rename) and re-rendering that case's HTML report from it — so a run
+that was executed without the switch can be narrated afterwards, off the model
+window it did not spend at the time. Tests: `tests/step-narration.test.ts`.
+
+## A step the trees do not account for is looked up, never guessed (`src/generator/step-evidence.ts`, 2026-09-08)
+
+`value-resolution.ts` answers *"the sheet left this VALUE as a token — what is
+the value?"* from the cheapest source that can answer, and records which one
+did. This is the other half of the same question: **"the sheet names a control
+the captured tree does not show — does anything else state that the application
+renders it?"**
+
+Measured on be-cycle1-sit (440 rows, 2026-09-07/08). The run's authoring log
+holds **507** `the review could not ground it either` lines, and their reasons
+are one shape: *"the กฎเงื่อนไขสิทธิ์ page's accessibility tree was never
+captured, so there is no tree evidence for a button named 'ส่งออก CSV'"* —
+pages reached only through a `workflow` leg, an upload wizard, or a route the
+journey capture ranked past. Twice in the same run the review answered `keep`
+instead, quoting `messages/th.json` (RU_06_13, RU_06_10): the repository had
+declared the string all along, and an `agent` call was spent discovering what a
+string comparison settles for nothing. Of the 25 rows the run could not write,
+eight were `unperformedScriptSteps` and the missing line was always the leg on
+that uncaptured page.
+
+The chain is the EVIDENCE, not the model — but unlike the PY-1 capture case
+(2026-09-04), the evidence existed and was never consulted: the prompt's
+repository slice is ranked against the row's words and capped at
+`DEFAULT_CONTEXT_MAX_NODES`, so it is chosen *before* anyone knows which
+controls the model will name. So the stage is keyed on the STEP's own name,
+sited exactly where value resolution is — after the model, before the lints:
+
+- **The repository** (`fromRepository`, $0, no model). Every quoted string of a
+  `message` or `component` node's own detail, from the WHOLE index
+  (`declaredStringsOf`, built once per run by `declaredRenderings` in
+  `commands/authoring.ts`, never sent to a prompt), plus the row's own slice.
+  An EXACT fold-match is grounding; a longer declaration that merely contains
+  the name is an evidence line only — the run must match an accessible name
+  whole. This is the grounding order the prompt already states (tree, then
+  repository, then a workflow leg) and the source `ungroundedTextExpectation`
+  has accepted since 2026-08-28; what is new is that it is searched per step.
+- **The database** (`fromDatabase`), read-only, under `value-resolution`'s own
+  rails — the resolver's client and its `chooseDbLookup` question, every
+  identifier checked against the introspected schema before it reaches SQL, one
+  `SELECT count(*)`, `MAX_DB_LOOKUPS` (2) per row. Only `count > 0` answers,
+  and it answers exactly `ungroundedFixtureAssertion`'s doubt: that lint exists
+  because thirteen be100 cases asserted records the database never held, so a
+  fixture the data DOES hold is not a fixture it can doubt. A count of zero —
+  the shape of the `BE-XXX-999` mask the sheet writes for a value that must NOT
+  exist — leaves the refusal exactly where it was.
+- **The documents are deliberately NOT a source for a control.** A requirement
+  document's wording is what the tree's rendering is checked against, not a
+  substitute for it; the same run's own refusal of RU_09_03 (*"that is the
+  requirement document's wording, and the step will dead-end on every run"*) is
+  the rule this stage must not undo. Documents stay where they already ground
+  things: values (`fromRepo`) and paths (`applyReview`).
+
+What it may touch, and the asymmetry that keeps it honest:
+
+- **It may excuse a claim, never accuse one.** The lines it finds go to the
+  checks that read a declared string as GROUNDING — `ungroundedTextExpectation`
+  and `wordingClaimAssertsDataValue` (`groundingEvidence`) — and never to
+  `workflowOverDeclaredControls`, which reads one as a PROHIBITION on an agent
+  leg (`codeEvidence`). A lookup meant to ground a step must not become a new
+  way to refuse it.
+- **The $0 audit stops paying for what the index already says.**
+  `ReviewEvidence.declaredControls` carries the names matched EXACTLY, and
+  `auditGrounding` treats a selector on one as grounded; `declaredEvidence`
+  puts the lines in the reviewer's own evidence so a decision it does make can
+  quote one. Nothing here is a model's word for it — the match is a string
+  comparison the harness performed. Roles are untouched:
+  `ungroundedSelectorRole` stays tree-only, because the index says what the app
+  renders, not what role it renders it as.
+- **Provenance travels on the step**, the value resolver's shape: the intent
+  ends `[evidence: repository — messages/th.json declares "ส่งออก CSV"]`, the
+  flow's `notes` carry the summary, the log prints one line per lookup. No
+  `FlowStep` field was added — an intent suffix is what every report already
+  renders, and `unperformedScriptSteps` / `expectedItemsIn` read the intent's
+  HEAD.
+- **Silence declines.** No tree, or a truncated one, and the stage returns
+  nothing — the rule every grounding lint follows. `expectHidden` and a zero
+  `expectCount` are exempt: asserting that something is not rendered needs no
+  rendering. Never fatal: a source that throws is a source that did not answer,
+  and the refusal that follows is the one this had before.
+
+**And the script steps the flow never reached are now performed, not merely
+noted** (`settleUnperformedScript`). `unperformedScriptSteps` was fatal with a
+`settle` that wrote a note — while the machinery to perform an uncovered script
+line from evidence already existed for `skipsAuthoredScript`
+(`settleScriptDemand`) and was simply not wired to it. At the last word only,
+each missing numbered line in script order: every `Field = value` pair on it
+(or the Test data pair whose key it names) whose field a captured tree names
+becomes the entry step that tree line's ROLE dictates; a line nothing grounds
+becomes ONE `workflow` leg carrying the sheet's own words, inserted before the
+first step citing a later script step — else before the flow's first assertion,
+so the action precedes the check. Two limits are the whole safety of it:
+**only a line that asks the tester to ACT** (`scriptDemand`, any tier) is
+performed — `8. ตรวจสอบ Employee Profile ใน EC` is an assertion the flow
+omitted, and performing it as an agent leg would make the agent the witness for
+its own claim — and `MAX_SETTLED_SCRIPT_LEGS` (3) bounds the delegation, the
+rest being named as not covered. It **never returns null**: a settlement that
+can insert nothing returns exactly the note this used to return, so no row that
+was handed over before is refused because of this. `import` / `นำเข้า` joined
+`authoring.script.acting` in `value-rules.ts` beside `upload`/`อัปโหลด` — the
+live rows' own verb, in both of the sheets' languages.
+
+Why none of it can make a result worse: the lookup adds evidence and never a
+step, a claim or an assertion; a name nothing declares is reported `unanswered`
+and the lint refuses it as before; the audit stand-down replaces an `unsure`
+the review was already returning for free; the fixture filter drops a fact only
+when the database states the row exists; the settlement inserts preparation the
+sheet itself scripts, into flows that were being BLOCKED outright, and cannot
+reduce `substantiveAssertions` — so a vacuous flow cannot be made out of a
+proving one.
+
+Two pure readers moved to the new module so there is one definition of each
+beside the lookup that uses them — `selectorsOf` and `declaredControlStrings`,
+both re-exported from `flow-author.ts`, so every caller and test keeps its
+import. Verified offline against the live rows through the modules themselves
+(no catalog command, a run was in flight): RU_10_11's `ส่งออก CSV` grounded
+from a message node with the audit's finding going 1 → 0, RU_09_54's step 2
+performed as a leg before its assertion, a `ตรวจสอบ` line left as not covered,
+a mask answering nothing, and no tree answering nothing. Tests:
+`tests/step-evidence.test.ts` (21, the module), `tests/flow-author.test.ts`
+("a step the trees do not account for is looked up, never guessed", "the script
+steps the flow never reached are performed, not merely noted"),
+`tests/flow-review.test.ts` (the audit's declared-control rule, and the
+either/or alternative judged on its own).
+
+## A thin claim is looked up before it is merely noted (`src/generator/concretise.ts`, 2026-09-09)
+
+A `weak` refusal is handed over with a note and nothing else, and the comment
+in `#authorWithRetries` says why: the re-ask used to run for weak violations
+too and **bought nothing measurable** — the model was told its leg was
+unchecked, came back with the same leg because it could not see the page, and
+the weak result was accepted anyway two calls and a minute later. That
+reasoning is about a **re-ask**, and it still holds. What it never covered is
+the case where a NEW FACT exists and nobody looked it up.
+
+Measured on be-high-en (2026-09-09, the 15 High rows of be-cycle1-sit): **12 of
+15 flows carried `the sheet's Destination (…/humi/en/login) is not followed`**,
+every one of them navigating perfectly well. The chain:
+
+- The sheet's Steps column opens EVERY row with the same preamble — *QA default
+  locale = en; เริ่มที่ https://…/humi/en/login และใช้ /humi/en/ สำหรับทุก route* —
+  and states the case's real page on the next line as a **bare path**,
+  `0. Route อ้างอิง /humi/en/admin/benefits/plans`.
+- `destinationOf` (`catalog/test-case-table.ts`) takes the FIRST url in Steps.
+  `URL_RE` needs a scheme, so the bare path cannot match and the login URL
+  always wins: every row in the workbook records the sign-in page as its
+  `Destination`.
+- `ignoresMenuPath` then reports, truly and uselessly, that the body never
+  navigates there — and its remedy is *"After the sign-in, goto that URL"*,
+  which no correct flow can perform. Two rows (PL_07_02, PL_08_01) crossed the
+  refusal threshold when a second, genuine complaint joined it and burned all
+  three attempts producing variants that tripped the same lint.
+
+So a weak complaint may now carry a **`concretise`** hook beside `settle`, run
+in the accept path before the notes are composed. It is handed
+`ConcreteEvidence`, assembled from what the run **already knows** at that point
+— no query, no model, no I/O:
+
+- `routes` — `FlowAuthor`'s `#declaredRoutes`, the indexed repository's route
+  patterns;
+- `existingFixtures` — `StepEvidenceOutcome.existingFixtures`, which
+  `step-evidence.ts` has already resolved from the read-only database **before
+  any lint ran**. There is deliberately no second database path here: a lookup
+  this module performed itself would be `fromDatabase` written twice.
+
+Three rules, and each is load-bearing:
+
+- **It may make an existing claim concrete; it may never add one.** Naming a
+  route, inserting the navigation that reaches it, or scoping a step to the row
+  the case is about are things the sheet already asked for. An `expect*` the
+  sheet never wrote would be an expected result nobody specified — what the
+  whole claim-fidelity family exists to prevent. Navigation and scoping only.
+  The guard is the contract in `concretise.ts` and the shape of the code, not a
+  mechanical assertion count (a deliberate choice, 2026-09-09); a future
+  concretiser that adds an assertion would break it silently, so read the
+  contract before writing one.
+- **Evidence may excuse a claim, never accuse one** — `step-evidence.ts`'s own
+  asymmetry, applied again. Nothing here can raise a refusal or change a
+  severity; a concretiser that finds nothing returns null and the lint's note
+  stands exactly as written.
+- **Travelling counts, not just `goto`.** A menu case is explicitly told NOT to
+  jump by URL (*ไม่เปิด URL ข้าม assertion*) and reaches its page by clicking
+  crumbs. `flowTravels` counts a `click` and a `workflow` leg, so a correctly
+  authored menu case is `honoured` rather than having a `goto` spliced into it
+  — which would destroy the very thing that case tests.
+
+`concretiseRoute` is the one wired concretiser and returns a pure decision the
+caller performs: `honoured` (the case's real page is declared and the flow
+reaches it — the note becomes the fact, and the 12 false positives go quiet),
+`navigate` (declared, and the flow reaches no page at all — a `goto` is
+inserted through `insertStepBefore`, marked `[generated: …]`), or `null` (the
+repository declares none of the paths the case names — silence declines, the
+rule every grounding lint here follows).
+
+**The root cause was fixed the same day** — see the section below. This layer
+stays: it is the general mechanism for sharpening a thin claim from evidence,
+and the route half now fires only where the extractor legitimately has no URL.
+
+Tests: `tests/concretise.test.ts` (13, unit tier, every case quoting the live
+sheet's preamble).
+
+## A sign-in URL is never a destination (`catalog/test-case-table.ts`, 2026-09-09)
+
+The extractor half of the section above, fixed at the root after the
+be-high-sonnet run measured what it costs.
+
+`destinationOf` took the FIRST absolute URL in Steps, then in Menu. The live
+sheet opens **every** row's Steps column with the same preamble — *QA default
+locale = en; เริ่มที่ https://…/humi/en/login และใช้ /humi/en/ สำหรับทุก route* —
+and writes the case's real page on the next line as a **bare path**
+(`0. Route อ้างอิง /humi/en/admin/benefits/plans`), which carries no scheme and
+so cannot match. Every one of the workbook's 429 rows therefore recorded the
+sign-in page as its destination.
+
+Measured on the 15 High rows (2026-09-09, sonnet-low authoring): **14 of ~30
+authoring complaints** were `ignoresMenuPath` reporting, truly and uselessly,
+that the flow never navigates to the sign-in page — with a remedy ("after the
+sign-in, goto that URL") that no correct flow can perform, so the model burned
+its whole budget producing variants that tripped the same lint. It induced the
+**seven `loginProofAssertsLoginPage` refusals** beside it, too: told its
+destination was `/humi/en/login`, the model proved the login by expecting the
+URL to contain `/humi/en` — which the login page already satisfies, so the
+assertion holds precisely when the sign-in did NOT take.
+
+`statedDestinationUrl` is now the reader, and the rule is absolute: **a sign-in
+URL is never a destination.** Not deprioritised — never. Signing in is what
+setup does, and `ignoresMenuPath` judges the BODY alone, so a login destination
+can only ever be a complaint no flow can answer, even on a row that genuinely
+is about signing in. A row naming a real page anywhere in Steps or Menu still
+gets it, wherever in the cell it appears; a row naming only sign-in surfaces
+answers null, and `CaseDestination` still carries the tab and the menu path, so
+`describeCase` renders `Destination: (the menu path above)` and the flow is
+judged against the crumbs — which is what these sheets intend, since they also
+say *ไม่เปิด URL ข้าม assertion*.
+
+`LOGIN_URL_PATTERN` moved from `flow-author.ts` to `value-rules.ts` — the leaf
+module the catalog parser already imports, the precedent set when the authoring
+vocabulary became data — and is re-exported from `flow-author.ts`, so every
+caller and test keeps its import. `concretise.ts`'s own `ENTRY_PATH` was
+deleted in favour of it: that constant's comment says two spellings of "is this
+a login URL" would drift, and a looser one had already misread a payroll app's
+`/admin/config/sso` once (PY-1 TC_SSO_001_001).
+
+Why it cannot make a result worse: the reader only ever declines to name a
+destination it used to name wrongly, and declining routes the judgement to the
+menu path the same row already carries. Nothing gains a destination it did not
+have. Tests: `tests/sheet-grammar.test.ts` ("a sign-in URL is never a
+destination"), including the `sso` case that must NOT be read as sign-in.
+
+## Three date-grammar gaps the second pass left (2026-09-09)
+
+`tests/value-resolution.test.ts`'s "the date grammar the second pass needed"
+had been red, and because `node:test` stops a test at its first failed
+assertion, one visible failure was hiding three independent gaps. Each is fixed
+structurally — the sheets' words stay data in `value-rules.ts`, and no phrase is
+special-cased.
+
+- **A relation may be preceded by the word for "date".** `ก่อน Hire Date 1 ปี`
+  and `วันก่อน Hire Date 1 ปี` both resolved; `วันที่ก่อน Hire Date 1 ปี`
+  resolved to nothing, because `before` listed `วันก่อน` and `ก่อน` but not the
+  third compound — the same enumeration that had already forced `วันที่ตั้งแต่`
+  into `prefixes` beside `ตั้งแต่`. `dates.dateNouns` (`วันที่`, `วัน`, `date`)
+  is now its own list and compiles as an OPTIONAL prefix on the `before` /
+  `after` matchers and on the phrase-shape probe. It consumes nothing alone —
+  a relation WORD must follow — so `วันที่ 20`, a bare day, parses exactly as
+  before. Pairs no longer multiply: any relation word gains the compound free.
+- **The amount may be written on either side of the relation.** English fronts
+  it (`2 weeks after Hire Date`), Thai trails it (`ก่อน Hire Date 1 ปี`), and
+  only the trailing order parsed — every fronted phrase was null. A leading
+  `<n> <unit>` is now consumed before the relation, but only when a relation
+  word actually follows (a lookahead leaves the word for the matcher below), so
+  a phrase that merely opens with a quantity — `3 วันก่อน`, an offset in its own
+  right — is untouched.
+- **A sign glued to a word is part of the word, not an operator.** The
+  remark-set-aside branch refused any trailing text matching `/[+\-−]\s*\d/`,
+  unanchored — so the `-41` inside the case id `E2E-41` read as "minus 41
+  days" and `14 เมษายน รันคู่กับ E2E-41` returned null instead of 14 April with
+  the remark set aside. The guard now requires the sign to open the remark or
+  follow a space. This is the rule `relationWord` already applies to `<` (a
+  symbol relation must be followed by a space, so `<runtime>` is never a date),
+  applied to the other end of the same problem.
+
+Why none can make a result worse: each widens what parses and narrows nothing.
+A phrase that resolved before resolves to the same date — the optional noun and
+the leading amount are both gated on a relation word that must still be there,
+and the guard change only stops a false positive inside a token. Tests:
+`tests/value-resolution.test.ts` (57, all green; the suite had been 56/57).
+
+## A tooltip is in no tree, and a confession is evidence (2026-09-09, be-high-sonnet PL_07_01 / RU_06_01)
+
+One 14-row slice carried the same Expected line six times — `2.1 แสดง Tooltip
+ข้อความ "Make Correction" เมื่อนำเมาส์ไปวาง` — and four lanes authored four
+different things for it: `expectAttribute role=button[name="Insert" i] title=
+"Insert"` (RU_07_01, passed, the grounded shape); `expectVisible role=button
+[name="Delete" i]` (RU_08_01, passed); `expectVisible text="Make Correction"`
+(RU_06_01, failed, healed to `>> visible=true >> nth=0`, then **passed against
+`span "Make Correction" · 110×23 at (549,100)` — the breadcrumb**, a green
+about a tooltip nobody hovered; `[c9] text=Create` did the same against `span
+"Create Plan"`); and `expectVisible role=tooltip[name="Make Correction" i]`
+(PL_07_01, 5 attempts × 5000 ms, three times, `dead-end`, filed against the
+application). The preceding agent leg had hovered successfully — the proof
+bundle's step 5 records `hover role=button[name="Make Correction" i] >> nth=0
+— ok` — so the app exposes no `tooltip` role at all.
+
+**No grounding lint spoke on any of them, and two separate guards were why.**
+`ungroundedSelectorRole` bails on line one when the tree carries `TREE
+TRUNCATED` (the journey capture of the plans table blew the 200-node budget)
+and bails again at a `workflow` step — and journey capture puts a leg at index
+0 of every row whose destination is not the start page, so 9 of 14 flows in
+this run had a leg and 3 were unjudged from step 0. Three changes, and one the
+evidence talked me out of:
+
+- **`ungroundedSelectorRole` has two tiers, because silence and contradiction
+  are different evidence.** SILENCE — the role is in no tree line — is still
+  judged only on a COMPLETE tree with no leg before the step: past the node
+  budget or past a leg, a missing role may be perfectly real. CONTRADICTION —
+  a tree line renders this very accessible NAME under a DIFFERENT role — is
+  judged always. That line is positive evidence in hand: it says what the
+  thing called "Make Correction" IS on the page the capture read. Truncation
+  cannot take a line away and a leg does not unwrite one. The contradicting
+  line is now returned FIRST in `nearest`, which is what `settleSelectorRole`
+  needs to repoint from, so the last word is `role=button[name="Make
+  Correction" i]` rather than a blocked row. The disabled tier keeps both of
+  its original guards: "disabled at rest" is a fact about the captured page,
+  and past a leg the flow is no longer on it.
+- **`admitsUngroundedSelector` (fatal, settles by annotating).** Twice in one
+  run the model wrote its own verdict into the step's intent — *"not confirmed
+  by any captured tree so this is best-effort"* (PL_07_01), *"not captured in
+  the tree; selector guessed from the case wording"* (PL_06_01, three steps) —
+  and the harness shipped the step because no rule read the intent. A
+  confession is the cheapest evidence there is: no tree, no lookup, no model
+  call. Two structural exclusions: a `workflow` step (its goal is the shape
+  the other refusals steer TO), and everything past the `[generated:` marker
+  (this file's own settles write "no captured tree names its control" as a
+  disclosure of a rewrite already made — reading that back as the model's
+  confession would refuse the harness's own honesty; the PL_06_01 flow has
+  both shapes, one step apart, and the lint separates them). Every admission
+  word names the EVIDENCE or the guess about a selector: a bare hedge was
+  tried and removed the same hour, having over-fired on RU_06_12's *"Line 3.1
+  (best-effort, blocked): … exact quoted values cannot be asserted because …"*
+  — an honest note about a value the sheet leaves unavailable, on a selector
+  the tree does render.
+- **`unanchoredHoverAssertion` (fatal, settles by anchoring).** The case's own
+  words claim a hover surface, the assertion's selector head names no role,
+  and a captured tree renders that very text as some control's accessible
+  NAME: refused, and the last word rewrites `text="Make Correction"` to
+  `role=button[name="Make Correction" i]`, keeping any `>> nth=0` tail. A
+  roleless `text=` matches every node holding those words; the anchored form
+  only the nodes of that role, so the rewrite is strictly narrower and can
+  cost the flow no claim it had. Where no tree line renders the text there is
+  nothing to point at and the step is left alone — absence is
+  `ungroundedTextExpectation`'s business, with its sheet-verbatim exemption.
+- **A `<claims>` rule states the shape once**: a tooltip is in NO tree —
+  nothing hovers while the page is read — so on the page at rest its words are
+  the accessible NAME of the control that shows it; assert that control by the
+  role and name the tree gives it, or `expectAttribute` the same control with
+  `"name": "title"` (else `aria-label`) where the app carries it there. Never
+  a bare `text="X"`. The words are data (`value-rules.ts`,
+  `authoring.hoverClaim` / `authoring.admission`); the structure is in the
+  lints.
+
+**What the evidence talked me out of:** making the `workflow` bail-out a
+`continue` in `ungroundedOnTruncatedTree` and `ungroundedTextExpectation` too.
+Both judge only ABSENCE, and past a leg the captured part does not describe the
+page at all. Measured on PL_07_01's own body with that change in place:
+`expectVisible role=button[name="Cancel" i]` — a control of the make-correction
+page, which the after-click capture holds and the narrowing had cut — was
+flagged and would have been demoted to an agent leg, which is precisely what
+the truncated-tree lint's own never-the-last-proof guard exists to prevent.
+They keep the stop; what speaks past a leg is positive evidence, and a name has
+no contradiction tier. The gap that remains is real: a step after a leg, on a
+page the JOURNEY capture did read, is judged by nothing — the harness cannot
+tell which of the captured pages a given step is on. Naming that would need
+page tracking through the flow, not a wider lint.
+
+**Not fixable here:** `hover` is an AGENT action (`workflow-agent.ts`), not an
+engine one — there is no `hover` in `FlowStep`, and the `script: [{action:
+"hover", …}]` visible in PL_07_01's flow file was written back after the run by
+the flow-file script rung (`scriptOf`), not authored. So the authoring plane
+cannot write "hover C, then assert"; the strongest grounded shape it has is
+the control's own name plus `expectAttribute`. RU_07_01's model said so itself
+— *"no hover action available; asserted via title"*. An engine `hover` action
+is `engine-expert`'s to add if the claim is judged worth it.
+
+Tests: `tests/flow-author.test.ts` — "the two tiers: silence needs a complete
+tree, contradiction never does" (PL_07_01's exact body as the fixture),
+"admitsUngroundedSelector (the author's own confession)",
+"unanchoredHoverAssertion (a hover claim proved by a roleless presence check)",
+"a hedge about the VALUE is not a confession about the selector". Verified
+offline by running the three lints over all 14 flow files of the live run
+against its own trees: exactly the five wrong flows are refused (PL_06_01,
+PL_07_01, PL_09_01, RU_06_01, RU_08_01) and the nine others, RU_07_01's
+`expectAttribute … title` among them, are untouched.
+
+## The record is identified before its fields are, and a repeated control is one of many (2026-09-10, be-sit-high PL_07_02 / RU_06_12)
+
+Run `be-sit-high-20260909-170213`, 15 rows of a Thai/English sheet against HUMI
+SIT: 5 passed, 6 failed, 3 needs-review, 1 blocked, and its own truth table
+scored **TP 0 · FP 3**. Of ~40 defects filed, ~34 describe the harness or the
+sheet. Three authoring causes, and only two of them earned a rail.
+
+**PL_07_02 alone filed 16 defects against a working application.** Its job is
+to open the Make Correction form for the plan the sheet names and check every
+field against that plan's data. What was authored opens
+`role=button[name="Make Correction" i] >> nth=0` — **whatever sits in row
+zero**; the proof bundle shows every step running on
+`.../make-correction?planId=319` — and then asserts eighteen plan-specific
+values. Country and Status passed (the same for every plan); twelve failed, each
+a `high` or `medium` defect about a page displaying plan 319 perfectly
+correctly.
+
+What made it undetectable is the second half, and it is this module's own doing.
+The sheet's line 3.3 is *Benefit Plan ID แสดง "PL_07_01_02_03_04_05_06"* — the
+identity of the record every other line is about — and it was authored
+`expectVisible role=textbox[name="Benefit Plan ID" i]`, a presence check that
+passes whatever the field holds. The model said why in the step's own intent:
+*"the sheet's id … is fixture data this flow does not create, so only the
+field's presence is asserted"*. **Two lints were pulling opposite ways on one
+line**: `unassertedExpectedItems` demands an assertion for 3.3, and
+`ungroundedFixtureAssertion` refuses the only assertion that makes it — so the
+one shape both accept is the vacuous one. Verified on the live flow: with the
+settle applied, the old lint returns `{fact: PL_07_01_02_03_04_05_06, action:
+expectValue}` and the new one returns null.
+
+- **`presenceForStatedValue`** (fatal, settles). An Expected line that STATES a
+  value — the sheet's own `<control> … "<value>"` grammar, read by
+  `statedValuesIn` — proved by an `expectVisible`/`expectEnabled`/
+  `expectDisabled` that cites that line and names that control, where the value
+  appears in no step of the flow. The prompt's `<claims>` first bullet has
+  always said *"a visibility check of the field is the claim going untested"*;
+  this is the guarantee for the rule the prompt already states. The last word
+  (`settleStatedValue`, up to `MAX_SETTLED_STATED_VALUES`) sharpens the step it
+  already has — `expectValue` for a textbox, `expectText` for a trigger the
+  tree lists as a button — keeping its selector and its cited line, so a row is
+  never blocked over it.
+- **`ungroundedFixtureAssertion` takes the case's stated pairs.** Reading a
+  record's identity off the record's OWN field is the flow's SCOPE, not a claim
+  that the record exists in a listing. Exempt only where the case itself pairs
+  that value with that control's label, and only as `expectValue`/`expectText`
+  on a value-holding role; a DB where-clause, an exact count, a row click
+  scoped by the fact and a `text=` presence are the be100 shapes the lint was
+  written for and stay judged. Exempted, PL_07_02 fails at line 3.3 with one
+  TRUE finding — the record on screen is not the one the sheet names — instead
+  of twelve false ones behind a pass.
+- **The pairing is folded EQUAL, never overlapping.** The label is the words
+  the Expected clause OPENS with (`Benefit Plan ID แสดง`), every prefix offered
+  and the author's own selector picking; `squash` already drops the decoration
+  an application adds (`Country*`). Containment was tried and removed the same
+  hour: the single prefix "Benefit" matched a control named "Benefit Name", and
+  a control name found mid-sentence ("…Entitlement Amount History สอดคล้อง…"
+  against "History Sidebar", RU_06_16) is a coincidence, not a pairing. A
+  quoted value carrying an ellipsis is the sheet showing a SHAPE and states
+  nothing (RU_06_16 again).
+
+**The settle is deliberately strict, and that is the one path that can still
+block a row.** `valueAssertionFor` — the single definition the refusal's
+wording and `settleStatedValue` both read — answers `expectValue` for a
+textbox/searchbox/spinbutton and `expectText` for a button/combobox/listbox/
+link/heading/cell, and null for anything else; a cited step naming a landmark
+or region therefore refuses with no rewrite, and one unsettled fatal keeps the
+whole refusal. An any-role `expectText` fallback was considered and **rejected**
+(2026-09-10): the engine reads `innerText`, so an `expectText` on a container
+passes whenever the value appears anywhere inside it — the RU_06_01 shape, a
+roleless presence check that healed to `>> visible=true >> nth=0` and passed
+green against the breadcrumb — which trades a blocked row for a false pass, and
+premise 3 says the refusal is the right answer then. What bounds the cost is
+the informed re-ask plus `AUTHORING_REFUSAL_CAP` (2), and the refusal's own
+wording for that shape names the remedy rather than the fault: it says the
+cited role holds no value of its own and that the assertion belongs on the
+control the Expected line names, never on the region containing it. A row still
+blocked after two asks cited a stated-value line against a landmark twice, and
+is worth a person's eyes. Not seen in the 15 live flows; reachable.
+
+**`ambiguousRepeatedControl`** (fatal, settles) is RC-3: one application, one
+table, one control, authored two ways. PL_07_01/PL_07_02/RU_07_01 wrote
+`>> nth=0` and resolved; RU_06_12 and RU_06_16 wrote the same selector bare and
+Playwright refused it — *strict mode violation: … resolved to 25 elements* — so
+both dead-ended and filed three defects each about a table having rows. A
+control in a repeated row is ambiguous BY CONSTRUCTION and the tree says so:
+twenty-five lines, one accessible name. That is **positive evidence**, so —
+`ungroundedSelectorRole`'s contradiction tier's own rule — it is judged on a
+truncated tree and past a `workflow` leg alike. Three limits are the safety of
+it: `ONE_ELEMENT_ACTIONS` only (everything that acts, plus the value reads;
+`expectCount`/`expectVisible`/`expectHidden` are exempt because "one of these
+is on the page" is satisfied by any match, and the ladder's rungs 1.3/1.35/1.36
+exist for those); a selector the author already narrowed is not judged; and
+`treeSections` counts within ONE capture, splitting on the harness's own
+section markers, because the evidence concatenates three pages and one
+`button "Cancel"` on each is not an ambiguous trio. The message names
+row-scoping and searching FIRST and `>> nth=0` last — `nth=0` is the minimum
+fix for ambiguity and the wrong answer when the row's identity matters, which
+is `presenceForStatedValue`'s question — and `settleRepeatedControl` marks that
+which row it opens is not established.
+
+**Two smaller things, and three deliberately not fixed.**
+
+- **`guessed accessible name` joined `authoring.admission`** in
+  `value-rules.ts`. PL_06_01's step 12 intent reads *"the close (X) control at
+  the top right; guessed accessible name "Close""* — the author knew it was
+  guessing, wrote it down where a person reads it, and the step shipped and
+  failed, because the list held `selector guessed`/`guessed from` and not this
+  spelling. Data only; measured on the run's own flows, it now fires on
+  PL_06_01 and on nothing else.
+- **The journey capture says which surface the click opened**
+  (`journeySection`/`captureAfterOpening` in `cli/commands/authoring.ts`). The
+  header read *"the dialog, form or wizard step the row's fields live in"*
+  whatever had happened — so RU_06_01, whose sheet says *แสดงป็อปอัพ* (shows a
+  popup), authored `expectModal` against an application that had just
+  NAVIGATED, and the step could only fail. The capture already compares the URL
+  before and after its own click; `opened.navigated` now carries the answer and
+  the header states it ("the click NAVIGATED: this is a PAGE, not a dialog,
+  whatever the row's own wording calls it"). The PY-1 precedent applies
+  unchanged — the fix is where the evidence is made. **No lint**: refusing an
+  `expectModal` needs a rewrite target the evidence may not hold, and blocking
+  a row over a claim the run settles in two seconds is the worse trade.
+- **`expectAttribute @required` is the ENGINE's** (PL_06_05, routed). The flow
+  asserted the HTML `required` attribute; the application marks it
+  `aria-required="true"`, so the step failed — and the harness's own sighted
+  agent look returned `proved` with the explanation, then the rail re-ran the
+  author's own comparison and failed anyway. There is no legal shape to steer
+  to: CDP's own `required` property (`propertyFlag(node, 'required')`, printed
+  on the tree line the author read) unifies both spellings, so the author
+  cannot know which the app uses, and an authoring lint would refuse a true
+  claim with nowhere to send it. The fix is one place in
+  `runner.ts:expectAttribute` — answer the ARIA-state names (`required`,
+  `disabled`, `checked`, `readonly`, `selected`, `expanded`) from the
+  accessibility property, which is the evidence the author was shown.
+- **Not fixed, and why**: RU_06_12's `role=complementary[name="History
+  Sidebar" i]` is silenced by a truncated tree, and that guard stays — absence
+  of evidence past the node budget is not evidence of absence. PL_06_05's
+  workflow leg for a field the screen does not have, and RU_08_01's "Confirm
+  delete plan" on a rule case, are the sheet's to fix; a lint that reads a live
+  dialog's title back against the sheet would be judging the sheet by the
+  application, which is the case's own verdict to reach.
+
+**A cascade this does not stop, and whose it is.** With line 3.3 asserted as a
+value, PL_07_02 fails at its third assertion with the true cause named — and
+the twenty steps after it still run and still fail, because nothing suppresses
+the tail of a failed VALUE assertion the way `dependentTail` suppresses the tail
+of a failed `workflow` leg. Making the first true finding the only one is the
+engine's and the reporter's, not this module's.
+
+Measured offline through the modules on all 15 flow files of the live run
+against their own case texts (`parseTestCaseTable` → `describeCase`, no browser,
+no model): `presenceForStatedValue` fires on **exactly one** step —
+PL_07_02's step 5, line 3.3 — and `admitsUngroundedSelector` on exactly one
+more, PL_06_01's step 12; the five passing flows and the other eight are
+untouched. Tests: `tests/flow-author.test.ts`
+(`ambiguousRepeatedControl` — the count, the truncation/leg tiers, the
+per-capture counting, the exempt shapes, the settle; `presenceForStatedValue` —
+`statedValuesIn`'s pairs, the live PL_07_02 body, both settle roles, the five
+silences, the ellipsis and mid-clause cases; and the fixture lint's pairing,
+with the three shapes it must still refuse), `tests/cli-wave2.test.ts` and
+`tests/flow-author.test.ts`'s `journeyTreeSection` fixtures for the new field.
+
+## The sign-in page going away is never a login proof (2026-09-10, be-sit-high-20260909-170213)
+
+**Incident.** HUMI SIT lands a SUCCESSFUL local sign-in back on its sign-in
+page: click Sign in → `POST /api/auth/local-login` 200 with the session cookie
+set → `/en` → `/en/me/home` → the client navigates to `/en/login` and re-mounts
+the form with empty fields and the Sign in button showing. The session is
+valid — the flow's next `goto` to `/en/admin/benefits/plans` renders signed in
+(Account menu, heading "Benefit Plans") — and the landing is intended by the
+app team. Every authored flow in the run proved the sign-in with `expectHidden`
+of the submit control: authored by the model (`{"action":"expectHidden",
+"selector":"role=button[name=\"Sign in\"] >> nth=1","intent":"Prove the
+sign-in succeeded."}`) or written by `groundLoginProof` in place of a vacuous
+`expectUrl`. That claim is false on this application by design: four cases
+failed on it, and the in-run reconstruction then re-clicked Sign in on empty
+fields ("Please fill out this field").
+
+**Rule.** A login proof is a positive claim about a signed-in surface, and it
+belongs on the page the flow goes to NEXT — a control only a signed-in page
+shows (the account menu, the greeting, the page heading), quoted from a tree.
+Nothing on the sign-in page after the submit is a proof: not the submit control
+disappearing, not the URL leaving the sign-in path. The engine, not the flow,
+judges the session — a `goto` to a protected page that bounces to a sign-in URL
+stops the run with the stranded verdict (`#strandedMessage`) — so dropping a
+submit-control proof cannot reduce what the flow proves, and a drop that leaves
+nothing is refused through the ordinary no-assertion rail, never patched with
+an invented assertion. What changed, all in `flow-author.ts`:
+
+- **`groundLoginProof` drops, never rewrites.** Its `replaceWith` (the
+  `expectHidden`-of-the-submit rewrite) is gone. Three shapes after a
+  credential submit, to the next `goto`, each dropped with its own disclosure
+  on `notes` and the log: a vacuous `expectUrl` the sign-in URL contains
+  (*"dropped: the sign-in is proved by the flow's assertions on the next
+  page"*, or *"…already proved by the assertion before it"* when a sound proof
+  stands); an `expectHidden` whose selector is the submit control the flow
+  clicked (`controlKey` folds `>> nth=N`, the ` i` flag, case and whitespace);
+  and a quoted-text proof (`expectVisible`/`expectText`) that no tree and not
+  the request shows. The scan now collects every drop in one pass rather than
+  returning at the first, so the be-high-sonnet-all shape (a real proof at
+  step 4 and a vacuous one at step 5) is settled in one call. An `expectHidden`
+  of any OTHER control is a claim and stays.
+- **The no-assertion / vacuity rail runs again after the drop**, once
+  (`provesNothing` in `FlowAuthor.author`; a flow already refused as written is
+  not refused twice for the same emptiness).
+- **`unsynchronizedLoginSubmit` accepts the proof on the next page.** It used
+  to refuse any credential click followed by a `goto` — the exact shape the
+  rule now asks for — with a remedy ("add an expectUrl … or expectVisible …
+  between the click and the goto") that no flow on this app can perform. It
+  now refuses only a submit → `goto` whose page nothing asserts before the
+  next `goto`/`signIn`/`workflow` (`assertsBeforeNextNavigation`); a check
+  between the click and the goto still satisfies it. The hydration race it
+  was written for is handled at the click itself by the engine's replay
+  (`nativeFormResubmitDetected` / `fillsLostToHydration` run inside the
+  click's own step), so no authoring-side assertion was ever what caught it.
+- **The three "means to succeed" gates read the flow's continuation, not the
+  proof.** `groundCredentialValues` (the invented-password fix, 19 of 107
+  be100 flows), `groundPersonaSignIns` (the `signIn`-by-label rewrite) and
+  `handTypedPersonaSignIn` all gated on `expectHidden` in the block — with the
+  proof no longer authored, all three would have gone silent and an invented
+  password would have reached the browser. `signInMeansToSucceed` is the one
+  predicate: the legacy `expectHidden` still counts (flows on disk), else the
+  block or the step ending it travels on as a signed-in person — a `goto` to a
+  non-sign-in URL, a `signIn` hand-off, a `workflow` leg, a click on a
+  `role=link`. A negative sign-in (wrong password, error asserted, flow ends
+  or returns to the sign-in page) is left exactly as written, as before. A
+  link click also ends `groundPersonaSignIns`'s block now, so the flow's own
+  travel is never swallowed into the `signIn` it replaces.
+- **The prompt** (`<sign_in>` steps 4–5, `<final_check>`) and the three
+  refusal messages say the same rule: assert nothing on the sign-in page after
+  the click; prove the sign-in on the next page with a control only a
+  signed-in page shows; never that the sign-in button is hidden or that the
+  URL left the sign-in page. The SIGN-IN LANDING line stays as evidence for a
+  `goto`, not a claim.
+
+**Why it cannot make a result worse.** Every drop removes a claim that holds
+on a failed sign-in or is false on a successful one; the positive proof on the
+next page is untouched (test (b)); a flow left with no assertion is refused as
+the no-assertion rail always refused it (test in "groundLoginProof"); the
+relaxed lint refuses only what asserts nothing anywhere; and the intent gates
+fire on strictly more flows than before (the legacy proof plus the
+continuation), never fewer for a flow that meant to sign in. Not this
+module's: whether the engine's `goto` should settle an in-flight login request
+before navigating (the click's own step ends when the click lands, not when
+the POST returns), and the engine's own `signInDidNotTakeMessage`, whose
+remedy still says "assert something only a signed-in page shows immediately
+after the submit click" — both `engine-expert`'s, a sibling change in flight
+the same day. `vacuous.ts`'s `isLoginProof` keeps excluding the old shape
+from `substantiveAssertions`, for flows on disk. `docs/artifacts/
+flow-author_original.ts` is untouched.
+
+Tests: `tests/flow-author.test.ts` — "the repair reaches as far as the lint"
+((a) the vacuous `expectUrl` dropped with nothing inserted, (b) the incident's
+own `expectHidden … >> nth=1` dropped with the next page's proof kept, an
+`expectHidden` of another control kept), "groundLoginProof" ((d) the quoted
+proof dropped, the no-assertion refusal through the pipeline, (c) a flow whose
+only proof is `expectVisible role=button[name="Account menu" i]` after its
+goto refused by nothing), "unsynchronizedLoginSubmit" (the next-page proof
+satisfies it, a second navigation before any assertion does not, the re-ask's
+wording), "groundCredentialValues" (the intent read off a goto, a link, and a
+return to the sign-in page); `tests/author-wave2.test.ts`'s hand-typed persona
+fixture now travels after its sign-in, as the rule requires.
+
+## The case narrative (`case-narrative.ts`, 2026-09-10)
+
+The sibling of step narration, for the case page (`src/reporter/case-page.ts`):
+one `generator`-role call per case, after the run, that writes `bundle.narrative`
+— a lede, the pre-read summary, the test data as the record shows it, the
+expectation restated, a ticket per recorded defect (plus at most one test-side
+ticket), the verifier's note and the questions the sheet leaves open that the
+record answers — in the run's report language (`--report-lang`). Same three
+rules as narration: **it is given the record and nothing else** (the step
+lines, `dbProofLines`, the defects, the masked variables, the notes, and the
+one sheet-owned source every runtime role already sees — the case card; a
+typed credential is not on the line it is shown), **it decides nothing** (no
+status, no defect, no finding; `applyNarrative` DROPS an `app` ticket that
+restates no recorded defect id — a model does not file a defect — keeps at
+most one `test`-side ticket, caps the lists, clips every field, and an empty
+answer leaves the bundle untouched; a test pins that `effectiveStatus` is the
+same with and without it), **it is attributed** (`by` is the model id, and
+the page labels every sentence). The generator role because the whole case
+is one prompt — 120 step lines and 200 DB lines is tens of thousands of
+tokens, past the healer's default tier; `WOWLIDATOR_GENERATOR_*` re-points it.
+ON by default for a RUN because the page is built around it —
+`--no-case-narrative` / `WOWLIDATOR_CASE_NARRATIVE=off` skips the call, a
+run sealed `blocked` (a ceiling, never ran, the harness alone) is never
+narrated, and no generator key degrades silently to the evidence-only page.
+A `wowlidator report` rebuild back-fills it only under `--case-narrative`,
+the `--narrate` rule one flag over: a rebuild is "no re-run", and one call
+per case across every ledger on disk is asked for, never assumed; it reads
+the case card back from the outcome's flow file, in the language the ledger
+recorded (`report` cannot change it). `needsNarrative(bundle, lang)` keeps a
+narrative already in that language, so a rebuild costs nothing twice. Tests:
+`tests/case-narrative.test.ts`.
+
+### The pre-read table's cells are cells, not paragraphs (2026-09-11)
+
+Read off the live ec-spot3 page for PRB-EC-053 (`…/02-catalog-prb-ec-053-c-expat-inbound-work-permit.html`, section
+*สรุปก่อนอ่านผล*): `summary` was ONE ~700-character Thai sentence chaining the whole run ("การรันเปิดแอป แล้ว… จากนั้น…
+ต่อมา… ในการตรวจสอบ พบ… แต่ไม่พบ…") and `testData` a comma-run of every value the run recorded, from the employee id to
+both URLs to "ไม่มีตัวแปรที่บันทึกไว้". Both sit inside one table cell, beside a step list that already tells the run
+step by step. The schema asked for "two or three sentences … step by step in plain words", so the model wrote exactly
+what it was asked for; the bound was `NARRATIVE_MAX_CHARS` (600) shared with the prose fields.
+
+`NARRATIVE_MAX_CELL_CHARS` (320) is the cell bound, on `summary` and `testData` only. **`expected` is deliberately NOT
+bound by it and keeps the sheet's own numbering** ("1. … 2. …", one item per line) — the reporter renders an enumerated
+field as a real list, and flattening it would lose the Expected column's own structure. The prompt states the bound
+(FIELD LENGTHS), the schema descriptions state it per field, the procedure and the self-check repeat it, and the one
+exception to "no bullets, no headings" is written next to the rule it excepts: a prompt rule alone is a request, a
+bound in `applyNarrative` alone is a cut sentence, so both.
+
+`clipCell` cuts at the last boundary the text itself carries — a sentence end, then a list separator, then a space —
+that leaves at least half the budget standing, else the plain character clip. A boundary cut ends a claim rather than
+halving one. Nothing else moved: the narrative is still written from the bundle alone, still decides nothing, and a
+field inside the bound is stored exactly as written.
+
+Why it cannot make the result worse: the bound only ever removes text from the tail of a field the model wrote too
+long, never rewords one, never generalises one — the prompt's own rule is "drop a detail rather than generalise it" —
+and no field gains content. Both report languages are unaffected: the bound is a character count on a field whose
+language the LANGUAGE line still sets. Tests: `tests/case-narrative.test.ts` ("the cell bound on summary and
+testData" — the live PRB-EC-053 summary as the fixture, the enumerated `expected` untouched, the three boundary tiers;
+"what the model is asked for" — the bound and the enumeration rule pinned in the system prompt and in the schema the
+model receives, captured through `MockLanguageModelV4`).
+
+### The verifier's note is the notes, summarised in 70 words (2026-09-11)
+
+The case page rendered `bundle.notes.join(' · ')` verbatim as one `<p class="caveat">` and `narrative.verifierNote`
+right after it. The blob is what nobody reads: a real one (PL_06_10) runs to ~300 words in a single paragraph — the
+session note, the sign-in POST evidence, the pre-run dead-end/expected-fail risk line, a three-case cross-case
+interference stamp, and a whole system-error diagnosis with the agent's trail and a suggested fix. `verifierNote` is
+now the ONE place those notes reach a reader: the model summarises the NOTES block it already receives
+(`buildNarrativePrompt`, `NOTES (n):`), most decision-relevant first — a diagnosed system error and its fix, then
+interference, then risk judged before the run, then session mechanics — in at most `NARRATIVE_NOTE_MAX_WORDS` (70)
+words, in the narrative's own `lang`, and empty only when `notes` is empty. Still ONE `generator`-role call per case:
+no second field, no second call, no second role.
+
+**Bound in words, under the existing soft/hard discipline.** `overSoftCap` measures the note in WORDS against 70
+(the tickets keep `NARRATIVE_SOFT_CHARS`), so an over-long note earns the same single re-ask — only the model can drop
+the least load-bearing clause and keep the rest true — and what comes back is cut by `clipNote`, which turns the word
+budget into the character index it lands on and hands that to `clipCell`, so the cut is at a sentence end, a list
+separator or a space, never mid-word.
+
+**Thai is measured in characters, and that is why the two paths differ.** `REPORT_LANGS` is `en` and `th`, and Thai
+writes no space between words: `split(/\s+/)` reads a whole Thai note as ONE word, so a word bound alone would let it
+run unbounded, while a character bound alone would truncate an English note absurdly. `measureNote` (one scan, so the
+count that judges and the cut that shortens can never disagree) counts spaced tokens as words and converts runs of a
+no-separator script at `CONTINUOUS_CHARS_PER_WORD` = 4.5 code points per orthographic word — measured on running Thai,
+function words 2–3 (`ว่า`, `ที่`, `ไม่`), content words 4–9 (`ข้อความ`, `แจ้งเตือน`), combining vowels and tone marks
+counted as the code points they are. So 70 words is ~315 Thai characters against ~420 English ones: the same
+paragraph in both. It reads the TEXT, not `lang`, because a Thai note quotes the application's English wording
+verbatim and both halves must be counted the way their own script is written. Lao, Khmer and Burmese fall under the
+same ratio; a CJK report language would need its own (its words are one or two characters) and `REPORT_LANGS` holds
+none. Where Thai offers no sentence mark to cut on, the plain character cut stands — a script that writes no boundary
+cannot be cut on one, and a segmenter would be a claim about the language the harness cannot check.
+
+Rule 2 is untouched: the note sets no status, files no defect, is read by no finding, and a run's verdict is
+identical with the narrative on and off. Why it cannot make the result worse: the bound only ever removes text from
+the tail of a field the model wrote too long — the prompt's own rule is still "drop a detail rather than generalise
+it" — and the re-ask is kept only where it helped (`keepShorter`). Tests: `tests/case-narrative.test.ts` ("the
+verifier's note is a 70-word summary of the run's notes": the English re-ask threshold, the boundary cut, the Thai
+measure and its paragraph length, a Thai note inside the bound stored verbatim, English quoted inside Thai, and an
+empty `notes` still yielding an empty note; plus the prompt/schema pin in "what the model is asked for"). The four
+render sites are a separate change.
+
+## A candidate must be able to perform the step, and a tooltip is caught on its own terms (2026-09-11, be-sit-high-sonnet-th-20260911-162004)
+
+**Incident.** 15 BE_SIT priority-high cases against HUMI SIT. Of 93 failure
+events only **5** were `resolved, but the claim did not hold` — a real statement
+about the application; **57** were `could not resolve`, and four cases
+(PL_07_01, PL_07_02, RU_06_08, RU_08_01) died on ONE selector shape.
+
+HUMI's English-locale page carries a Thai-named global search — a ⌘K command
+palette for employees and documents — and the captured tree exposes it as two
+ARIA **landmarks**: `search "ค้นหา"`, `search "ค้นหา"`. The table's own filter is
+a separate English `button "Search"`; it appears once in the whole run and
+worked on the one occasion a case reached it. A case needed the table filter.
+The model authored `role=searchbox[name="ค้นหา"]`. `ungroundedSelectorRole`
+correctly found no `searchbox` in the tree — and then said, **in the
+imperative**: *"The page exposes it as: `search "ค้นหา"` — use that role and
+name verbatim."* You cannot `fill` a landmark. Worse, `settleSelectorRole` — *the
+last word: the tree's own role for the same name* — then **wrote that role onto
+the step**, so the wrong control was not merely suggested, it was certified. The
+healer spent dozens of model calls elaborating it.
+
+The rail built to stop an invented selector was directing the model at a
+container that can never satisfy the step. **A refusal that redirects the model
+to a control it cannot use is worse than staying silent**, which is premise 3
+exactly. What changed, all in `flow-author.ts`:
+
+- **`rolePerforms(action, role)`** — one predicate, derived from the harness's
+  own entry table rather than a parallel one. `ENTRY_ACTION_BY_ROLE` is the map
+  `entryStepFor` has always switched on (textbox/searchbox/spinbutton → fill,
+  button/combobox/listbox → selectOption, checkbox/switch → check,
+  radio/option/tab/menuitem* → click; `button` is a chooser because the engine
+  drives a custom-select trigger with `selectOption`, `engine/listbox.ts`), and
+  `entryStepFor` now READS it, so the forwards and backwards readings cannot
+  drift. A `fill` also accepts `combobox` — the engine's own listbox driver
+  types into one to filter it. `CONTAINER_ROLES` (the landmarks and structural
+  roles) is what a `click`/`press` is refused on, and it is **deliberately
+  narrow**: `row`, `cell`, `gridcell`, `listitem`, `heading`, `img` and `link`
+  are NOT in it, because clicking a table row to open it is an ordinary step and
+  a rule that can refuse a true claim is the wrong rule. Permissive by default —
+  an action the table has no opinion about (every assertion, `goto`, `waitFor`)
+  reads any node, so this can only narrow the candidates a refusal offers and
+  can never raise a refusal of its own.
+- **`ungroundedSelectorRole` filters its candidates by the step's action, and
+  returns `container`.** `nearest` now holds only lines whose role could perform
+  the step; when none can and the same-name node is a container, that line comes
+  back as `container` instead. **The contradiction tier needs positive evidence
+  that could stand in for the step**: a container holding the same name
+  contradicts nothing — the control may be inside it, unnamed by this capture or
+  cut past the node budget — so past a `workflow` leg or on a truncated tree the
+  lint now stays silent where it used to name the landmark.
+- **The register changes when the only same-name node is a container.** The
+  refusal says the name belongs to a region, not to a control, that the step's
+  own action can never be performed on it, **"Do NOT copy that role and name"**,
+  and that the control is a different node with a name of its own — else a
+  `workflow` goal in the case's own words. Where the tree holds a real
+  actionable alternative the old verbatim sentence is unchanged.
+- **`settleSelectorRole` refuses to write a role that cannot perform the
+  action.** `nearest` is already filtered, so this is the guarantee for the
+  exported settle's other callers: the last word is a REWRITE, and a rewrite
+  onto a landmark is a step that can never run.
+- **`tooltipRoleSelector`** — a rail in its own right (fatal, settles).
+  `role=tooltip` reached EXECUTION **16 times** in this run, RU_06_01 and
+  RU_07_01 dead-ending on it, because `ungroundedSelectorRole` is silenced by a
+  leg at step 0 and a truncated plans tree, and the tooltip paragraph was gated
+  on `AUTHORING.hoverClaim` matching the CASE TEXT — which is prose, not
+  evidence. Nothing hovers while a capture reads a tree, so absence of a tooltip
+  line is not absence of evidence, it is **the shape of every tree there will
+  ever be**: this is the one role judgeable with no tree at all, which is exactly
+  what a step past a leg needs. `expectHidden` is exempt on the usual rule, and a
+  `workflow` goal that merely says the word is untouched. Reported only where
+  `ungroundedSelectorRole` has not already spoken about the same step, so one
+  wrong selector earns one refusal. `TOOLTIP_GUIDANCE` is the single definition
+  both refusals carry. Its settle repoints to the tree's own line for the same
+  name when a capture holds one; with none it annotates and hands the step over
+  exactly as it shipped before the lint existed — a dead-end is no worse than
+  today's, and the note tells the reader why.
+- **`treeLineRole`, and the one multiline anchor that would have broken.** The
+  capture is gaining indentation to show containment (`tree-containment`,
+  `healer/jit-healer.ts`). Every tree-line read in this file was audited:
+  `treeLineName`, `ungroundedSelectorRole`, `treeSections`, `ambiguousRepeated
+  Control`, `unanchoredHoverAssertion`, `settleSelectorRole`, `scopeCountedSets`,
+  `settleExclusivity`, `treeControlNamed`, `fillsReadOnlyNode`,
+  `ungroundedOnTruncatedTree`, `ungroundedTextExpectation`,
+  `wordingClaimAssertsDataValue` and `staleFixtureFacts` already trim or use
+  `^\s*`. **One did not**: `ungroundedCountRole` tested
+  `new RegExp('^' + role + '\\b', 'im')` against the whole tree, which would have
+  reported every nested role as a phantom the day indentation landed. It is
+  `^[ \t]*` now. The four inline `/^([a-z]+)\b/` copies are one exported
+  `treeLineRole`, which trims.
+
+**Why none of it can make a result worse.** Filtering only ever removes a
+candidate the step could not have used, so a refusal offers strictly fewer
+wrong answers and never fewer right ones; the container branch replaces an
+instruction no flow could follow with a description of what the evidence
+actually says; the settle guard only ever declines to write a step that could
+not run, leaving the model's own selector for the run to settle; the tooltip
+lint's own last word is either the tree's grounded line or the status quo; and
+`rolePerforms` defaults to true, so no action it does not model can be refused
+by it.
+
+Tests: `tests/flow-author.test.ts` — "a candidate must be able to satisfy the
+step (be-sit-high-sonnet-th, the Thai ⌘K search)" (`rolePerforms`'s four action
+classes, the landmark not offered for a `fill`, the settle refusing it, a
+genuine alternative still offered verbatim and still settled, the withholding
+past a leg and on a truncated tree, and the composed refusal's own wording);
+"tooltipRoleSelector — a role no capture can ever ground" (no tree needed, the
+exemptions, the refusal with and without a hover-matching case text, the settle
+both ways, one guidance sentence); "a tree line is read whatever its
+indentation" (`treeLineRole`/`treeLineName` trim, `ungroundedCountRole` sees a
+nested role, `ungroundedSelectorRole` reads nested roles and names).
+
+## A table name is the harness's own, in two spellings — and a lookup that could not run is not an answer (2026-09-11, be-sit-high-opus-th-20260911-174323 PL_09_01)
+
+PL_09_01's Test Data calls its fixture a *"Create fixture (new proposed ID, not
+yet persisted)"*, so `ungroundedFixtureAssertion` rightly refuses an
+`expectVisible` on `QA260908_BE_137` unless evidence shows the application
+already holds it. The evidence was there and never arrived: the run log reads
+*the database did not answer — the model named table "benefit_management.
+benefit_plan", which the schema does not declare* — about a table the
+connection holds. The fixture went unproven, the same refusal came back twice,
+and the row sealed `blocked`, where a plain `--resume` can never pick it up.
+
+**Both spellings are the harness's own, and it validated one against the
+other.** `DbClient.introspect` spells a table of `current_schema()` BARE and
+every other table `schema.table` (`qualifiedName`, `src/db/client.ts`) — and
+this run's DSN carries `options=-csearch_path=benefit_management,public`, which
+`pg` passes in the startup packet, so `current_schema()` is
+`benefit_management` and its 14 tables come back as `benefit_plan`. Meanwhile
+`tableInventory` (`cli/commands/authoring.ts`) showed the model
+`benefit_management.benefit_plan`, because the context graph's schema nodes
+were indexed from `sit-benefit-schema.sql`, where every name is qualified. The
+model used the spelling the prompt gave it. `tableIn`'s fallback ran one way
+only — bare want → qualified entry — so the reverse resolved to null.
+
+- **`resolveTableIn` is the one resolver** (`value-resolution.ts`); `tableIn`
+  is the view over it every caller kept, and `tableLookupFailure` is the one
+  wording both `fromDb` and `step-evidence.ts`'s `fromDatabase` throw.
+  Precedence is ordered and total — exact, then bare-want against a qualified
+  entry, then qualified-want against a bare entry — so widening the match can
+  never move a name that already resolved. `qualifiedIdent` still quotes
+  `table.name`, the schema's OWN spelling, so a name resolved through the new
+  tier queries the bare identifier the same connection's `search_path`
+  resolves: the lookup and the validation now agree by construction.
+- **An ambiguous bare name is refused, never resolved by position.**
+  `public.benefit_plan` and `benefit_management.benefit_plan` are different
+  tables; returning whichever the introspection listed first would read a real
+  value off the wrong one and produce a lookup that LOOKS grounded — strictly
+  worse than the miss this was widened to fix, because nothing downstream can
+  tell the two apart. The message names both candidates and the remedy
+  (qualify it).
+- **The reverse tier is gated on the introspection's own usage.** `DbSchema`
+  carries no `current_schema()`, so a bare entry cannot be attributed to a
+  schema by reading it. A schema prefix the introspection WRITES anywhere is
+  one it would have written here too, and the table really is undeclared then;
+  only a prefix it never writes can be the current schema whose tables it left
+  bare. So `benefit_management.benefit_plan` finds `benefit_plan` on the live
+  connection, and `public.benefit_plan` stays undeclared beside it.
+
+**And unavailable is not absent.** `resolveStepEvidence` caught the throw,
+logged it and returned the fixture unproven — which is byte-for-byte what it
+returns when the database answers "no such row", so a fault in the harness's
+own plumbing hardened into a claim about the application. `StepEvidenceOutcome.
+unavailableFixtures` records the fact and the reason apart from
+`existingFixtures`, and `FlowAuthor` judges the two in separate passes: a
+fixture the database answered "absent" about keeps its FATAL refusal, and one
+whose lookup could not run is a `weak` complaint — the flow ships, the note
+names the fixture and the failure, and the RUN settles the claim against the
+real page. The module still judges nothing: this is `step-evidence.ts`'s own
+asymmetry, evidence may excuse a claim and never accuse one. Only a lookup
+ATTEMPTED and failed counts; a row with no database configured, or one past
+`MAX_DB_LOOKUPS`, is exactly as unproven as it was before the lookup existed.
+
+Why it cannot make the result worse: the resolver only ever adds a tier below
+the ones that already matched, refuses where it cannot tell two tables apart,
+and hands `qualifiedIdent` the schema's own name as before; the weak tier turns
+a blocked row into a runnable flow carrying its own disclosure, and takes
+nothing away from a database that genuinely answered.
+
+**Reported, not fixed — `schemaSummary` at 497 tables.** It is `slice(0, 80)`
+over an introspection ordered by `(table_schema, table_name)`, and it is the
+ONLY schema `chooseDbLookup` sees: on this connection 417 tables are never
+shown to the model that must name one, and which 80 survive is decided by
+schema name alphabetically, not by the row's words. The precedent for the fix
+is `TABLE_INVENTORY_MAX`'s BM25 narrowing (386 → 9 tables, 56k → 7k tokens);
+applying it here would change which table every DB lookup in the suite picks,
+so it is a measured change of its own, not a contained one.
+
+Tests: `tests/value-resolution.test.ts` ("a table name is matched in both
+spellings (PL_09_01)": the four bare/qualified combinations, the spelled-prefix
+guard, the ambiguous pair with both candidates named, and the undeclared
+sentence both lookups always threw), `tests/step-evidence.test.ts` (the
+unavailable lookup recorded apart, "no row" NOT recorded as unavailable, and
+the PL_09_01 spelling resolving against a bare introspection),
+`tests/flow-author.test.ts` (the pipeline: a database that could not be asked
+hands the flow over with the reason, and absent still refuses where unavailable
+does not).

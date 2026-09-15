@@ -515,11 +515,12 @@ h1 { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.02em; line-hei
   border: 1px solid var(--line-strong); border-radius: var(--r-sm);
   color: var(--ink); background: var(--panel); min-width: 0;
 }
-.picker .sel { flex: 0 0 auto; max-width: 190px; }
-.picker .inp { flex: 1 1 auto; font-family: var(--mono); font-size: var(--fs-mono); }
+.picker .sel { flex: 0 0 max-content; inline-size: max-content; max-inline-size: none; }
+.picker .inp { flex: 0 0 30ch; inline-size: 30ch; font-family: var(--mono); font-size: var(--fs-mono); }
 .picker .sel:focus, .picker .inp:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent-line); }
 .picker-note { margin-top: 4px; font-size: var(--fs-xs); color: var(--faint); }
 .picker-note .mono { font-family: var(--mono); font-size: var(--fs-mono); }
+.key-mask code { white-space: nowrap; }
 
 /* Live progress. The bar is a run in flight, so it is only ever on screen while
    something is actually moving — there is no finished state to style. */
@@ -1272,11 +1273,17 @@ function agentActionLog(acts) {
       value = '';
     }
     var observed = typeof a.observed === 'string' && a.observed !== '' ? '\n     observed ' + JSON.stringify(a.observed) : '';
-    return (a.ok ? '\u2713' : '\u2717') + ' ' + (i + 1) + '. ' + a.action + ' ' + target + value +
+    /* A held action (the typed "outcome", Phase B) is drawn as a hold: the
+       harness withheld it on a policy, provenance or approval rule, and the
+       line must not read as the application failing. */
+    var held = a.outcome && a.outcome.kind === 'blocked' ? a.outcome : null;
+    return (a.ok ? '\u2713' : held ? '\u25a1' : '\u2717') + ' ' + (i + 1) + '. ' + a.action + ' ' + target + value +
       (a.durationMs !== undefined && a.durationMs !== null ? ' (' + fmtMs(a.durationMs) + ')' : '') +
       observed +
       (a.reasoning ? '\n     ' + a.reasoning : '') +
-      (a.error ? '\n     FAILED: ' + String(a.error).split('\n')[0] : '');
+      (held
+        ? '\n     HELD (' + held.reason + ', ' + held.rule + '): ' + String(held.message).split('\n')[0]
+        : a.error ? '\n     FAILED: ' + String(a.error).split('\n')[0] : '');
   }).join('\n');
 }
 
@@ -1294,7 +1301,7 @@ function stepClaim(step) {
 function familyOf(bundle, step) {
   var defect = (bundle.defects || []).filter(function (d) { return d.stepIndex === step.index; })[0];
   if (defect) return defect.category;
-  if (step.status !== 'passed') return 'unclassified';
+  if (step.status !== 'passed' && step.status !== 'skipped') return 'unclassified';
   return null;
 }
 
@@ -2192,7 +2199,7 @@ function taskRow(task) {
       /* Who spent it: authoring vs repair vs the agent, per flow. Only roles
          that actually called appear; bundles from before the split have none. */
       if (latest.session.byRole) {
-        var roleLabels = { generator: 'author', healer: 'heal', agent: 'agent', data: 'data' };
+        var roleLabels = { generator: 'author', healer: 'heal', agent: 'agent', governor: 'governor', data: 'data' };  /* the last two label a bundle recorded before those roles were retired */
         var parts = [];
         for (var roleName in latest.session.byRole) {
           var spend = latest.session.byRole[roleName];
@@ -2280,7 +2287,7 @@ function taskRow(task) {
 function firstFailure(card) {
   var bundle = S.bundles[card.runId];
   if (!bundle) return null;
-  var step = bundle.steps.filter(function (s) { return s.status !== 'passed'; })[0];
+  var step = bundle.steps.filter(function (s) { return s.status !== 'passed' && s.status !== 'skipped'; })[0];
   return step ? stepClaim(step) : null;
 }
 
@@ -3037,19 +3044,44 @@ function claimsSummary(bundle) {
    leads with, served alongside the bundle so the two surfaces cannot disagree
    about the same run. Rendered only for failed / error / dead-end: a green
    run's why is the table itself. */
-/* Everything the run wrote onto bundle.notes, verbatim: the pre-run risk
-   line, the system-error diagnosis, an auto-review ruling, the session note,
-   an authoring coverage warning ("Expected line(s) … have no assertion").
-   These were reachable only in the run log before; the card is where a
-   person actually reads a run. */
+/* What a reader should know about how this run went — a summary, not the
+   record. The run writes bundle.notes verbatim (the pre-run risk line, the
+   system-error diagnosis with the agent click trail and its suggested fix,
+   an auto-review ruling, the session note, a cross-case interference stamp,
+   an authoring coverage warning), and together they reached ~300 words for
+   one case and stopped being read. The notes stay in the proof bundle JSON
+   and are no longer DRAWN: what shows is the model-written summary of them,
+   bundle.narrative.verifierNote (at most 70 words, in the run report
+   language), attributed to the model that wrote it the way the review block
+   attributes an automatic ruling.
+
+   THE VERBATIM FALLBACK IS NOT DEAD CODE, do not simplify it away:
+   --no-case-narrative, WOWLIDATOR_CASE_NARRATIVE=off and a role with no key
+   each produce a bundle that has notes and no narrative, and drawing nothing
+   there would delete the only evidence the reader has.
+
+   The reporter surfaces apply the SAME rule from a TypeScript projection.
+   This is client script composed into a string and cannot import it, so the
+   two are kept in agreement by hand — change one, change the other. */
 function notesBlock(bundle) {
+  var narrative = bundle.narrative || null;
+  var note = narrative && typeof narrative.verifierNote === 'string' ? narrative.verifierNote.trim() : '';
   var notes = bundle.notes || [];
-  if (notes.length === 0) return null;
+  if (note === '') {
+    if (notes.length === 0) return null;
+    var raw = el('div', { class: 'why-block notes-block' });
+    raw.appendChild(el('div', { class: 'cap', text: 'Run notes (' + notes.length + ')' }));
+    notes.forEach(function (line) {
+      raw.appendChild(el('div', { class: 'why-line muted2', text: line }));
+    });
+    return raw;
+  }
   var box = el('div', { class: 'why-block notes-block' });
-  box.appendChild(el('div', { class: 'cap', text: 'Run notes (' + notes.length + ')' }));
-  notes.forEach(function (line) {
-    box.appendChild(el('div', { class: 'why-line muted2', text: line }));
-  });
+  box.appendChild(el('div', { class: 'cap', text: 'Run notes, summarised' }));
+  box.appendChild(el('div', { class: 'why-line', text: note }));
+  box.appendChild(el('div', { class: 'why-line muted2', text: 'Written by ' + (narrative.by || 'the model') +
+    ' from this run’s notes' + (narrative.at ? ' · ' + timeAgo(narrative.at) : '') +
+    '. It explains; it decides nothing — the notes stay in the proof file.' }));
   return box;
 }
 
@@ -3071,7 +3103,7 @@ function whyBlock(bundle) {
   } else {
     // The verdict travels with the bundle fetch; a bundle read before this
     // build (or a fetch that failed) still gets the honest floor.
-    var step = (bundle.steps || []).filter(function (s) { return s.status !== 'passed' && !s.superseded; })[0];
+    var step = (bundle.steps || []).filter(function (s) { return s.status !== 'passed' && s.status !== 'skipped' && !s.superseded; })[0];
     box.appendChild(el('div', { class: 'why-line', text: bundle.error || (step ? stepClaim(step) + ' \u2014 ' + ((step.error || '').split('\n')[0] || 'did not hold') : 'the run did not complete') }));
   }
   /* The system-error diagnosis, when the judge ran: which layer broke and the
@@ -3762,6 +3794,13 @@ function evidenceFix(panel, bundle, step) {
     }
   }
 
+  if (step.blocked) {
+    /* The typed hold that ended the leg (Phase B): named before the agent's
+       account, because it is the one fact this step carries — the harness
+       withheld the action, and nothing about the application was proved. */
+    panel.appendChild(el('div', { class: 'cap', text: 'Held by the run’s rules — no verdict about the application' }));
+    panel.appendChild(el('div', { class: 'repro', text: step.blocked.reason + ' · ' + step.blocked.rule + '\n' + step.blocked.message }));
+  }
   if (step.agent) {
     panel.appendChild(el('div', { class: 'cap', text: 'The navigation agent' }));
     panel.appendChild(el('div', { class: 'repro', text: step.agent.goal + '\n\n' + step.agent.summary }));
@@ -4139,7 +4178,7 @@ function renderHealed(main) {
     for (var i = 0; i < 5; i += 1) bars.appendChild(el('i', { class: confidence * 5 > i ? null : 'off' }));
 
     body.appendChild(el('tr', {}, [
-      el('td', {}, [
+      el('td', { class: 'key-mask' }, [
         el('div', {}, [el('code', { text: entry.key })]),
         el('div', { class: 'mono', style: 'margin-top:4px', text: '→ ' + entry.healed })
       ]),
@@ -4284,7 +4323,6 @@ function roleBlurb(role) {
   if (role === 'healer') return 'repairs a selector that already failed';
   if (role === 'generator') return 'writes the tests, and repairs whole flows';
   if (role === 'agent') return 'drives the browser through unknown pages';
-  if (role === 'data') return 'regenerates a field value that was rejected';
   return '';
 }
 
@@ -4706,8 +4744,7 @@ function untilTime(iso) {
  * that evaporates on restart is not a setting) and apply from the next run.
  */
 /* The machinery gates: every on/off that shapes a run — the scenario gate,
-   data sections, the governor, the risk judge, diagnosis, the auto-review
-   judge. A flip persists to .env and the panel's own env, so the NEXT run
+   data sections, the risk judge, diagnosis, the auto-review judge. A flip persists to .env and the panel's own env, so the NEXT run
    inherits it; the run already in flight keeps the gates it started with,
    and the card says so. The allowlist is the server's (ui/gates.ts). */
 function renderGatesBlock(card) {
@@ -4896,7 +4933,7 @@ function renderClaudeSection(main) {
   /* --- the usage cap: a hard stop at N% of any window ---------------------- */
   renderUsageCapBlock(card, claude.usageCap);
 
-  /* --- the run gates: scenario gate, sections, governor, judges ------------ */
+  /* --- the run gates: scenario gate, sections, judges ---------------------- */
   renderGatesBlock(card);
 
   /* --- the claude -p ledger: every claude-cli call, across processes ------- */
@@ -6245,8 +6282,8 @@ function openFlowPlayer(bundle) {
       return {
         at: s.videoOffsetMs / 1000, step: s.index,
         text: s.intent || (s.action + (s.selector ? ' ' + s.selector : '')),
-        failed: s.status !== 'passed' && !s.superseded,
-        error: s.status !== 'passed' ? String(s.error || '').split('\n')[0] : ''
+        failed: s.status !== 'passed' && s.status !== 'skipped' && !s.superseded,
+        error: s.status !== 'passed' && s.status !== 'skipped' ? String(s.error || '').split('\n')[0] : ''
       };
     });
 

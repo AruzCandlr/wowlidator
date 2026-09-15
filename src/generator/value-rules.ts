@@ -40,6 +40,15 @@ export interface DateWords {
   previousMonth: readonly string[];
   before: readonly string[];
   after: readonly string[];
+  /**
+   * The word for "date" itself, which a sheet may put in front of a relation:
+   * `วันที่ก่อน Hire Date` is `วันที่` + `ก่อน`, exactly as `วันที่ตั้งแต่` is
+   * `วันที่` + `ตั้งแต่`. Kept as its own list rather than enumerating every
+   * compound into `before`/`after`/`prefixes` — the pairs multiply, and the
+   * one that was missing (`วันที่ก่อน`) is why HIR-EC-037 resolved to nothing
+   * while `ก่อน` and `วันก่อน` both worked.
+   */
+  dateNouns: readonly string[];
   at: readonly string[];
   prefixes: readonly string[];
   exact: readonly string[];
@@ -136,6 +145,7 @@ const DEFAULT_VALUE_VOCABULARY: Vocabulary = {
     thisMonth: ['ปัจจุบัน', 'นี้', 'ที่ทดสอบ', 'this', 'current'],
     nextMonth: ['ถัดไป', 'หน้า', 'next'],
     previousMonth: ['ก่อนหน้า', 'ก่อน', 'ที่แล้ว', 'previous', 'last'],
+    dateNouns: ['วันที่', 'วัน', 'date'],
     before: ['before', 'prior to', 'the day before', 'day before', 'วันก่อน', 'ก่อน', '<'],
     after: ['after', 'the day after', 'day after', 'วันหลัง', 'หลัง', '>'],
     at: ['ณ', 'at', 'as of', 'as at'],
@@ -187,6 +197,25 @@ export interface AuthoringRules {
   };
   /** A claim about how the page is WORDED, as opposed to what it holds. */
   wordingClaim: readonly string[];
+  /**
+   * A claim about a surface that exists only while the pointer is over a
+   * control — a tooltip. No capture ever hovers, so no tree can hold it
+   * (2026-09-09, be-high-sonnet PL_07_01 / RU_06_01).
+   */
+  hoverClaim: readonly string[];
+  /**
+   * How a step's own intent ADMITS that its selector rests on no captured
+   * evidence. English only, deliberately: unlike every other list here these
+   * are not the sheet's words but the MODEL's, written into the intent it
+   * authors, and the authored intents this harness reads are English.
+   *
+   * Every entry names the EVIDENCE or the guess about a selector. A bare
+   * hedge is not one, and was removed after it over-fired on the live
+   * RU_06_12 intent *"Line 3.1 (best-effort, blocked): … exact quoted values
+   * cannot be asserted because …"* — an honest note about the VALUE the sheet
+   * left unavailable, on a selector the tree does render.
+   */
+  admission: readonly string[];
   /** A claim that two readings agree, or that a quantity did not move. */
   matchClaim: {
     agree: readonly string[];
@@ -218,10 +247,10 @@ export const DEFAULT_AUTHORING_RULES: AuthoringRules = {
     typing: ['กรอก', 'คีย์', 'ระบุ', 'พิมพ์', 'ใส่ค่า', 'แนบ', 'fill', 'fill in', 'fill out', 'key in', 'key-in', 'enter', 'type', 'attach'],
     choosing: ['เลือก', 'ติ๊ก', 'select', 'choose', 'pick', 'tick', 'check', 'uncheck', 'toggle'],
     acting: [
-      'กด', 'กดปุ่ม', 'คลิก', 'บันทึก', 'ยอมรับ', 'ประกาศ', 'เปิดไฟล์', 'เปิดหน้า', 'เปิดเมนู', 'อัปโหลด', 'ลบ', 'แก้ไข', 'สร้าง',
+      'กด', 'กดปุ่ม', 'คลิก', 'บันทึก', 'ยอมรับ', 'ประกาศ', 'เปิดไฟล์', 'เปิดหน้า', 'เปิดเมนู', 'อัปโหลด', 'นำเข้า', 'ลบ', 'แก้ไข', 'สร้าง',
       'เข้าสู่ระบบ', 'ล็อกอิน', 'ส่ง', 'อนุมัติ', 'ปฏิเสธ',
       'click', 'press', 'tap', 'submit', 'save', 'accept', 'approve', 'reject', 'publish', 'announce', 'open', 'upload',
-      'log in', 'login', 'sign in', 'sign-in', 'delete', 'edit', 'create', 'send',
+      'log in', 'login', 'sign in', 'sign-in', 'delete', 'edit', 'create', 'send', 'import',
     ],
     routeLine: ['ไปที่', 'ไปยัง', 'เข้าไปที่', 'เข้าที่', 'เปิดเมนู', 'เมนู', 'menu', 'go to', 'navigate', 'open the'],
     stepWords: ['step', 'ขั้นตอนที่', 'ขั้นตอน', 'ข้อที่', 'ข้อ'],
@@ -231,6 +260,21 @@ export const DEFAULT_AUTHORING_RULES: AuthoringRules = {
     'spelling', 'spelled', 'spell', 'misspelled', 'wording', 'worded', 'label', 'labels', 'labelled', 'labeled', 'caption', 'captions',
     'typo', 'typos', 'terminology', 'copy text', 'text is', 'text matches', 'text reads', 'text appears',
     'ข้อความ', 'สะกด', 'คำแสดง', 'คำที่แสดง', 'ตัวสะกด', 'ป้ายชื่อ',
+  ],
+  hoverClaim: [
+    'tooltip', 'tooltips', 'tool tip', 'hover', 'hovers', 'hovered', 'hovering',
+    'mouse over', 'mouseover', 'mouse-over', 'pointer over',
+    'ทูลทิป', 'นำเมาส์ไปวาง', 'เอาเมาส์ไปวาง', 'วางเมาส์', 'ชี้เมาส์', 'เลื่อนเมาส์ไปวาง',
+  ],
+  admission: [
+    'not confirmed by any captured tree', 'not confirmed by the captured tree', 'not confirmed by any tree',
+    'not confirmed in the tree', 'not captured in the tree', 'not in the captured tree',
+    'not present in the captured tree', 'no captured tree', 'not verified against the tree',
+    'selector guessed', 'guessed from', 'guessed selector', 'guessing the selector',
+    // The same confession about the one part of a selector a tree supplies
+    // (2026-09-10, be-sit-high PL_06_01): *"the close (X) control at the top
+    // right; guessed accessible name "Close""* — the step then dead-ended.
+    'guessed accessible name', 'guessed the accessible name', 'accessible name guessed', 'name guessed',
   ],
   matchClaim: {
     agree: [
@@ -298,6 +342,7 @@ export const ValueRulesSchema = z
           .object({
             today: words, tomorrow: words, yesterday: words, future: words, past: words,
             thisMonth: words, nextMonth: words, previousMonth: words, before: words, after: words, at: words,
+            dateNouns: words,
             prefixes: words, exact: words, back: words, forward: words,
             units: z.object({ day: words, week: words, month: words, year: words }).strict().optional(),
             birthFieldWords: words, ageWords: words, ageUnder: words, ageOver: words, ageAtLeast: words, ageAtMost: words, ageExact: words,
@@ -313,6 +358,8 @@ export const ValueRulesSchema = z
       .object({
         script: z.object({ typing: words, choosing: words, acting: words, routeLine: words, stepWords: words, skipWords: words }).strict().optional(),
         wordingClaim: words,
+        hoverClaim: words,
+        admission: words,
         matchClaim: z.object({ agree: words, unchanged: words, readings: words, quantities: words }).strict().optional(),
         openQuestionPrefixes: words,
         sheetNote: z.object({ cancelled: words, notYet: words, retest: words }).strict().optional(),
@@ -410,6 +457,10 @@ export interface CompiledAuthoringRules {
     citation: RegExp;
   };
   wordingClaim: RegExp;
+  /** The case claims a tooltip / a surface shown on hover. */
+  hoverClaim: RegExp;
+  /** The step's own intent says its selector rests on nothing. */
+  admission: RegExp;
   matchClaim: RegExp;
   /** An id that carries one of the open-question prefixes. */
   openQuestion: RegExp;
@@ -435,6 +486,8 @@ export function compileAuthoringRules(rules: AuthoringRules = DEFAULT_AUTHORING_
       citation: new RegExp(`(?:(${skipWord})\\s+)?${stepWord}\\s*(\\d{1,2})\\b`, 'giu'),
     },
     wordingClaim: new RegExp(wordAlternation(rules.wordingClaim), 'iu'),
+    hoverClaim: new RegExp(wordAlternation(rules.hoverClaim), 'iu'),
+    admission: new RegExp(wordAlternation(rules.admission), 'iu'),
     matchClaim: new RegExp(
       `${wordAlternation(m.agree)}[^.\\n]{0,80}${wordAlternation(m.readings)}` +
         `|${wordAlternation(m.unchanged)}[^.\\n]{0,60}${wordAlternation(m.quantities)}` +
@@ -469,3 +522,20 @@ export function openQuestionIdsIn(caseText: string): Set<string> {
 export const VALUE_RULES: ValueRules = loadValueRules();
 /** The authoring half of `VALUE_RULES`, compiled once. */
 export const AUTHORING: CompiledAuthoringRules = compileAuthoringRules(VALUE_RULES.authoring);
+
+/** A URL that reads as a sign-in surface. */
+/**
+ * Exported because the journey capture needs exactly this rule: a capture that
+ * bounced to a sign-in page must be discarded, not handed to the model under
+ * the destination's name. Two spellings of "is this a login URL" would drift.
+ */
+export const LOGIN_URL_PATTERN =
+  // "login"/"sign-in" anywhere; "auth"/"sso" only where a sign-in surface
+  // actually lives — as a word in the HOST (auth.corp.com, sso.company.com),
+  // as the FIRST path segment after an optional locale (/auth/callback,
+  // /en/sso, /oauth2/authorize), or as a query flag (?sso=1). A bare
+  // substring match read /admin/config/sso — a payroll app's Social
+  // Security Office page — as a sign-in URL (2026-09-03, PY-1 TC_SSO_001_001):
+  // the journey capture dropped the row's own destination, ranked its way to
+  // the wrong page, and the author wrote against a form the case never opens.
+  /login|sign-?in|signin|(?:^|\/\/)[^/]*\b(?:auth|sso)\b[^/]*(?:\/|$)|(?:^|\/\/[^/]+)\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(?:auth|oauth2?|authn|authorize|authenticat(?:e|ion)|sso)(?:\/|$|\?|#)|[?&](?:sso|auth)=/i;

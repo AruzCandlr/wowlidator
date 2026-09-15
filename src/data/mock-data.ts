@@ -1,22 +1,25 @@
 /**
- * Deterministic mock-data generation — the default path for `fillRetry`.
+ * Deterministic mock-data generation — the whole of `fillRetry`.
  *
- * No model call: most "email already exists" conflicts are resolved by
+ * No model call, ever. Most "email already exists" conflicts are resolved by
  * generating a value nothing has seen before, not by reasoning about what to
- * type. AI escalation (`DataModel`, the `custom` kind) lives in
- * `data-model.ts`, for a field a heuristic can't classify — not for the
- * common case, which is why most `fillRetry` steps never reach a model at
- * all.
+ * type.
+ *
+ * There used to be a sixth kind, `custom`, that escalated to a `data` model
+ * role for a field a heuristic could not classify. It was retired on
+ * 2026-09-11 having never been used: across 1,429 authored flows not one
+ * `fillRetry` step was written at all, let alone a `custom` one, and every
+ * call the usage ledger held under that role was `doctor` proving the model
+ * id still resolved. A kind nothing emits is not an escape hatch, it is a
+ * branch that cannot be tested by use.
  */
 
 import { faker } from '@faker-js/faker';
 
-export const DATA_KINDS = ['email', 'username', 'name', 'phone', 'text', 'custom'] as const;
+export const DATA_KINDS = ['email', 'username', 'name', 'phone', 'text'] as const;
 export type DataKind = (typeof DATA_KINDS)[number];
 
-type DeterministicKind = Exclude<DataKind, 'custom'>;
-
-const GENERATORS: Record<DeterministicKind, () => string> = {
+const GENERATORS: Record<DataKind, () => string> = {
   email: () => faker.internet.email({ provider: 'example.com' }),
   username: () => faker.internet.username(),
   name: () => faker.person.fullName(),
@@ -24,16 +27,11 @@ const GENERATORS: Record<DeterministicKind, () => string> = {
   text: () => faker.lorem.words(3),
 };
 
-/** True for every kind this module can generate without a model. */
-export function isDeterministicKind(kind: DataKind): kind is DeterministicKind {
-  return kind !== 'custom';
-}
-
 /**
  * A short, unique-per-call suffix, embedded rather than appended blindly —
  * an email needs it before the `@`, everything else after.
  */
-function withUniqueSuffix(base: string, kind: DeterministicKind, attempt: number): string {
+function withUniqueSuffix(base: string, kind: DataKind, attempt: number): string {
   const suffix = `${Date.now().toString(36)}${attempt}`;
   if (kind === 'email') {
     const at = base.indexOf('@');
@@ -50,13 +48,9 @@ function withUniqueSuffix(base: string, kind: DeterministicKind, attempt: number
  * conflicted with something, so attempt 2+ makes that structurally
  * impossible rather than merely unlikely.
  *
- * Throws for `custom` — that kind has no deterministic generator by design;
- * see `DataModel`.
+ * Every kind has a generator, so this cannot fail on a kind the type allows.
  */
 export function generateValue(kind: DataKind, attempt = 1): string {
-  if (!isDeterministicKind(kind)) {
-    throw new Error(`"${kind}" has no deterministic generator — use a DataModel instead`);
-  }
   const base = GENERATORS[kind]();
   return attempt <= 1 ? base : withUniqueSuffix(base, kind, attempt);
 }

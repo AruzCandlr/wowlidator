@@ -45,7 +45,13 @@ The short fast-path timeout is deliberate: a selector that is going to work work
 
 **`clearStorage` before the first `goto` has nothing to clear, and that is done, not an error.** Storage is origin-scoped and a page sits on `about:blank` until it navigates, where reading `localStorage` throws `SecurityError: Access is denied for this document`. A model reliably opens `setup` with it as hygiene, and setup short-circuits the body — so every case authored from one catalog failed at step 0, each filing a high-severity *frontend* defect about a page none of them had visited. `hasStorableOrigin()` decides by inspecting the URL (http/https only) before the call is made, and the skip is recorded on the step's `detail` rather than left to be inferred from a fast pass. On a real origin the call still happens and a `SecurityError` there still fails: storage refused by a page that *has* storage is a genuine finding. **`setLocalStorage` deliberately does not get this treatment** — its intent is to put a value somewhere, which an opaque origin cannot honour, so a flow that seeds auth before navigating must fail loudly rather than run on unauthenticated and fail later somewhere confusing. Clearing is the opposite: "leave no storage behind" is already true of a page that has none.
 
-**Form interaction is four actions beyond `click`/`fill`, all deterministic, all through the ladder.** `selectOption` picks a dropdown option by its visible label — a native `<select>` via Playwright's own `selectOption` (label first, value attribute second), anything else the way a user does it: click to open, then click the option (`role=option`/`menuitem`/`menuitemradio`, searched page-wide because custom dropdowns portal their options to the end of the document; Escape on failure so a retry starts from a closed dropdown). `check`/`uncheck` verify the state actually moved — Playwright's `setChecked` for native inputs, an `aria-checked`/`aria-pressed` read-click-reread fallback for styled toggles, and a control exposing no state at all is refused rather than clicked blind. `type` presses keys one at a time (`pressSequentially`) for the fields `fill` cannot wake — autocomplete, typeahead, masked input — with the typing itself charged to the healed budget, not the rung's: resolving the field is the race the ladder times, typing N characters at a human pace is not. These existed because the old vocabulary could complete no form containing a dropdown: `fill` throws on a `<select>` and `click` can only open one.
+**Form interaction is four actions beyond `click`/`fill`, all deterministic, all through the ladder.** `selectOption` picks a dropdown option by its visible label — a native `<select>` via Playwright's own `selectOption` (label first, value attribute second), anything else the way a user does it via `selectFromListbox` (`src/engine/listbox.ts`, EH-01 2026-09-03): click to open, wait for the list to hold something, type the value's stable head into a search box when the list offers one, match by whole name then whole word (never a substring), tick each row of a multi-value, and read the trigger back. `check`/`uncheck` verify the state actually moved — Playwright's `setChecked` for native inputs, an `aria-checked`/`aria-pressed` read-click-reread fallback for styled toggles, and a control exposing no state at all is refused rather than clicked blind. `type` presses keys one at a time (`pressSequentially`) for the fields `fill` cannot wake — autocomplete, typeahead, masked input — with the typing itself charged to the healed budget, not the rung's: resolving the field is the race the ladder times, typing N characters at a human pace is not. These existed because the old vocabulary could complete no form containing a dropdown: `fill` throws on a `<select>` and `click` can only open one.
+
+**A search box can be all a trigger opens onto — the list itself does not exist until something is typed (RC-5, 2026-09-10, be-sit-high-20260909-170213 PL_06_10).** `selectFromListbox`'s `openList()` looks for a `role=listbox`/`menu`/`tree` (or the trigger's own `aria-controls` target) becoming visible; `HumiSearchableSelect` — `<button aria-haspopup="listbox">` and nothing else, already named in this file's ec10 post-mortem below — opens onto a bare search input with no ARIA container anywhere in the DOM yet, so `openList()` had nothing to find and the ladder reported "no listbox or menu became visible within 10000 ms of opening" about a control that genuinely held the value. The duplicate-ID validation the case existed to test never ran, and the missing message was filed as a `high` functional defect against a working application. The fix stays inside the same universal, ARIA-informed shape the rest of this module uses: when `openList()` finds nothing, count the page's visible search-shaped inputs (`SEARCH_INPUT`) before the trigger was clicked and after; a new one that appeared **as a result of the click** — never one already on the page, which searching page-wide unconditionally could grab by coincidence — gets one probe keystroke (the value's code head, or the whole value) before giving up, the way a person facing an apparently-empty dropdown starts typing. The probe need not be the exact match; it only has to cause the real `role=listbox`/`option` tree to render, and the existing per-part loop re-types the correct head into it once a container exists to scope that search to. A control that still offers nothing after the probe — the value genuinely absent, or no search box ever appeared — fails exactly as before, naming what the list held: this rung can only heal onto the right thing or fail identically, never manufacture a match. Tests: `tests/form-actions.test.ts` (a lazily-rendered `HumiSearchableSelect`-shaped fixture, picked correctly, and a companion proving a value the list never offers still fails and still names it).
+
+**And the panel may carry no list role at all — which is a harness blindness, never a verdict about the control (2026-09-11, be-sit-high-sonnetlow PL_08_01).** The probe above assumed the search keystroke would make a `role=listbox`/`option` tree render. Measured on the live page with the panel open and `aria-expanded="true"`, humi's Company picker renders **zero** `role=listbox|menu|tree` and **zero** `role=option` — the trigger has no `aria-controls`, and each choice is a bare `input[type=checkbox]` whose accessible name is the value (`CDS (C001)`). `openList()` found nothing at either attempt, and the case was failed with *"opened '— Select company —' but no option named 'CDS (C001)' appeared"* — a sentence asserting something about the application from an empty `shown: []`, i.e. from no evidence at all. The agent then spent a whole leg inventing workarounds against a control that was working, and the case sealed `blocked` on a stall.
+
+Three changes, each narrow: **(1)** `revealedPanel()` finds the panel by its CONTENT when no role announces it — take the search box the click revealed and walk up to the nearest ancestor that also holds a row (checkbox or option), capped at eight levels; an ancestor with no rows is not a panel. Everything downstream already worked against it, including the checkbox rows `listState` has always counted. **(2)** `findOption` scans `role=checkbox` too, but only INSIDE the panel, never in the page-wide `body` fallback — a multi-select renders each choice as a checkbox named for the choice, while ticking a same-named form checkbox elsewhere on the page is worse than a miss. A matched checkbox row is ticked (not clicked), Escape closes the panel, and the row's own checked state is read back as the pick's proof, since such a trigger often shows `1 selected` rather than the value. **(3)** The two misses are now two errors: `ListboxOptionMissingError` still means *the list was read and the option is not in it* and still carries the `no option named … appeared` wording `isStateContradiction` keys on; `ListboxNotReadableError` means *no list was found, so nothing is known*, is deliberately NOT a state contradiction, and still skips the healer (which cannot open a popup either way — the `popupTarget` pattern matches both wordings). Tests: `tests/engine-helpers.test.ts` — a fixture built from what the live page actually serves (no list role, no `aria-controls`, checkbox rows, a count-only trigger), plus one proving an unreadable panel says so instead of claiming the option is absent. The pre-existing multi-select fixture has a `role=listbox` because it was written from what the widget was assumed to be; that is exactly why it passed while the real control failed.
 
 `use` and `when` are the two actions that never reach `#resolve` *or* `#bareStep` in the usual way — `use` is gone before the run starts, and `when` records itself while its condition deliberately bypasses healing. When adding an ordinary action (e.g. `hover`), it must go through `#step` → `#resolve`, or it silently loses healing. **Five** places to touch: the method on `SmartRunner`, the `FlowStep` union, the `switch` in `executeStep` (the dispatch moved out of `executeFlow`; there is a second, browser-free switch in `executeApiSteps`), `flowStepSchema` in `src/mcp/server.ts`, and the `GENERATOR_ACTIONS` list plus `toFlowStep` in `src/generator/test-generator.ts` (otherwise the generator can never produce it). An HTTP action has a sixth place: `API_GENERATOR_ACTIONS`/`toApiFlowStep` in `src/generator/api-test-generator.ts`. An *assertion* has a seventh: `ASSERTION_ACTIONS` in the runner, or `hasAssertion()` silently rejects every generated case that relies on it. And an action the *catalog* path should be able to author has an eighth: `AUTHOR_ACTIONS` plus `flow-author.ts`'s own `toFlowStep` — catalogs author through `flow-author.ts`, not `test-generator.ts`.
 
@@ -228,6 +234,10 @@ Three details worth keeping:
 
 ## In-run step reconstruction (`executeSteps` in `src/engine/runner.ts`)
 
+**A failed place-establishing step closes its dependent tail (2026-09-05, widened 2026-09-10).** When a `workflow`, `goto`, or dead-ended `click` step records a non-pass, `dependentTail` marks every following step through the next place-establishing action (or the next browser-free `request`/DB step, which reads nothing off the page) as `skipped`: those assertions and interactions are consequences of a page the step never reached, not fresh defects to time out independently. Skipped steps stay in the proof with the reason (the workflow's goal; "did not land" for a `goto`; "never resolved" for a click) and still pass through the data gate's `after`, so a skipped window end releases its locks; they count as neither passed nor failed. `WOWLIDATOR_SKIP_AFTER_FAILED_LEG=off` restores run-to-the-end.
+
+**The trigger, not the scope, needed widening (2026-09-10, be-sit-high-20260909-170213).** `dependentTail` always scoped correctly; it only ever fired for a failed `workflow` leg. Both of this run's largest defect clusters failed on a plain `click`: RU_06_12's click resolved to 25 elements (a strict-mode violation — proof nothing was ever touched) and the three following assertions each dead-ended independently against a record the flow never opened, filing three `high` defects the ladder's own memo lines ("known content mismatch: step 7 already read this element on this same page", then "known dead end: identical failure at step 8") show it had already recognised as repeats. PL_07_02 lost 14 of 16 defects the same way. `closesDependentTail(action, lastIssueKind)` is the new, narrow trigger: `workflow` and `goto` stay unconditional — a leg either reaches its goal or not, a navigation either lands or not, with no state in between where the run is nonetheless somewhere useful — but a `click` closes the tail **only** when `classifyStepFailure` scored it `dead-end`, never `failed`. That distinction is the whole safety argument: a `dead-end` click means the ladder never actually touched anything (the selector never resolved to one element, or something blocked the pointer before it could land), so the page is provably unchanged and everything after it, up to the next place-establishing action, is a consequence rather than a fresh finding. A `failed` click — one that resolved an element and genuinely acted on it, disagreeing only on content or state afterwards (a click on a disabled control, EH-14) — changed something real, so the steps after it keep their own verdict; skipping them would hide a genuinely independent defect on the same page. Tests: `tests/runner-wave2.test.ts` (`closesDependentTail`'s pure decision table, and a live CDP pair proving both halves — an ambiguous unhealed click skips its three followers, a disabled-click's unrelated same-page assertion never does).
+
 Between the ladder (one selector, mid-step) and `--repair` (whole flow, between runs) sits the level a failed *step* actually wants: on failure, the repair model rebuilds the step against the **live page** — no re-run, session intact — and the step retries, until its failures reach `STEP_RECONSTRUCT_TRIES` (3, total, including the original). Only then does the ordinary classification (failed / error / dead end) land. On by default; `--no-reconstruct` disables; no generator key degrades silently to pre-reconstruction behaviour.
 
 Four rails hold it honest:
@@ -279,10 +289,14 @@ Temporarily setting `tabindex="-1"` on body and focusing it resets both. Don't "
 
 The standing rule (2026-08-26). A step whose deterministic ladder has failed gets **ONE look** and, only if that look earns it, **ONE repair**. `#agentTriage` owns both and can spend no more; `#agentRescue` is gone, its contract absorbed.
 
-1. **The look** — `readOnly`, so it structurally cannot click, type or navigate. It answers with one of three verdicts in the decision's `value` (a field the schema already has, so no prompt pays for a new one): `proved` + the selector of the element that shows it; `can-heal` + what stands in the way; `fail`. Anything unrecognised reads as `fail` — the safe direction is to spend nothing.
+1. **The look** — `readOnly`, so it structurally cannot click, type or navigate, and **`sighted`, so it is given a screenshot alongside the tree** (2026-09-08). It answers with one of three verdicts in the decision's `value` (a field the schema already has, so no prompt pays for a new one): `proved` + the selector of the element that shows it; `can-heal` + what stands in the way; `fail`. Anything unrecognised reads as `fail` — the safe direction is to spend nothing.
+
+   **Why this one turn gets eyes, and no other.** The accessibility tree is the right observation for *driving* — it names controls, and a name is what a selector is built from. It is the wrong one for *judging*, because much of what a tester validates never reaches it: a value rendered into a plain div, a control that only looks disabled, a calendar popover standing where a textbox was asked for (humi's `DateField` is a `button[aria-haspopup="dialog"]`, and the EC hiring wizard burned 17 turns guessing text-input strategies at one). Each of those reads as absent in the tree and is plainly present on screen. So the judging turn sees; the driving loop stays blind, where an image per turn would buy nothing the tree does not already answer for free.
+
+   The picture is taken once per turn, beside the tree it belongs to — a shot from a different moment is evidence about a different page — and a capture that fails is simply no image, leaving the turn exactly as it was. A model with no vision is **not** an error: `looksLikeNoVision` catches that one refusal, marks the instance blind for the rest of its life, and re-asks the same turn without the picture, because a rung that used to answer from the tree may never start erroring instead. Every other failure is re-thrown untouched — falling back blind on any failure would quietly halve the evidence each time a provider hiccups.
 2. **The repair** — only on `can-heal`, and only under `--agent-assist`, because this stage changes the application and that has always been a decision about someone's system rather than a default. The look is ungated precisely because it cannot act. For an **assertion** the repair is further restricted to `REVEAL_ACTIONS` (open, focus, follow; never `fill`, never `dbCount`): a claim an agent typed into existence proves nothing.
 
-**Neither verdict is believed.** After `proved` the harness re-runs the author's own comparison against the element named; after a repair it re-runs the author's own selector. A step whose claim does not then hold fails exactly as it would have. That is what lets an assertion be offered this at all, where the old `#agentRescue` refused one — its rule was about ACTING, and forbidding action structurally is what makes a reading question safe to ask.
+**Neither verdict is believed — and sight does not change that.** After `proved` the harness re-runs the author's own comparison against the element named; after a repair it re-runs the author's own selector. A step whose claim does not then hold fails exactly as it would have. What the agent *saw* is never the evidence either: a screenshot lets it find the element the step should have named, and the element then has to survive the author's own comparison like any other. Seeing more is allowed to make the agent a better witness; it is not allowed to make it the judge. That is what lets an assertion be offered this at all, where the old `#agentRescue` refused one — its rule was about ACTING, and forbidding action structurally is what makes a reading question safe to ask.
 
 **The healer keeps its place, for the one thing it is good at.** It reads a static tree and proposes a different string — the right tool for a WRONG SELECTOR, the wrong one for a CONTENT miss. Measured (be100 PL_03_01, 2026-08-25): asked why `text=Total plans` did not contain "75", it proposed `text="68"` — find an element containing the expected value, which is circular — at 0.20 confidence, and was rightly refused. So a content-only miss (`isContentMiss` across every attempt) skips the healer entirely and goes straight to triage. Ahead of both sits the free **kin** rung (`ancestorSelectors`, two levels): a summary card is a label and a value in sibling elements, and climbing to the container that holds both costs nothing.
 
@@ -297,6 +311,35 @@ Three layers, because a rule enforced in one place is a rule with a hole in it:
 | Dispatch | `SmartRunner.assertBackendAllowed` | Throws `BackendDisabledError` per step, for a caller that drove the runner directly (MCP, the repair loop, an embedder) |
 
 **Refused, never silently skipped.** A suite that quietly drops assertions goes green having proved less than it claims — the vacuous pass in a new coat. `BackendDisabledError` is harness-class (`classifyStepFailure` → `error`, `reconstructionFutile` → true), so the case is recorded **blocked**: a limit the run was given, never a finding about the application.
+
+## A harness-sent request is not an application defect (`HeaderRefusedError`, 2026-09-08)
+
+`request` steps run through `#bareStep` and are off the ladder, so this is a
+classification rule rather than a rung — but it lands in `runner.ts` and belongs
+here with the other harness-class names.
+
+`BrowserTransport` sends through `BrowserContext.request`, which shares the
+cookie jar and **no application headers at all**. Live (PL_11_03, PL_10_23): a
+`GET …/plan/export` came back `400 Missing required header(s)` with
+`requestHeaders: {}` on the bundle and was filed `backend`/`high` — against an
+application refusing a malformed request correctly. The fix is in `src/api/`
+(`header-profile.ts` merges a header floor out of what `NetworkObserver` already
+saw the page send, scoped to the origin, per-request unique values regenerated,
+authored headers always winning, `inheritHeaders: false` to opt out). Two lines
+land in this module:
+
+- `'HeaderRefusedError'` joins `MethodRefusedError` in **`classifyStepFailure`**
+  (scored `error`, so `harnessOnly` records the case blocked, no defect) and in
+  **`reconstructionFutile`** (no rewrite invents a header nobody was seen
+  sending).
+- `SmartRunner` injects the floor as `headerProfile: (target) =>
+  this.#network?.headerProfile(target) ?? null` — a getter, not the observer
+  itself, because `#network` follows the active `PersonaSession` and a hand-off
+  must re-point the floor exactly as it re-points the transport.
+
+`download` needed nothing: `captureDownload` arms the download event and then
+*clicks*, so Chrome sends the page's own headers. `BrowserTransport` was the one
+bypass. Tests: `tests/api.test.ts`, three describes, all pure.
 
 ## A 404 is two findings, and only the codebase tells them apart
 
@@ -389,6 +432,40 @@ and the panel) turns the rectangle off; the target is recorded either way.
 the CLI line, both reports, the workbook and wowUI share.
 `tests/target.test.ts`: the pure half always, the browser half CDP-gated —
 what the role IS and whether the box is gone afterwards are browser facts.
+
+## A `position: fixed` overlay is invisible to `scrollWidth`/`scrollHeight`, and so to `fullPage` (`src/engine/evidence.ts`, 2026-09-10)
+
+Found by reading, not by a live incident: Playwright's own `_fullPageSize`
+(`screenshotter.js`) sizes a `fullPage` capture from
+`document.documentElement`/`body`'s `scrollWidth`/`scrollHeight`/`offsetWidth`/
+`offsetHeight`/`clientWidth`/`clientHeight` — nothing else. A `position: fixed`
+element is, by definition, positioned against the viewport rather than flowed
+into its parent, so it contributes to **none** of those. Nearly every modal,
+tooltip and popup library renders with `position: fixed` for exactly that
+reason (it has to track the viewport, not the document). The consequence: an
+overlay that renders taller or wider than the viewport is not merely out of
+frame in the still — the pixels past the edge are never in the buffer Chrome
+hands back, because the capture region Chrome was asked for stopped short of
+them. `target.ts`'s highlight box already had to design around the same fact
+from the other side (a `position:fixed` rectangle would itself land at the top
+of a tall image); this is the same coordinate quirk read for content the page
+renders rather than content wowlidator draws.
+
+`expandCaptureBounds()` grows the capture to match, the same trick in reverse:
+a `position: absolute` element DOES count toward its containing block's
+scrollable overflow, so a transient 1px marker (`CAPTURE_BOUNDS_ATTR`, same
+append-before-the-shutter/remove-in-`finally` shape as
+`drawTargetHighlight`/`removeTargetHighlight`) placed at the furthest corner
+any currently-rendered `position: fixed` element's own `getBoundingClientRect()`
+reaches — already in the coordinate space the capture pins fixed content to —
+grows `scrollWidth`/`scrollHeight` to cover it before `captureEvidence` calls
+`page.screenshot`. An overlay that never renders past the edge moves nothing:
+the marker is only ever placed at a corner something already occupies, never
+ahead of it, so this cannot manufacture margin around a control that is
+genuinely mispositioned by the app — that stays a real, visible defect.
+`tests/evidence.test.ts`'s CDP-gated overlay fixture pins a `position: fixed`
+dialog whose floor sits 220px past a 1080px viewport and asserts the captured
+JPEG's own height reaches it.
 
 ## Volatile greetings and the agent's tree notation (`src/engine/selector.ts`, 2026-09-02)
 
@@ -774,3 +851,598 @@ single call the step always made; CDP: no keydown + read-back + a combobox
 filled in one move, the click lands where the plain one would and a miss
 fails in one window, a filmed run performs and an unfilmed one does not, with
 identical resolutions).
+
+## "Could not resolve" is never said about a control the ladder measured (2026-09-09)
+
+The third way a resolved selector fails, beside a content miss and a state
+contradiction — and the one the failure header got wrong.
+
+Live, be-high-opusgen PL_08_01: steps 9, 10 and 11 resolved
+`role=button[name="Insert" i] >> nth=0`, scrolled to it, and read it **visible**
+and **enabled** in 8 ms and 10 ms. Step 12 clicked the same selector and spent
+**60,319 ms** across six rungs, every one of them reporting nothing but
+`locator.click: Timeout 1426ms exceeded` — an actionability timeout, which names
+no cause. With no attempt line matching the content or state shapes, the message
+fell through to the default: `could not resolve "role=button[name="Insert" i]
+>> nth=0" after 6 attempt(s)`, about a control the engine had just measured
+twice.
+
+The word is not cosmetic. It is the premise every later reader takes:
+
+- the **healer** was asked to repair a correct selector, proposed the same one,
+  and the ladder recorded *"nothing on this page serves the author's intent"*;
+- **reconstruction** invented a cause — *"the selector failed because of the
+  unsupported case-insensitive `i` flag inside the role name"* — which steps
+  9-11 disprove, having used that flag successfully three times;
+- the **report** told a person the control was never found, when it was on
+  screen at (1695,498) the whole time.
+
+The engine already knew better. `parseInterception` had named the blocker out of
+Playwright's own actionability log (the overlay rung's second attempt reads
+`scroll (clear of "div.humi-topbar")`), and `intercepted` was in scope at every
+throw — it was simply never carried onto the failure.
+
+`StepResolutionError` now takes `blockedBy`, and the ladder builds every failure
+through one `resolutionFailure()` helper so a throw site added later cannot
+forget it. The header becomes *"… resolved, but the action was blocked by
+div.humi-topbar … — the control is on the page and something over it took the
+pointer"*.
+
+Two properties keep it honest:
+
+- **`blockedBy` is not a guess.** Playwright names the interceptor from its own
+  log, and it cannot name one for an element it never found — so its presence is
+  proof the selector resolved. Absent, the resolution header stands unchanged,
+  which is what a genuinely missing control must still read as.
+- **Classification is deliberately untouched.** `contentOnly` stays false and the
+  step stays a dead end: it still could not proceed. Only the account of WHY
+  changed. Widening `contentOnly` here would silently reclassify dead ends as
+  failures across every run, which is a verdict change nobody asked for.
+
+Tests: `tests/smoke.test.ts` ("an intercepted action headlines as blocked, not as
+unresolved", and its converse — no interceptor, no change).
+
+## The backend rung must not fire on a selector strict mode already proved present (2026-09-10)
+
+The same class reached by a different signal, one rung earlier: rung 2.5, the
+backend stop.
+
+Live, be-sit-high-20260909-170213 (HUMI SIT), RU_06_12 and PL_10_01:
+
+```
+could not resolve "role=button[name="Make Correction" i]" after 2 attempt(s):
+  - fast "role=button[name="Make Correction" i]": strict mode violation: resolved to 25 elements: …
+  - backend: 5 request(s) failed while this step was waiting (GET …/content-management/language -> 500 in 28ms, …) - no repair attempted, the selector is not the problem
+```
+
+The backend rung's premise is explicit in its own comment: *"the control this
+step wants probably never rendered because the data behind it never
+arrived."* A Playwright strict-mode violation falsifies that premise directly
+— Playwright cannot report "resolved to 25 elements" for a control that never
+rendered. The rung fired anyway, because it checked only whether a request had
+failed, never what the attempts already on hand said about the selector, and
+the ladder never reached the healer — which verifies a candidate resolves to
+exactly one element, and here would have proposed the missing `>> nth=0`, as
+it already does for the same shape reached through rung 1.36/1.37's narrowing.
+
+This was not incidental: this SIT environment's four
+`/humi/api/content-management/*` endpoints 500 on every page load, so the rung
+was armed on effectively every step of every case. Any ambiguous `role=`
+selector in the run — and `role=` selectors have no narrowing rung of their
+own by design (unlike `text=`'s rungs 1.3/1.35: picking an arbitrary row for a
+*click* would change what the test exercises, so the healer, which asks a
+model to name the right one and then verifies it, is the only rung that may
+disambiguate an acting step) — became a phantom missing control, filed
+`backend`/`high` against an application that was fine.
+
+The fix is one line at the rung's own gate: a request failure recorded
+alongside an attempt containing `strict mode violation` no longer stops the
+ladder — `attempts.some((line) => line.includes('strict mode violation'))`,
+the same idiom rungs 1.3/1.35/1.36/1.37 already use to test the same string.
+Nothing else about the rung changes: a genuine not-found selector next to the
+same failing backend call stops here exactly as before, and `contentOnly`/the
+eventual verdict are untouched — same restraint as `blockedBy` above, only the
+account of why changes.
+
+Safe by the same argument that already orders rungs 2–6 ahead of 7: the healer
+cannot heal onto the wrong element here, because it still verifies exactly one
+match before accepting a candidate. Skipping the backend stop only lets that
+verification run; it cannot make a bad repair pass.
+
+Tests: `tests/smoke.test.ts` ("a strict-mode violation alongside a failing
+backend call still reaches the healer", and its converse — a plain not-found
+next to the same failing call still stops at the rung, unhealed); the second
+direction is also covered live in `tests/api.test.ts` ("declines to heal when
+the request behind the step returned 500").
+
+## A tree line is not a selector (`fromTreeLine`, 2026-09-09)
+
+The worst failure class this system can produce: a **false claim about a
+working application**.
+
+Live, be-high-ctx PL_08_01. The flow clicked the Insert icon, the application
+opened the dialog titled *"Insert new changes for Benefit: QA-Import"* — exactly
+what the case's Expected output 3.2 requires — and step 12 asserted:
+
+```
+expectVisible   dialog "Insert New Changes for Benefit: QA-Import"
+```
+
+It spent **35,602 ms**, reported `not visible (hidden or absent)`, and the case
+was filed `DEAD-END` against the application. The screenshot in the report shows
+the dialog filling the screen.
+
+That string is not a selector in any engine. It is how the **accessibility tree
+prints a node** — `<role> "<name>"` — and an author holding a tree writes it
+back out as if it were a locator. Playwright reads it as CSS, where a quoted
+string after a tag is a syntax error, so it matches nothing, ever, on any page.
+
+`fromTreeNotation` (authoring plane) already rewrote the BRACKETED versions of
+this mistake — `StaticText[text="…"]`, `role=link[url="…"]`, `[placeholder=…]`,
+`[aria-label=…]` — and every one of them was found the same way, in a live run.
+The tree's plainest form had no bracket for any of those patterns to catch.
+
+`fromTreeLine` (in `selector.ts`, beside the `ARIA_ROLES` set it uses) is the
+same move for it: `dialog "X"` → `role=dialog[name="X" i]`, `StaticText "X"` →
+`text="X"` (the tree's word for a text node is not a role).
+
+Three properties, each load-bearing:
+
+- **It cannot make a selector worse.** The input shape is invalid by
+  construction — nothing matching `<token> "<quoted>"` resolves in any engine —
+  so a rewrite can only turn a guaranteed miss into a possible match.
+- **Only a real ARIA role is rewritten** (`ARIA_ROLES`, the W3C set
+  `qualifyBareRole` already uses). No app vocabulary decides this, and a CSS
+  selector cannot be swept in: `widget "Whatever"` is left exactly as written.
+- **The name is matched case-insensitively.** The sheet and the page capitalise
+  differently as a matter of course — this very step wrote "Insert New Changes"
+  where the page renders "Insert new changes" — and an accessible name is
+  matched whole either way, so the ` i` flag costs nothing and removes a second
+  guaranteed miss hiding behind the first.
+
+Tests: `tests/flow-author.test.ts` ("a tree line is not a selector"), including
+the non-role and real-selector cases that must pass through untouched.
+
+## `expectAttribute` answers an ARIA state from either spelling (2026-09-10, PL_06_05)
+
+Live, be-sit-high-20260909-170213: the sheet's Expected 3.1 is "Benefit Plan ID
+is marked required." The flow authored `expectAttribute role=textbox[name="Benefit
+Plan ID" i]` with `attribute: required` — and failed: `expected @required to be
+"", got null`. The application marks the field with `aria-required="true"`, not
+the HTML `required` attribute. The claim is true; the run filed it as a defect.
+
+This is not a case authoring could have avoided. CDP's own `required` property
+(`propertyFlag(node, 'required')`, printed on the tree line the author reads —
+`formatAxNode`) **unifies both spellings**: the tree shows `required` whether
+the application used the bare attribute or the ARIA one. The author has no way
+to know which one to write, and a lint refusing `@required` would be refusing
+a true claim with nowhere to steer it. The harness's own sighted look already
+proved this live: it returned `proved` with "the requiredness is exposed via
+aria-required rather than an attribute the step read," the `proved` rail
+correctly re-ran the author's own comparison (`getAttribute('required') ===
+''`), and that comparison failed anyway — the rail did its job; the job itself
+was too narrow. The healer independently proposed the correct
+`[aria-required="true"]` selector and was refused at 0.35 confidence against
+the 0.5 gate — right selector, wrong problem to solve with a selector.
+
+The fix is in `expectAttribute` itself, not the ladder and not authoring:
+`ARIA_STATE_ATTRIBUTES` names the six state attributes exposed two ways —
+`required`, `disabled`, `checked`, `readonly`, `selected`, `expanded` — and
+when the raw attribute comparison misses on one of them, `ariaStateMatches`
+answers from `aria-<name>` before the step fails. `expected === ''` is the
+idiom flows already use for a bare HTML boolean attribute's mere presence
+(`<input required>` reads back `''`), and it means the same thing against the
+ARIA spelling — "this state holds" — so only `aria-<name>="true"` satisfies
+it; any other `expected` (`"true"`, `"false"`, a tri-state `aria-checked`'s
+`"mixed"`) is compared to the ARIA value directly, which is what lets a claim
+that already spells the ARIA token out keep working unchanged. A state the
+ARIA attribute never mentions (`null`) satisfies nothing, whichever spelling
+was asked for — the fallback can only turn a spelling mismatch into a pass; it
+cannot turn a genuinely unrequired field into one. Every other attribute name
+— `title`, `aria-label`, `href`, `data-*`, and the literal `aria-*` spelling
+itself — is not in the set and keeps reading only the raw attribute, byte for
+byte (RU_07_01 in this same run, `title="Insert"`, untouched).
+
+The failure message names both readings when the fallback still misses
+(`… (aria-required is "false")` / `(aria-required is absent too)`), because
+"expected @required to be '', got null" told a reader nothing about the ARIA
+attribute sitting right there. A step that DOES match via the fallback records
+`detail.matchedVia` (`aria-required`), so the report shows which spelling
+proved the claim.
+
+Tests: `tests/runner-wave2.test.ts` (`ariaStateMatches`'s pure decision table:
+the live miss, a genuinely false or absent state staying a fail, and the
+tri-state comparison) and `tests/form-actions.test.ts` (a live fixture pairing
+`aria-required="true"`/`"false"`/absent, and the `title` control proving the
+non-state path is unchanged).
+
+## A sign-in URL is never evidence of no session; an accepted credential POST is evidence it took (2026-09-10, be-sit-high-20260909-170213)
+
+**Incident.** The application under test lands a SUCCESSFUL local sign-in
+back on its sign-in page: the submit click POSTs the credentials, the server
+answers 200 with the session cookie, the client's own redirect goes to the
+home route and then back to the sign-in URL, which re-mounts the login form
+with EMPTY fields. The session is real — a `goto` to a protected page with
+that jar renders signed in (verified with a plain Playwright probe, no
+harness) — and the landing is intended by the app team. The harness read it
+as two failures in `executeSteps` and sealed 15 of 15 cases blocked or failed:
+
+1. `fillsLostToHydration` read the password field right after the click. The
+   re-mounted form read back empty, so the click was filed as "hydration reset
+   the filled fields" (`recordLostFillFinding`) and the fill block plus click
+   were replayed — a second, equally successful sign-in with the same landing.
+2. After the replay, `noteSignInOutcome(looksLikeSignIn(url))` set
+   `#signInDidNotTake` from the URL alone, and `signInDidNotTakeMessage` then
+   sealed the case "no verdict: the sign-in did not take effect" at the flow's
+   next protected `goto` — even when that goto LANDED (RU_06_01: 10/10 steps
+   passed, the goto to the rules page passed, case sealed blocked).
+
+**Rule.** "Still on a sign-in URL" is never evidence of "no session". The
+evidence that a credential submit took is the network: during the
+credential-shaped click, the page made a POST the server accepted
+(`acceptedCredentialSubmit` — method POST compared case-insensitively,
+`status` defined and under 400). The two hydration signatures are
+distinguishable from it by construction: a hydration-reset submit posts empty
+credentials and is refused (4xx), and a pre-hydration native submit is a GET
+(the URL signature, `nativeFormResubmitDetected`, is unchanged). So:
+
+- `executeSteps` takes a plain observer mark (`SmartRunner.netMark()`,
+  deliberately not `#takeNetMark`, whose evidence floor the backend rung
+  reads) right before a `click` that follows a fill block, and
+  `hydrationResetEvidence` consults `fillsLostToHydration` ONLY when no
+  accepted POST was observed since that mark. An accepted POST beside empty
+  fields is no finding and no replay: it is disclosed on the click step
+  (`detail.submitAccepted: 'POST <url> <status>'`,
+  `ProofBundleBuilder.annotateLastStep`) and as a bundle note, the way
+  `sessionEstablished`/`consentAccepted` are.
+- The lost-fill read can run while the submit's POST is still in flight, so
+  before a replay the question is asked once more after the existing
+  `networkidle` wait (`settled`); the native-GET signature is never re-asked,
+  a GET being no POST.
+- After a replay, the verdict is `signInDidNotTakeAfter(url, accepted)` —
+  `looksLikeSignIn(url) && accepted === null`, judged on a second mark taken
+  before the replayed click, so the replay's own POST is what is judged.
+- `performSignIn` (`sign-in.ts`; the `signIn` step, the session bootstrap,
+  the capture) judged "did the sign-in take" by the URL alone and would have
+  replayed and then reported "the page never left the sign-in screen" on this
+  application. It now watches Playwright's own `response` events during the
+  submit (`watchAcceptedSubmit`: POST, xhr/fetch/document, status under 400).
+  Once a POST is accepted the URL gets a 2 s window to move instead of the
+  full 8 s; a page still on the sign-in URL after an accepted submit is
+  `ok: true` with `acceptedSubmit` set, and the hydration replay is skipped —
+  replaying would sign in twice and prove nothing. The `signIn` step records
+  it as `detail.submitAccepted` plus a note; the bootstrap's note names it.
+
+Nothing else about the guard changed: `#strandedMessage`'s three conditions,
+`signInDidNotTakeMessage`, the `click` exemption and the credential-block
+clearing branch are byte for byte as before.
+
+**Safety argument.** This change can only stop the engine from calling a
+real session absent; it cannot make an absent session pass. `#signInDidNotTake`
+was always positive evidence only, and the new evidence is stricter than the
+old (a server's acceptance rather than a URL's shape). A session that truly
+never existed is still caught by the stranded guard on the next protected
+`goto`, which bounces to a sign-in URL the goto did not ask for — the same
+three conditions as ever. The one thing an accepted POST buys is that the
+verdict waits for that goto instead of being pronounced from a URL that this
+application's own landing makes meaningless. The `performSignIn` half has the
+same floor: a `signIn` that returns `ok` on the sign-in page sets
+`#lastGotoPath` to that page, so the step after it is guarded exactly as
+before and a protected `goto` that bounces still stops the run.
+
+**Residual edges, disclosed.** A persona who signed in on this application and
+is switched back to (`#sessionOf`) sits on a sign-in URL, so the `signIn` step
+reads `sessionExpired` and signs in again — an extra login, disclosed on the
+step, never a verdict. The suite session vault banks a session only off the
+sign-in page, so a run that ENDS on this landing without a later protected
+`goto` banks nothing; the next case pays its own sign-in. Any accepted
+XHR/fetch POST during the click counts — an application whose sign-in click
+also fires an accepted analytics POST would be judged by that; the next
+protected goto is still the proof.
+
+**Not measured live.** Delivered on typecheck and the pure tests below; the
+engine was not run against the application in this change.
+
+**Pinned by** `tests/smoke.test.ts` ("a sign-in URL is never evidence of no
+session; an accepted credential POST is evidence it took"): the accepted-POST
+reader (case of the method, a GET, a 4xx, a call still in flight), (a) an
+accepted POST beside empty fields — no replay, no finding, the fields not
+even read, the flag not set; (b) no POST beside empty fields — the replay and
+the finding as before; (c) a 401 POST — replayed as before; (d) after a
+replay, an accepted POST clears the verdict on a sign-in URL and no POST keeps
+it.
+
+### The sign-in retry: reload, re-enter, re-click, up to `SIGN_IN_ATTEMPTS` (2026-09-10, same seam)
+
+**Asked for.** When a sign-in does not take and would otherwise seal the case
+blocked, the engine reloads the page, enters the credentials again and clicks
+the sign-in control again, up to ten attempts in total, before it gives up.
+
+**Interpretation.** "Refresh and re-click" is a navigation back to the URL
+the credential block started on (`urlBeforeFills`, which `executeSteps`
+already holds; `page.reload()` when it holds none, and always in
+`performSignIn`), then the FILL BLOCK replayed, then the click — a reload
+empties the fields, so a bare re-click would submit nothing. An attempt is
+one credential submission: the original click is attempt 1, the hydration
+replay attempt 2, the reload retries 3…N. The ceiling is
+`SIGN_IN_ATTEMPTS` (10, `sign-in.ts`), overridden by
+`WOWLIDATOR_SIGN_IN_ATTEMPTS` read the way `WOWLIDATOR_SKIP_AFTER_FAILED_LEG`
+is (`signInAttemptCeiling(env)`); `0` and `1` both mean no retry, anything
+unparseable means the default. Between attempts the run waits for
+`networkidle` (bounded, 10 s, as the replay already did) so a slow login is
+not hammered.
+
+**Where it lands.**
+
+- `executeSteps`' credential block, after the accepted-POST check and the one
+  hydration replay, only where the verdict would still be "did not take" (no
+  accepted POST and `looksLikeSignIn(url)`): `retrySignIn` (pure, `sign-in.ts`)
+  drives attempts 3…N; each is the navigation back, the fills and the click
+  recorded in the proof exactly like the replay (`markReplayed`, reason
+  "sign-in retry N of 10"), a mark taken before the click, `networkidle`, and
+  the same `signInDidNotTakeAfter` judgement on the retry's own POST. Only
+  after the ceiling is spent does `noteSignInOutcome(true)` fire. ONE
+  `usability`/`medium` finding for the whole loop
+  (`recordSignInRetryFinding`: "The sign-in took N attempts" / "did not take
+  after N attempts"), never one per attempt. It does NOT fire in the
+  clearing branch (a credential click with intact fields on a sign-in URL and
+  no accepted POST): that branch never set the flag, and it is where a
+  negative sign-in test asserting its error message lives — ten reloads
+  there would erase the very message the test came to read; the stranded
+  guard on the next protected `goto` still catches a wrong password there.
+- `performSignIn` (`signIn` step, the bootstrap, the capture pilot): the
+  procedure is now `signInOnce` (form, fills, submit, and on the first pass
+  its one hydration replay) inside the same `retrySignIn` loop with a
+  `tab.reload()` and a `networkidle` between passes; a retry pass makes
+  exactly one submission so the ceiling counts what it says. `SignInResult`
+  gains `attempts` on both variants; the `signIn` step records
+  `detail.attempts` and a note when more than two were needed, the
+  bootstrap's note says so too.
+- A step of a retry that itself fails (the control no longer resolves after
+  the reload; the form gone in `performSignIn`) ends the loop as `failed`
+  with the verdict left set: the ceiling is for a login that did not take,
+  not for ten ladder walks. `SessionLostError` / `BrowserGoneError` inside an
+  attempt propagate — they are not attempts.
+
+**Safety argument, unchanged.** A retry can turn "no session" into "session"
+only by actually signing in: the accepted POST or the URL leaving the
+sign-in page is still the only thing that ends the loop early, and the
+stranded guard on the next protected `goto` is untouched. A genuinely wrong
+password spends the ceiling and then fails exactly as before, with the
+attempt count on the finding.
+
+**Bounded, and by how much.** Each `executeSteps` retry is at most: the
+navigation back (10 s) + `networkidle` (10 s) + the fills (one fast window
+each, 2 s, on a control that resolves) + the click (2 s fast window, plus
+the not-found landing read, 1 s) + `networkidle` (10 s) ≈ 37 s with two
+fills; eight retries ≈ 5 min worst case, and a fast 401 on every attempt
+costs ≈ 2–3 s each, ≈ 20 s for the loop. Each `performSignIn` retry is at
+most: reload (10 s) + `networkidle` (10 s) + the hydration settle (0.4 s) +
+the URL wait (8 s; 2 s once a POST is accepted) + `networkidle` (10 s) ≈
+38.4 s (plus the 6 s render wait when no field is visible); nine retries ≈
+5.8 min worst case, ≈ 90 s when every attempt is a fast 401 (the 8 s URL
+wait is the cost per refused attempt). Neither loop can exceed its ceiling:
+`retrySignIn` counts up from the submissions already made and stops at the
+ceiling, a failing step stops it sooner, and there is no exponential
+component.
+
+**Not measured live** — delivered on typecheck and the pure tests.
+`performSignIn`'s `attempts` is only observable against a real page and has
+no fixture yet: CDP-gated, not written in this change.
+
+**Pinned by** `tests/smoke.test.ts` ("the sign-in retry: reload, re-enter,
+re-click, up to the ceiling"): an accepted POST on attempt 3 stops at 3 with
+the flag clear; ten refused submits stop at exactly 10 with the flag set
+(attempts 3…10, eight retries); a failed step ends the loop; a thrown
+lost-session/dead-browser propagates; `WOWLIDATOR_SIGN_IN_ATTEMPTS=1` (and
+`0`, and garbage → default) retries nothing and leaves the verdict as before.
+
+### A credential click settles before the next step; the verdict's advice moved to the next page (2026-09-10, same seam)
+
+Authored flows now carry NO assertion between the credential click and the
+next `goto` — the sign-in proof lives on the page the flow goes to next
+(`src/generator/`'s rule). Two engine consequences:
+
+- **The settle** (`SmartRunner.settleCredentialSubmit`, decision in the pure
+  `credentialSettleOutcome`). `click` returns when the click lands, so a
+  `goto` issued right after it aborts the login POST in flight and the run
+  arrives with no session. After a click that closes a credential-shaped
+  block, and before the hydration signatures read anything, the run waits —
+  bounded by the healed timeout — until the first of: an accepted POST since
+  the click mark, the URL leaving the sign-in page, `networkidle`. The same
+  three facts the verdict reads, strongest first; a page that was never on a
+  sign-in URL (a change-password form) settles at once, so an application
+  that navigates promptly pays nothing. Polled every 100 ms because two of
+  the facts are reads. Recorded on the click as `settledOn`/`settledAfterMs`
+  only when it waited `CREDENTIAL_SETTLE_NOTE_MS` (500) or more. The same
+  settle now follows the hydration replay's click and every retry's click,
+  in place of a bare `networkidle` wait, so the verdict never reads a POST
+  that has not landed. Inside the credential-click path only — `goto` is
+  untouched.
+- **`signInDidNotTakeMessage`'s advice** no longer says to assert something
+  "immediately after the submit click". It says the engine judges the submit
+  itself (the accepted POST, the next protected page landing), that neither
+  the replay nor the retries recovered this one, and that the flow's proof
+  belongs on the page it goes to next — a control only a signed-in page
+  shows. The rest of the message ("not a redirect", the path asked for) is
+  unchanged; `tests/smoke.test.ts` pins both the new phrasing and the
+  absence of the old.
+
+Tests: `tests/smoke.test.ts` ("a credential click settles before the next
+step runs"): an accepted POST settles first; the URL leaving settles and a
+non-sign-in page settles at once; a quiet network settles a page still on
+the sign-in URL while an in-flight or refused POST alone does not.
+
+## A click-catcher is clicked through, and "opened by the previous click" needs evidence (2026-09-10, be-sit-high-fixed-20260910-141440 PL_08_01; lanes c4, c8, c14)
+
+**Incident.** The JIT healer's pre-heal probe clicked a top-bar trigger
+(`aria-haspopup="dialog"`). Its popover renders a `position:fixed; inset:0;
+aria-hidden` click-catcher inside the bar and closes ONLY on a click — no
+Escape handler. The probe's Escape failed and left it open; from then on every
+click in the lane was "blocked by" the bar (Playwright names the catcher's
+ancestor as the interceptor). Two engine rungs then failed to clear it:
+`#clearInterceptingOverlay` tries a dismiss control then Escape, both no-ops
+on a click-to-close catcher; and rung 1.5 treated the popover's `role=dialog`
+as "opened by the previous click" because `#lastAction` was a click — but
+that click (a sidebar navigation) did not open it; it appeared seconds later,
+mid-ladder, opened by the harness's own probe.
+
+**Rule 1 — the scrim rung (1.65).** After the dismiss-button and Escape
+attempts and before any model, `#clickThroughScrim` asks the SHARED decision
+in `src/engine/click-catcher.ts` (`findClickCatcher`, the same predicate the
+healer's probe uses, so the two seams cannot disagree) for a viewport point
+whose topmost element is a catcher — nameless, textless, fixed or absolute,
+covering ≥ 95 % of the viewport on both axes, not an actionable tag. A real
+`mouse.click` at that point, 350 ms, a fresh probe at the same spot must no
+longer find a catcher, then the author's own selector is retried once.
+Recorded as resolution `dialog` with `DialogRecord { name: <interceptor>,
+button: 'click-catcher' }` and a note naming the catcher. **Safety argument:**
+a nameless, textless, viewport-covering element has no action of its own —
+clicking it is exactly the dismiss a person performs, and it cannot be a
+Submit/Delete because those carry names; and the point is over the catcher
+by construction (`elementFromPoint` returned it as topmost), so it is never
+over the step's own target. A named modal still goes through the
+dismiss-button path first and never reaches a blind click.
+
+**Rule 2 — intended context needs evidence.** `#resolve` snapshots which
+dialog is open when the step's resolution BEGINS (`openDialogNow` +
+`describeDialog`; a single `count()` on the usual dialog-free page, so the
+fast path pays effectively nothing). At rung 1.5 the "opened by the previous
+<action>" exemption (`dialogIsIntendedContextGiven(lastAction, openAtStart)`,
+`modal.ts`) applies only when the dialog found now carries the same label as
+the one open at that snapshot. A dialog that appeared after the step began
+was opened by the ladder (probe, agent) or by the page, not by the previous
+step — it is a blocker and dismissed as before. The second exemption
+("holding the very control this step is aimed at") is unchanged.
+`findDismissButton`'s policies, the sticky-bar rung and the dead-end memo are
+untouched.
+
+**Also disclosed:** a heal outcome's `probeWarnings` (a disclosure the probe
+left open, one closed by a click rather than Escape, a trigger that navigated)
+are written as bundle notes `<selector>: disclosure probe — <warning>`, so the
+report can say the page state a heal ran on was the probe's doing. No
+verdict, no defect.
+
+**Measured** (headless Chrome on :9222, `tests/modal.test.ts`): the scrim
+fixture — a trigger opening a `role=dialog` plus a fixed inset-0 aria-hidden
+catcher with no Escape handler — passes 4/4 with the blocked click resolved
+`dialog` / `click-catcher` in ~4.0 s; the promo fixture (a modal with a named
+Close) still resolves by that button, never a blind click, in ~1.8 s.
+
+**Pinned by** `tests/smoke.test.ts` ("a click-catcher scrim, and the
+intended-context evidence": full-viewport nameless fixed div → catcher; a
+BUTTON, a named layer, a layer with text, a 60 px sticky bar, an absolute
+layer covering only the width → not; open-at-start + click → intended,
+appeared mid-ladder + click → blocker) and the two CDP cases in
+`tests/modal.test.ts` above.
+
+## A century-scale jump goes through the month view by ASSUMED shape, and humi's is a different one (EH-DOB, 2026-09-14, e2e01-dedup-20260914-154219 hir-ec-001-key-in-60)
+
+**Incident.** Hire Date (a small delta from "now") resolves via plain
+month-nav in ~12 clicks, ~0.7 s. Date of Birth for `1968-03-01` — ~702 months
+back from ~September 2026 — spent **121,231 ms** across four ladder rungs and
+failed completely: `fast` walked `MAX_MONTH_STEPS` (240) month-by-month clicks
+and stopped at "September 2006", 240 short; `jit` was disabled; the agent's
+look correctly diagnosed nothing actionable; `agent-enter` clicked `Next
+month` until the loop's own no-progress guard stopped it, still short. The
+module's own doc comment already claimed the long-jump shortcut existed ("a
+month view behind the heading… a `select` for the month, a number input for
+the year") — so on paper this should have been unreachable.
+
+**Root cause, found live** (`humi-sit-int.central.co.th/humi/en/admin/hire`,
+the real Date of Birth `DateField`, DOM read directly, not guessed): the
+assumption behind `jumpViaMonthView` was written from a WRITER's idea of the
+widget, never from the widget — the same failure shape this file has already
+named twice (the multi-select `role=listbox` fixture, the searchable-select
+panel with no list role). Two divergences, both fatal on their own:
+
+1. **The month-view toggle's accessible name is not its visible text.** The
+   heading is `<button aria-label="Choose month and year">September 2026</button>`.
+   `jumpViaMonthView` looked up the toggle with `getByRole('button', { name:
+   <regex of the heading text> })` — an ACCESSIBLE-NAME match — which can never
+   find a button whose `aria-label` says something else entirely. The toggle
+   was never clicked; the month view never opened.
+2. **There is no `select` and no year input at all.** Once opened (confirmed
+   by driving it directly with `el.click()`), the month view renders a plain
+   grid of month BUTTONS (`Jan`…`Dec`, no `aria-label`, matched by their own
+   text) and a year row of `Previous year`/`Next year` icon buttons flanking a
+   bare, roleless `<p>2026</p>` — no `combobox`, no `spinbutton`, no
+   `textbox`. `jumpViaMonthView`'s existing combobox/year-field branch had
+   nothing to find even had the toggle been reached.
+
+Measured live before writing anything: the year-nav buttons update the `<p>`
+in ~4 ms/click with no artificial wait (53 clicks, 222 ms, no minimum-year
+bound encountered down to 1900); clicking a month button both sets the month
+AND returns to day view, with the header re-reading "March 2021" correctly —
+but that header text is FROZEN during year navigation (it kept reading
+"August 2026" through five year-back clicks), so it cannot be used to poll
+progress the way the day-view heading can.
+
+**Fix, `jumpViaMonthView` (`src/engine/calendar.ts`).** Two independent
+mechanisms, chosen by what the DOM actually renders, not by which one was
+assumed:
+
+- The heading TOGGLE is now found by `dialog.getByRole('button').filter({
+  hasText: <the heading's own rendered text> })` — Playwright's `hasText`
+  matches `textContent`, never the accessible name, so an `aria-label`
+  override can no longer hide it. This can only turn a guaranteed miss into a
+  match: a button whose accessible name already equalled its own text (every
+  existing fixture) is found exactly as before.
+- The YEAR is set through a fillable field when one is visible (unchanged,
+  Case A); otherwise `stepYearButtons()` clicks `Previous year`/`Next year` in
+  a loop, reading the displayed year off whichever ancestor of the nav button
+  (up to four levels up) carries a bare 4-digit number — no id, no testid, no
+  label assumed, the same "understate, never overstate" discipline the rest
+  of this module already uses for CSS/ARIA detection. Bounded to the actual
+  distance plus five clicks of slack (`YEAR_NAV_SLACK`), not a flat ceiling —
+  a Date of Birth ~58 years back costs ~58 clicks, not `MAX_MONTH_STEPS`'s 240
+  and not an unbounded loop either; a button that stops moving the year (a
+  min/max bound) or offers no visible nav in the needed direction stops the
+  walk and the function returns `false`, falling through to the caller's
+  existing month-nav loop exactly as a `jumpViaMonthView` failure always has.
+- The MONTH is picked from a `select` when one is visible (unchanged, Case A);
+  otherwise `findMonthButton()` scans the dialog's buttons for the one whose
+  OWN text (not accessible name) parses via `monthNumberOf` to the target
+  month, and clicks it — the same day-grid idiom (`dayButtons` matched by
+  their own rendered number) applied one level up.
+- The function's final check is untouched: it re-reads the dialog's own
+  heading and only reports success when it names the target month AND year —
+  the same "re-run the author's own read" contract every rung in this module
+  already gives, so a partial or wrong navigation still fails honestly rather
+  than "successfully" landing on the wrong month.
+
+**Why this cannot heal onto the wrong date.** Every step is either a read
+(the heading text, the year `<p>`, a button's own text) or a click on a
+control matched by what the read just found — never a guess at a day, a
+month, or a year. A stalled year walk or an unfound month button returns
+`false` and the caller's existing plain month-nav loop and its own bound
+(`MAX_MONTH_STEPS`) are the fallback, unchanged; the day-picking phase (the
+disabled-day verdict, the last/first match by day ≥ 15) is untouched entirely.
+`MAX_MONTH_STEPS` itself was not raised — a jump this month-view path cannot
+resolve still fails in the same bounded way it always did, it does not fail
+slower.
+
+**Measured, live** (`humi-sit-int.central.co.th`, the real Date of Birth
+field, VPN-connected, headless Chrome on `:9333`): before, 121,231 ms,
+`failed`, nothing entered. After, driving `pickDateInDialog` directly against
+the same live field with the fix applied: **2,192 ms**, `via: "month-view"`,
+`navigated: 0`, `confirmed: true`, trigger reads `"1 Mar 1968"`. Near-term
+Hire Date is unaffected (`MONTH_VIEW_THRESHOLD` still gates `jumpViaMonthView`
+to jumps over 13 months; the existing month-nav CDP tests still pass
+byte-for-byte, see below).
+
+**Measured, CDP fixture** (`tests/engine-helpers.test.ts`, a new `#dob-date`
+`DateField` built from the live widget's exact shape — button-grid month
+view, no combobox, no year input, a toggle whose `aria-label` differs from
+its text): a ~700-month jump (`1968-03-01`) resolves via `month-view` in
+~2.6 s, confirmed; the SAME widget's near-term date (`2026-11-10`, 2 months
+out) still resolves via plain `month-nav` with `navigated: 2`, unaffected;
+every pre-existing calendar test (the combobox+year-input Case A fixtures,
+the Buddhist heading, the disabled-day verdict) stays green, unchanged.
+
+**Pinned by** `tests/engine-helpers.test.ts`: "calendar: a century-scale jump
+(Date of Birth) drives a button-grid month view, not 700+ month-nav clicks
+(EH-DOB)" and "calendar: the same button-grid widget still resolves a
+near-term date via plain month-nav (unaffected)", both CDP-gated against the
+new fixture; the four pre-existing calendar tests (Case A: combobox+year
+input) are unchanged and still pass.

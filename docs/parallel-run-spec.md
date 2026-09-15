@@ -2,7 +2,15 @@
 
 *2026-08-28. Status: IMPLEMENTED same day (sections + scheduler + interference
 detector + governor + session-cap sizing; `awaitDbChange` and `dependsOn` are
-the remaining phase-4 work). Requested as: explore
+the remaining phase-4 work).*
+
+*Superseded in part, 2026-09-11: **§2.4's queue governor was removed**, with
+its `db` tool and the `governor` role. It was specified as an optimiser that
+could change no verdict if absent, and the usage ledger showed its model half
+never took a turn in 18,704 recorded calls. Everything else here — the
+sections, the scheduler, the interference detector, the session-cap sizing —
+stands. The governor text below is kept as the record of what was built and
+why, not as a description of the code.* Requested as: explore
 maximum parallelism using `claude -p`; if a case's data changes are not in the
 same section as another's, allow parallel run; support "await datachange on a
 specific task"; estimate the defects this introduces and how to cover them.*

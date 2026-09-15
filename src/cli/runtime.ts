@@ -11,9 +11,10 @@ import { LlmValueResolverModel } from '../generator/value-resolution.js';
 import { FlowReviewer, LlmFlowReviewModel } from '../generator/flow-review.js';
 import { LlmRiskModel, riskEnabled, type RiskModel } from '../generator/dead-end-risk.js';
 import { LlmDiagnosisModel, diagnosisEnabled, type DiagnosisModel } from '../generator/error-diagnosis.js';
+import { LlmNarrationModel, type NarrationModel } from '../generator/step-narration.js';
+import { LlmCaseNarrativeModel, type CaseNarrativeModel } from '../generator/case-narrative.js';
 import type { CacheManager } from '../cache/cache-manager.js';
 import { describeRouting } from '../config.js';
-import { LlmDataModel } from '../data/data-model.js';
 import { formatAgentAction, formatStepLine, type ProofStep } from '../engine/proof-bundle.js';
 import type { RunPlan } from '../engine/runner.js';
 import { CAPTURE_PILOT_MAX_STEPS } from '../context/capture-pilot.js';
@@ -22,8 +23,24 @@ import { LlmFlowRepairModel, type FlowRepairModel } from '../repair/flow-repair-
 import { LlmReviewJudge, type ReviewJudge } from '../engine/review-judge.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
 import { JitHealer, LlmHealerModel } from '../healer/jit-healer.js';
+import { LlmCorroborationModel } from '../engine/backend-corroboration.js';
 import { LlmAgentModel, WorkflowAgent } from '../orchestrator/workflow-agent.js';
+import {
+  mutationPolicyFromEnv,
+  type MutationPolicy,
+  type MutationReversibility,
+} from '../orchestrator/mutation-policy.js';
 import type { CliOptions } from './options.js';
+
+/**
+ * The verdict model for backend corroboration — the AGENT role's own config,
+ * asked for as `verdict-agent` (2026-09-11). Null when the run has no agent
+ * (`--no-agent`): a corroboration nobody can map is simply not attempted, and
+ * every assertion keeps exactly the verdict it has today.
+ */
+export function buildCorroboration(options: CliOptions): LlmCorroborationModel | null {
+  return options.agent ? new LlmCorroborationModel({ factory: options.factory }) : null;
+}
 
 export function buildHealer(options: CliOptions, hints?: HealHintsProvider | undefined) {
   return options.heal
@@ -101,11 +118,31 @@ export function lineLogger(
   return options.json ? undefined : (line) => emitTagged(tag, line + '\n');
 }
 
-export function buildAgent(options: CliOptions, tag?: string | undefined): WorkflowAgent | null {
+export function buildAgent(
+  options: CliOptions,
+  tag?: string | undefined,
+  /**
+   * What this run can put back, once the baseline has actually been taken
+   * (2026-09-09). Threaded in rather than read from the environment here,
+   * because it is not configuration: it is a measurement the runner makes —
+   * a snapshot exists, a write credential resolved, tables came back
+   * restorable — and only the runner is in a position to have made it.
+   */
+  reversible?: MutationReversibility | undefined,
+): WorkflowAgent | null {
   if (!options.agent) return null;
+  // The manifest keeps precedence in every direction: reversibility only ever
+  // ADDS the run's undo to whatever the host declared, and can neither widen
+  // an `allow` list nor overrule a `deny`.
+  const base = mutationPolicyFromEnv();
+  const policy: MutationPolicy | null =
+    reversible === undefined || reversible.tables.length === 0
+      ? base
+      : { ...(base ?? {}), reversible };
   return new WorkflowAgent({
     model: new LlmAgentModel({ factory: options.factory }),
     earlyStop: options.agentEarlyStop,
+    ...(policy === null ? {} : { mutationPolicy: policy }),
     // Per-turn live progress — a `workflow` step can run for several seconds
     // across multiple model calls, and this is the only visibility into it
     // before the step as a whole finishes. Suppressed under --json: the
@@ -162,6 +199,30 @@ export function buildDiagnosisModel(options: CliOptions): DiagnosisModel | null 
   return new LlmDiagnosisModel({ factory: options.factory });
 }
 
+/**
+ * The per-step narrator (`generator/step-narration.ts`): OFF unless `--narrate`
+ * or `WOWLIDATOR_NARRATE=on`, through the healer role. Asked for once per case,
+ * never per step. No healer key degrades silently to the step lines the report
+ * has always shown — the capture-pilot rule.
+ */
+export function buildNarrationModel(options: CliOptions): NarrationModel | null {
+  if (!options.narrate) return null;
+  if (!options.factory.canResolve('healer')) return null;
+  return new LlmNarrationModel({ factory: options.factory });
+}
+
+/**
+ * The case narrative — one `generator`-role call per case that writes the
+ * per-case page's lede, summary, tickets, note and open questions onto the
+ * bundle. On by default; `--no-case-narrative` turns it off, and no
+ * generator key degrades silently to the evidence-only page.
+ */
+export function buildCaseNarrativeModel(options: CliOptions): CaseNarrativeModel | null {
+  if (!options.caseNarrative) return null;
+  if (!options.factory.canResolve('generator')) return null;
+  return new LlmCaseNarrativeModel({ factory: options.factory });
+}
+
 export function buildStepRepair(options: CliOptions): FlowRepairModel | null {
   if (!options.reconstruct) return null;
   if (!options.factory.canResolve('generator')) return null;
@@ -202,10 +263,6 @@ export function buildCapturePilot(options: CliOptions): WorkflowAgent | null {
   });
 }
 
-// Lazy like every other role: a flow with no `fillRetry(kind: 'custom')` step
-// never resolves the `data` role or demands its key. No `--no-data` flag —
-// the deterministic kinds cost nothing to leave enabled, and `custom` is
-// opt-in per step by construction.
 /**
  * The authoring review (`src/generator/flow-review.ts`), on the agent role.
  * Default on; `--no-author-review` disables; no agent key degrades silently
@@ -295,10 +352,6 @@ export function runPersonas(
     ...(extra ?? {}),
   };
   return Object.keys(map).length === 0 ? undefined : map;
-}
-
-export function buildDataModel(options: CliOptions): LlmDataModel {
-  return new LlmDataModel({ factory: options.factory });
 }
 
 /**

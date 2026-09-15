@@ -143,7 +143,15 @@ export function parseJson(body: string): unknown {
 export function recordOf(
   spec: ApiRequestSpec,
   response: ApiResponse | null,
-  options: { redaction?: RedactionPolicy | undefined; error?: string | undefined; saved?: readonly string[] | undefined } = {},
+  options: {
+    redaction?: RedactionPolicy | undefined;
+    error?: string | undefined;
+    saved?: readonly string[] | undefined;
+    /** Header names the harness supplied from the page's own observed traffic. */
+    inherited?: readonly string[] | undefined;
+    /** The subset of those whose value was generated fresh rather than replayed. */
+    regenerated?: readonly string[] | undefined;
+  } = {},
 ): RequestRecord {
   const redaction = options.redaction ?? {};
   return {
@@ -155,6 +163,10 @@ export function recordOf(
     sizeBytes: response?.sizeBytes,
     requestHeaders: redactHeaders(spec.headers, redaction),
     requestBody: redactBody(spec.body, redaction),
+    inheritedHeaders:
+      options.inherited && options.inherited.length > 0 ? [...options.inherited] : undefined,
+    regeneratedHeaders:
+      options.regenerated && options.regenerated.length > 0 ? [...options.regenerated] : undefined,
     responseHeaders: response ? redactHeaders(response.headers, redaction) : undefined,
     responseBody: response ? redactBody(response.body, redaction) : undefined,
     saved: options.saved && options.saved.length > 0 ? [...options.saved] : undefined,
@@ -179,6 +191,18 @@ export interface RequestRecord {
   sizeBytes?: number | undefined;
   requestHeaders?: Record<string, string> | undefined;
   requestBody?: string | undefined;
+  /**
+   * Which of `requestHeaders` the HARNESS supplied, merged from the page's own
+   * observed traffic rather than written by the flow. Names only — the values
+   * are in `requestHeaders`, redacted on the usual rule.
+   *
+   * On the record because `requestHeaders: {}` under a 400 is what made the
+   * 2026-09-08 defect diagnosable in the first place: a reader has to be able
+   * to tell what the harness sent from what the test asked for.
+   */
+  inheritedHeaders?: string[] | undefined;
+  /** Inherited names whose value was generated fresh, never replayed. */
+  regeneratedHeaders?: string[] | undefined;
   responseHeaders?: Record<string, string> | undefined;
   responseBody?: string | undefined;
   /** Names of variables extracted from the response — never their values. */

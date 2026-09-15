@@ -35,6 +35,8 @@ import {
   valueSpellings,
   differentPage,
   wanderedOffPage,
+  childPage,
+  fixtureAlreadyPresent,
   queryAndHash,
   urlMoveNote,
   wizardStepHint,
@@ -259,6 +261,128 @@ describe('wanderedOffPage — the HIR-EC-002 wander (2026-09-03)', () => {
   });
 });
 
+describe("a page below the step's own is not off it (PL_09_01, 2026-09-09)", () => {
+  // The fixture-creation leg of run `be-high-sonnet-20260909-153617`, lane
+  // c14: started on the plans list, clicked the page's own Create control,
+  // and the application opened the list's `…/create` view. The goal is
+  // written in the user's terms and holds no path at all — so
+  // `goalDestination` was null, every off-path URL counted, and eight turns
+  // of ordinary form work ended the leg as a wander after it had submitted.
+  const LIST = 'http://x.test/en/admin/benefits/plans';
+  const CREATE = 'http://x.test/en/admin/benefits/plans/create';
+  const GOAL =
+    'Click Create Plan, then fill the new plan form with Country=Thailand, Status=Active, ' +
+    'Benefit Category=Medical, Plan ID=QA260908_BE_137, Name=QA-Delete_37929Z, then submit/Insert ' +
+    'so the new plan is saved and appears as a row in the Benefit plan catalog table';
+
+  it('the list page\'s own create view is not a wander, on a goal that names no path', () => {
+    assert.equal(goalDestination(GOAL), null, 'the goal is written in user terms and holds no URL');
+    assert.equal(childPage(LIST, CREATE), true);
+    assert.equal(wanderedOffPage(GOAL, LIST, CREATE), false);
+  });
+
+  it('a sibling route is still a wander, and so is a prefix that is not a segment', () => {
+    assert.equal(wanderedOffPage(GOAL, LIST, 'http://x.test/en/admin/benefits/rules'), true);
+    assert.equal(childPage(LIST, 'http://x.test/en/admin/benefits/plans-archive'), false);
+    assert.equal(wanderedOffPage(GOAL, LIST, 'http://x.test/en/admin/benefits/plans-archive'), true);
+  });
+
+  it('a deeper descendant is on the page too, and the start page itself is never off it', () => {
+    assert.equal(childPage(LIST, `${CREATE}/step-2?draft=1`), true);
+    assert.equal(childPage(LIST, LIST), true);
+    assert.equal(childPage(`${LIST}/`, CREATE), true, 'a trailing slash on the start page is the same page');
+  });
+
+  it('another origin is never a child, whatever the path says', () => {
+    assert.equal(childPage(LIST, 'http://elsewhere.test/en/admin/benefits/plans/create'), false);
+  });
+
+  it('a site root has no children — everything is below it, and the rail would be withdrawn', () => {
+    assert.equal(childPage('http://x.test/', 'http://x.test/en/anywhere'), false);
+    assert.equal(wanderedOffPage(GOAL, 'http://x.test/', 'http://x.test/en/anywhere'), true);
+  });
+});
+
+describe('fixtureAlreadyPresent — the row the leg would create is already there (2026-09-09)', () => {
+  // PL_09_01 and PL_06_05 of run `be-high-sonnet-20260909-153617`. Both legs
+  // filled a creation form with the id their goal names, submitted, and read
+  // back the application's own duplicate-key refusal; one then typed a
+  // DIFFERENT id (which the flow's next `expectVisible` on the goal's id
+  // could never have matched), the other called `fail`. Two cases ended with
+  // no verdict.
+  const GOAL =
+    'Click Create Plan, then fill the new plan form with Country=Thailand, Status=Active, ' +
+    'Plan ID=QA260908_BE_137, Name=QA-Delete_37929Z, then submit/Insert so the new plan is saved';
+  const tree = (...lines: string[]): string =>
+    ['RootWebArea "Benefit Plans"', 'heading "Create Benefit Plan"', ...lines, 'button "Create Plan"'].join('\n');
+  const REFUSED = tree(
+    'textbox "Benefit Plan ID*" value="QA260908_BE_137" required',
+    'StaticText "Plan ID already exists."',
+    'textbox "Benefit Name*" value="QA-Delete_37929Z" required',
+  );
+
+  it('settles on the refusal the harness read, naming the goal\'s own pair', () => {
+    const present = fixtureAlreadyPresent(GOAL, REFUSED);
+    assert.ok(present, 'the page said the key is taken and shows the goal\'s value in that control');
+    assert.deepEqual(present.outcome, { control: 'Plan ID', value: 'QA260908_BE_137' });
+    assert.equal(present.error, 'StaticText "Plan ID already exists."');
+    assert.match(present.shown, /QA260908_BE_137/);
+  });
+
+  it('does not fire when the refusal is about a DIFFERENT value than the goal names', () => {
+    // The shape the live leg created for itself by typing a new id: the page
+    // still refuses, but the value standing in the control is no longer the
+    // goal\'s, so nothing about the goal\'s record has been demonstrated.
+    assert.equal(
+      fixtureAlreadyPresent(
+        GOAL,
+        tree('textbox "Benefit Plan ID*" value="QA260908_BE_138" required', 'StaticText "Plan ID already exists."'),
+      ),
+      null,
+    );
+  });
+
+  it('does not fire without a refusal on the page', () => {
+    assert.equal(
+      fixtureAlreadyPresent(GOAL, tree('textbox "Benefit Plan ID*" value="QA260908_BE_137" required')),
+      null,
+    );
+  });
+
+  it('does not fire on a refusal that names no field — it scopes to nothing', () => {
+    assert.equal(
+      fixtureAlreadyPresent(
+        GOAL,
+        tree('textbox "Benefit Plan ID*" value="QA260908_BE_137" required', 'StaticText "This record already exists."'),
+      ),
+      null,
+    );
+  });
+
+  it('does not fire when the refusal names a field the goal states no value for', () => {
+    assert.equal(
+      fixtureAlreadyPresent(
+        'Fill the new plan form with Plan ID=QA260908_BE_137 and submit',
+        tree('textbox "Benefit Plan ID*" value="QA260908_BE_137" required', 'StaticText "Benefit Code already exists."'),
+      ),
+      null,
+    );
+  });
+
+  it('does not fire on a goal whose pairs this module cannot read', () => {
+    assert.equal(fixtureAlreadyPresent('Create a new plan and save it', REFUSED), null);
+  });
+
+  it('reads the refusal in the sheet\'s own language too', () => {
+    const thai = tree('textbox "Benefit Plan ID*" value="QA260908_BE_137" required', 'StaticText "Plan ID ซ้ำ"');
+    assert.ok(fixtureAlreadyPresent(GOAL, thai));
+  });
+
+  it('declines on a truncated tree — absence from a cut tree is not absence from the page', () => {
+    assert.equal(fixtureAlreadyPresent(GOAL, `${REFUSED}\n[TREE TRUNCATED: showing 4 of 90 nodes]`), null);
+  });
+});
+
 describe('destinationReached', () => {
   it('is the mid-flight rule and never the sign-in one', () => {
     // Left the sign-in page, but the goal named a destination it has not
@@ -388,6 +512,49 @@ describe('goal outcome: multi-word values and dash spellings (HIR-EC-002 leg 12)
   });
 });
 
+describe('goal outcome: a padded colon is the same value (PL_06_10, be-sit-high-opusheal-th-20260911-175757)', () => {
+  // humi drew `text "Reimbursement : Employee/HR"`; the goal spelled it
+  // "Reimbursement: Employee/HR". The agent had set the field and said so —
+  // its own reasoning read `value="Reimbursement : Employee/HR" (matching the
+  // requested "Reimbursement: Employee/HR")` — and outcomeShown refused the
+  // finish twice. The case sealed ERROR at 14/20 steps, the dependent tail
+  // skipped five steps that would have passed, and the diagnosis filed the
+  // navigation agent at 72% confidence for a value it had applied.
+  const PAGE = 'Reimbursement : Employee/HR';
+  const GOAL = 'Reimbursement: Employee/HR';
+
+  it('folds the spacing around a colon the way it folds a dash', () => {
+    assert.equal(foldValue(GOAL), foldValue(PAGE));
+    assert.equal(foldValue(GOAL), 'reimbursement: employee/hr');
+    assert.equal(foldValue('Type :Info'), foldValue('Type:Info'), 'every spacing is one spelling, not three');
+    assert.equal(foldValue('สถานะ：ใช้งาน'), foldValue('สถานะ: ใช้งาน'), 'the full-width colon a Thai page draws');
+  });
+
+  it('settles the leg on the tree the page actually rendered', () => {
+    const tree = `button "Benefit Type" value="${PAGE}"\nStaticText "Benefit Type*"`;
+    assert.ok(valueShownIn(`text "${PAGE}"`, GOAL));
+    assert.ok(outcomeShown({ control: 'Benefit Type', value: GOAL }, tree));
+    assert.ok(valueAppearsAnywhere(GOAL, tree));
+  });
+
+  it('does not make two different values equal', () => {
+    assert.equal(valueShownIn(`option "${PAGE}"`, 'Reimbursement: Employer/HR'), false, 'Employee is not Employer');
+    assert.equal(valueShownIn('option "Reimbursement : Employee/HRBP"', GOAL), false, 'HR is not HRBP — the whole-word rule stands');
+    assert.equal(valueShownIn('option "Advance : Employee/HR"', GOAL), false, 'a different benefit type with the same tail');
+    assert.equal(valueShownIn('button "Gender" value="Status: Female"', 'Status: Male'), false, 'Male is still not inside Female');
+    assert.equal(valueShownIn('StaticText "Select a type:"', 'A (Active)'), false, 'a one-character half is still only a quoted token');
+    // The fold makes a padded page behave exactly as an unpadded one, no
+    // looser: "Reimbursement: Employee" matching inside "…: Employee/HR" is
+    // the whole-word rule's long-standing concession at a non-word boundary,
+    // which already applied when the page wrote the colon tight.
+    assert.equal(
+      valueShownIn(`option "${PAGE}"`, 'Reimbursement: Employee'),
+      valueShownIn('option "Reimbursement: Employee/HR"', 'Reimbursement: Employee'),
+      'padded and unpadded pages answer alike',
+    );
+  });
+});
+
 // --- OA-13: the sheets' own language --------------------------------------------
 
 describe('goal classifiers in the sheets\' own words (OA-13, 2026-09-03)', () => {
@@ -488,6 +655,90 @@ describe('goalOutcomes — every pair a goal names (OA-4)', () => {
     assert.deepEqual(full?.missing, []);
     assert.ok(anyValueAppears(['Male', 'Thai'], tree), 'the value-hunt judge waits while ANY cited value has shown');
     assert.equal(anyValueAppears(['Male', 'Chinese'], tree), false);
+  });
+});
+
+// --- A quantifier is never a control (PL_06_07, 2026-09-08) ---------------------
+
+describe('a count is never a control (PL_06_07, 2026-09-08)', () => {
+  it('drops the multi-select goal whose colon introduces the values to pick', () => {
+    // Verbatim from PL_06_07 on HUMI SIT (run key pl-06-07-v2-csv@2026-09-08T07:53).
+    // `OUTCOME_EQ` read `select more than one value` : `ePatient`, the lead verb
+    // and the trailing generic noun were stripped, and the leg was asked to prove
+    // a control called `more than one` — so every finish was refused, the leg was
+    // sealed short of its goal and the nine steps after it were skipped, while the
+    // tree in fact carried both chips. The sentence names no field a page can show:
+    // dropping the pair is the honest result, and the record says `agent-claim`.
+    const goal = "In the Condition searchable multi-select, select more than one value: 'ePatient' and 'Tops care', so that both appear as selected chips.";
+    assert.deepEqual(goalOutcomes(goal), []);
+    assert.deepEqual(goalCitedValues(goal), [], 'the value-hunt judge is fed by the same parse');
+  });
+
+  it('drops every quantifier wording a sheet or the author writes for a multi-select', () => {
+    for (const goal of [
+      "In the Condition multi-select, select at least two values: 'ePatient' and 'Tops care'.",
+      "Select both options: 'ePatient' and 'Tops care'.",
+      "Pick multiple items: 'A' and 'B'.",
+      "select all four values: 'A', 'B'",
+      "choose several options: 'ePatient'",
+      "select one or more values: 'ePatient'",
+      "select two or more entries: 'ePatient'",
+      "select any two options: 'A'",
+      "select all of the values: 'A'",
+      "select each value: 'A'",
+      "select 2 values: 'A'",
+      "select up to three chips: 'A'",
+      "select no more than 2 tags: 'A'",
+    ]) {
+      assert.deepEqual(goalOutcomes(goal), [], goal);
+    }
+  });
+
+  it('keeps a real control whose NAME holds a quantifier word', () => {
+    // Screened as the whole control only — these are field names a page shows.
+    assert.deepEqual(goalOutcomes('set Multiple Choice = Yes'), [{ control: 'Multiple Choice', value: 'Yes' }]);
+    assert.deepEqual(goalOutcomes('set All Employees filter to Active'), [{ control: 'All Employees', value: 'Active' }]);
+    assert.deepEqual(goalOutcomes('set the Any Status filter to Inactive'), [{ control: 'Any Status', value: 'Inactive' }]);
+    assert.deepEqual(goalOutcomes('set Number of Dependents = 2'), [{ control: 'Number of Dependents', value: '2' }]);
+  });
+
+  it('screens the COUNTING phrases on the value side, and only those', () => {
+    // "selected values = more than one" is the same defect written the other way
+    // round: no tree renders "more than one" either.
+    assert.deepEqual(goalOutcomes('selected values = more than one'), []);
+    assert.deepEqual(goalOutcomes('set the Chips count = at least two'), []);
+    // A bare determiner IS a real option label — dropping these would trade a
+    // checkable pair for a claim.
+    assert.deepEqual(goalOutcomes('set Status filter to All'), [{ control: 'Status', value: 'All' }]);
+    assert.deepEqual(goalOutcomes('set Coverage = Both'), [{ control: 'Coverage', value: 'Both' }]);
+    assert.deepEqual(goalOutcomes('set Type = Multiple'), [{ control: 'Type', value: 'Multiple' }]);
+    // Anchored: a value that merely begins with the words keeps its pair.
+    assert.deepEqual(goalOutcomes('set Company = More Than One Ltd'), [{ control: 'Company', value: 'More Than One Ltd' }]);
+  });
+
+  it('leaves every pair the live runs already parse exactly as it was', () => {
+    assert.deepEqual(goalOutcome('On the catalog page, set the "Rows per page" control to 25, then stay on /en/plans'), { control: 'Rows per page', value: '25' });
+    assert.deepEqual(goalOutcome('Set the Status filter to Inactive'), { control: 'Status', value: 'Inactive' });
+    assert.deepEqual(goalOutcome('Fill Country = "Thailand (TH)" and save'), { control: 'Country', value: 'Thailand (TH)' });
+    assert.deepEqual(
+      goalOutcomes('set Gender = Female, Nationality = Thai and Employee Group = A - Permanent on the New Hire form and stay on /en/admin/hire'),
+      [{ control: 'Gender', value: 'Female' }, { control: 'Nationality', value: 'Thai' }, { control: 'Employee Group', value: 'A - Permanent' }],
+    );
+    assert.deepEqual(goalOutcomes('คีย์ Employee Group = A - Permanent Employee Sub Group = 10 ตามชุดข้อมูล'), [
+      { control: 'Employee Group', value: 'A - Permanent' },
+      { control: 'Employee Sub Group', value: '10' },
+    ]);
+    assert.deepEqual(goalOutcomes('Personnel Grade (PG) = 10 Employee Group = A - Permanent Employee Sub Group = 10').map((o) => o.control), [
+      'Personnel Grade (PG)', 'Employee Group', 'Employee Sub Group',
+    ]);
+    assert.deepEqual(goalOutcomes('ระบบสร้างพนักงานสำเร็จ และ Employee Status = A (Active)'), [{ control: 'Employee Status', value: 'A (Active)' }]);
+    assert.deepEqual(
+      goalOutcomes('Menu: EC > Hire & Onboard (New Hire). Data: Country = Thailand (TH). at 10:30 open Status: Awaiting manager'),
+      [{ control: 'Country', value: 'Thailand (TH)' }],
+    );
+    assert.deepEqual(goalOutcome('เลือก probation result = Pass probation'), { control: 'probation result', value: 'Pass probation' });
+    assert.deepEqual(goalOutcome('ผลการประเมิน = Pass probation'), { control: 'ผลการประเมิน', value: 'Pass probation' });
+    assert.deepEqual(goalCitedValues('set Gender = Female and Nationality = Thai'), ['Female', 'Thai']);
   });
 });
 

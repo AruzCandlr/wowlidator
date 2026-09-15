@@ -16,10 +16,11 @@ import { join } from 'node:path';
 
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 import type { CatalogReportCase, CatalogReportInput } from '../src/reporter/catalog-report.js';
-import { readZip } from '../src/catalog/extract.js';
+import { extractWorkbookSheets, readZip } from '../src/catalog/extract.js';
 import {
   buildCaseWorkbook,
   buildPassedCasesWorkbook,
+  buildTextWorkbook,
   buildZip,
   excelExportNames,
   passedCases,
@@ -254,6 +255,138 @@ describe('the container', () => {
   });
 });
 
+describe('the narration in the Proof column', () => {
+  const narration = { text: 'Looked for "Create Plan" and found "สร้างแผนสวัสดิการ" instead.', by: 'groq:llama-3.3-70b', at: '2026-09-07T00:00:00.000Z' };
+
+  it('rides in the Proof column, marked as a reading and signed — never a column of its own', () => {
+    const s = step({
+      index: 0, action: 'expectModal', selector: 'role=dialog[name="Create Plan" i]', status: 'failed',
+      error: 'could not resolve\nstack', detail: { expected: 'Create Plan', actual: 'สร้างแผนสวัสดิการ' }, narration,
+    } as Partial<ProofStep>);
+    const proof = stepProof(s);
+    const lines = proof.split('\n');
+    // Last, after every recorded fact — a reading of the record, never ahead of it.
+    assert.equal(
+      lines.at(-1),
+      'in plain language (written by groq:llama-3.3-70b; a description of this step, not a recorded fact): Looked for "Create Plan" and found "สร้างแผนสวัสดิการ" instead.',
+    );
+    assert.ok(lines.indexOf('expected "Create Plan" · actual "สร้างแผนสวัสดิการ"') < lines.length - 1);
+    assert.ok(lines.some((l) => l.startsWith('error: could not resolve')));
+    // A step with no narration is the cell it always was.
+    delete (s as { narration?: unknown }).narration;
+    assert.equal(stepProof(s).includes('in plain language'), false);
+    assert.equal(stepProof(s), proof.slice(0, proof.lastIndexOf('\n')));
+  });
+
+  it('reaches the workbook and reads back through the independent xlsx reader', () => {
+    const c = kase({ bundle: bundle([step({ index: 0, action: 'expectModal', narration } as Partial<ProofStep>)]) });
+    const [sheet] = extractWorkbookSheets(buildCaseWorkbook(c).xlsx);
+    // Column I of the step row — the Proof column, read back by `extract.ts`'s
+    // own zip reader, not by the writer that made it.
+    assert.equal(sheet!.rows[0]?.[8], 'Proof');
+    assert.equal(sheet!.rows[0]?.length, 10, 'no eleventh column was added for it');
+    const proof = sheet!.rows[2]?.[8] ?? '';
+    assert.ok(proof.includes('in plain language (written by groq:llama-3.3-70b'), proof);
+    assert.ok(proof.includes('Looked for "Create Plan" and found "สร้างแผนสวัสดิการ" instead.'), 'the application text it quotes survives the round trip verbatim');
+  });
+});
+
+/**
+ * The workbook has no disclosure to fold behind, so an agent leg that did not
+ * decide its step is MARKED rather than hidden (2026-09-08): one line above
+ * the `agent:` line, from the same `inconsequentialAgentLeg` predicate and in
+ * the same words as both HTML reports. Nothing is removed — a workbook is the
+ * proof handed over, and a leg dropped from it is evidence gone.
+ */
+describe('the agent leg that decided nothing, in the Proof column', () => {
+  const leg = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    goal: 'open the Company Code picker',
+    model: 'stub',
+    success: false,
+    summary: 'agent found nothing the goal names to act on',
+    turns: 2,
+    maxSteps: null,
+    latencyMs: 5,
+    actions: [{ index: 0, action: 'save', selector: 'text=PLAN-1', value: 'plan', url: 'u', reasoning: 'keep it', ok: true, durationMs: 1 }],
+    ...over,
+  });
+
+  const legStep = (over: Partial<ProofStep> = {}, agent: Record<string, unknown> = leg()): ProofStep =>
+    step({ index: 0, action: 'selectOption', selector: 'role=combobox[name="Company Code" i]', agent, ...over } as Partial<ProofStep>);
+
+  it('marks the leg immediately above it and drops not one recorded line', () => {
+    const lines = stepProof(legStep()).split('\n');
+    const marker = lines.indexOf("agent leg — did not affect this step's outcome: the step passed on the flow's own selector regardless");
+    assert.notEqual(marker, -1, lines.join(' | '));
+    assert.equal(lines[marker + 1], 'agent: agent found nothing the goal names to act on (2 turn(s))', 'the mark frames the line it is about');
+    // Every other line the cell always carried is still there, in order.
+    assert.ok(lines.some((l) => l.startsWith('agent save: text=PLAN-1 → {{plan}}')));
+    assert.ok(lines.some((l) => l.startsWith('at http://localhost:3000/en/login')));
+  });
+
+  it('says "it never engaged a control the goal names" for a look-only leg', () => {
+    const lines = stepProof(legStep({}, leg({ lookedOnly: true, endedBy: 'no-progress' }))).split('\n');
+    assert.ok(lines.includes("agent leg — did not affect this step's outcome: it never engaged a control the goal names"));
+  });
+
+  it('marks nothing on a failing step, a hold, a "fail" claim or a leg that succeeded — those cells are exactly what they were', () => {
+    const held = { reason: 'irreversible', rule: 'manifest', message: 'no approval' };
+    for (const s of [
+      legStep({ status: 'failed', error: 'could not resolve' }),
+      legStep({ blocked: held } as Partial<ProofStep>),
+      legStep({}, leg({ blocked: held })),
+      legStep({}, leg({ endedBy: 'fail' })),
+      legStep({}, leg({ success: true })),
+    ]) {
+      const proof = stepProof(s);
+      assert.equal(proof.includes("did not affect this step's outcome"), false, proof);
+      assert.ok(proof.includes('agent: '), 'the leg is still logged');
+    }
+  });
+
+  it('a marked step is the cell it always was plus that one line, and it reads back through the independent xlsx reader', () => {
+    const marked = legStep();
+    const proof = stepProof(marked);
+    (marked.agent as unknown as { endedBy?: string }).endedBy = 'fail';
+    const plain = stepProof(marked);
+    assert.equal(
+      proof.replace("agent leg — did not affect this step's outcome: the step passed on the flow's own selector regardless\n", ''),
+      plain,
+      'the mark is one added line; nothing else in the cell moved',
+    );
+    delete (marked.agent as unknown as { endedBy?: string }).endedBy;
+    const [sheet] = extractWorkbookSheets(buildCaseWorkbook(kase({ bundle: bundle([marked]) })).xlsx);
+    assert.equal(sheet!.rows[0]?.[8], 'Proof');
+    assert.equal(sheet!.rows[0]?.length, 10, 'no eleventh column was added for it');
+    assert.ok((sheet!.rows[2]?.[8] ?? '').includes("agent leg — did not affect this step's outcome"), sheet!.rows[2]?.[8]);
+  });
+});
+
+describe('a text sheet through the same writer', () => {
+  it('round-trips a preface, a bold header and wrapped rows through the independent xlsx reader', () => {
+    const xlsx = buildTextWorkbook({
+      sheetName: 'Findings',
+      preface: 'Suggested severity is a stated rule.',
+      header: ['Finding', 'Cases', 'Status as sealed'],
+      rows: [['POST /v1/plans answered 500', 'EC_01_01 (failed)\nEC_01_02 (error)', 'failed: 1\nerror: 1'], ['<b>escaped</b>', '', 'x']],
+      widths: [40, 20, 12],
+    });
+    const [sheet] = extractWorkbookSheets(xlsx);
+    assert.equal(sheet!.name, 'Findings');
+    assert.deepEqual(sheet!.rows[0], ['Suggested severity is a stated rule.']);
+    assert.deepEqual(sheet!.rows[1], ['Finding', 'Cases', 'Status as sealed']);
+    assert.deepEqual(sheet!.rows[2], ['POST /v1/plans answered 500', 'EC_01_01 (failed)\nEC_01_02 (error)', 'failed: 1\nerror: 1']);
+    assert.deepEqual(sheet!.rows[3], ['<b>escaped</b>', '', 'x'], 'markup is data in the cell, not markup in the XML');
+    const raw = new Map(readZip(xlsx).map((e) => [e.name, e.data])).get('xl/worksheets/sheet1.xml')!.toString('utf8');
+    assert.ok(!raw.includes('<b>escaped'));
+    assert.ok(raw.includes('<mergeCell ref="A1:C1"/>'), 'the preface spans the header columns');
+  });
+
+  it('refuses more columns than the writer has letters for', () => {
+    assert.throws(() => buildTextWorkbook({ sheetName: 's', header: Array.from({ length: 11 }, (_, i) => `c${i}`), rows: [] }), /11 columns asked for/);
+  });
+});
+
 describe('the writer', () => {
   it('writes the run workbook beside the report, and under <base>-media/ each proved case’s workbook and recording', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'wow-excel-'));
@@ -305,5 +438,112 @@ describe('the writer', () => {
     assert.equal(names.xlsxPath, '/x/reports/run-key-passed.xlsx');
     assert.equal(names.mediaDir, '/x/reports/run-key-media');
     assert.equal(names.mediaDirName, 'run-key-media');
+  });
+});
+
+/**
+ * The database check in the Proof column (2026-09-08): the workbook is the
+ * proof handed over, so it carries the statement that answered the claim and
+ * the rows it returned, in the same words the two HTML reports use
+ * (`dbProofLines` in `step-facts.ts`). No new column — the Proof column
+ * already IS the step's own log, and a column of its own would sit empty on
+ * every run that never touched a database.
+ */
+describe('the database check in the Proof column', () => {
+  const RECORD = {
+    kind: 'row',
+    table: 'benefit_plan',
+    where: 'id = 42 AND session_token = [redacted]',
+    expected: 'at least 1 row',
+    observed: '1 row(s)',
+    rows: [{ id: '42', name: 'Part time' }],
+    rowsMatched: 42,
+    durationMs: 12,
+    statements: [{ sql: 'SELECT * FROM "benefit_plan" WHERE "id" = $1 LIMIT 25', params: ['42'], tables: ['benefit_plan'] }],
+    note: 'read directly from the database while this flow ran',
+  };
+  const dbStep = (db: Record<string, unknown>): ProofStep =>
+    step({ index: 0, action: 'expectDbRow', intent: 'the plan row is there', db: db as never } as Partial<ProofStep>);
+
+  it('carries the query, its parameters and the rows it returned', () => {
+    const lines = stepProof(dbStep(RECORD)).split('\n');
+    assert.ok(lines.includes('db row on benefit_plan'));
+    assert.ok(lines.includes('where id = 42 AND session_token = [redacted]'));
+    assert.ok(lines.includes('query: SELECT * FROM "benefit_plan" WHERE "id" = $1 LIMIT 25'));
+    assert.ok(lines.includes('parameters: $1 = 42'));
+    assert.ok(lines.includes('rows returned — showing 1 of 42 row(s) — the sample is capped at 3'));
+    assert.ok(lines.includes('id | name'));
+    assert.ok(lines.includes('42 | Part time'));
+    assert.ok(lines.includes('note: read directly from the database while this flow ran'));
+  });
+
+  it('a bundle sealed before the statement existed is the cell it always was', () => {
+    const { statements: _dropped, rowsMatched: _also, ...older } = RECORD;
+    const lines = stepProof(dbStep(older)).split('\n');
+    assert.equal(lines.some((l) => l.startsWith('query:')), false);
+    assert.equal(lines.some((l) => l.startsWith('parameters:')), false);
+    assert.ok(lines.includes('rows returned — 1 row(s)'));
+  });
+
+  it('a credential-shaped parameter is the redacted one, and reads back that way through the independent xlsx reader', () => {
+    const s = dbStep({
+      ...RECORD,
+      rows: [{ password: '[redacted]' }],
+      statements: [{ sql: 'SELECT * FROM "u" WHERE "password" = $1', params: ['[redacted]'] }],
+    });
+    const [sheet] = extractWorkbookSheets(buildCaseWorkbook(kase({ bundle: bundle([s]) })).xlsx);
+    assert.equal(sheet!.rows[0]?.[8], 'Proof');
+    assert.equal(sheet!.rows[0]?.length, 10, 'no eleventh column was added for it');
+    const proof = sheet!.rows[2]?.[8] ?? '';
+    assert.ok(proof.includes('query: SELECT * FROM "u" WHERE "password" = $1'), proof);
+    assert.ok(proof.includes('parameters: $1 = [redacted]'));
+    assert.ok(!proof.includes('hunter2'));
+  });
+});
+
+/**
+ * A broken step that decided nothing is MARKED in the workbook, not hidden
+ * (2026-09-08) — the same rule the agent leg follows above, from
+ * `inconsequentialBrokenStep`. The Result column is untouched: a status is
+ * never rewritten, only laid out.
+ */
+describe('the step that decided nothing, in the Proof column', () => {
+  const steps = (broken: Partial<ProofStep> = {}): ProofStep[] => [
+    step({ index: 0, action: 'goto' }),
+    step({ index: 1, action: 'click', intent: 'dismiss the consent gate', selector: 'role=button[name="Accept" i]', status: 'failed', error: 'could not resolve\nstack', ...broken } as Partial<ProofStep>),
+    step({ index: 2, action: 'expectText', selector: 'text="Part time"' }),
+  ];
+  const MARK = "failed — did not decide this run's outcome: it makes no claim, the run carried past it, and every claim the run did make held";
+
+  it('marks it as the first line of its own log and drops not one recorded line', () => {
+    const all = steps();
+    const run = bundle(all, { status: 'passed-with-issues' });
+    const lines = stepProof(all[1]!, run).split('\n');
+    assert.equal(lines[0], MARK);
+    assert.equal(stepProof(all[1]!), lines.slice(1).join('\n'), 'the mark is one added line; nothing else in the cell moved');
+    assert.ok(lines.some((l) => l === 'error: could not resolve'));
+  });
+
+  it('marks nothing on an assertion, an `error`, a hold, or a run whose claims did not hold', () => {
+    const marked = (over: Partial<ProofStep>, bundleOver: Partial<ProofBundle> = {}): boolean => {
+      const all = steps(over);
+      return stepProof(all[1]!, bundle(all, { status: 'passed-with-issues', ...bundleOver })).includes("did not decide this run's outcome");
+    };
+    assert.equal(marked({ action: 'expectVisible' }), false);
+    assert.equal(marked({ status: 'error' }), false);
+    const held = { reason: 'irreversible', rule: 'manifest', message: 'no approval' };
+    assert.equal(marked({ blocked: held } as Partial<ProofStep>), false);
+    assert.equal(marked({}, { status: 'failed' }), false);
+    assert.equal(marked({}), true, 'the shape under test really does mark');
+  });
+
+  it('reaches the workbook, leaves the Result column alone, and reads back through the independent xlsx reader', () => {
+    const all = steps();
+    const c = kase({ bundle: bundle(all, { status: 'passed-with-issues' }), status: 'passed-with-issues' });
+    const [sheet] = extractWorkbookSheets(buildCaseWorkbook(c).xlsx);
+    const row = sheet!.rows.find((r) => r[1] === '1');
+    assert.ok(row, 'the broken step is still a row of the workbook');
+    assert.equal(row![6], 'failed', 'the Result column says exactly what was sealed');
+    assert.ok((row![8] ?? '').startsWith(MARK), row![8]);
   });
 });

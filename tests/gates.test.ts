@@ -21,6 +21,7 @@ import {
   persistGate,
   persistSelect,
 } from '../src/ui/gates.js';
+import { LLM_ROLES } from '../src/config.js';
 
 let dir: string;
 
@@ -120,15 +121,21 @@ describe('the selects — reasoning effort per role', () => {
     );
   });
 
-  it('every role that resolves an --effort has a select', () => {
-    for (const env of [
-      'WOWLIDATOR_GENERATOR_EFFORT',
-      'WOWLIDATOR_HEALER_EFFORT',
-      'WOWLIDATOR_AGENT_EFFORT',
-      'WOWLIDATOR_DATA_EFFORT',
-      'WOWLIDATOR_GOVERNOR_EFFORT',
-    ]) {
+  it('every role that resolves an --effort has a select, and no retired role does', () => {
+    // Read from LLM_ROLES rather than a second hand-kept list: a role
+    // retired in config (`data` and `governor`, 2026-09-11) must not leave a
+    // control behind offering to configure it.
+    for (const role of LLM_ROLES) {
+      const env = `WOWLIDATOR_${role.toUpperCase()}_EFFORT`;
       assert.ok(SELECTS.some((s) => s.env === env), env);
+    }
+    for (const select of SELECTS) {
+      const match = /^WOWLIDATOR_(.+)_EFFORT$/.exec(select.env);
+      if (match === null) continue;
+      assert.ok(
+        (LLM_ROLES as readonly string[]).includes(match[1]!.toLowerCase()),
+        `${select.env} configures a role that no longer exists`,
+      );
     }
   });
 

@@ -1,6 +1,6 @@
 ---
 name: orchestrator-optimizer
-description: Expert on wowlidator's control-plane agent in src/orchestrator/ (WorkflowAgent loop, agent-guards, goal-evidence, queue-governor). Use when a workflow leg is slow, loops, stalls, over-spends model turns, mis-settles a finish, or when a change to the agent's progress judge, guards, prompt, tree budget or turn ceilings is being designed, reviewed or measured. Diagnoses from run logs and reports first, then proposes a change local to the loop that cannot slow a passing leg.
+description: Expert on wowlidator's control-plane agent in src/orchestrator/ (WorkflowAgent loop, agent-guards, goal-evidence). Use when a workflow leg is slow, loops, stalls, over-spends model turns, mis-settles a finish, or when a change to the agent's progress judge, guards, prompt, tree budget or turn ceilings is being designed, reviewed or measured. Diagnoses from run logs and reports first, then proposes a change local to the loop that cannot slow a passing leg.
 tools: Read, Grep, Glob, Bash, Edit, Write
 model: inherit
 ---
@@ -20,7 +20,7 @@ You are the resident expert on `src/orchestrator/` — the workflow agent that d
 - **Panel job logs** are the only place timings live. `node .claude/skills/monitor/joblog.mjs latest` (or `job-N`, `latest all`) prints the timeline, per-role model time and slowest steps. Lines: `[llm HH:MM:SS] → agent · model · request #N` / `← … · 12.3s · in/out`, `[cN]   ✓ agent: …` per turn. Jobs run `dist/cli.js`, so a code change needs `npm run build` before it is measurable.
 - **Attribute wall time to turn count first, per-turn latency second.** Every measured stall (ec09 leg [14]: 320 s / ~60 turns; HIR-EC-002 steps 16 and 19: 903 s of 1,377 s) was turns, not tokens. Ask: which judge should have fired, and why did it not?
 - **Benchmarks:** HIR-EC-029 (`valst-output/reports/en-login/e2e-29/*.flow.json`, expected `failed` 18/19 in ~50 s at 0 tokens) and HIR-EC-002 (`e2e-02/*.flow.json`). Run with `npm run cli -- run <flow> --report-dir <tmp>`. Report before/after as a table: verdict, steps passed, wall seconds, in/out tokens, agent request count.
-- **Tests:** `tests/agent-guards.test.ts`, `tests/goal-evidence.test.ts`, `tests/agent-economy.test.ts`, `tests/agent-wave2.test.ts`, `tests/queue-governor.test.ts`, `tests/smoke.test.ts` (pins one model call per `fail` verdict), `tests/full-workflow.test.ts`. Single test: `npx tsx --test --test-name-pattern "<name>" tests/<file>`. If CDP-tier tests die at attach with `Browser.setDownloadBehavior … not supported`, the attached Chrome has zero targets: `curl -X PUT "http://localhost:9222/json/new?about:blank"` and rerun. Always `npm run typecheck` (`exactOptionalPropertyTypes` is on).
+- **Tests:** `tests/agent-guards.test.ts`, `tests/goal-evidence.test.ts`, `tests/agent-economy.test.ts`, `tests/agent-wave2.test.ts`, `tests/smoke.test.ts` (pins one model call per `fail` verdict), `tests/full-workflow.test.ts`. Single test: `npx tsx --test --test-name-pattern "<name>" tests/<file>`. If CDP-tier tests die at attach with `Browser.setDownloadBehavior … not supported`, the attached Chrome has zero targets: `curl -X PUT "http://localhost:9222/json/new?about:blank"` and rerun. Always `npm run typecheck` (`exactOptionalPropertyTypes` is on).
 
 ## The knobs and where the judges live (`workflow-agent.ts`)
 

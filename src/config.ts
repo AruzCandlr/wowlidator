@@ -25,10 +25,18 @@ import { DEFAULT_REPORT_DIR as REPORTER_DEFAULT_DIR } from './reporter/html-repo
 import { DEFAULT_CAPTURE_DELAY_MS } from './engine/evidence.js';
 import type { ScreenshotMode, VideoMode } from './engine/runner.js';
 
-export const LLM_ROLES = ['healer', 'generator', 'agent', 'data', 'governor'] as const;
+// Three roles, and both retirements on 2026-09-11 were decided by the usage
+// ledger rather than by taste. `data` reached a model only for a `fillRetry`
+// step whose kind was `custom`, and across 1,429 authored flows not one
+// `fillRetry` step was ever written. `governor` advised the parallel queue,
+// and its default was already a pure rules function — the model half had
+// fired zero times in 18,704 recorded calls, and the whole queue governor is
+// gone with it because the scheduler it advised was correct without it by
+// its own stated contract.
+export const LLM_ROLES = ['healer', 'generator', 'agent'] as const;
 export type LlmRole = (typeof LLM_ROLES)[number];
 
-export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'claude-cli', 'claude-tty', 'claude-cloud', 'airforce', 'cerebras', 'requesty'] as const;
+export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'agy-cli', 'codex-cli', 'claude-cli', 'claude-tty', 'claude-cloud', 'airforce', 'cerebras', 'requesty'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 /** Which env var carries each provider's key, and where to get one. */
@@ -36,6 +44,18 @@ export const PROVIDER_META: Record<
   ProviderName,
   { envKey: string; label: string; consoleUrl: string; freeTier: string }
 > = {
+  'agy-cli': {
+    envKey: '',
+    label: 'Agy CLI (this machine\'s signed-in session)',
+    consoleUrl: 'https://antigravity.google/',
+    freeTier: 'billed to the session already signed in here — no key to configure',
+  },
+  'codex-cli': {
+    envKey: '',
+    label: 'Codex CLI (this machine\'s signed-in session)',
+    consoleUrl: 'https://chatgpt.com/codex',
+    freeTier: 'billed to the ChatGPT session already signed in here — no key to configure',
+  },
   'claude-cli': {
     // Deliberately empty: the CLI carries the operator's own logged-in
     // session, so there is no key to set and the role gate must not demand
@@ -155,6 +175,46 @@ export const PROVIDER_META: Record<
 // session behind it — still one request at a time per terminal.
 export const SERIAL_PROVIDERS: ReadonlySet<string> = new Set(['local', 'claude-tty', 'claude-cloud']);
 
+/**
+ * How many calls a provider will take AT ONCE from one key, when it states a
+ * ceiling at all. `undefined` is "as many as the lanes want" — most providers
+ * meter by the minute, not by what is in flight.
+ *
+ * Measured, not assumed. On 2026-09-10 a four-lane BE catalog on
+ * `emmiedev:default` was answered with
+ * `{"type":"rate_limit_error","code":"too_many_concurrent"}` — *"key นี้กำลังมี
+ * งานวิ่งอยู่ 2 รายการแล้ว"*, the key already has two jobs running — and the
+ * row sealed as a sticky authoring refusal. A ceiling here is cheaper than
+ * every mechanism that deals with the refusal afterwards: the third call
+ * WAITS (`providers/serial-gate.ts`) instead of being thrown away.
+ *
+ * `WOWLIDATOR_<PROVIDER>_CONCURRENCY` overrides one (`EMMIEDEV`, `GROQ`, …);
+ * `off` removes the ceiling. Raise it only with a refusal-free run to show
+ * for it.
+ */
+export const PROVIDER_CONCURRENCY: Readonly<Partial<Record<ProviderName, number>>> = {
+  emmiedev: 2,
+};
+
+/**
+ * The in-flight ceiling for one provider: the environment's number, else the
+ * measured table, else none. A serial provider is the same rule expressed as
+ * a ceiling of one — `SERIAL_PROVIDERS` keeps its own gate options and is not
+ * re-stated here.
+ */
+export function providerConcurrency(
+  provider: string,
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  const raw = env[`WOWLIDATOR_${provider.replace(/-/g, '_').toUpperCase()}_CONCURRENCY`]?.trim().toLowerCase();
+  if (raw !== undefined && raw !== '') {
+    if (raw === 'off' || raw === '0' || raw === 'false') return undefined;
+    const value = Number(raw);
+    if (Number.isFinite(value) && value >= 1) return Math.floor(value);
+  }
+  return PROVIDER_CONCURRENCY[provider as ProviderName];
+}
+
 /** Where the `local` provider's server listens. */
 export const DEFAULT_LOCAL_LLM_BASE_URL = 'http://localhost:8080/v1';
 export function localLlmBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
@@ -189,6 +249,25 @@ export function portOfBaseUrl(baseUrl: string): number | null {
 export const LOCAL_LLM_PLACEHOLDER_KEY = 'local';
 /** The same idea for the Claude CLI — see where it is assigned. */
 export const CLAUDE_CLI_PLACEHOLDER_KEY = 'claude-cli-session';
+export const CODEX_CLI_PLACEHOLDER_KEY = 'codex-cli-session';
+export const CODEX_CLI_MODELS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'] as const;
+export const AGY_CLI_PLACEHOLDER_KEY = 'agy-cli-session';
+export const AGY_CLI_MODELS = [
+  'gemini-3.8-flash-medium',
+  'gemini-3.8-flash-high',
+  'gemini-3.8-flash-low',
+  'gemini-3.7-flash-high',
+  'gemini-3.7-flash-medium',
+  'gemini-3.7-flash-low',
+  'gemini-3.6-flash-high',
+  'gemini-3.6-flash-medium',
+  'gemini-3.6-flash-low',
+  'gemini-3.1-pro-high',
+  'gemini-3.1-pro-low',
+  'claude-sonnet-4-6',
+  'claude-opus-4-6-thinking',
+  'gpt-oss-120b-medium',
+] as const;
 
 /**
  * Defaults chosen to match each role's shape.
@@ -204,14 +283,6 @@ export const DEFAULT_ROLE_MODELS: Record<LlmRole, { provider: ProviderName; mode
   healer: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
   generator: { provider: 'google', modelId: 'gemini-3.6-flash' },
   agent: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
-  // Same job shape as healer — small, latency-sensitive, rarely called (most
-  // data generation is deterministic and never reaches a model at all).
-  data: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
-  // The queue governor: a handful of event-driven turns per SUITE, each a
-  // compact observation and one structured decision. Cheap by default; the
-  // person may point it at an expensive model (claude-cli opus) precisely
-  // because the turn budget, not the model, bounds the spend.
-  governor: { provider: 'groq', modelId: 'openai/gpt-oss-120b' },
 };
 
 /**
@@ -259,6 +330,8 @@ export const DEFAULT_PROVIDER_MODELS: Record<ProviderName, string> = {
   cerebras: 'llama3.1-8b',
   requesty: 'default',
   local: 'default_model',
+  'agy-cli': 'gemini-3.8-flash-medium',
+  'codex-cli': 'gpt-5.6-terra',
   // An alias, not a dated id: the CLI resolves `fable` to whatever the
   // current Fable is. A DEFAULT and not a fixed model — each role keeps its
   // own `WOWLIDATOR_<ROLE>_MODEL`, so a run can put the expensive model where
@@ -379,22 +452,15 @@ const envSchema = z.object({
   WOWLIDATOR_HEALER_EFFORT: z.string().min(1).optional(),
   WOWLIDATOR_GENERATOR_EFFORT: z.string().min(1).optional(),
   WOWLIDATOR_AGENT_EFFORT: z.string().min(1).optional(),
-  WOWLIDATOR_DATA_EFFORT: z.string().min(1).optional(),
   WOWLIDATOR_HEALER_TOOLS: z.string().optional(),
   WOWLIDATOR_GENERATOR_TOOLS: z.string().optional(),
   WOWLIDATOR_AGENT_TOOLS: z.string().optional(),
-  WOWLIDATOR_DATA_TOOLS: z.string().optional(),
-  WOWLIDATOR_GOVERNOR_TOOLS: z.string().optional(),
   WOWLIDATOR_HEALER_ALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_GENERATOR_ALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_AGENT_ALLOWED_TOOLS: z.string().optional(),
-  WOWLIDATOR_DATA_ALLOWED_TOOLS: z.string().optional(),
-  WOWLIDATOR_GOVERNOR_ALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_HEALER_DISALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_GENERATOR_DISALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_AGENT_DISALLOWED_TOOLS: z.string().optional(),
-  WOWLIDATOR_DATA_DISALLOWED_TOOLS: z.string().optional(),
-  WOWLIDATOR_GOVERNOR_DISALLOWED_TOOLS: z.string().optional(),
   WOWLIDATOR_HEALER_BASE_URL: z.string().url().optional(),
   WOWLIDATOR_GENERATOR_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_GENERATOR_MODEL: z.string().min(1).optional(),
@@ -402,13 +468,6 @@ const envSchema = z.object({
   WOWLIDATOR_AGENT_PROVIDER: providerSchema.optional(),
   WOWLIDATOR_AGENT_MODEL: z.string().min(1).optional(),
   WOWLIDATOR_AGENT_BASE_URL: z.string().url().optional(),
-  WOWLIDATOR_DATA_PROVIDER: providerSchema.optional(),
-  WOWLIDATOR_DATA_MODEL: z.string().min(1).optional(),
-  WOWLIDATOR_DATA_BASE_URL: z.string().url().optional(),
-  WOWLIDATOR_GOVERNOR_PROVIDER: providerSchema.optional(),
-  WOWLIDATOR_GOVERNOR_MODEL: z.string().min(1).optional(),
-  WOWLIDATOR_GOVERNOR_BASE_URL: z.string().url().optional(),
-  WOWLIDATOR_GOVERNOR_EFFORT: z.string().optional(),
 
   GOOGLE_GENERATIVE_AI_API_KEY: z.string().min(1).optional(),
   GROQ_API_KEY: z.string().min(1).optional(),
@@ -635,6 +694,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
   apiKeys['claude-cli'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
   apiKeys['claude-tty'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
   apiKeys['claude-cloud'] = [CLAUDE_CLI_PLACEHOLDER_KEY];
+  apiKeys['codex-cli'] = [CODEX_CLI_PLACEHOLDER_KEY];
+  apiKeys['agy-cli'] = [AGY_CLI_PLACEHOLDER_KEY];
 
   return {
     roles: {
@@ -667,26 +728,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
         e.WOWLIDATOR_AGENT_TOOLS,
         e.WOWLIDATOR_AGENT_ALLOWED_TOOLS,
         e.WOWLIDATOR_AGENT_DISALLOWED_TOOLS,
-      ),
-      data: role(
-        'data',
-        e.WOWLIDATOR_DATA_PROVIDER,
-        e.WOWLIDATOR_DATA_MODEL,
-        e.WOWLIDATOR_DATA_BASE_URL,
-        e.WOWLIDATOR_DATA_EFFORT,
-        e.WOWLIDATOR_DATA_TOOLS,
-        e.WOWLIDATOR_DATA_ALLOWED_TOOLS,
-        e.WOWLIDATOR_DATA_DISALLOWED_TOOLS,
-      ),
-      governor: role(
-        'governor',
-        e.WOWLIDATOR_GOVERNOR_PROVIDER,
-        e.WOWLIDATOR_GOVERNOR_MODEL,
-        e.WOWLIDATOR_GOVERNOR_BASE_URL,
-        e.WOWLIDATOR_GOVERNOR_EFFORT,
-        e.WOWLIDATOR_GOVERNOR_TOOLS,
-        e.WOWLIDATOR_GOVERNOR_ALLOWED_TOOLS,
-        e.WOWLIDATOR_GOVERNOR_DISALLOWED_TOOLS,
       ),
     },
     apiKeys,

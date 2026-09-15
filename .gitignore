@@ -19,3 +19,13 @@ supervisor.hold
 .DS_Store
 .lavish/
 scripts-scratch/
+CLAUDE.local.md
+.claude/skills/wowlidate/monitor/run-state.js
+
+# Local provider keys — the backups too. These hold live credentials, and only
+# `.env` itself was ignored, so a `git add -A` would have committed them.
+.env.bak
+.env.bak-*
+
+# Run artefacts — one run's output, not the project's history.
+reports/

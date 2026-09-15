@@ -33,6 +33,8 @@
  * than a placeholder that reads like a fact.
  */
 
+import { isPassing } from '../engine/proof-bundle.js';
+import { DB_EVIDENCE_MAX_ROWS } from '../db/redact-row.js';
 import type { AgentAction, ProofBundle, ResolutionSource } from '../engine/proof-bundle.js';
 
 /** One labelled fact about a step, rendered wherever the step is. */
@@ -52,6 +54,18 @@ export interface StepLike {
   browser?: string | undefined;
   /** The agent record, when the step was a workflow leg; `observations` (OA-14) is read off it structurally. */
   agent?: object | undefined;
+  /** A model's plain-language reading of the step — see `stepNarration`. */
+  narration?: unknown;
+}
+
+/**
+ * The slice `stepNarration` needs. Structural and `unknown`-typed on purpose:
+ * the field is optional on the bundle and absent from every run that did not
+ * ask for it, so a reader must handle "not there" and "not the shape" the
+ * same way — by rendering nothing.
+ */
+export interface NarratedLike {
+  narration?: unknown;
 }
 
 /** A persona LABEL and nothing else: no address, no `LABEL=email:password` remnant. See `signInPersona`. */
@@ -221,6 +235,70 @@ export function browserFact(step: StepLike): string | null {
   const port = raw.match(/:(\d+)\/?$/)?.[1];
   const who = step.persona !== undefined && step.persona !== '' ? ` (${step.persona})` : '';
   return `${port ?? raw}${who}`;
+}
+
+/* --------------------------------------------------------- the narration */
+
+/**
+ * The label every surface puts in front of a narration, and the note that
+ * says what it is. One wording, three surfaces — a sentence a reader meets
+ * differently framed in the report, the catalog and the workbook is a
+ * sentence they will weigh differently.
+ */
+export const NARRATION_LABEL = 'in plain language';
+/**
+ * Short on purpose: it is rendered as a `title` on EVERY narrated step, and a
+ * 400-case catalog narrating twenty steps each repeats it eight thousand
+ * times. Two facts earn their bytes — where the sentence came from, and that
+ * it decides nothing.
+ */
+export const NARRATION_NOTE =
+  "A model's plain-language reading of this step's own recorded line, written after the run from that line and nothing else. Descriptive only: it sets no status, files no defect, and is no part of the verdict.";
+
+/** A narration as it reaches a renderer — see `ProofStep.narration`. */
+export interface StepNarrationLine {
+  /** The sentences, whitespace-folded, verbatim otherwise. Application text inside them is quoted, never translated. */
+  text: string;
+  /** The model that wrote them, as the surfaces credit it. */
+  by: string;
+  label: string;
+  /** The visible attribution: short enough to sit on every step. */
+  attribution: string;
+  note: string;
+}
+
+/**
+ * The step's narration, or null when it has none — which is every step of
+ * every run that did not ask for one (`--narrate`), so "null renders exactly
+ * what the step rendered before this existed" is the common case, not the
+ * edge one.
+ *
+ * Defensive like the rest of this module: a bundle written by an older build,
+ * or one whose narration is an empty string, has no narration at all. Never a
+ * placeholder that reads like a fact.
+ */
+export function stepNarration(step: NarratedLike): StepNarrationLine | null {
+  const record = step.narration;
+  if (record === null || record === undefined || typeof record !== 'object') return null;
+  const raw = (record as { text?: unknown }).text;
+  const text = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
+  if (text === '') return null;
+  const attributed = (record as { by?: unknown }).by;
+  // Never unattributed: a sentence with no author reads as the harness's own.
+  const by = typeof attributed === 'string' && attributed.trim() !== '' ? attributed.trim() : 'a model';
+  return { text, by, label: NARRATION_LABEL, attribution: `written by ${by}`, note: NARRATION_NOTE };
+}
+
+/**
+ * The narration as one line of plain text — what a workbook cell and any
+ * other unstyled surface carries, where a muted colour and a hover cannot do
+ * the marking. The label and the attribution are inside the line itself.
+ */
+export function narrationProofLine(step: NarratedLike): string | null {
+  const narration = stepNarration(step);
+  return narration === null
+    ? null
+    : `${narration.label} (${narration.attribution}; a description of this step, not a recorded fact): ${narration.text}`;
 }
 
 /**
@@ -432,6 +510,422 @@ export function describeAgentAction(action: AgentActionLike): { target: string; 
   }
 }
 
+/**
+ * An agent leg that did not determine its step's outcome.
+ *
+ * Measured over this workspace's 722 sealed bundles (10,247 steps, 988 agent
+ * legs, 2026-09-08): 112 legs in 70 bundles. Two shapes, both of them a leg
+ * a reader scrolls past on the way to the steps that decided something:
+ *
+ * - **`looked-only`** (85) — `AgentRecord.lookedOnly`: the loop never engaged
+ *   a control the goal names. The runner already treats this as a reading
+ *   question deferred to the assertions after it (`verification-deferred`).
+ *   The wording here is deliberately NOT the field's doc comment ("every
+ *   action was a scroll or a wait"): `WorkflowAgent` sets the flag on TWO
+ *   branches — `onlyLooked` (every action idle) and `missedEveryInteraction`
+ *   (it clicked, and no click ever engaged anything) — and on this
+ *   workspace's bundles the second is 76 of the 85. "Every action was a
+ *   scroll or a wait" would be a false sentence about 76 real steps, so the
+ *   one clause both branches make true is the one that is printed.
+ * - **`did-not-decide`** (27) — the agent reported `success: false` and the
+ *   step passed anyway, on the flow's own selector. This is the assist rung
+ *   stalling on its second turn after its first action had already opened
+ *   the panel; `agentBlock` was re-worded for exactly this shape in 2026-09-04
+ *   ("A rescued step shows once"), and folding is the same fact carried one
+ *   step further.
+ *
+ * Four shapes are deliberately NOT inconsequential, and every surface must
+ * keep rendering them exactly as it does today:
+ *
+ * - **a leg on a step that did not pass** — that leg IS the evidence of the
+ *   failure, and failure evidence is never folded. This is why BOTH shapes
+ *   require a passing step, including `lookedOnly`: a look-only leg on a
+ *   broken step is the whole account of what was tried.
+ * - **a held action** (`ProofStep.blocked`, `AgentRecord.blocked`) — the
+ *   harness withheld a mutation; that is never noise.
+ * - **`endedBy: 'fail'`** — the model's own claim that it could not proceed.
+ *   7 of the 119 candidate legs above; they stay open.
+ * - a leg whose actions changed the page and the step then passed — it DID
+ *   decide the outcome, and it has neither marker.
+ *
+ * Pure and structural, like the rest of this module: the fields are optional
+ * and absent from bundles older than them, and an unrecognised shape folds
+ * nothing. This decides only how a leg is LAID OUT; nothing here is a status,
+ * a verdict, a defect or a count, and no surface may remove the leg from the
+ * document — it is folded behind a closed disclosure, still a full record,
+ * the same rule a superseded attempt follows.
+ */
+export type InconsequentialAgentLegKind = 'looked-only' | 'did-not-decide';
+
+/** The slice `inconsequentialAgentLeg` reads. `unknown`-typed so a half-built record fits. */
+export interface AgentLegLike {
+  status?: string | undefined;
+  /** `ProofStep.blocked` — the harness withheld the action. */
+  blocked?: unknown;
+  agent?: unknown;
+}
+
+export interface InconsequentialAgentLeg {
+  kind: InconsequentialAgentLegKind;
+  /** Why it did not decide the outcome, in one clause — the honest half of the summary. */
+  why: string;
+  /** The one line every surface folds the leg behind. */
+  summary: string;
+}
+
+/**
+ * The one wording, three surfaces. A leg framed one way in the report and
+ * another in the workbook is a leg a reader weighs differently.
+ */
+export const AGENT_LEG_ASIDE_LABEL = "agent leg — did not affect this step's outcome";
+
+const AGENT_LEG_ASIDE_WHY: Record<InconsequentialAgentLegKind, string> = {
+  'looked-only': 'it never engaged a control the goal names',
+  'did-not-decide': "the step passed on the flow's own selector regardless",
+};
+
+/**
+ * `null` for every leg that decided something, which is every leg on a run
+ * that has no such shape — so "null renders exactly what the step rendered
+ * before this existed" is the common case, not the edge one.
+ */
+export function inconsequentialAgentLeg(step: AgentLegLike): InconsequentialAgentLeg | null {
+  const agent = step.agent;
+  if (agent === null || agent === undefined || typeof agent !== 'object') return null;
+  // A hold is not noise: the harness withheld an action, and the step says so.
+  if (step.blocked !== null && step.blocked !== undefined) return null;
+  const record = agent as { success?: unknown; lookedOnly?: unknown; blocked?: unknown; endedBy?: unknown };
+  if (record.blocked !== null && record.blocked !== undefined) return null;
+  // The model's own claim that it could not proceed stays where a reader meets it.
+  if (record.endedBy === 'fail') return null;
+  // `isPassing` is the one rule every surface follows; a step is never
+  // `passed-with-issues`, so this is exactly "the step passed".
+  if (typeof step.status !== 'string' || !isPassing(step.status)) return null;
+  const kind: InconsequentialAgentLegKind | null =
+    record.lookedOnly === true ? 'looked-only' : record.success === false ? 'did-not-decide' : null;
+  if (kind === null) return null;
+  const why = AGENT_LEG_ASIDE_WHY[kind];
+  return { kind, why, summary: `${AGENT_LEG_ASIDE_LABEL}: ${why}` };
+}
+
+/* ------------------------------------------------------- database checks */
+
+/**
+ * The database check a step made, projected once for all three surfaces.
+ *
+ * Everything here was redacted on its way into the bundle (`redact-row.ts`),
+ * and this function must never reach past `step.db` for a raw value — the
+ * same rule the per-run report's `requestBlock`/`dbBlock` have always
+ * followed: a report that re-derives a value is the leak.
+ *
+ * It reads defensively. A bundle sealed before the statement was recorded
+ * has no `statements` and no `rowsMatched`, and renders exactly the summary
+ * it always did: no query section, and never an invented one. A check that
+ * was refused before any SQL ran (an undeclared table, an unparseable where,
+ * no connection) is exactly that case.
+ */
+export interface DbEvidenceStatement {
+  sql: string;
+  /** Bound values in `$1…$n` order, redacted at the source. */
+  params: string[];
+  tables: string[];
+}
+
+export interface DbEvidence {
+  kind: string;
+  /** The table(s) the check was about, however the record spells them. */
+  target: string | null;
+  where: string | null;
+  expected: string | null;
+  observed: string | null;
+  note: string | null;
+  durationMs: number | null;
+  polledMs: number | null;
+  /** The statement(s) the check ran. Empty for a bundle sealed before they were recorded. */
+  statements: DbEvidenceStatement[];
+  /** Header row of the sample: every column any sampled row names, in first-appearance order. */
+  columns: string[];
+  /** One row per sampled row, aligned to `columns`; a column a row does not hold is empty. */
+  rows: string[][];
+  rowsMatched: number | null;
+  /** `showing 3 of 42 row(s) — the sample is capped at 3`, or null when nothing is shown. */
+  sample: string | null;
+}
+
+/** The slice `dbEvidence` reads. `unknown` so a half-built record fits. */
+export interface DbCheckLike {
+  db?: unknown;
+}
+
+/** One wording, three surfaces — a query labelled `query` here and `SQL` there is two things to a reader. */
+export const DB_QUERY_LABEL = 'query';
+export const DB_PARAMS_LABEL = 'parameters';
+export const DB_ROWS_LABEL = 'rows returned';
+
+function dbStr(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+function dbNum(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+export function dbEvidence(step: DbCheckLike): DbEvidence | null {
+  const record = step.db;
+  if (record === null || record === undefined || typeof record !== 'object') return null;
+  const r = record as Record<string, unknown>;
+  const kind = dbStr(r['kind']) ?? 'check';
+
+  const tables = Array.isArray(r['tables'])
+    ? (r['tables'] as unknown[]).filter((t): t is string => typeof t === 'string' && t !== '')
+    : [];
+  const target = dbStr(r['table']) ?? (tables.length > 0 ? tables.join(', ') : null);
+
+  const statements: DbEvidenceStatement[] = [];
+  if (Array.isArray(r['statements'])) {
+    for (const entry of r['statements'] as unknown[]) {
+      if (entry === null || typeof entry !== 'object') continue;
+      const e = entry as Record<string, unknown>;
+      const sql = dbStr(e['sql']);
+      if (sql === null) continue;
+      statements.push({
+        sql,
+        params: Array.isArray(e['params'])
+          ? (e['params'] as unknown[]).map((p) => (typeof p === 'string' ? p : String(p)))
+          : [],
+        tables: Array.isArray(e['tables'])
+          ? (e['tables'] as unknown[]).filter((t): t is string => typeof t === 'string')
+          : [],
+      });
+    }
+  }
+
+  // The sample as a real table: the columns are the union of what the rows
+  // name, in the order they first appear, so a row missing a column renders
+  // an empty cell rather than shifting every value one place left.
+  const columns: string[] = [];
+  const rows: string[][] = [];
+  const sampled = Array.isArray(r['rows']) ? (r['rows'] as unknown[]) : [];
+  for (const row of sampled) {
+    if (row === null || typeof row !== 'object') continue;
+    for (const column of Object.keys(row as Record<string, unknown>)) {
+      if (!columns.includes(column)) columns.push(column);
+    }
+  }
+  for (const row of sampled) {
+    if (row === null || typeof row !== 'object') continue;
+    const cells = row as Record<string, unknown>;
+    rows.push(columns.map((column) => (column in cells ? String(cells[column] ?? '') : '')));
+  }
+
+  const rowsMatched = dbNum(r['rowsMatched']);
+  // `called` samples matching STATEMENTS, not rows of a table; the caption
+  // must say what it is showing or it reads as a result set.
+  const subject = kind === 'called' ? 'matching statement(s)' : 'row(s)';
+  const sample =
+    rows.length === 0
+      ? null
+      : rowsMatched !== null && rowsMatched > rows.length
+        ? `showing ${rows.length} of ${rowsMatched} ${subject} — the sample is capped at ${DB_EVIDENCE_MAX_ROWS}`
+        : `${rows.length} ${subject}`;
+
+  return {
+    kind,
+    target,
+    where: dbStr(r['where']),
+    expected: dbStr(r['expected']),
+    observed: dbStr(r['observed']),
+    note: dbStr(r['note']),
+    durationMs: dbNum(r['durationMs']),
+    polledMs: dbNum(r['polledMs']),
+    statements,
+    columns,
+    rows,
+    rowsMatched,
+    sample,
+  };
+}
+
+/**
+ * The same evidence for a surface with no table and no disclosure — the
+ * workbook's Proof cell. One fact per line, in the order a reader checks
+ * them: what the check claimed, then the SQL that answered it, then the rows
+ * it got back.
+ */
+export function dbProofLines(step: DbCheckLike): string[] {
+  const e = dbEvidence(step);
+  if (e === null) return [];
+  const lines: string[] = [];
+  lines.push(`db ${e.kind}${e.target === null ? '' : ` on ${e.target}`}`);
+  if (e.where !== null) lines.push(`where ${e.where}`);
+  if (e.expected !== null) lines.push(`expected ${e.expected}`);
+  if (e.observed !== null) lines.push(`observed ${e.observed}`);
+  for (const statement of e.statements) {
+    lines.push(`${DB_QUERY_LABEL}: ${statement.sql}`);
+    if (statement.params.length > 0) {
+      lines.push(
+        `${DB_PARAMS_LABEL}: ${statement.params.map((p, i) => `$${i + 1} = ${p}`).join(' · ')}`,
+      );
+    }
+  }
+  if (e.rows.length > 0) {
+    lines.push(e.sample === null ? DB_ROWS_LABEL : `${DB_ROWS_LABEL} — ${e.sample}`);
+    lines.push(e.columns.join(' | '));
+    for (const row of e.rows) lines.push(row.join(' | '));
+  }
+  if (e.polledMs !== null) lines.push(`polled ${e.polledMs}ms`);
+  if (e.note !== null) lines.push(`note: ${e.note}`);
+  return lines;
+}
+
+/* --------------------------------------------------- a step that decided nothing */
+
+/**
+ * The actions whose outcome IS a claim.
+ *
+ * Mirrors `ASSERTION_ACTIONS` in the runner, restated here for exactly the
+ * reason `proof-bundle.ts` restates it: this plane cannot import the runner
+ * (the whole execution plane, Playwright included, would come with it), and
+ * the reporter is a pure render over a bundle. `tests/reporter-wave2.test.ts`
+ * pins the mirror against the runner's own list, so it cannot drift quietly.
+ */
+export function isAssertionStepAction(action: string | null | undefined): boolean {
+  return (
+    typeof action === 'string' &&
+    (action.startsWith('expect') ||
+      action === 'snapshot' ||
+      action === 'fillEach' ||
+      action === 'fillRetry')
+  );
+}
+
+/** The slice `inconsequentialBrokenStep` reads of a step. */
+export interface BrokenStepLike {
+  index?: number | undefined;
+  action?: string | undefined;
+  status?: string | undefined;
+  /** `ProofStep.superseded` — an attempt a reconstruction replaced; already folded as one. */
+  superseded?: unknown;
+  /** `ProofStep.blocked` — the harness withheld the action. */
+  blocked?: unknown;
+}
+
+/** The run a broken step is judged against — the bundle's own status and step list. */
+export interface BrokenStepRunLike {
+  status?: string | undefined;
+  steps?: readonly BrokenStepLike[] | undefined;
+}
+
+export interface InconsequentialStep {
+  /** The status as SEALED — never rewritten, only laid out differently. */
+  status: string;
+  /** Why it did not decide the outcome, in one clause. */
+  why: string;
+  /** The one line every surface folds the step behind. */
+  summary: string;
+}
+
+/**
+ * The one wording, three surfaces. Built from constants and the sealed
+ * status only: no application text, no selector, no credential can reach it.
+ */
+export const BROKEN_STEP_ASIDE_LABEL = "did not decide this run's outcome";
+
+const BROKEN_STEP_ASIDE_WHY =
+  'it makes no claim, the run carried past it, and every claim the run did make held';
+
+/** The run outcomes that mean the claims held. `pass**` IS a pass. */
+const RUN_PASSED = new Set(['passed', 'passed-with-issues']);
+
+/**
+ * A broken step that decided nothing — folded, never dropped.
+ *
+ * `passed-with-issues` is the engine's own name for this run: the claims
+ * held, the path did not. Inside such a run an *action* step that broke sits
+ * red beside real failures, and a reader who learns that red does not mean a
+ * finding stops reading red at all. So it is laid out as an aside — and
+ * `inconsequentialAgentLeg`'s constitution applies word for word: this
+ * decides only how a step is LAID OUT. It is not a status, not a verdict,
+ * not a defect, not a count. It changes no run status, no case verdict, no
+ * tally, no defect table, not `harnessOnly()` and no exit code, and no
+ * surface may remove the step from the document — it goes behind a CLOSED
+ * disclosure whose summary names the sealed status and why it did not
+ * decide, and a reader who opens it sees exactly what they see today.
+ *
+ * Every condition is structural, over typed fields, and all must hold:
+ *
+ * - **it claims nothing** — the action is not an assertion
+ *   (`isAssertionStepAction`), so it has no expected-result verdict to fail;
+ * - **it broke, and the harness did not** — status `failed` or `dead-end`,
+ *   NEVER `error` (an `error` says the harness could not proceed, and
+ *   `harnessOnly()` in `cli/exit.ts` depends on it being visible) and never a
+ *   step carrying `blocked` (a withheld action is a finding about the run);
+ * - **the run reached a passing outcome anyway** — its status is `passed` or
+ *   `passed-with-issues`, it made at least one assertion, and every
+ *   assertion step passed;
+ * - **nothing downstream depended on it** — the run carried past it: at
+ *   least one later step ran and passed, and no later step was skipped or
+ *   ended in `error`. A later *action* step that also broke does not make
+ *   this one consequential; a later step the run never reached does.
+ *
+ * A superseded attempt returns null: it is already folded under the step
+ * that replaced it (`details.replaced`), and folding it twice would hide the
+ * rescue as well as the attempt.
+ */
+export function inconsequentialBrokenStep(
+  step: BrokenStepLike,
+  run: BrokenStepRunLike,
+): InconsequentialStep | null {
+  if (typeof run.status !== 'string' || !RUN_PASSED.has(run.status)) return null;
+  if (step.superseded === true) return null;
+  if (step.blocked !== null && step.blocked !== undefined) return null;
+  if (isAssertionStepAction(step.action)) return null;
+  if (typeof step.action !== 'string' || step.action === '') return null;
+  const status = step.status;
+  if (status !== 'failed' && status !== 'dead-end') return null;
+
+  const steps = (run.steps ?? []).filter((s) => s.superseded !== true);
+  // A run that proved nothing has nothing to say this break was beside the
+  // point OF; and one unheld claim makes every break part of the account.
+  let assertions = 0;
+  for (const s of steps) {
+    if (!isAssertionStepAction(s.action)) continue;
+    assertions += 1;
+    if (typeof s.status !== 'string' || !isPassing(s.status)) return null;
+  }
+  if (assertions === 0) return null;
+
+  let position = steps.indexOf(step);
+  if (position === -1 && typeof step.index === 'number') {
+    position = steps.findIndex((s) => s.index === step.index);
+  }
+  // A step this run's own list does not hold cannot be placed in it, and a
+  // fold decided without the downstream evidence would be a guess.
+  if (position === -1) return null;
+
+  const after = steps.slice(position + 1);
+  let carriedOn = false;
+  for (const s of after) {
+    if (typeof s.status === 'string' && isPassing(s.status)) {
+      carriedOn = true;
+      continue;
+    }
+    // Another action step that broke leaves the run's claims exactly where
+    // they were. A step that never ran, or one the harness ended, does not.
+    if ((s.status === 'failed' || s.status === 'dead-end') && !isAssertionStepAction(s.action)) {
+      continue;
+    }
+    return null;
+  }
+  if (!carriedOn) return null;
+
+  return {
+    status,
+    why: BROKEN_STEP_ASIDE_WHY,
+    summary: `${status} — ${BROKEN_STEP_ASIDE_LABEL}: ${BROKEN_STEP_ASIDE_WHY}`,
+  };
+}
+
 /* --------------------------------------------------------------- cases */
 
 /**
@@ -576,4 +1070,68 @@ export function describeVerdictCounts(counts: VerdictCounts, labels: Partial<Rec
   if (counts.noVerdict > 0) parts.push(`${counts.noVerdict} ${labels.noVerdict ?? 'no verdict'}`);
   if (counts.blocked > 0) parts.push(`${counts.blocked} ${labels.blocked ?? 'never ran'}`);
   return parts.join(' · ');
+}
+
+/**
+ * What the reader is told about the run's own notes — see `runNotesSummary`.
+ */
+export interface RunNotesSummary {
+  /** The paragraph a reader sees: the model's summary, or the run's own notes joined. */
+  text: string;
+  /**
+   * The notes exactly as recorded, one per entry, for a surface that lays the
+   * degraded path out line by line. EMPTY when `text` is the model's summary —
+   * the summary replaces the notes on the page, it does not precede them.
+   */
+  lines: readonly string[];
+  /** The model that wrote `text`, or null when `text` is the run's own notes. */
+  by: string | null;
+  /** The visible attribution, or null on the unattributed degraded path. */
+  attribution: string | null;
+}
+
+/** The slice of a bundle this reading needs. Structural, so a half-built record and wowUI's own shapes fit. */
+export interface RunNotesLike {
+  notes?: readonly string[] | null | undefined;
+  narrative?: unknown;
+}
+
+/**
+ * The run's notes as a reader meets them (2026-09-11). One projection, three
+ * surfaces — the per-case page, the catalog report and the per-run report —
+ * so the same run cannot be described three ways.
+ *
+ * A live case (PL_06_10) wrote five notes that rendered as ~300 words in one
+ * `·`-joined line above the coverage bar: the session note, the sign-in POST
+ * evidence, a pre-run risk line, a cross-case interference stamp and a full
+ * system-error diagnosis with the agent's click trail. So where the run has a
+ * narrative, the reader is shown the model's own ≤70-word summary of those
+ * notes (`CaseNarrative.verifierNote`, bounded and written in
+ * `generator/case-narrative.ts` from the notes themselves) INSTEAD of the
+ * notes. Nothing is derived here and no model is called: this reads two
+ * recorded fields and picks one.
+ *
+ * The unattributed fallback is not an edge case and must not be dropped:
+ * `--no-case-narrative`, `WOWLIDATOR_CASE_NARRATIVE=off` and a generator role
+ * with no key all seal a bundle that HAS notes and no narrative, and that page
+ * degrades to the evidence alone. Rendering nothing there would delete the only
+ * account of the run a reader has.
+ *
+ * Defensive like the rest of this module: a narrative written by an older
+ * build, one whose note is an empty string, and a `narrative` that is not an
+ * object all fall through to the notes rather than to a placeholder.
+ */
+export function runNotesSummary(bundle: RunNotesLike | null | undefined): RunNotesSummary | null {
+  const notes = (bundle?.notes ?? []).map((n) => String(n ?? '').replace(/\s+/g, ' ').trim()).filter((n) => n !== '');
+  const record = bundle?.narrative;
+  const raw = record !== null && typeof record === 'object' ? (record as { verifierNote?: unknown }).verifierNote : undefined;
+  const note = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
+  if (note !== '') {
+    const attributed = (record as { by?: unknown }).by;
+    // Never unattributed: a sentence with no author reads as the harness's own.
+    const by = typeof attributed === 'string' && attributed.trim() !== '' ? attributed.trim() : 'a model';
+    return { text: note, lines: [], by, attribution: `written by ${by}` };
+  }
+  if (notes.length === 0) return null;
+  return { text: notes.join(' · '), lines: notes, by: null, attribution: null };
 }

@@ -11,17 +11,25 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import type { ProofBundle, ProofStep } from '../src/engine/proof-bundle.js';
 import {
   CatalogLiveReport,
   buildCatalogReportCases,
   scenarioFromId,
+  writeCatalogArtifacts,
 } from '../src/cli/catalog-live-report.js';
 import { newLedger, recordOutcome, type SuiteLedger } from '../src/cli/suite-progress.js';
+import {
+  RECORDING_BUDGET_BYTES,
+  SCREENSHOT_BUDGET_BYTES,
+  catalogCaseExportName,
+  catalogMediaDirName,
+} from '../src/reporter/catalog-report.js';
+import { caseVideoFile } from '../src/reporter/excel-export.js';
 
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0xff, 0xd9]);
 
@@ -72,6 +80,213 @@ describe('the report exists before any verdict', () => {
     // The run workbook exists too, saying there is nothing in it yet; no media folder.
     assert.ok(existsSync(first.excel.xlsxPath));
     assert.ok(!existsSync(mediaDir(cwd)));
+    // And the findings export, beside the report from the first write.
+    assert.equal(first.findings.markdownPath, join(cwd, 'reports', 'be100-csv-2026-09-02t04-00-00-000z-findings.md'));
+    assert.ok(existsSync(first.findings.markdownPath));
+    assert.ok(existsSync(first.findings.xlsxPath));
+    assert.equal(first.findings.findings, 0);
+  });
+});
+
+describe('the findings export rides with the report', () => {
+  it('`wowlidator report`\'s path — writeCatalogArtifacts over a fixture ledger — writes <base>-findings.md from the ledgers alone', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'wow-live-'));
+    const ledger = newLedger('be100.csv', ['BE_01_01', 'BE_01_02', 'BE_02_01']);
+    ledger.runKey = 'be100-csv@2026-09-02T04:00:00.000Z';
+    // Two cases that met the same 500 on the same endpoint, their bundles on disk as an earlier pass left them.
+    for (const id of ['BE_01_01', 'BE_01_02']) {
+      const failed = bundle(`${id} create`, 'failed', {
+        steps: [
+          step({ index: 0, action: 'request', url: null, request: { method: 'POST', url: 'http://api.test/v1/plans', status: 500, durationMs: 50 } } as Partial<ProofStep>),
+          step({ index: 1, action: 'expectStatus', url: null, status: 'failed', detail: { expected: [201], actual: '500 Internal Server Error' } }),
+        ],
+      });
+      const proofPath = join(cwd, `${id}.json`);
+      writeFileSync(proofPath, JSON.stringify(failed), 'utf8');
+      recordOutcome(ledger, { name: failed.name, verdict: 'failed', bundle: failed, reason: 'step 1 broke' }, { proofPath });
+    }
+    const cases = await buildCatalogReportCases(ledger, async (id) => {
+      const proofPath = ledger.outcomes[id]?.proofPath;
+      return typeof proofPath === 'string' ? (JSON.parse(readFileSync(proofPath, 'utf8')) as ProofBundle) : null;
+    });
+    const artifacts = await writeCatalogArtifacts({ title: ledger.title, runKey: ledger.runKey, generatedAt: null, cases }, cwd);
+    const mdPath = artifacts.htmlPath.replace(/\.html$/, '-findings.md');
+    assert.equal(artifacts.findings.markdownPath, mdPath);
+    assert.ok(existsSync(mdPath));
+    const md = readFileSync(mdPath, 'utf8');
+    assert.ok(md.includes('1 finding account for 2 of 2 non-passing cases · 0 unclustered'));
+    assert.ok(md.includes('POST /v1/plans answered 500'));
+    assert.ok(md.includes('BE_01_01 (failed), BE_01_02 (failed)'));
+    assert.ok(md.includes('Never ran (1)'));
+    assert.ok(existsSync(artifacts.findings.xlsxPath));
+    // The HTML leads with the same finding.
+    const html = readFileSync(artifacts.htmlPath, 'utf8');
+    assert.ok(html.includes('1 finding account for 2 of 2 non-passing cases · 0 unclustered'));
+  });
+
+  it('writes an over-budget screenshot under the media shots folder and links it relatively', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'wow-live-'));
+    const bytes = Buffer.alloc(Math.ceil((SCREENSHOT_BUDGET_BYTES + 1) * 3 / 4), 0xab);
+    const base64 = bytes.toString('base64');
+    const caseId = 'PL_07_09';
+    const input = {
+      title: 'catalog.csv',
+      runKey: 'catalog-csv@2026-09-06T04:00:00.000Z',
+      generatedAt: null,
+      cases: [{
+        id: caseId,
+        name: `${caseId} review`,
+        scenario: 'PL_07',
+        verdict: 'review',
+        status: 'needs-review',
+        reason: null,
+        bundle: bundle(`${caseId} review`, 'passed', { steps: [step({ index: 4, screenshot: base64 })] }),
+        history: [],
+      }],
+    };
+
+    const artifacts = await writeCatalogArtifacts(input, cwd);
+    const mediaName = catalogMediaDirName(input.runKey, input.title);
+    const fileName = `${catalogCaseExportName(caseId)}-4.jpg`;
+    const shotPath = join(cwd, 'reports', mediaName, 'shots', fileName);
+    const html = readFileSync(artifacts.htmlPath, 'utf8');
+
+    assert.ok(existsSync(shotPath));
+    assert.deepEqual(readFileSync(shotPath), bytes);
+    assert.match(html, new RegExp(`src="${mediaName}/shots/${fileName}"`));
+    assert.ok(!html.includes(`src="/${mediaName}/shots/${fileName}"`));
+  });
+
+  it('writes an over-budget recording under the media folder and links it relatively', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'wow-live-'));
+    const bytes = Buffer.alloc(Math.ceil((RECORDING_BUDGET_BYTES + 1) * 3 / 4), 0xbc);
+    const base64 = bytes.toString('base64');
+    const caseId = 'PL_07_11';
+    const input = {
+      title: 'catalog.csv',
+      runKey: 'catalog-csv@2026-09-06T04:30:00.000Z',
+      generatedAt: null,
+      cases: [{
+        id: caseId,
+        name: `${caseId} review`,
+        scenario: 'PL_07',
+        verdict: 'review',
+        status: 'needs-review',
+        reason: null,
+        bundle: bundle(`${caseId} review`, 'passed', {
+          video: { data: base64, bytes: bytes.byteLength, width: 960, height: 540 },
+        }),
+        history: [],
+      }],
+    };
+
+    const artifacts = await writeCatalogArtifacts(input, cwd);
+    const mediaName = catalogMediaDirName(input.runKey, input.title);
+    const fileName = caseVideoFile(caseId);
+    const videoPath = join(cwd, 'reports', mediaName, fileName);
+    const html = readFileSync(artifacts.htmlPath, 'utf8');
+
+    assert.ok(existsSync(videoPath));
+    assert.deepEqual(readFileSync(videoPath), bytes);
+    assert.match(html, new RegExp(`src="${mediaName}/${fileName}"`));
+    assert.ok(!html.includes(`src="/${mediaName}/${fileName}"`));
+  });
+
+  it('keeps writing the report when the shots directory cannot be created', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'wow-live-'));
+    const input = {
+      title: 'catalog.csv',
+      runKey: 'catalog-csv@2026-09-06T05:00:00.000Z',
+      generatedAt: null,
+      cases: [{
+        id: 'PL_07_10',
+        name: 'PL_07_10 review',
+        scenario: 'PL_07',
+        verdict: 'review',
+        status: 'needs-review',
+        reason: null,
+        bundle: bundle('PL_07_10 review', 'passed', {
+          steps: [step({ screenshot: 'A'.repeat(SCREENSHOT_BUDGET_BYTES + 1) })],
+        }),
+        history: [],
+      }],
+    };
+    const shotsPath = join(cwd, 'reports', catalogMediaDirName(input.runKey, input.title), 'shots');
+    mkdirSync(join(cwd, 'reports', catalogMediaDirName(input.runKey, input.title)), { recursive: true });
+    writeFileSync(shotsPath, 'not a directory', 'utf8');
+
+    const artifacts = await writeCatalogArtifacts(input, cwd);
+    const html = readFileSync(artifacts.htmlPath, 'utf8');
+
+    assert.match(html, /omitted for size — it stays in the proof bundle/);
+    assert.ok(!html.includes('screenshot(s) written beside this file'));
+  });
+});
+
+describe('each case with a bundle gets its own page beside its workbook (case-page.ts)', () => {
+  it('writes <media>/<case>.html and the DB sidecars for a case with a DB step, links it from the row, and none for a never-ran row', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'wow-live-'));
+    const ledger = newLedger('be100.csv', ['BE_01_01', 'BE_01_02', 'BE_02_01']);
+    ledger.runKey = 'be100-csv@2026-09-02T04:00:00.000Z';
+    ledger.launch = { catalog: 'be100.csv', claims: 'be100.claims.json', reportLang: 'th' };
+    const withDb = bundle('BE_01_01 create', 'failed', {
+      steps: [
+        step({ index: 0, intent: 'open the page' }),
+        step({
+          index: 1, action: 'expectDbRow', status: 'failed', url: null,
+          db: {
+            kind: 'row', table: 'benefit_plan', where: 'id = 7', expected: 'status = ACTIVE', observed: 'status = DRAFT', durationMs: 12,
+            statements: [{ sql: 'SELECT * FROM "benefit_plan" WHERE "id" = $1 LIMIT 25', params: ['7'], tables: ['benefit_plan'] }],
+            rows: [{ id: '7', status: 'DRAFT' }], rowsMatched: 1,
+          },
+        } as Partial<ProofStep>),
+      ],
+    });
+    const plain = bundle('BE_01_02 list', 'passed');
+    for (const b of [withDb, plain]) {
+      const proofPath = join(cwd, `${b.name.split(' ')[0]}.json`);
+      writeFileSync(proofPath, JSON.stringify(b), 'utf8');
+      recordOutcome(ledger, { name: b.name, verdict: b.status === 'passed' ? 'passed' : 'failed', bundle: b }, { proofPath });
+    }
+    // The ledger names where BE_01_02's own report is — a run folder of its
+    // own, as the run loop writes it — so its page goes THERE and the index
+    // links there; BE_01_01 has no reportPath and lands in the media folder.
+    const ownReport = join(cwd, 'runs', 'be', 'humi-en-login-be-01', '02-catalog-be-01-02-list.html');
+    ledger.outcomes['BE_01_02']!.reportPath = ownReport;
+    // A stale page from an earlier pass for the case that never ran this time.
+    mkdirSync(mediaDir(cwd), { recursive: true });
+    writeFileSync(join(mediaDir(cwd), 'be-02-01.html'), '<p>stale</p>', 'utf8');
+    const cases = await buildCatalogReportCases(ledger, async (id) => {
+      const proofPath = ledger.outcomes[id]?.proofPath;
+      return typeof proofPath === 'string' ? (JSON.parse(readFileSync(proofPath, 'utf8')) as ProofBundle) : null;
+    });
+    const artifacts = await writeCatalogArtifacts(
+      { title: ledger.title, runKey: ledger.runKey, generatedAt: null, cases, lang: ledger.launch.reportLang },
+      cwd,
+    );
+    assert.deepEqual(artifacts.casePages, [join(mediaDir(cwd), 'be-01-01.html'), ownReport]);
+    const own = readFileSync(ownReport, 'utf8');
+    assert.match(own, /<a href="\.\.\/\.\.\/\.\.\/reports\/be100-csv-2026-09-02t04-00-00-000z\.html">/);
+    assert.ok(!existsSync(join(mediaDir(cwd), 'be-01-02.html')));
+    const page = readFileSync(join(mediaDir(cwd), 'be-01-01.html'), 'utf8');
+    assert.match(page, /<html lang="th">/);
+    assert.match(page, /Query ที่ใช้เก็บหลักฐาน DB/);
+    assert.match(page, /SELECT \* FROM &quot;benefit_plan&quot; WHERE &quot;id&quot; = \$1 LIMIT 25;/);
+    assert.match(page, /<a href="\.\.\/be100-csv-2026-09-02t04-00-00-000z\.html">/);
+    assert.match(readFileSync(join(mediaDir(cwd), 'be-01-01-db-query.sql'), 'utf8'), /BEGIN TRANSACTION READ ONLY;/);
+    assert.match(readFileSync(join(mediaDir(cwd), 'be-01-01-db-evidence.csv'), 'utf8'), /^step,check,table,where,expected,observed,row,field,value\n1,row,benefit_plan,id = 7,/);
+    // No baseline diff on this run: the before/after chips are plain, and the files do not exist.
+    assert.ok(!existsSync(join(mediaDir(cwd), 'be-01-01-db-before.csv')));
+    assert.match(page, /<span class="chip muted"><code>db-before\.csv<\/code>/);
+    // A case with no DB step has a page and no sidecars; a never-ran case has neither, and its stale page is gone.
+    assert.ok(!existsSync(join(dirname(ownReport), '02-catalog-be-01-02-list-db-query.sql')));
+    assert.ok(!existsSync(join(mediaDir(cwd), 'be-01-02-db-query.sql')));
+    assert.ok(!existsSync(join(mediaDir(cwd), 'be-02-01.html')));
+    // The index links each page from the case's name, relative to itself.
+    const html = readFileSync(artifacts.htmlPath, 'utf8');
+    assert.match(html, /<a class="open-case" href="be100-csv-2026-09-02t04-00-00-000z-media\/be-01-01\.html"/);
+    assert.match(html, /<a class="open-case" href="\.\.\/runs\/be\/humi-en-login-be-01\/02-catalog-be-01-02-list\.html"/);
+    assert.doesNotMatch(html, /be-02-01\.html/);
   });
 });
 
@@ -200,7 +415,8 @@ describe('concurrency', () => {
 describe('the rows', () => {
   it('scenario falls back to the id prefix, and the order is the plan order', async () => {
     assert.equal(scenarioFromId('PL_06_05'), 'PL_06');
-    assert.equal(scenarioFromId('HIR-EC-010'), 'ungrouped');
+    assert.equal(scenarioFromId('HIR-EC-010'), 'HIR-EC', 'a dashed id groups by its family, not under "ungrouped"');
+    assert.equal(scenarioFromId('42'), 'ungrouped');
     const ledger = newLedger('t', ['B_01_01', 'A_01_01']);
     const cases = await buildCatalogReportCases(ledger, async () => null);
     assert.deepEqual(cases.map((c) => c.id), ['B_01_01', 'A_01_01']);

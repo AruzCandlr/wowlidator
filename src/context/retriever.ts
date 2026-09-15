@@ -106,6 +106,30 @@ export function buildRetriever(kind = process.env['WOWLIDATOR_RETRIEVER']): Retr
  * label line is evidence about which page the tree describes, and ranking it
  * away would re-create exactly the mislabelling the label exists to prevent.
  */
+/** Indent level of a rendered tree line — two spaces per level of containment. */
+function indentOf(line: string): number {
+  return Math.floor((/^ */.exec(line)?.[0].length ?? 0) / 2);
+}
+
+/**
+ * The lines a tree line is indented under, outermost first.
+ *
+ * The text-space twin of `ancestorIndexes` in the healer: scanning back, the
+ * first line shallower than this one is its container. Flat text has none.
+ */
+function ancestorLines(body: readonly string[], index: number): number[] {
+  const chain: number[] = [];
+  let want = indentOf(body[index] as string) - 1;
+  for (let i = index - 1; i >= 0 && want >= 0; i -= 1) {
+    const depth = indentOf(body[i] as string);
+    if (depth <= want) {
+      chain.push(i);
+      want = depth - 1;
+    }
+  }
+  return chain.reverse();
+}
+
 export function focusTreeText(
   tree: string,
   query: string,
@@ -118,12 +142,28 @@ export function focusTreeText(
   if (body.length <= maxLines) return { text: tree, kept: body.length, total: body.length };
 
   const scores = bm25(body, query);
-  const keptIndexes = body
+  const ranked = body
     .map((_, index) => index)
-    .sort((a, b) => (scores[b] ?? 0) - (scores[a] ?? 0) || a - b)
-    .slice(0, maxLines)
-    // Document order restored — the tree still reads as the page.
-    .sort((a, b) => a - b);
+    .sort((a, b) => (scores[b] ?? 0) - (scores[a] ?? 0) || a - b);
+
+  // A ranked line arrives with the lines it is INDENTED UNDER. A rendered AX
+  // tree carries containment in its indentation (`formatAxTree`), and BM25
+  // ranks one line at a time: keeping `button "Delete"` while ranking away the
+  // row it belongs to would leave it indented under an unrelated line, which
+  // is the one reading a scoped selector is written from. The closure is a
+  // no-op on flat text — every line is at indent 0, so nothing has ancestors
+  // and the selection is exactly the top-`maxLines` it always was.
+  const kept = new Set<number>();
+  for (const index of ranked) {
+    if (kept.size >= maxLines) break;
+    if (kept.has(index)) continue;
+    const missing = ancestorLines(body, index).filter((i) => !kept.has(i));
+    if (kept.size + missing.length + 1 > maxLines) continue;
+    for (const i of missing) kept.add(i);
+    kept.add(index);
+  }
+  // Document order restored — the tree still reads as the page.
+  const keptIndexes = [...kept].sort((a, b) => a - b);
 
   const lines = [
     ...head,

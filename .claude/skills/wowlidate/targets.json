@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "_comment": "Named environments for /wowlidate. A target names WHERE a catalog runs — never how hard. Lanes, policy and repair stay a per-run decision. No credential ever belongs in this file: it is tracked in git. Secrets live in .env, and a target only names the keys that must be set.",
+  "targets": {
+    "humi-sit": {
+      "description": "HUMI SIT, with the humi-SIT repo index and the HRCenter-SIT database behind it.",
+      "url": "https://humi-sit-int.central.co.th/humi/en/login",
+      "repo": "humi-SIT-1fc0",
+      "db": {
+        "_comment": "Coordinates only. The password lives in .env (WOWLIDATOR_DB_URL) and never here — this file is tracked in git.",
+        "host": "10.179.72.9",
+        "port": 5432,
+        "database": "HRCenter-SIT",
+        "schema": "benefit_management",
+        "username": "hrcenter_app",
+        "access": "read-only",
+        "source": "k8s-config /sit/config/benefit-management/.env — Azure DevOps centralgroup/'Product - Humi', needs a PAT with Code (Read)",
+        "note": "not localhost. The app-facing string names 10.179.72.9 and is reachable only over the FortiClient VPN; a WOWLIDATOR_DB_URL pointing at localhost silently proves nothing and cost a run on 2026-09-07."
+      },
+      "reach": {
+        "host": "humi-sit-int.central.co.th",
+        "expectIp": "10.179.64.39",
+        "note": "needs FortiClient VPN — without it the host is NXDOMAIN, which has killed a relaunch on its own"
+      },
+      "requires": {
+        "WOWLIDATOR_AS": "the fallback account, used for the first persona a row names",
+        "WOWLIDATOR_PERSONAS": "the labelled personas",
+        "WOWLIDATOR_DB_URL": "HRCenter-SIT — must match the db block below: 10.179.72.9:5432, search_path benefit_management,public"
+      },
+      "optional": {
+        "WOWLIDATOR_DB_REMOTE_OK": "1 — this database is remote, and the client refuses a remote write without it",
+        "WOWLIDATOR_DB_RESTORE_URL": "unset here, so `wowlidator db restore` cannot put the tables back after a mutating run"
+      },
+      "notes": [
+        "The repo index carries the schema: 14 tables, alongside 336 routes, 136 API operations and 872 components. A run without --repo degrades claims that assert database state to what the UI alone shows.",
+        "Every configured persona points at the same account, so role-separation cases do not really prove role separation. Say so in a report rather than passing quietly.",
+        "The indexed schema is benefit_management alone (14 tables), not all 489 in HRCenter-SIT. A claim needing employee or workflow tables cannot see them — widen the dump rather than wonder why."
+      ]
+    }
+  }
+}

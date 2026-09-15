@@ -14,33 +14,44 @@ import { statSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 import type { RequestRecord } from '../api/api-client.js';
-import type { DbCheckRecord } from '../db/db-actions.js';
 import { classifyCall, isBlockingFailure, type NetworkCall } from '../api/network-observer.js';
 import { BACKEND_TIER_ACTIONS,
   describeValueSource,
   valueWasGenerated,
   describeTarget,
   familyLabel,
+  isPassing,
   meaningfulCoverage,
 } from '../engine/proof-bundle.js';
 import { buildVerdict, escalationTrace, type Verdict } from './verdict.js';
 import { describeDbChanges } from '../engine/proof-bundle.js';
 import {
+  NARRATION_LABEL,
+  NARRATION_NOTE,
   RESOLUTION_EXPLANATIONS,
   describeAgentAction,
   describeResolution,
   displayCaseId,
+  inconsequentialAgentLeg,
+  inconsequentialBrokenStep,
+  dbEvidence,
+  DB_QUERY_LABEL,
+  DB_PARAMS_LABEL,
+  DB_ROWS_LABEL,
   observedEvidence,
   provenanceExtras,
   recordedCaptures,
+  runNotesSummary,
   sheetLabel,
   stepKindFacts,
+  stepNarration,
   stepTarget,
   visibleDetail,
   type AgentActionLike,
 } from './step-facts.js';
 import type {
   AgentRecord,
+  BlockedOutcome,
   StepDecision,
   DataCaseResult,
   DataRetryRecord,
@@ -287,6 +298,10 @@ const RESOLUTION_GLOSSARY: Record<string, string> = Object.fromEntries(
 export const GLOSSARY: Record<string, string> = {
   // Every resolution rung's label, explained — see `RESOLUTION_EXPLANATIONS`.
   ...RESOLUTION_GLOSSARY,
+  // The one label a model's sentence wears in this document. The wording
+  // lives in `step-facts.ts` so the catalog report and the workbook say the
+  // same thing about the same sentence.
+  [NARRATION_LABEL]: NARRATION_NOTE,
   'value generated':
     'The sheet left this value as a placeholder or a description, and no test data, document, repository or database source named a real one — so the author invented a well-formed stand-in. The step ran with it; judge the result knowing the input was not the sheet\'s.',
   'matched as exact text':
@@ -362,11 +377,20 @@ function verdictBlock(verdict: Verdict): string {
       ? ''
       : `<a class="jump" href="#step-${verdict.firstFailingStep}">go to the first failing step &rarr;</a>`;
 
+  // The button carries no path. A report is a file that gets copied and sent,
+  // and an absolute path from the machine that made it is both a leak and a
+  // lie anywhere else — so the page works out what to publish from its own
+  // URL, which is only meaningful where the panel is serving it anyway.
+  const publish =
+    `<button type="button" class="publish" id="publish-artifact" ` +
+    `title="Publish this page to claude.ai as a private artifact">publish to artifact</button>` +
+    `<span class="publish-note" id="publish-note"></span>`;
+
   return `
   <section class="verdict ${esc(verdict.status)}">
     <h2 class="verdict-headline">${esc(verdict.headline)}</h2>
     ${lines.map((line) => `<p class="verdict-line">${esc(line)}</p>`).join('')}
-    <div class="verdict-actions">${owner}${jump}</div>
+    <div class="verdict-actions">${owner}${jump}${publish}</div>
   </section>`;
 }
 
@@ -417,6 +441,9 @@ function stepBadges(step: ProofStep, afterFailure = false): string {
     );
   }
   if (step.agent) badges.push('<span class="badge res-agent">agent takeover</span>');
+  // The harness withheld this step's mutation (Phase B): not a finding, and
+  // the badge says so before the reader opens the callout.
+  if (step.blocked) badges.push(`<span class="badge held">held · ${esc(step.blocked.reason)}</span>`);
   if (step.backendHint) badges.push('<span class="badge">visual only</span>');
   // Distinct from the takeover badge: that one says a model drove the step,
   // this one says a model was asked to JUDGE something the flow never
@@ -580,39 +607,64 @@ function requestBlock(record: RequestRecord): string {
 }
 
 /**
- * The database check this step made. Everything rendered here was redacted on
- * the way into the bundle (`redact-row.ts`) — same rule as `requestBlock`:
- * this function must never reach for a raw value, or the report is the leak.
+ * The database check this step made — the summary, the SQL that answered it,
+ * and the rows it got back.
+ *
+ * Everything rendered here was redacted on the way into the bundle
+ * (`redact-row.ts`) and projected once in `step-facts.ts`, so the catalog
+ * report and the workbook cannot describe the same check differently. Same
+ * rule as `requestBlock`: this function must never reach for a raw value, or
+ * the report is the leak — the bound parameters shown are the redacted ones
+ * the check recorded, and the placeholders stay placeholders.
+ *
+ * A bundle sealed before the statement was recorded, or a check refused
+ * before any SQL ran, renders no query section at all rather than an empty
+ * one that reads like a fact.
  */
-function dbBlock(record: DbCheckRecord): string {
-  const target =
-    record.table !== undefined
-      ? record.table
-      : record.tables !== undefined
-        ? record.tables.join(', ')
-        : '';
+function dbBlock(step: ProofStep): string {
+  const e = dbEvidence(step);
+  if (e === null) return '';
+  const query = e.statements
+    .map(
+      (statement) => `
+        <div class="http-part">
+          <div class="http-part-title">${esc(DB_QUERY_LABEL)}</div>
+          <pre><code>${esc(statement.sql)}</code></pre>
+          ${
+            statement.params.length === 0
+              ? ''
+              : `<table class="agent-trace"><thead><tr><th colspan="2">${esc(DB_PARAMS_LABEL)}</th></tr></thead><tbody>${statement.params
+                  .map((p, i) => `<tr><td><code>$${i + 1}</code></td><td>${captured(p)}</td></tr>`)
+                  .join('')}</tbody></table>`
+          }
+        </div>`,
+    )
+    .join('');
   const sample =
-    record.rows && record.rows.length > 0
-      ? `<table class="agent-trace"><tbody>${record.rows
-          .map(
-            (row) =>
-              `<tr>${Object.entries(row)
-                .map(([column, value]) => `<td>${esc(column)} = ${esc(value)}</td>`)
-                .join('')}</tr>`,
-          )
-          .join('')}</tbody></table>`
-      : '';
+    e.rows.length === 0
+      ? ''
+      : `
+        <div class="http-part">
+          <div class="http-part-title">${esc(e.sample === null ? DB_ROWS_LABEL : `${DB_ROWS_LABEL} — ${e.sample}`)}</div>
+          <table class="agent-trace">
+            <thead><tr>${e.columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+            <tbody>${e.rows
+              .map((row) => `<tr>${row.map((cell) => `<td>${captured(cell)}</td>`).join('')}</tr>`)
+              .join('')}</tbody>
+          </table>
+        </div>`;
   return `
     <div class="callout request">
-      <div class="callout-title">DB ${esc(record.kind)}${target ? ` &mdash; ${esc(target)}` : ''}</div>
+      <div class="callout-title">DB ${esc(e.kind)}${e.target === null ? '' : ` &mdash; ${esc(e.target)}`}</div>
       <dl class="kv">
-        ${kv('where', record.where)}
-        ${kv('expected', record.expected)}
-        ${kv('observed', record.observed)}
-        ${kv('duration', ms(record.durationMs))}
-        ${kv('polled', record.polledMs === undefined ? undefined : ms(record.polledMs))}
+        ${kv('where', e.where ?? undefined)}
+        ${kv('expected', e.expected ?? undefined)}
+        ${kv('observed', e.observed ?? undefined)}
+        ${kv('duration', e.durationMs === null ? undefined : ms(e.durationMs))}
+        ${kv('polled', e.polledMs === null ? undefined : ms(e.polledMs))}
       </dl>
-      ${record.note ? `<p class="reason">${esc(record.note)}</p>` : ''}
+      ${e.note === null ? '' : `<p class="reason">${esc(e.note)}</p>`}
+      ${query}
       ${sample}
     </div>`;
 }
@@ -734,17 +786,24 @@ function decisionBlock(decision: StepDecision): string {
  */
 function agentBlock(agent: AgentRecord, stepPassed = agent.success): string {
   const failed = !agent.success && !stepPassed;
+  const held = agent.blocked !== undefined;
   const title = agent.success
     ? 'Workflow agent took over'
     : stepPassed
       ? 'Workflow agent prepared the page — the step then passed on the flow\'s own selector'
-      : 'Workflow agent took over — goal not reached';
+      : held
+        ? 'Workflow agent was held by the run\'s rules — no verdict about the application'
+        : 'Workflow agent took over — goal not reached';
+  // A held action is drawn as a hold, not as a failure: the typed outcome on
+  // the record says the harness withheld it, and the row says the same.
   const rows = agent.actions
     .map(
       (a) => `
-      <tr class="${a.ok ? '' : 'bad'}">
+      <tr class="${a.ok ? '' : a.outcome?.kind === 'blocked' ? 'held' : 'bad'}">
         <td class="num">${a.index + 1}</td>
-        <td><span class="act">${esc(a.action)}</span></td>
+        <td><span class="act">${esc(a.action)}</span>${
+          a.outcome?.kind === 'blocked' ? ` <span class="badge held">held · ${esc(a.outcome.reason)}</span>` : ''
+        }</td>
         <td>${agentTargetCell(a)}</td>
         <td class="reason-cell">${esc(a.reasoning)}${a.error ? `<div class="err">${esc(a.error)}</div>` : ''}</td>
         <td class="num">${ms(a.durationMs)}</td>
@@ -753,7 +812,7 @@ function agentBlock(agent: AgentRecord, stepPassed = agent.success): string {
     .join('');
 
   return `
-    <div class="callout agent ${failed ? 'failed' : ''}">
+    <div class="callout agent ${held ? 'held' : failed ? 'failed' : ''}">
       <div class="callout-title">${title}</div>
       <p class="goal"><span>goal</span> ${esc(agent.goal)}</p>
       <p class="reason">${esc(agent.summary)}</p>
@@ -771,6 +830,30 @@ function agentBlock(agent: AgentRecord, stepPassed = agent.success): string {
         <div><dt>tokens</dt><dd>${agent.inputTokens ?? 0} in / ${agent.outputTokens ?? 0} out</dd></div>
       </dl>
     </div>`;
+}
+
+/**
+ * The leg as the step's body carries it — open where it decided the outcome,
+ * folded where it did not.
+ *
+ * An agent leg that neither rescued the step nor broke it (`inconsequentialAgentLeg`)
+ * sat between the failure evidence above it and the recorded facts below it,
+ * at full height, on a step that passed. It is still evidence of what was
+ * tried, so nothing leaves the document: it goes behind a CLOSED disclosure
+ * in the ordinary colour, exactly as a superseded attempt does
+ * (`details.replaced`), and the step itself neither changes status nor opens
+ * on load — the page script keys auto-expansion off the step's status class
+ * alone, and a folded leg only ever sits on a passing step.
+ */
+function agentLeg(step: ProofStep, agent: AgentRecord): string {
+  const block = agentBlock(agent, isPassing(step.status));
+  const aside = inconsequentialAgentLeg(step);
+  if (aside === null) return block;
+  return `
+    <details class="aside-leg">
+      <summary>${esc(aside.summary)}</summary>
+      ${block}
+    </details>`;
 }
 
 /** Boundary-value table: the whole matrix, not just the first failure. */
@@ -844,6 +927,36 @@ function pageContextBlock(step: ProofStep): string {
  * "the agent says the status was Active" and "textbox "Status" held Active
  * at /en/employees/42" are different amounts of evidence.
  */
+/**
+ * The hold that ended a `workflow` leg (Phase B, 2026-09-05): which rule,
+ * why, and what the provenance ledger knew. Its own callout, above the
+ * agent trace, because the one thing a reader must take from this step is
+ * that it is NOT a finding — the application was never asked.
+ */
+function heldBlock(blocked: BlockedOutcome): string {
+  const facts = blocked.provenance;
+  return `
+    <div class="callout held">
+      <div class="callout-title">Held by the run's rules — no verdict about the application</div>
+      <p class="reason">${esc(blocked.message)}</p>
+      <dl class="kv">
+        <div><dt>reason</dt><dd>${esc(blocked.reason)}</dd></div>
+        <div><dt>rule</dt><dd><code>${esc(blocked.rule)}</code></dd></div>
+        <div><dt>category</dt><dd>${esc(blocked.category)}</dd></div>
+        ${blocked.target === null ? '' : `<div><dt>target</dt><dd><code>${esc(blocked.target)}</code></dd></div>`}
+        <div><dt>policy</dt><dd>${blocked.policySource === null ? 'none configured' : esc(blocked.policySource)}</dd></div>
+        ${
+          facts === undefined
+            ? ''
+            : `<div><dt>observed this session</dt><dd>${facts.observedThisSession.length === 0 ? 'none of the targets' : esc(facts.observedThisSession.join(', '))}</dd></div>
+        <div><dt>in the latest snapshot</dt><dd>${facts.inLatestSnapshot.length === 0 ? 'none of the targets' : esc(facts.inLatestSnapshot.join(', '))}${
+          facts.latestSnapshotAt === null ? ' (nothing captured yet)' : ` (captured ${esc(facts.latestSnapshotAt)}${facts.latestSnapshotUrl === null ? '' : ` on ${esc(facts.latestSnapshotUrl)}`})`
+        }</dd></div>`
+        }
+      </dl>
+    </div>`;
+}
+
 function observedBlock(step: ProofStep): string {
   const items = observedEvidence(step);
   if (items.length === 0) return '';
@@ -1029,8 +1142,8 @@ function videoBlock(bundle: ProofBundle): string {
       at: (step.videoOffsetMs ?? 0) / 1000,
       step: step.index,
       text: step.intent ?? `${step.action}${step.selector ? ` ${step.selector}` : ''}`,
-      failed: step.status !== 'passed' && !step.superseded,
-      error: step.status !== 'passed' ? (step.error?.split('\n')[0] ?? '') : '',
+      failed: step.status !== 'passed' && step.status !== 'skipped' && !step.superseded,
+      error: step.status !== 'passed' && step.status !== 'skipped' ? (step.error?.split('\n')[0] ?? '') : '',
     }));
   return `
   <figure class="video" data-segments="${esc(JSON.stringify(segments))}">
@@ -1083,10 +1196,54 @@ function expectedActualLine(step: ProofStep): string {
   const render = (v: unknown): string => (typeof v === 'string' ? v : JSON.stringify(v));
   const expected = render(detail['expected']);
   const actual = detail['actual'] === undefined ? null : render(detail['actual']);
-  const bad = step.status !== 'passed';
+  const bad = step.status !== 'passed' && step.status !== 'skipped';
   return `<p class="step-compare">expected <code>${captured(expected)}</code>${
     actual === null ? '' : ` &middot; actual <code${bad ? ' class="cmp-bad"' : ''}>${captured(actual)}</code>`
   }</p>`;
+}
+
+/**
+ * A model's plain-language reading of the step, when the run asked for one
+ * (`--narrate`). Three rules decide how it renders, and all three are about
+ * not letting a reading be mistaken for the record:
+ *
+ * - **It is last in the always-visible group**, after the intent, the
+ *   action/selector line, the kind facts and the expected-vs-actual line — it
+ *   displaces no recorded fact and is read after them, which is the same
+ *   ranking every other surface uses (`narrationProofLine` ends the Proof
+ *   cell; the catalog report ends the step's rows with it).
+ * - **It is attributed where it is read**, not on hover: the model id is
+ *   visible on the line. The rule that makes it safe to sit here —
+ *   descriptive, never a verdict — is the label's own glossary entry, so it
+ *   is one wording, testable, and not repeated forty times down a page.
+ * - **It is `captured()`**, not `esc()`: the model quotes application text
+ *   inside its sentences verbatim, so a Thai plan name in a narration is
+ *   marked `lang=""` exactly like the same string in a selector or a
+ *   comparison.
+ */
+/**
+ * The run's notes in the diagnostics callout: the model's bounded summary of
+ * them where the run has a narrative, the notes themselves when it has none.
+ * One reading (`runNotesSummary`), shared with the per-case page and the
+ * catalog report, so the same run is not described three ways.
+ */
+function runNotes(bundle: ProofBundle): string {
+  const summary = runNotesSummary(bundle);
+  if (summary === null) return '';
+  const body =
+    summary.by === null
+      ? summary.lines.map((n) => `<p class="reason">${esc(n)}</p>`).join('')
+      : `<p class="reason">${captured(summary.text)} <span class="narr-by">&mdash; ${esc(summary.attribution)}</span></p>`;
+  const count = summary.by === null ? ` (${summary.lines.length})` : '';
+  return `<div class="prov"><div class="callout-title">Run notes${count}</div>${body}</div>`;
+}
+
+function narrationLine(step: ProofStep): string {
+  const narration = stepNarration(step);
+  if (narration === null) return '';
+  return `<p class="step-narration"><span class="narr-k">${term(narration.label)}</span> <span class="narr-t">${captured(
+    narration.text,
+  )}</span> <span class="narr-by">&mdash; ${esc(narration.attribution)}</span></p>`;
 }
 
 function polarityPill(bundle: ProofBundle): string {
@@ -1136,7 +1293,7 @@ function stepList(bundle: ProofBundle, hasVideo: boolean): string {
   const steps = bundle.steps;
   // A superseded failure is history, not a break in the run: the passes that
   // follow it are not "in doubt", so the first LIVE failure is what counts.
-  const firstFailure = steps.findIndex((s) => s.status !== 'passed' && !s.superseded);
+  const firstFailure = steps.findIndex((s) => s.status !== 'passed' && s.status !== 'skipped' && !s.superseded);
   const rows: string[] = [];
   let pending: ProofStep[] = [];
   for (const step of steps) {
@@ -1146,14 +1303,39 @@ function stepList(bundle: ProofBundle, hasVideo: boolean): string {
     }
     const afterFailure = firstFailure !== -1 && step.index > firstFailure;
     if (step.reconstruction && pending.length > 0) {
-      rows.push(stepRow(step, hasVideo, afterFailure, false, pending));
+      rows.push(asideStep(step, stepRow(step, hasVideo, afterFailure, false, pending), bundle));
       pending = [];
     } else {
-      rows.push(stepRow(step, hasVideo, afterFailure));
+      rows.push(asideStep(step, stepRow(step, hasVideo, afterFailure), bundle));
     }
   }
   for (const orphan of pending) rows.push(stepRow(orphan, hasVideo, false));
   return rows.join('');
+}
+
+/**
+ * A broken step that decided nothing, folded — the whole row, behind a closed
+ * disclosure, in the ordinary colour (`inconsequentialBrokenStep`).
+ *
+ * Nothing leaves the document: the row inside is byte for byte the row that
+ * rendered before, red dot, badges, error, screenshot and all, so a reader
+ * who opens it sees exactly what they saw. The summary states the sealed
+ * status first — no status is rewritten anywhere, this only decides where the
+ * row sits. Same treatment as `details.replaced` and `details.aside-leg`, and
+ * the page script needs no change: it keys auto-expansion off the step's own
+ * status class, which a closed wrapper does not touch.
+ */
+function asideStep(step: ProofStep, row: string, bundle: ProofBundle): string {
+  const aside = inconsequentialBrokenStep(step, bundle);
+  if (aside === null) return row;
+  const headline = step.intent ? captured(step.intent) : esc(step.action);
+  return `
+  <li class="step-aside">
+    <details class="aside-step">
+      <summary><span class="idx">${step.index}</span> <span class="headline">${headline}</span> <span class="act">${esc(step.action)}</span> &mdash; ${esc(aside.summary)}</summary>
+      <ol class="steps">${row}</ol>
+    </details>
+  </li>`;
 }
 
 function stepRow(
@@ -1174,6 +1356,9 @@ function stepRow(
   const detail = visibleDetail(step);
   const compare = expectedActualLine(step);
   const facts = stepFactsLine(step);
+  // Last of the always-visible lines: a reading of the record, never ahead of
+  // the record. Empty for every step of every run that did not ask for one.
+  const narration = narrationLine(step);
 
   // Intent leads. A reader triaging a red run needs "what was this step for"
   // before "which selector expressed it"; the selector is one line down, and
@@ -1192,18 +1377,18 @@ function stepRow(
     </button>
     <p class="step-sub"><span class="action">${esc(step.action)}</span> <code class="target">${captured(target ?? '—')}</code>${step.target ? ` <span class="target-what" title="what the selector resolved to, read from the live element">→ ${captured(describeTarget(step.target) ?? '')}</span>` : ''}</p>
     ${facts}
-    ${compare}
+    ${compare}${narration}
     <div class="step-body" hidden>
       ${step.unsure ? `<div class="callout unsure"><div class="callout-title">Proved-? — a human must rule on this step</div><pre>${captured(step.unsure)}</pre></div>` : ''}
       ${step.backendHint ? `<div class="callout"><div class="callout-title">Proved on screen — a backend check could prove it better</div><p>Backend testing was off for this run, so this claim was settled through the page. ${captured(step.backendHint)}</p><p class="muted">The step passed on its own terms. Turn backend testing on (and give the run a database URL) to prove it against the data itself.</p></div>` : ''}
-      ${step.error ? `<div class="callout error"><div class="callout-title">Failure</div><pre>${esc(step.error.split('\n')[0] ?? step.error)}</pre></div>` : ''}
+      ${step.error ? `<div class="callout${step.status === 'skipped' ? '' : ' error'}"><div class="callout-title">${step.status === 'skipped' ? 'Not run' : 'Failure'}</div><pre>${esc(step.error.split('\n')[0] ?? step.error)}</pre></div>` : ''}
       ${pageContextBlock(step)}
       ${seekControl(step, hasVideo)}
       ${
         step.screenshot
           ? `<figure class="shot-wrap">
                <img loading="lazy" alt="Screenshot at step ${step.index}" src="data:image/jpeg;base64,${step.screenshot}">
-               <figcaption>${step.status !== 'passed' ? 'the page when this step failed' : 'the page after this step'} — click to enlarge</figcaption>
+               <figcaption>${step.status === 'skipped' ? 'this step was not run' : step.status !== 'passed' ? 'the page when this step failed' : 'the page after this step'} — click to enlarge</figcaption>
              </figure>`
           : ''
       }
@@ -1214,10 +1399,11 @@ function stepRow(
       ${reconstructionBlock(step)}
       ${replacedAttemptsBlock(replaced, hasVideo)}
       ${step.request ? requestBlock(step.request) : ''}
-      ${step.db ? dbBlock(step.db) : ''}
+      ${dbBlock(step)}
       ${step.dialog ? dialogBlock(step.dialog) : ''}
       ${step.decision ? decisionBlock(step.decision) : ''}
-      ${step.agent ? agentBlock(step.agent, step.status === 'passed') : ''}
+      ${step.blocked ? heldBlock(step.blocked) : ''}
+      ${step.agent ? agentLeg(step, step.agent) : ''}
       ${observedBlock(step)}
       ${step.snapshot ? snapshotBlock(step) : ''}
       ${step.dataCases ? dataBlock(step.dataCases) : ''}
@@ -1315,6 +1501,17 @@ h1{font-size:21px;margin:0;font-weight:650;letter-spacing:-.01em}
 .step-compare{margin:2px 0 0;font-size:12px;color:var(--muted)}
 .step-compare code{font-size:12px}
 .step-compare .cmp-bad{color:var(--bad)}
+/* A model's sentence in a document made of the run's own facts: set apart by
+   a rule down its left edge, muted, labelled and signed. It must never read
+   as another recorded line. */
+.step-narration{margin:4px 16px 10px 46px;padding:1px 0 1px 10px;font-size:12.5px;color:var(--muted);
+  border-left:2px solid var(--line);font-style:italic}
+.step-narration .narr-k{font-size:10.5px;font-style:normal;text-transform:uppercase;letter-spacing:.06em;
+  margin-right:6px;opacity:.85}
+.step-narration .narr-k abbr{text-decoration:none;border-bottom:1px dotted var(--line);cursor:help}
+.step-narration .narr-by{font-style:normal;font-size:11px;white-space:nowrap;opacity:.8}
+/* The same attribution on the run-notes summary in diagnostics. */
+.prov .narr-by{font-size:11px;white-space:nowrap;opacity:.8}
 .step-facts{margin:-4px 0 0;padding:0 16px 8px 46px;font-size:12px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap}
 .step-facts .fact-k{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin-right:4px}
 .callout.observed{background:var(--agent-bg);border:1px solid color-mix(in srgb,var(--agent) 30%,transparent)}
@@ -1336,12 +1533,14 @@ ol.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
 .step{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
 .step.failed,.step.dead-end{border-color:var(--bad)}
 .step.error{border-color:var(--warn)}
+.step.skipped{border-color:var(--line);color:var(--muted)}
 .step-head{width:100%;display:flex;align-items:center;gap:11px;padding:11px 14px;background:none;
   border:0;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .step-head:hover{background:color-mix(in srgb,var(--ink) 4%,transparent)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}
 .step.failed .dot,.step.dead-end .dot{background:var(--bad)}
 .step.error .dot{background:var(--warn)}
+.step.skipped .dot{background:var(--muted)}
 .idx{color:var(--muted);font-size:12px;min-width:20px;font-family:ui-monospace,monospace}
 .action{font-weight:600;min-width:88px}
 .target{flex:1;color:var(--muted);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1358,6 +1557,15 @@ ol.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;g
 .chev{color:var(--muted);transition:transform .15s;font-size:11px}
 .step-head[aria-expanded=true] .chev{transform:rotate(180deg)}
 .step-body{padding:4px 14px 16px;border-top:1px solid var(--line)}
+li.step-aside{list-style:none}
+details.aside-step{margin:6px 0;border:1px dashed var(--line);border-radius:8px;padding:6px 10px}
+details.aside-step>summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+details.aside-step>summary .idx{margin-right:6px}
+details.aside-step>summary .act{font-family:var(--mono)}
+details.aside-step[open]>summary{margin-bottom:8px}
+details.aside-leg{margin:12px 0}
+details.aside-leg>summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+details.aside-leg[open]>summary{margin-bottom:8px}
 details.replaced{margin:12px 0;font-size:12.5px}
 details.replaced summary{cursor:pointer;color:var(--muted)}
 details.replaced .attempts{margin:10px 0 0;padding:0;list-style:none;display:grid;gap:8px}
@@ -1374,6 +1582,10 @@ details.replaced .attempts{margin:10px 0 0;padding:0;list-style:none;display:gri
 .callout.agent.failed .callout-title{color:var(--bad)}
 .callout.data{background:var(--cache-bg);border:1px solid color-mix(in srgb,var(--cache) 30%,transparent)}
 .callout.data .callout-title{color:var(--cache)}
+.callout.held,.callout.agent.held{background:var(--warn-bg,var(--bad-bg));border:1px solid color-mix(in srgb,var(--warn) 40%,transparent)}
+.callout.held .callout-title,.callout.agent.held .callout-title{color:var(--warn)}
+.badge.held{color:var(--warn);background:var(--warn-bg,var(--bad-bg))}
+.agent-trace tr.held td{background:color-mix(in srgb,var(--warn) 10%,transparent)}
 .prov.trend-newly-broken{border-color:var(--bad)}
 .prov.trend-flaky{border-color:var(--jit)}
 .prov.trend-newly-fixed{border-color:var(--ok)}
@@ -1486,6 +1698,12 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 .verdict.passed-with-issues .verdict-headline{color:var(--warn)}
 .verdict-line{margin:0 0 7px;font-size:14.5px;line-height:1.55;max-width:78ch}
 .verdict-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.publish{font:inherit;font-size:12.5px;font-weight:600;padding:5px 12px;border-radius:999px;
+  border:1px solid var(--line-strong,var(--line));background:var(--panel);color:var(--ink);cursor:pointer}
+.publish:hover:not(:disabled){border-color:var(--accent);color:var(--accent-ink,var(--accent))}
+.publish:disabled{opacity:.55;cursor:default}
+.publish-note{font-size:12px;color:var(--muted)}
+.publish-note a{border-bottom:1px dashed currentColor}
 .owner{font-size:12px;padding:3px 9px;border-radius:999px;font-weight:600;
   background:color-mix(in srgb,var(--ink) 8%,transparent)}
 .owner-backend{color:var(--dialog);background:var(--dialog-bg)}
@@ -1536,6 +1754,64 @@ dialog.lightbox img{max-width:94vw;max-height:94vh;border-radius:8px;display:blo
 `;
 
 const SCRIPT = `
+// --- publish to artifact -------------------------------------------------
+// The page asks the PANEL to publish it, because publishing needs a Claude
+// session and a page cannot start one. A report opened from disk has no panel
+// to ask, so the button says so rather than failing into a dead fetch.
+(function () {
+  const button = document.getElementById('publish-artifact');
+  const note = document.getElementById('publish-note');
+  if (!button || !note) return;
+
+  // Which file is this? Whatever the panel used to serve it — /view?path=<abs>
+  // or /reports/<name>. Read back off the URL rather than baked in at render
+  // time, so a report that travels carries no path from the machine that made
+  // it, and so the button is live exactly where it can work.
+  function reportPath() {
+    try {
+      const here = new URL(window.location.href);
+      if (here.protocol !== 'http:' && here.protocol !== 'https:') return null;
+      const given = here.searchParams.get('path');
+      if (given) return given;
+      if (here.pathname.indexOf('/reports/') === 0) {
+        return decodeURIComponent(here.pathname.slice('/reports/'.length));
+      }
+      return null;
+    } catch (_) { return null; }
+  }
+
+  if (reportPath() === null) {
+    button.disabled = true;
+    note.textContent = 'open this report from the panel (npm run ui) to publish it';
+    return;
+  }
+
+  button.addEventListener('click', async function () {
+    button.disabled = true;
+    note.textContent = 'starting a Claude session to publish…';
+    try {
+      const res = await fetch('/api/publish-artifact', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ reportPath: reportPath() }),
+      });
+      const body = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(body.error || res.statusText);
+      // The session still has to be ALLOWED to publish: uploading to
+      // Anthropic's servers raises Claude Code's own prompt. Saying so is the
+      // difference between "nothing happened" and "it is waiting for you".
+      const bits = ['publishing'];
+      if (body.strippedFilm) bits.push('(recording dropped to fit)');
+      bits.push('— approve it in the Claude session');
+      if (body.sessionId) bits.push('claude attach ' + body.sessionId);
+      note.textContent = bits.join(' ') + '.';
+    } catch (err) {
+      button.disabled = false;
+      note.textContent = 'could not start the publish: ' + ((err && err.message) || err);
+    }
+  });
+})();
+
 for (const head of document.querySelectorAll('.step-head')) {
   head.addEventListener('click', () => {
     const open = head.getAttribute('aria-expanded') === 'true';
@@ -1946,10 +2222,7 @@ export function renderReport(bundle: ProofBundle, options: RenderOptions = {}): 
         : ''
     }
     ${
-      bundle.notes && bundle.notes.length > 0
-        ? `<div class="prov"><div class="callout-title">Run notes (${bundle.notes.length})</div>
-           ${bundle.notes.map(n => `<p class="reason">${esc(n)}</p>`).join('')}</div>`
-        : ''
+      runNotes(bundle)
     }
     ${
       bundle.status === 'needs-review'

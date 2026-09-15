@@ -761,8 +761,8 @@ export async function runQueue<T>(
   /**
    * A soft hold: while true, nothing new is dispatched but in-flight lanes
    * finish normally and the loop resumes when it clears. What the
-   * interference re-run and the governor's `hold` use — unlike `shouldPause`,
-   * which ends the loop for good.
+   * interference re-run and the quota hold use — unlike `shouldPause`, which
+   * ends the loop for good.
    */
   waitWhile?: () => boolean,
 ): Promise<void> {

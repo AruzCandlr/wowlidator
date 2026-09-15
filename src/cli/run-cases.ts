@@ -3,7 +3,7 @@
  * Split out of cli.ts verbatim.
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { formatElapsed, phaseHeader, withLogTag } from '../log-format.js';
 
@@ -35,18 +35,11 @@ import {
   type CaseScheduleMeta,
 } from './sections.js';
 import { SectionLocks, dataGateFor, dataLocksEnabled, dataWindows } from './data-locks.js';
-import {
-  LlmGovernorModel,
-  QueueGovernor,
-  RuleGovernorModel,
-  governorMode,
-  validateGovernorRead,
-  validateGovernorWrite,
-  type GovernorCaseFact,
-  type GovernorObservation,
-} from '../orchestrator/queue-governor.js';
 import { raiseSessionCapFor } from '../providers/claude-cli-session.js';
+import { ensureQuotaHold, quotaHolding, stopQuotaHold } from './quota-hold.js';
 import { describeDiagnosis, diagnoseError } from '../generator/error-diagnosis.js';
+import { narrateBundle } from '../generator/step-narration.js';
+import { composeNarrative } from '../generator/case-narrative.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
 import { growPool, laneBrowsers, writeFlowFile } from './artifacts.js';
 import { BrowserLease } from '../browser/pool.js';
@@ -57,7 +50,8 @@ import { SessionVault } from '../engine/session-vault.js';
 import { slugify } from '../reporter/html-reporter.js';
 import { RunHistory, formatTrend } from '../history/run-history.js';
 import { resolveReportPath, writeHtmlReport } from '../reporter/html-reporter.js';
-import { CatalogLiveReport } from './catalog-live-report.js';
+import { CatalogLiveReport, scenarioFromId, writeCasePageAt } from './catalog-live-report.js';
+import { catalogReportPath } from '../reporter/catalog-report.js';
 import {
   baselineMaxRows,
   baselinePath,
@@ -68,6 +62,7 @@ import {
   restoreBaseline,
   tablesNamedBySteps,
   takeBaseline,
+  restoreScript,
   writeBaseline,
   type Baseline,
   type DbBaselineProbe,
@@ -93,6 +88,7 @@ import {
   carriedOutcomes,
   newLedger,
   readLedger,
+  recordAuthored,
   recordOutcome,
   remaining,
   sortByPlan,
@@ -123,13 +119,16 @@ import {
   writeTruthTable,
   type KnownResult,
 } from '../reporter/truth-table.js';
-import type { CliOptions } from './options.js';
+import { DEFAULT_CASE_TIMEOUT_MS, type CliOptions } from './options.js';
+import type { LlmRole } from '../config.js';
 import { clearPauseFile, pauseFileFor, pauseRequested, requestPause, resetPause } from './pause.js';
 import {
   assertRolesResolvable,
   buildAgent,
-  buildDataModel,
+  buildCorroboration,
   buildDiagnosisModel,
+  buildCaseNarrativeModel,
+  buildNarrationModel,
   buildHealer,
   buildInvestigationAgent,
   buildReviewJudge,
@@ -140,6 +139,75 @@ import {
   runPersonas,
   stepLogger,
 } from './runtime.js';
+import { recoveryNote, type MutationReversibility } from '../orchestrator/mutation-policy.js';
+
+/**
+ * What the runner hands its caller once the ledger is its to write: the
+ * seam through which a case authored elsewhere (the pipelined catalog
+ * authors in one loop, runs in another) is recorded the moment it is queued
+ * — see `SuiteLedger.authored`. Only the runner writes the ledger file, so
+ * the caller asks through here rather than opening the file itself.
+ */
+export interface LedgerHooks {
+  /** Record where this queued case's flow was written. No-op for a refused case or one without a flow path; never throws. */
+  noteAuthored(testCase: SuiteCase): Promise<void>;
+}
+
+export interface CaseDeadlineResult {
+  bundle: ProofBundle;
+  ceilingReached: boolean;
+  elapsedMs: number;
+}
+
+export async function runCaseWithDeadline(
+  run: (signal: AbortSignal | undefined) => Promise<ProofBundle>,
+  options: { timeoutMs: number; startedMs: number },
+): Promise<CaseDeadlineResult> {
+  if (options.timeoutMs === 0) {
+    return { bundle: await run(undefined), ceilingReached: false, elapsedMs: Date.now() - options.startedMs };
+  }
+  const controller = new AbortController();
+  const running = run(controller.signal);
+  let timer: NodeJS.Timeout | undefined;
+  const ceiling = new Promise<'ceiling'>((resolveCeiling) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolveCeiling('ceiling');
+    }, Math.max(0, options.timeoutMs - (Date.now() - options.startedMs)));
+  });
+  try {
+    const winner = await Promise.race([
+      running.then((bundle) => ({ kind: 'bundle' as const, bundle })),
+      ceiling.then(() => ({ kind: 'ceiling' as const })),
+    ]);
+    if (winner.kind === 'bundle') {
+      return { bundle: winner.bundle, ceilingReached: false, elapsedMs: Date.now() - options.startedMs };
+    }
+    return {
+      bundle: await running,
+      ceilingReached: true,
+      elapsedMs: Date.now() - options.startedMs,
+    };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+export function caseCeilingReason(timeoutMs: number, elapsedMs: number): string {
+  return `stopped at the ${formatElapsed(timeoutMs)} case ceiling (WOWLIDATOR_CASE_TIMEOUT_MS) — no verdict; --resume runs it again (elapsed ${formatElapsed(elapsedMs)})`;
+}
+
+const PROVIDER_FAILURE_ORDER: readonly LlmRole[] = ['generator', 'healer', 'agent'];
+
+export function providerFailureLine(failures: ReadonlyMap<LlmRole, number>): string | null {
+  const parts = PROVIDER_FAILURE_ORDER.flatMap((role) => {
+    const count = failures.get(role) ?? 0;
+    return count === 0 ? [] : [`${role} ${count}`];
+  });
+  return parts.length === 0
+    ? null
+    : `provider failures: ${parts.join(' · ')} (each degraded one step, never the verdict)`;
+}
 
 /** One listed case, ready to run. */
 export interface SuiteCase {
@@ -182,7 +250,7 @@ export interface SuiteCase {
    * reason and the attempt count, so the ledger and the report carry it and a
    * resume can decide whether to author it again. See `suite-progress.ts`.
    */
-  refused?: { reason: string; attempt: number } | undefined;
+  refused?: { reason: string; attempt: number; providerRefused?: boolean | undefined } | undefined;
   /**
    * Cases this one continues from (CG-12), as the ids their names start
    * with. The lane waits for each to finish and runs only if every one
@@ -281,8 +349,7 @@ export async function runCases(
     /**
      * Schedule facts from the indexed repository, when the caller holds a
      * graph: FK pairs (a section is a JOIN FAMILY, not a table) and the
-     * declared tables (the governor's db-tool allowlist). Absent = table
-     * sections stay unexpanded and the governor's db tools refuse.
+     * declared tables. Absent = table sections stay unexpanded.
      */
     graphFacts?: { fkPairs: readonly (readonly [string, string])[]; tables: readonly string[] } | undefined;
     /**
@@ -304,6 +371,13 @@ export async function runCases(
           runKey?: (() => string | null) | undefined;
           /** What started this run, recorded so a resume can be rebuilt later. */
           launch?: SuiteLedger['launch'];
+          /**
+           * Called synchronously, before the runner's first await, with the
+           * hooks that write into ITS ledger. A pipelined caller calls
+           * `noteAuthored` right after each `queue.push`; notes that arrive
+           * before the ledger file is open are held and written then.
+           */
+          hooks?: ((hooks: LedgerHooks) => void) | undefined;
         }
       | undefined;
     /**
@@ -325,6 +399,7 @@ export async function runCases(
     planRows?: readonly { name: string; text: string }[] | undefined;
   },
 ): Promise<CaseOutcome[]> {
+  const caseTimeoutMs = options.caseTimeoutMs ?? DEFAULT_CASE_TIMEOUT_MS;
   const log = lineLogger(options);
   // The ledger: reset on a fresh run, carried forward on a resume, written
   // after every case so a stop at any point leaves the high-water mark on
@@ -337,6 +412,31 @@ export async function runCases(
   // rather than re-running. Snapshotted here because `ledger` IS the prior
   // object and every fresh case overwrites its own entry.
   let inherited: Record<string, LedgerOutcome> | null = null;
+  // **An authored flow is on the ledger the moment its case is queued**
+  // (2026-09-05). The outcome comes minutes later — or never, when the run
+  // is paused, signalled or held for quota first — and until now that was
+  // the moment the flow's whereabouts were first written down, so a stop
+  // discarded every flow queued and not yet run (17, then 11, measured; each
+  // ~190 s and ~$1 of model time to author again). Handed to the caller
+  // synchronously, below, before the first await: a note that arrives before
+  // the ledger file is open waits here and is written the moment it is.
+  let ledgerOpen = false;
+  const notedBeforeOpen: SuiteCase[] = [];
+  const noteAuthored = async (testCase: SuiteCase): Promise<void> => {
+    if (where.ledger === undefined || testCase.refused !== undefined || testCase.flowPath === undefined) return;
+    if (!ledgerOpen) {
+      notedBeforeOpen.push(testCase);
+      return;
+    }
+    if (ledger === null) return;
+    recordAuthored(ledger, testCase.name, {
+      flowPath: testCase.flowPath,
+      ...(testCase.risk === undefined ? {} : { risk: testCase.risk }),
+      ...(testCase.scenarioId === undefined ? {} : { scenarioId: testCase.scenarioId }),
+    });
+    await writeLedger(where.ledger.path, ledger).catch(() => undefined);
+  };
+  where.ledger?.hooks?.({ noteAuthored });
   if (where.ledger !== undefined) {
     const prior = where.ledger.resume ? await readLedger(where.ledger.path) : null;
     if (prior !== null) {
@@ -348,6 +448,8 @@ export async function runCases(
     ledger.launch = where.ledger.launch ?? ledger.launch;
     ledger.ended = null;
     await writeLedger(where.ledger.path, ledger);
+    ledgerOpen = true;
+    for (const queued of notedBeforeOpen.splice(0)) await noteAuthored(queued);
     onSignal = (signal) => {
       if (ledger && where.ledger) {
         ledger.ended = {
@@ -391,6 +493,7 @@ export async function runCases(
       vacuous?: boolean | undefined;
       proofPath?: string | undefined;
       authoringRefused?: number | undefined;
+      providerRefused?: boolean | undefined;
       dependsOn?: readonly string[] | undefined;
       knownResult?: KnownResult | undefined;
     } = {},
@@ -430,6 +533,10 @@ export async function runCases(
           (c) => c.dependsOn ?? [],
         ),
       );
+  // A closed list's flows are all on disk already: every one is on the
+  // ledger before the first case runs. (A streaming caller notes each push
+  // through the hooks above.)
+  if (!streaming) for (const listed of queue.items) await noteAuthored(listed);
   // The report exists before the first case has a verdict.
   if (liveReport !== null) await liveReport.refresh();
 
@@ -445,6 +552,11 @@ export async function runCases(
   let baselineProbeForRun: DbBaselineProbe | null = null;
   let baselineClient: DbClient | null = null;
   let activeBaseline: Baseline | null = null;
+  // What this run can actually put back — measured, never declared. Set only
+  // where a baseline was taken, a write credential resolved, and tables came
+  // back restorable; the mutation gate reads it as a standing undo, so an
+  // over-eager value here would license a delete nothing can reverse.
+  let runReversible: MutationReversibility | undefined;
   const priorBaseline = ledger?.dbBaseline;
   if (baselineResolved.mode !== 'off') {
     try {
@@ -496,7 +608,51 @@ export async function runCases(
             runKey: ledger?.runKey ?? null,
           });
           const path = await writeBaseline(baselinePath(ledger?.runKey ?? null), activeBaseline);
+          // **The undo is written down whether or not this run may perform
+          // it** (2026-09-09). Without a write credential the snapshot was
+          // inert: the run knew exactly how to put the tables back and had no
+          // way to say so. Real values, so it is a local file beside the
+          // baseline and never report content — the report links to it.
+          let restoreSqlPath: string | null = null;
+          try {
+            restoreSqlPath = path.replace(/\.json$/, '') + '.restore.sql';
+            await writeFile(restoreSqlPath, restoreScript(activeBaseline), 'utf8');
+            log?.(`db baseline  restore script ${restoreSqlPath} — run it with psql to put the tables back`);
+          } catch (error) {
+            // A script that could not be written is not a verdict about
+            // anything; the baseline itself still stands.
+            restoreSqlPath = null;
+            log?.(`db baseline  could not write the restore script: ${error instanceof Error ? error.message : String(error)}`);
+          }
           baselineProbeForRun = baselineProbe(baselineClient, activeBaseline, baselineMaxRows());
+          const restorableNow = activeBaseline.tables.filter((t) => t.restorable);
+          // **The WRITTEN recovery is the undo, not the credential**
+          // (2026-09-09, revised the same day). The first cut required
+          // `restoreDbConfig()`, which conflated two things: whether the way
+          // back exists, and whether this process may walk it. The script is
+          // written either way and restores the exact pre-run state, so a run
+          // that recorded one has an undo — a person performs it when the
+          // harness may not, which on a shared environment is often the better
+          // order. What must never happen is approving on an undo nobody can
+          // replay, so the script's presence is the condition, not the mode.
+          runReversible =
+            restorableNow.length > 0 && restoreSqlPath !== null
+              ? {
+                  tables: restorableNow.map((t) => t.table),
+                  by: 'db-baseline',
+                  script: restoreSqlPath,
+                }
+              : undefined;
+          if (runReversible !== undefined) {
+            log?.(
+              `db baseline  ${runReversible.tables.length} table(s) recoverable — irreversible actions on them ` +
+                'are approved by the recorded undo' +
+                (restoreDbConfig() === null
+                  ? '; no write credential, so run the restore script yourself when you are done'
+                  : '; the restore at the end performs it'),
+            );
+            log?.(`db baseline  ${recoveryNote({ reversible: runReversible }) ?? ''}`);
+          }
           const notRestorable = activeBaseline.tables.filter((t) => !t.restorable);
           log?.(
             `db baseline  snapshot ${path} — ` +
@@ -509,6 +665,7 @@ export async function runCases(
               tables: activeBaseline.tables.map((t) => t.table),
               takenAt: activeBaseline.takenAt,
               mode: baselineResolved.mode,
+              ...(restoreSqlPath === null ? {} : { restoreSql: restoreSqlPath }),
             };
             await writeLedger(where.ledger.path, ledger).catch(() => undefined);
           }
@@ -554,6 +711,8 @@ export async function runCases(
   // The post-run judge for a SYSTEM ERROR — a run that delivered no verdict.
   // Built once for the suite; called only on `status === 'error'` bundles.
   const diagnosisModel = buildDiagnosisModel(options);
+  const narrationModel = buildNarrationModel(options);
+  const narrativeModel = buildCaseNarrativeModel(options);
   // One session across the whole suite: the sign-in a case establishes is
   // banked as storage state and injected into later cases' own isolated
   // contexts (never a shared context), so a flow that does not sign itself
@@ -692,14 +851,14 @@ export async function runCases(
     return exclusive[index]!;
   };
 
-  // ---- interference registry + governor state ------------------------------
+  // ---- interference registry ------------------------------------------------
   /** Every case's window and sections, for the interference detector. */
   const windows = new Map<number, { name: string; meta: CaseScheduleMeta; startedMs: number; endedMs: number }>();
   const inFlightMeta = new Map<number, { name: string; meta: CaseScheduleMeta; startedMs: number }>();
-  const heldCases = new Set<string>();
-  /** Governor pool override; null = the ordinary sizing. Never above ceiling. */
-  let poolOverride: number | null = null;
-  let governorHold = false;
+  // The account's session window: stop dispatching before it is full and
+  // resume when it reopens (`quota-hold.ts`). Idempotent — the authoring
+  // pool may already have armed it.
+  ensureQuotaHold(options.config, (line) => process.stderr.write(`${line}\n`));
   /**
    * Cases whose non-pass was stamped as possible cross-case interference.
    * Each re-runs ALONE — but after the plan, not in the middle of it: the
@@ -711,19 +870,11 @@ export async function runCases(
    */
   const pendingSoloReruns: { name: string; run: () => Promise<void> }[] = [];
 
-  /** Set once the governor is built below; canRunWith fires blocked events through it. */
-  let governorRef: QueueGovernor | null = null;
-  const blockedPolls = new Map<number, number>();
-
-  const heldBlocks = (name: string): boolean =>
-    [...heldCases].some((id) => name === id || name.startsWith(`${id} `) || name.startsWith(id));
-
   /**
    * Where a case's sources stand (CG-12) — `dependencyStanding` in
-   * `case-plan.ts` owns the answer; this only supplies the lookups. The gate
-   * lives in the deterministic scheduler, never the governor: a dependent's
-   * verdict is correctness, and the governor is an optimiser that may be
-   * absent, off, or out of budget without changing any verdict.
+   * `case-plan.ts` owns the answer; this only supplies the lookups. A
+   * dependent's verdict is correctness, so the gate is deterministic by
+   * construction: no advisory layer has ever been allowed to move it.
    */
   const dependencyStatus = (testCase: SuiteCase, index: number): DependencyStanding =>
     dependencyStanding(caseIdOf(testCase.name), testCase.dependsOn ?? [], index, {
@@ -746,161 +897,33 @@ export async function runCases(
     // answer is `'defer'`, not `false`: the loop parks the dependent and
     // goes on dispatching the cases behind it (2026-09-04 — `false` held the
     // head of the queue, and a ten-lane pool drained to the one lane running
-    // the prerequisite). The wait still counts toward the governor's
-    // queue-blocked event, so a long one is explained, not mistaken for a
-    // scheduler fault — see `waitingOn` on the observation.
+    // the prerequisite).
     const dependency = dependencyStatus(testCase, index);
     if (dependency.kind === 'wait') {
       if (!dependencyWaitLogged.has(index)) {
         dependencyWaitLogged.add(index);
         process.stdout.write(`  [c${index + 1}]      waits for ${dependency.on} — ${testCase.name} continues from it\n`);
       }
-      const polls = (blockedPolls.get(index) ?? 0) + 1;
-      blockedPolls.set(index, polls);
-      if (polls === 25 && governorRef !== null) void governorRef.onEvent(observe('queue-blocked'));
       return 'defer';
     }
-    const held = heldBlocks(testCase.name);
-    // Under data locks the only thing that can refuse a dispatch is an
-    // explicit hold: two cases that touch the same section are no longer kept
-    // apart here, they queue at the step that changes the data. That also
-    // ends the head-of-line blocking this check used to cause — the loop
-    // takes cases in order, so one un-dispatchable case stalled every
-    // compatible case behind it.
-    const compatible =
-      !held &&
-      (useLocks ||
-        !useSections ||
-        inflight.every(({ item, index: otherIndex }) =>
-          compatibleCases(metaOf(testCase, index), metaOf(item, otherIndex)),
-        ));
-    if (compatible) {
-      blockedPolls.delete(index);
-      return true;
-    }
-    // A dispatch refused ~25 polls (~5s of lanes finishing nothing) is the
-    // governor's queue-blocked event — once per case, fire-and-forget, and
-    // only when a governor exists at all.
-    const polls = (blockedPolls.get(index) ?? 0) + 1;
-    blockedPolls.set(index, polls);
-    if (polls === 25 && governorRef !== null) void governorRef.onEvent(observe('queue-blocked'));
-    return false;
-  };
-
-  // ---- the queue governor (docs/parallel-run-spec.md §2.4) -----------------
-  // Advisory and event-driven: absent, off, or out of budget, everything
-  // above runs exactly as the deterministic scheduler alone. Built only for
-  // a parallel suite — a serial run has no queue to govern.
-  const poolCeiling = (): number => Math.max(concurrencyOf(), 2);
-  // `rules` (the default) is a pure function — no model, no budget pressure,
-  // so it may speak on every event; `model` restores the LLM governor with
-  // its hard turn budget. See `governorMode`.
-  const govMode = governorMode();
-  const recentFailures: string[] = [];
-  const governor: QueueGovernor | null =
-    parallel && govMode !== 'off' && (govMode === 'rules' || options.agent)
-      ? new QueueGovernor({
-          model: govMode === 'rules' ? new RuleGovernorModel() : new LlmGovernorModel({ factory: options.factory }),
-          ...(govMode === 'rules' ? { budget: 10_000 } : {}),
-          hooks: {
-            hold: (caseId) => {
-              if (caseId === '') return false;
-              heldCases.add(caseId);
-              return true;
-            },
-            release: (caseId) => heldCases.delete(caseId),
-            resizePool: (size) => {
-              poolOverride = Math.max(1, Math.min(poolCeiling(), size));
-              return poolOverride;
-            },
-            rerunAlone: () => false, // granted only at case end, through the detector's own path
-            dbRead: async (sql) => {
-              const gate = validateGovernorRead(sql);
-              if (!gate.ok) return `refused: ${gate.reason}`;
-              return runGovernorSql(sql, process.env['WOWLIDATOR_DB_URL'], 'read');
-            },
-            dbWrite: async (sql) => {
-              const admin = process.env['WOWLIDATOR_DB_ADMIN_URL'];
-              if (admin === undefined || admin.trim() === '') {
-                return 'refused: WOWLIDATOR_DB_ADMIN_URL is not set — the governor may not write without an operator-supplied admin credential';
-              }
-              const gate = validateGovernorWrite(sql, where.graphFacts?.tables ?? []);
-              if (!gate.ok) return `refused: ${gate.reason}`;
-              return runGovernorSql(sql, admin, 'write');
-            },
-          },
-          log: (line) => process.stderr.write(`  ${line}\n`),
-        })
-      : null;
-  governorRef = governor;
-
-  /** One statement through a short-lived client. Lazy import: a suite with no governor DB use never demands the driver. */
-  async function runGovernorSql(sql: string, url: string | undefined, kind: 'read' | 'write'): Promise<string> {
-    if (url === undefined || url.trim() === '') return `refused: no ${kind === 'read' ? 'WOWLIDATOR_DB_URL' : 'admin'} connection configured`;
-    try {
-      const { connectDb } = await import('../db/client.js');
-      const client = await connectDb({ url });
-      try {
-        const result = await client.query(sql, []);
-        return `${result.rowCount} row(s) in ${result.durationMs}ms` + (kind === 'read' ? `: ${JSON.stringify(result.rows.slice(0, 3)).slice(0, 300)}` : '');
-      } finally {
-        await client.close();
-      }
-    } catch (error) {
-      return `failed: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`;
-    }
-  }
-
-  /** The compact observation a governor turn reads — bounded on purpose. */
-  const observe = (event: GovernorObservation['event']): GovernorObservation => {
-    const now = Date.now();
-    const pending: string[] = [];
-    /** The prerequisite a pending case is parked on, if any — the observation's, not a guess. */
-    const waitingOn = (c: SuiteCase, i: number): string | undefined => {
-      if (c.dependsOn === undefined || c.dependsOn.length === 0) return undefined;
-      const standing = dependencyStatus(c, i);
-      return standing.kind === 'wait' ? standing.on : undefined;
-    };
-    queue.items.forEach((c, i) => {
-      if (collected[i] !== undefined || inFlightMeta.has(i)) return;
-      const m = metaOf(c, i);
-      const on = waitingOn(c, i);
-      pending.push(`${c.name.slice(0, 60)} [${m.writes ? 'writer' : 'reader'}${m.deletes ? ' deletes' : ''} ${m.sections.join(' ') || 'no-sections'}]${heldBlocks(c.name) ? ' HELD' : ''}${on === undefined ? '' : ` waits-for:${on}`}`);
-    });
-    const lanes = [...inFlightMeta.values()].map(
-      (l) => `${l.name.slice(0, 60)} [${l.meta.writes ? 'writer' : 'reader'} ${l.meta.sections.join(' ') || 'no-sections'}] ${Math.round((now - l.startedMs) / 1000)}s`,
+    // Under data locks nothing here refuses a dispatch: two cases that touch
+    // the same section are no longer kept apart here, they queue at the step
+    // that changes the data. That also ends the head-of-line blocking this
+    // check used to cause — the loop takes cases in order, so one
+    // un-dispatchable case stalled every compatible case behind it.
+    return (
+      useLocks ||
+      !useSections ||
+      inflight.every(({ item, index: otherIndex }) =>
+        compatibleCases(metaOf(testCase, index), metaOf(item, otherIndex)),
+      )
     );
-    const done = collected.filter((c) => c !== undefined);
-    const tally = `passed ${done.filter((c) => c!.verdict === 'passed').length} · failed ${done.filter((c) => c!.verdict === 'failed').length} · blocked ${done.filter((c) => c!.verdict === 'blocked').length} · left ${queue.items.length - done.length}`;
-    const interfered = [...windows.values()].filter((w) => w.name.includes('interference')).length;
-    const fact = (name: string, meta: CaseScheduleMeta, on?: string): GovernorCaseFact => ({
-      name,
-      writes: meta.writes,
-      sections: meta.sections,
-      ...(on === undefined ? {} : { waitingOn: on }),
-    });
-    const pendingFacts = queue.items
-      .map((c, i) => ({ c, i }))
-      .filter(({ i }) => collected[i] === undefined && !inFlightMeta.has(i))
-      .slice(0, 30)
-      .map(({ c, i }) => fact(c.name, metaOf(c, i), waitingOn(c, i)));
-    const flyingFacts = [...inFlightMeta.values()].map((l) => fact(l.name, l.meta));
-    return {
-      event,
-      pendingFacts,
-      flyingFacts,
-      recentFailures: recentFailures.slice(-6),
-      queue: pending.slice(0, 20),
-      lanes,
-      tally,
-      health: [
-        `pool ${poolOverride ?? concurrencyOf()} (ceiling ${poolCeiling()})`,
-        `held cases: ${heldCases.size === 0 ? 'none' : [...heldCases].join(', ')}`,
-        `interference stamps so far: ${interfered}`,
-      ],
-      pool: { current: poolOverride ?? concurrencyOf(), max: poolCeiling() },
-    };
   };
+
+  process.stdout.write(
+    `  case ceiling ${caseTimeoutMs === 0 ? 'off' : formatElapsed(caseTimeoutMs)} ` +
+      '(WOWLIDATOR_CASE_TIMEOUT_MS; --case-timeout overrides)\n',
+  );
   if (parallel && !streaming) {
     const alone = queue.items.filter((c, i) => scheduleOf(c, i)).length;
     const locked = useLocks ? queue.items.filter((c) => dataWindows(c.flow, fkPairs).length > 0).length : 0;
@@ -937,10 +960,9 @@ export async function runCases(
   if (parallel && browsers.size > 1) {
     process.stdout.write(`  browsers   ${browsers.size}, each case on the least-busy one\n`);
   }
-  if (governor !== null && !streaming && queue.length > 1) void governor.onEvent(observe('suite-start'));
   await runQueue(
     queue,
-    () => Math.min(poolOverride ?? concurrencyOf(), Math.max(concurrencyOf(), poolOverride ?? 1)),
+    () => concurrencyOf(),
     (testCase, index) => scheduleOf(testCase, index),
     // The lane's tag on the async context: every line written on this
     // case's behalf without an explicit tag — the repair loop's, the llm
@@ -954,16 +976,30 @@ export async function runCases(
       );
     }
     const tag = tagOf(index);
+    // A streaming caller that never wired the hooks still gets the flow on
+    // the ledger no later than its dispatch.
+    if (ledger !== null && testCase.flowPath !== undefined && ledger.authored?.[caseIdOf(testCase.name)] === undefined) {
+      await noteAuthored(testCase);
+    }
     // **A case authoring refused to write has no flow to run.** It is recorded
     // blocked with the lint's reason — on the ledger, so the report's row
     // says why instead of "never ran", and so the next resume knows how many
     // times this row has been refused (see `AUTHORING_REFUSAL_CAP`).
     if (testCase.refused !== undefined) {
-      const reason = `authoring refused (attempt ${testCase.refused.attempt}): ${testCase.refused.reason}`;
+      // A provider that turned the call away is the machinery, not the row:
+      // the case is blocked for this pass and its refusal count stands still,
+      // so a resume authors it again rather than finding it at the cap.
+      const byProvider = testCase.refused.providerRefused === true;
+      const reason = byProvider
+        ? `the provider refused the call, so this case was never authored: ${testCase.refused.reason}`
+        : `authoring refused (attempt ${testCase.refused.attempt}): ${testCase.refused.reason}`;
       emitTagged(tag, `\nBLOCKED ${testCase.name} — ${reason}\n`, 'err');
       if (parallel) emitTagged(tag, `case "${testCase.name}" blocked\n`);
       collected[index] = { name: testCase.name, verdict: 'blocked', bundle: null, reason };
-      await noteOutcome(collected[index]!, { authoringRefused: testCase.refused.attempt, ...caseFacts(testCase) });
+      await noteOutcome(collected[index]!, {
+        ...(byProvider ? { providerRefused: true } : { authoringRefused: testCase.refused.attempt }),
+        ...caseFacts(testCase),
+      });
       where.onCaseDone?.(testCase, collected[index]!);
       return;
     }
@@ -1086,8 +1122,8 @@ export async function runCases(
       dataGate: caseGate,
       reviewJudge: buildReviewJudge(options),
         healer: options.heal ? undefined : null,
-        agent: buildAgent(options, tag),
-        dataModel: buildDataModel(options),
+        agent: buildAgent(options, tag, runReversible),
+        corroboration: buildCorroboration(options),
         updateBaselines: options.updateBaselines,
         network: options.network,
         // Carried for masking only: a password the person supplied must not
@@ -1116,21 +1152,16 @@ export async function runCases(
        * One function because a solo re-run (interference) needs to do all of
        * it again for its replacement verdict.
        */
-      const settle = async (bundle: ProofBundle, { notify }: { notify: boolean }): Promise<void> => {
-        // The governor hears about a case that still did not pass — it may
-        // hold a sibling, shrink the pool, or seed the fixture the section is
-        // starved on. Fire-and-forget: a verdict never waits on advice.
-        if (!isPassing(bundle.status)) {
-          recentFailures.push(bundle.error ?? bundle.status);
-          if (recentFailures.length > 20) recentFailures.shift();
-        }
-        if (governor !== null && !isPassing(bundle.status)) void governor.onEvent(observe('case-ended'));
+      const settle = async (
+        bundle: ProofBundle,
+        { notify, blockedReason }: { notify: boolean; blockedReason?: string | undefined },
+      ): Promise<void> => {
         // A SYSTEM ERROR gets one healer-role call saying which layer broke —
         // the test catalog, the generator, the agent, the environment or the
         // application — and the fix when one exists. Written into the bundle
         // BEFORE it is persisted, so the proof, the report and the panel all
         // carry it. A test-failure is a verdict and is never diagnosed.
-        if (bundle.status === 'error' && diagnosisModel) {
+        if (blockedReason === undefined && bundle.status === 'error' && diagnosisModel) {
           const diagnosis = await diagnoseError(
             {
               caseName: testCase.name,
@@ -1149,6 +1180,35 @@ export async function runCases(
   `);
           }
         }
+        // Every step gets a plain-language sentence, written onto the bundle
+        // BEFORE it is persisted so the proof, the report and the panel all
+        // carry it — one call for the case, not one per step. Descriptive
+        // only: it cannot reach the verdict, and a failure here leaves the
+        // steps reading exactly as they always did.
+        if (narrationModel) {
+          const narrated = await narrateBundle(bundle, testCase.flow.caseContext ?? testCase.name, {
+            model: narrationModel,
+            log: (line) => emitTagged(tag, `${line}\n`, 'err'),
+          });
+          if (narrated > 0) emitTagged(tag, `  narrated  ${narrated} step(s) in plain language (${narrationModel.id})\n`);
+        }
+        // The case's own front page — lede, summary, tickets, note, open
+        // questions — written onto the bundle before it is persisted, in the
+        // run's report language, so the case page (`reporter/case-page.ts`)
+        // can show it without a model of its own. Same constitution as the
+        // narration: descriptive, attributed, never the verdict.
+        // Not for a run that delivers no verdict (a ceiling, never ran, the
+        // harness alone): the ledger seals those `blocked` and a resume
+        // replaces them, so a narrative would describe a status the page
+        // never shows and spend a call on a bundle about to be superseded.
+        if (narrativeModel && (blockedReason ?? neverRan(bundle) ?? harnessOnly(bundle)) === null) {
+          const landed = await composeNarrative(bundle, testCase.flow.caseContext ?? testCase.name, {
+            model: narrativeModel,
+            lang: options.reportLang,
+            log: (line) => emitTagged(tag, `${line}\n`, 'err'),
+          });
+          if (landed) emitTagged(tag, `  narrative  written for the case page in ${options.reportLang} (${narrativeModel.id})\n`);
+        }
         const proofPath = await writeProofBundle(bundle, options.out);
         const target = resolveReportPath(
           { path: options.report, dir: options.reportDir, enabled: options.reportEnabled },
@@ -1162,7 +1222,48 @@ export async function runCases(
             kind: testCase.kind,
           },
         );
-        const reportPath = target === null ? null : await writeHtmlReport(bundle, target);
+        // Two ways a run delivers no verdict (see `blocked` below); read here
+        // as well, because the page written next shows the verdict the
+        // ledger will seal, not the bundle's own status.
+        const blockedEarly = blockedReason ?? neverRan(bundle) ?? harnessOnly(bundle);
+        // A catalog case's report IS its case page (`reporter/case-page.ts`,
+        // 2026-09-10): the file the ledger names, the panel's card opens and
+        // the run folder holds. The per-run report (`html-reporter.ts`) stays
+        // for `run` / `go` / `generate` suites, which have no catalog index
+        // for a page to belong to. Written here so the path exists the
+        // moment it is printed; the live roll-up rewrites the same file.
+        const reportPath =
+          target === null
+            ? null
+            : ledger !== null && where.ledger !== undefined
+              ? await writeCasePageAt(
+                  target,
+                  {
+                    id: caseIdOf(bundle.name),
+                    name: bundle.name,
+                    scenario: testCase.scenarioId ?? testCase.group ?? scenarioFromId(caseIdOf(bundle.name)),
+                    verdict:
+                      blockedEarly !== null
+                        ? 'blocked'
+                        : effectiveStatus(bundle) === 'needs-review'
+                          ? 'review'
+                          : isPassing(effectiveStatus(bundle))
+                            ? 'passed'
+                            : 'failed',
+                    status: bundle.status,
+                    reason: blockedEarly,
+                    bundle,
+                    history: [],
+                    reportPath: target,
+                  },
+                  {
+                    title: where.indexTitle,
+                    runKey: ledger.runKey,
+                    lang: options.reportLang,
+                    indexPath: catalogReportPath(ledger.runKey, where.indexTitle),
+                  },
+                ).catch(async () => writeHtmlReport(bundle, target))
+              : await writeHtmlReport(bundle, target);
 
         emitTagged(
           tag,
@@ -1182,7 +1283,7 @@ export async function runCases(
         // gave up, a provider that refused the call). Both score `blocked`,
         // never `failed`: filing the harness's own gap as a product defect is
         // the false test failure this suite used to produce 136 times over.
-        const blocked = neverRan(bundle) ?? harnessOnly(bundle);
+        const blocked = blockedReason ?? neverRan(bundle) ?? harnessOnly(bundle);
         if (blocked !== null) {
           // Said out loud, at the moment it happens, and on stderr: this is not a
           // verdict, and a reader scanning stdout for verdicts must not take it
@@ -1246,30 +1347,43 @@ export async function runCases(
         if (notify) where.onCaseDone?.(testCase, collected[index]!);
       };
 
-      let bundle;
-      if (autoheal && !failFast) {
-        // The loop runs the first attempt itself, so the case is not run twice
-        // — a clean first pass is one run, exactly as without autoheal.
-        const loop = new FlowRepairLoop({
-          model: new LlmFlowRepairModel({ factory: options.factory }),
-          maxAttempts: options.repairAttempts,
-          // Repaired attempts land beside the case's own artifacts, one
-          // reviewable file per attempt — never overwriting anything.
-          outDir: testCase.group === undefined ? where.dir : join(where.dir, slugify(testCase.group)),
-          onLog: (line) => emitTagged(tag, `${line}\n`),
-          agent: options.repairInvestigate ? buildInvestigationAgent(options) : null,
-          regenerateFrom: options.repairRegenerate,
-          memory: repairMemory,
-          runOptions: caseRunOptions,
-        });
-        const outcome = await loop.run(testCase.flow, slugify(testCase.name));
-        const repaired = outcome.attempts.filter((a) => a.repair);
-        for (const a of repaired) {
-          emitTagged(tag, `  autoheal   ${a.repair!.flowPath}\n  patch      ${a.repair!.patchPath}\n`);
-        }
-        bundle = outcome.attempts[outcome.attempts.length - 1]!.bundle;
-      } else {
-        bundle = await runFlow(testCase.flow, caseRunOptions);
+      const caseRun = await runCaseWithDeadline(
+        async (abortSignal) => {
+          const boundedRunOptions: RunFlowOptions = {
+            ...caseRunOptions,
+            ...(abortSignal === undefined ? {} : { abortSignal }),
+          };
+          if (!autoheal || failFast) return runFlow(testCase.flow, boundedRunOptions);
+          const loop = new FlowRepairLoop({
+            model: new LlmFlowRepairModel({ factory: options.factory }),
+            maxAttempts: options.repairAttempts,
+            outDir: testCase.group === undefined ? where.dir : join(where.dir, slugify(testCase.group)),
+            onLog: (line) => emitTagged(tag, `${line}\n`),
+            agent: options.repairInvestigate ? buildInvestigationAgent(options) : null,
+            regenerateFrom: options.repairRegenerate,
+            memory: repairMemory,
+            runOptions: boundedRunOptions,
+          });
+          const outcome = await loop.run(testCase.flow, slugify(testCase.name));
+          const repaired = outcome.attempts.filter((attempt) => attempt.repair);
+          for (const attempt of repaired) {
+            emitTagged(tag, `  autoheal   ${attempt.repair!.flowPath}\n  patch      ${attempt.repair!.patchPath}\n`);
+          }
+          return outcome.attempts[outcome.attempts.length - 1]!.bundle;
+        },
+        { timeoutMs: caseTimeoutMs, startedMs: caseStartedMs },
+      );
+      const bundle = caseRun.bundle;
+      const blockedReason = caseRun.ceilingReached
+        ? caseCeilingReason(caseTimeoutMs, caseRun.elapsedMs)
+        : undefined;
+      if (blockedReason !== undefined) {
+        bundle.notes = [...(bundle.notes ?? []), blockedReason];
+        emitTagged(
+          tag,
+          `  ⏱ case ceiling reached at ${formatElapsed(caseTimeoutMs)} — no verdict, released for --resume\n`,
+          'err',
+        );
       }
 
       // Stamp the case span before the bundle is persisted — from pickup to
@@ -1289,7 +1403,13 @@ export async function runCases(
       // the note. The lane itself never waits: waiting here is what deadlocked
       // three lanes that were stamped together. This is the honesty backstop
       // for every mis-drawn section boundary.
-      if (useSections && parallel && !isPassing(bundle.status) && bundle.status !== 'needs-review') {
+      if (
+        blockedReason === undefined &&
+        useSections &&
+        parallel &&
+        !isPassing(bundle.status) &&
+        bundle.status !== 'needs-review'
+      ) {
         const mine = { meta: metaOf(testCase, index), startedMs: caseStartedMs, endedMs: Date.now() };
         const culprits = [...windows.entries(), ...[...inFlightMeta.entries()].map(([i, l]) => [i, { ...l, endedMs: Date.now() }] as const)]
           .filter(([otherIndex, other]) => otherIndex !== index && windowsInterfere(mine, other))
@@ -1303,14 +1423,35 @@ export async function runCases(
             name: testCase.name,
             run: async () => {
               emitTagged(tag, `\nre-running alone "${testCase.name}" — first attempt ${firstStatus}, flagged as possible interference\n`);
-              inFlightMeta.set(index, { name: testCase.name, meta: metaOf(testCase, index), startedMs: Date.now() });
+              const rerunStartedMs = Date.now();
+              const rerunStartedAt = new Date(rerunStartedMs).toISOString();
+              inFlightMeta.set(index, { name: testCase.name, meta: metaOf(testCase, index), startedMs: rerunStartedMs });
               try {
-                const rerun = await runFlow(testCase.flow, caseRunOptions);
-                rerun.caseStartedAt = caseStartedAt;
-                rerun.caseDurationMs = Date.now() - caseStartedMs;
+                const rerunCase = await runCaseWithDeadline(
+                  async (abortSignal) =>
+                    runFlow(testCase.flow, {
+                      ...caseRunOptions,
+                      ...(abortSignal === undefined ? {} : { abortSignal }),
+                    }),
+                  { timeoutMs: caseTimeoutMs, startedMs: rerunStartedMs },
+                );
+                const rerun = rerunCase.bundle;
+                const rerunBlocked = rerunCase.ceilingReached
+                  ? caseCeilingReason(caseTimeoutMs, rerunCase.elapsedMs)
+                  : undefined;
+                rerun.caseStartedAt = rerunStartedAt;
+                rerun.caseDurationMs = Date.now() - rerunStartedMs;
                 if (testCase.risk) rerun.risk = testCase.risk;
                 rerun.notes = [...(rerun.notes ?? []), `${stamp} — re-ran alone (first attempt: ${firstStatus})`];
-                await settle(rerun, { notify: false });
+                if (rerunBlocked !== undefined) {
+                  rerun.notes.push(rerunBlocked);
+                  emitTagged(
+                    tag,
+                    `  ⏱ case ceiling reached at ${formatElapsed(caseTimeoutMs)} — no verdict, released for --resume\n`,
+                    'err',
+                  );
+                }
+                await settle(rerun, { notify: false, blockedReason: rerunBlocked });
               } catch (error) {
                 // The provisional verdict stands, and says why it is provisional.
                 const reason = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);
@@ -1326,7 +1467,7 @@ export async function runCases(
           });
         }
       }
-      await settle(bundle, { notify: true });
+      await settle(bundle, { notify: true, blockedReason });
     } catch (error) {
       // The narrower case: something threw before there was a bundle at all —
       // a report that could not be written, an unexpected engine error.
@@ -1349,7 +1490,7 @@ export async function runCases(
     }),
     () => pauseRequested(pauseFile),
     canRunWith,
-    () => governorHold,
+    () => quotaHolding(),
   ).catch(async (error: unknown) => {
     if (ledger !== null && where.ledger !== undefined) {
       ledger.ended = {
@@ -1367,6 +1508,7 @@ export async function runCases(
   }
   if (process.platform !== 'win32') process.off('SIGUSR2', onPause);
   if (pausePoll !== null) clearInterval(pausePoll);
+  stopQuotaHold();
 
   // **Interference re-runs, alone, after the plan.** Nothing is in flight now,
   // so each re-run is the clean proof the stamp asked for — one at a time, in
@@ -1634,6 +1776,9 @@ export async function runCases(
       }
     }
   }
+
+  const failures = providerFailureLine(options.factory.providerFailures());
+  if (failures !== null) process.stdout.write(`  ${failures}\n`);
 
   if (ledger !== null && where.ledger !== undefined) {
     const left = remaining(ledger);

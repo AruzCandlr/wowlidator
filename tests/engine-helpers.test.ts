@@ -42,9 +42,11 @@ import {
 } from '../src/engine/dates.js';
 import { headRoleOf, optionNamePatterns, targetsPopupContent } from '../src/engine/selector.js';
 import {
+  ListboxNotReadableError,
   ListboxOptionDisabledError,
   ListboxOptionMissingError,
   optionCandidates,
+  uniquePrefixMatch,
   selectFromListbox,
   splitMultiValue,
 } from '../src/engine/listbox.js';
@@ -238,6 +240,22 @@ describe('variables: {{date:…}} builtins and {{x+N}} arithmetic', () => {
   });
 });
 
+describe('listbox: uniquePrefixMatch is the one option that starts with the value', () => {
+  it('picks the single prefix match, in either half of a code - label name', () => {
+    assert.equal(uniquePrefixMatch(['Thailand - Thailand', 'Taiwan - Taiwan'], 'Thai'), 'Thailand - Thailand');
+    assert.equal(uniquePrefixMatch(['TH - Thailand', 'TW - Taiwan'], 'thai'), 'TH - Thailand');
+    assert.equal(uniquePrefixMatch(['  New  Hire  '], 'new hire'), null, 'a whole match is the rung above, not a prefix');
+  });
+
+  it('never a substring and never one of several', () => {
+    assert.equal(uniquePrefixMatch(['Male', 'Female'], 'Male'), null, '"Male" is whole, "Female" is not a prefix match');
+    assert.equal(uniquePrefixMatch(['Female'], 'Male'), null, 'a substring is not a prefix');
+    assert.equal(uniquePrefixMatch(['New Hire — A', 'New Hire — B'], 'New Hire'), null, 'two prefix matches decide nothing');
+    assert.equal(uniquePrefixMatch(['Assistant Store Manager'], 'A'), null, 'one character is not a value');
+    assert.equal(uniquePrefixMatch([], 'Thai'), null);
+  });
+});
+
 describe('cache: scopeUrl keeps the page-naming params only', () => {
   it('drops navigation and tracking noise, keeps ?step= and friends, sorted', () => {
     assert.equal(scopeUrl('https://example.test/login?next=/home'), 'https://example.test/login');
@@ -321,7 +339,7 @@ describe('healer: the prompt says what an entry step needs; the tree says requir
     assert.doesNotMatch(buildUserPrompt(request), /ENTERS a value/);
     const withEntry = buildUserPrompt({ ...request, entry: 'A - Permanent' });
     assert.match(withEntry, /This step ENTERS a value \("A - Permanent"\)/);
-    assert.ok(withEntry.indexOf('ENTERS a value') < withEntry.indexOf('Accessibility tree:'), 'before the tree');
+    assert.ok(withEntry.indexOf('ENTERS a value') < withEntry.indexOf('Accessibility tree'), 'before the tree');
     assert.doesNotMatch(buildUserPrompt({ ...request, action: 'click', entry: 'x' }), /ENTERS a value/);
   });
 
@@ -361,6 +379,17 @@ const FIXTURE_HTML = `<!doctype html>
       <li role="option"><label><input type="checkbox" value="C009"> OfficeMate (C009)</label></li>
     </ul>
 
+    <!-- The shape measured live on humi SIT (2026-09-11, BE PL_08_01): a
+         searchable picker with NO aria-controls, NO role=listbox anywhere,
+         and a bare input[type=checkbox] per row. The fixture above it has a
+         role=listbox because it was written from what the widget was assumed
+         to be; this one is written from what the page actually serves. -->
+    <button id="roleless" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Legal entity">— Select company —</button>
+    <div id="roleless-pop" class="popup" hidden>
+      <input id="roleless-search" type="text" placeholder="Search company...">
+      <div id="roleless-rows"></div>
+    </div>
+
     <button id="gender" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Gender">Select Gender</button>
     <ul id="gender-list" role="listbox" hidden>
       <li role="option" tabindex="-1">Female</li>
@@ -370,6 +399,10 @@ const FIXTURE_HTML = `<!doctype html>
     <!-- DateField: button[aria-haspopup=dialog] → role=dialog calendar -->
     <button id="hire-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Hire Date">Select date</button>
     <button id="start-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="วันที่มีผล">เลือกวันที่</button>
+    <!-- EH-DOB: humi's REAL DateField month view — no combobox, no year
+         input, and the heading toggle's aria-label ("Choose month and year")
+         never equals its own rendered text, unlike the two fixtures above. -->
+    <button id="dob-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Date of Birth">Select date</button>
 
     <!-- FormField: label + control + aria-describedby message -->
     <div class="field">
@@ -491,13 +524,48 @@ const FIXTURE_HTML = `<!doctype html>
       portalSelect(document.getElementById('province'), function () { return provinces; }, function (p) { chosenProvince = p; document.getElementById('district').textContent = 'Select District'; setStatus('province:' + p); }, 0);
       portalSelect(document.getElementById('district'), function () { return chosenProvince ? districts[chosenProvince] : []; }, function (d) { setStatus('district:' + d); }, 300);
       // --- multi-select
+      // The role-less picker: rows render only once the search narrows them,
+      // and the trigger shows a COUNT rather than the value — so the row's
+      // own checked state is the only proof the pick landed.
+      var roleless = document.getElementById('roleless');
+      var rolelessPop = document.getElementById('roleless-pop');
+      var rolelessSearch = document.getElementById('roleless-search');
+      var rolelessRows = document.getElementById('roleless-rows');
+      var COMPANIES = ['CDS (C001)', 'B2S (C006)', 'OfficeMate (C009)'];
+      function renderRoleless() {
+        var q = rolelessSearch.value.trim().toLowerCase();
+        rolelessRows.innerHTML = '';
+        var shown = q === '' ? COMPANIES : COMPANIES.filter(function (c) { return c.toLowerCase().indexOf(q) >= 0; });
+        if (shown.length === 0) { rolelessRows.innerHTML = '<p>No matching options</p>'; return; }
+        shown.forEach(function (name) {
+          var label = document.createElement('label');
+          var box = document.createElement('input');
+          box.type = 'checkbox';
+          box.setAttribute('aria-label', name);
+          box.addEventListener('change', function () {
+            var n = rolelessRows.querySelectorAll('input:checked').length;
+            roleless.textContent = n ? n + ' selected' : '— Select company —';
+          });
+          label.appendChild(box);
+          label.appendChild(document.createTextNode(' ' + name));
+          rolelessRows.appendChild(label);
+        });
+      }
+      roleless.addEventListener('click', function () {
+        var open = rolelessPop.hidden;
+        rolelessPop.hidden = !open;
+        roleless.setAttribute('aria-expanded', String(open));
+        if (open) { rolelessSearch.value = ''; renderRoleless(); }
+      });
+      rolelessSearch.addEventListener('input', renderRoleless);
+
       var company = document.getElementById('company'), companyList = document.getElementById('company-list');
       company.addEventListener('click', function () { var open = companyList.hidden; companyList.hidden = !open; company.setAttribute('aria-expanded', String(open)); });
       companyList.addEventListener('change', function () {
         var picked = Array.prototype.map.call(companyList.querySelectorAll('input:checked'), function (c) { return c.parentElement.textContent.trim(); });
         company.textContent = picked.length ? picked.join(', ') : 'Select companies';
       });
-      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { companyList.hidden = true; company.setAttribute('aria-expanded', 'false'); genderList.hidden = true; gender.setAttribute('aria-expanded', 'false'); grpPop.hidden = true; grp.setAttribute('aria-expanded', 'false'); } });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { rolelessPop.hidden = true; roleless.setAttribute('aria-expanded', 'false'); companyList.hidden = true; company.setAttribute('aria-expanded', 'false'); genderList.hidden = true; gender.setAttribute('aria-expanded', 'false'); grpPop.hidden = true; grp.setAttribute('aria-expanded', 'false'); } });
       // --- gender
       var gender = document.getElementById('gender'), genderList = document.getElementById('gender-list');
       gender.addEventListener('click', function () { var open = genderList.hidden; genderList.hidden = !open; gender.setAttribute('aria-expanded', String(open)); });
@@ -585,6 +653,76 @@ const FIXTURE_HTML = `<!doctype html>
       }
       dateField(document.getElementById('hire-date'), 'en', new Date(2026, 8, 3), new Date(2025, 0, 1), new Date(2028, 10, 30));
       dateField(document.getElementById('start-date'), 'th', new Date(2026, 8, 3), new Date(2025, 0, 1), new Date(2028, 10, 30));
+      // --- EH-DOB: humi's real DateField month view (no select, no year
+      // input — Previous/Next-year buttons and a plain year readout; the
+      // heading toggle's accessible name is fixed copy, distinct from its
+      // own rendered text, exactly the shape that broke jumpViaMonthView).
+      (function humiDobField(btn, initial, min, max) {
+        var view = { y: initial.getFullYear(), m: initial.getMonth() }, mode = 'day', popup = null, value = null;
+        function label(d) { return d.getDate() + ' ' + ENS[d.getMonth()] + ' ' + d.getFullYear(); }
+        function disabled(d) { return d < min || d > max; }
+        function close() { if (popup) { popup.remove(); popup = null; } btn.setAttribute('aria-expanded', 'false'); }
+        function render() {
+          popup.innerHTML = '';
+          var head = document.createElement('div');
+          var prevM = document.createElement('button'); prevM.type = 'button'; prevM.setAttribute('aria-label', 'Previous month'); prevM.textContent = '‹';
+          prevM.addEventListener('click', function () { view.m -= 1; if (view.m < 0) { view.m = 11; view.y -= 1; } render(); });
+          head.appendChild(prevM);
+          var title = document.createElement('button'); title.type = 'button';
+          title.setAttribute('aria-label', 'Choose month and year');
+          title.setAttribute('aria-expanded', String(mode === 'month'));
+          title.textContent = EN[view.m] + ' ' + view.y;
+          title.addEventListener('click', function () { mode = mode === 'month' ? 'day' : 'month'; render(); });
+          head.appendChild(title);
+          var nextM = document.createElement('button'); nextM.type = 'button'; nextM.setAttribute('aria-label', 'Next month'); nextM.textContent = '›';
+          nextM.addEventListener('click', function () { view.m += 1; if (view.m > 11) { view.m = 0; view.y += 1; } render(); });
+          head.appendChild(nextM);
+          popup.appendChild(head);
+          if (mode === 'day') {
+            var grid = document.createElement('div');
+            var first = new Date(view.y, view.m, 1), days = new Date(view.y, view.m + 1, 0).getDate();
+            for (var p = 0; p < first.getDay(); p++) { var pad = document.createElement('div'); pad.setAttribute('aria-hidden', 'true'); grid.appendChild(pad); }
+            for (var d = 1; d <= days; d++) {
+              (function (day) {
+                var date = new Date(view.y, view.m, day);
+                var b = document.createElement('button'); b.type = 'button'; b.textContent = String(day);
+                b.setAttribute('aria-pressed', String(value !== null && value.getTime() === date.getTime()));
+                if (disabled(date)) b.disabled = true;
+                b.addEventListener('click', function () { if (disabled(date)) return; value = date; btn.textContent = label(date); setStatus('date:' + btn.id + ':' + date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0')); close(); });
+                grid.appendChild(b);
+              })(d);
+            }
+            popup.appendChild(grid);
+          } else {
+            var yrow = document.createElement('div');
+            var prevY = document.createElement('button'); prevY.type = 'button'; prevY.setAttribute('aria-label', 'Previous year'); prevY.textContent = '‹';
+            prevY.addEventListener('click', function () { view.y -= 1; render(); });
+            yrow.appendChild(prevY);
+            var yp = document.createElement('p'); yp.textContent = String(view.y);
+            yrow.appendChild(yp);
+            var nextY = document.createElement('button'); nextY.type = 'button'; nextY.setAttribute('aria-label', 'Next year'); nextY.textContent = '›';
+            nextY.addEventListener('click', function () { view.y += 1; render(); });
+            yrow.appendChild(nextY);
+            popup.appendChild(yrow);
+            var mgrid = document.createElement('div');
+            ENS.forEach(function (m, i) {
+              var mb = document.createElement('button'); mb.type = 'button'; mb.textContent = m;
+              mb.setAttribute('aria-pressed', String(i === view.m));
+              mb.addEventListener('click', function () { view.m = i; mode = 'day'; render(); });
+              mgrid.appendChild(mb);
+            });
+            popup.appendChild(mgrid);
+          }
+        }
+        btn.addEventListener('click', function () {
+          if (popup) { close(); return; }
+          var base = value || initial; view = { y: base.getFullYear(), m: base.getMonth() }; mode = 'day';
+          popup = document.createElement('div'); popup.setAttribute('role', 'dialog'); popup.setAttribute('aria-label', 'Calendar');
+          popup.className = 'popup'; popup.style.position = 'fixed'; popup.style.top = '40px'; popup.style.left = '40px'; popup.style.zIndex = '100';
+          document.body.appendChild(popup); btn.setAttribute('aria-expanded', 'true'); render();
+        });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+      })(document.getElementById('dob-date'), new Date(2026, 8, 3), new Date(1900, 0, 1), new Date(2030, 11, 31));
       // --- uploads
       function reportFiles(input) { input.addEventListener('change', function () { document.getElementById('upload-status').textContent = input.id + ':' + Array.prototype.map.call(input.files, function (f) { return f.name; }).join(','); }); }
       reportFiles(document.getElementById('import-file')); reportFiles(document.getElementById('cert-file')); reportFiles(document.getElementById('chooser-input'));
@@ -690,6 +828,45 @@ describe('engine helpers against a real page (CDP)', { skip: skipBrowser }, () =
     });
   });
 
+  it('listbox: reads a picker that carries no list role at all (humi Company, 2026-09-11)', async () => {
+    await withPage(async (page) => {
+      // Nothing here has role=listbox/option and the trigger has no
+      // aria-controls — the exact shape that made PL_08_01 report
+      // "no option named CDS (C001) appeared" about a control offering it.
+      const result = await selectFromListbox(page, page.locator('#roleless'), 'CDS (C001)');
+      assert.deepEqual(result.picked, ['CDS (C001)']);
+      assert.equal(result.via, 'checkbox', 'a checkbox row is ticked, not clicked through as an option');
+      assert.ok(result.confirmed, `the ticked row is the proof; trigger read back ${result.readBack}`);
+      assert.ok(
+        await page.locator('#roleless-rows input[aria-label="CDS (C001)"]').isChecked(),
+        'the row the value names is the one that ended up ticked',
+      );
+      assert.equal(await page.locator('#roleless').getAttribute('aria-expanded'), 'false', 'Escape closed the panel');
+    });
+  });
+
+  it('listbox: a role-less picker that offers nothing says the list was UNREADABLE, never that the option is absent', async () => {
+    await withPage(async (page) => {
+      // Remove the rows CONTAINER, so the panel can never hold a row at any
+      // search — the click handler re-renders into it otherwise, and a panel
+      // that renders rows and then filters them empty is the OTHER case
+      // (read, and the option is not there), which keeps its own wording.
+      await page.evaluate("document.getElementById('roleless-rows').remove()");
+      // With no rows to find at any search, there is no panel to read — and
+      // the error must not claim anything about what the control offers.
+      await assert.rejects(
+        selectFromListbox(page, page.locator('#roleless'), 'Nowhere Ltd (C999)', { timeout: 1_000 }),
+        (error: unknown) => {
+          assert.ok(error instanceof ListboxNotReadableError, `got ${(error as Error).name}`);
+          assert.match((error as Error).message, /could not read its list/);
+          assert.match((error as Error).message, /nothing is known about whether/);
+          assert.doesNotMatch((error as Error).message, /no option named/);
+          return true;
+        },
+      );
+    });
+  });
+
   it('listbox: a disabled option is a state verdict, not a missing one', async () => {
     await withPage(async (page) => {
       await assert.rejects(selectFromListbox(page, page.locator('#grp'), 'C - Contract'), ListboxOptionDisabledError);
@@ -772,6 +949,27 @@ describe('engine helpers against a real page (CDP)', { skip: skipBrowser }, () =
       const result = await pickDateInDialog(page, page.locator('#hire-date'), '2028-06-20');
       assert.equal(result.via, 'month-view');
       assert.equal(result.shown, '20 Jun 2028');
+      assert.ok(result.confirmed);
+    });
+  });
+
+  it('calendar: a century-scale jump (Date of Birth) drives a button-grid month view, not 700+ month-nav clicks (EH-DOB)', async () => {
+    await withPage(async (page) => {
+      const result = await pickDateInDialog(page, page.locator('#dob-date'), '1968-03-01', { timeout: 3_000 });
+      assert.equal(result.via, 'month-view');
+      assert.equal(result.shown, '1 Mar 1968');
+      assert.ok(result.confirmed);
+      assert.equal(await page.locator('#status').innerText(), 'date:dob-date:1968-03-01');
+      assert.equal(await openDialogNow(page), null, 'the dialog closed');
+    });
+  });
+
+  it('calendar: the same button-grid widget still resolves a near-term date via plain month-nav (unaffected)', async () => {
+    await withPage(async (page) => {
+      const result = await pickDateInDialog(page, page.locator('#dob-date'), '2026-11-10');
+      assert.equal(result.via, 'month-nav');
+      assert.equal(result.navigated, 2);
+      assert.equal(result.shown, '10 Nov 2026');
       assert.ok(result.confirmed);
     });
   });

@@ -1135,9 +1135,8 @@ describe('which model each role runs on', () => {
     assert.equal(healer.configuredProvider, 'groq');
     assert.equal(healer.configuredModelId, 'llama-3.3-70b-versatile');
 
-    const data = roles.find((role) => role.role === 'data')!;
-    assert.equal(data.overridden, false);
-    assert.equal(data.modelId, 'llama-3.1-8b-instant');
+    const agent = roles.find((role) => role.role === 'agent')!;
+    assert.equal(agent.overridden, false);
   });
 
   it('puts a role back on the environment', () => {
@@ -1453,13 +1452,13 @@ describe('a local role addressed by port', () => {
     const { createModelForRole } = await import('../src/providers/llm-factory.js');
     const { loadConfig } = await import('../src/config.js');
     const cfg = loadConfig({
-      WOWLIDATOR_DATA_PROVIDER: 'local',
-      WOWLIDATOR_DATA_BASE_URL: 'http://localhost:9001/v1',
+      WOWLIDATOR_AGENT_PROVIDER: 'local',
+      WOWLIDATOR_AGENT_BASE_URL: 'http://localhost:9001/v1',
       GROQ_API_KEY: 'k',
       GOOGLE_GENERATIVE_AI_API_KEY: 'k',
     } as NodeJS.ProcessEnv);
     const seen: unknown[] = [];
-    createModelForRole('data', cfg, 0, {
+    createModelForRole('agent', cfg, 0, {
       ...Object.fromEntries(
         ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local'].map((p) => [
           p,
@@ -1487,5 +1486,65 @@ describe('a local role addressed by port', () => {
     text = await readFile(env, 'utf8');
     assert.match(text, /^# WOWLIDATOR_GENERATOR_BASE_URL=/m);
     assert.doesNotMatch(text, /^WOWLIDATOR_GENERATOR_BASE_URL=/m);
+  });
+});
+
+describe('the run-notes block on a proof card', () => {
+  const html = renderWowUi();
+
+  /** `notesBlock` on its own, with `el()` and `timeAgo` stubbed: the page is a
+   *  string, so the rule is tested by evaluating the function it ships. */
+  function notesBlockOf(): (bundle: unknown) => { cap: string; lines: string[] } | null {
+    const src = /function notesBlock\(bundle\) \{[\s\S]*?\n\}/.exec(html)?.[0];
+    assert.ok(src, 'notesBlock is declared in the page');
+    const el = (_tag: string, attrs: Record<string, string> | null, kids?: unknown[]) => {
+      const node = {
+        cls: (attrs && attrs.class) || '',
+        text: (attrs && attrs.text) || '',
+        kids: (kids as { text: string }[]) || [],
+        appendChild(child: { text: string }) { node.kids.push(child); },
+      };
+      return node;
+    };
+    const fn = new Function('el', 'timeAgo', `${src}\nreturn notesBlock;`) as (
+      e: unknown, t: unknown,
+    ) => (bundle: unknown) => { kids: { cls: string; text: string }[] } | null;
+    const raw = fn(el, () => '2m ago');
+    return (bundle: unknown) => {
+      const box = raw(bundle);
+      if (box === null) return null;
+      return { cap: box.kids[0]!.text, lines: box.kids.slice(1).map((k) => k.text) };
+    };
+  }
+
+  it('shows the model-written summary, attributed, and never the verbatim notes beside it', () => {
+    const block = notesBlockOf();
+    const shown = block({
+      notes: ['pre-run risk: medium', 'session note: signed in as MANAGER', 'diagnosed: agent — clicked Save twice'],
+      narrative: { verifierNote: 'The case signed in and reached the plan page; the save was never confirmed.', by: 'claude-cli:opus', at: '2026-09-11T00:00:00.000Z' },
+    })!;
+    assert.equal(shown.cap, 'Run notes, summarised');
+    assert.equal(shown.lines[0], 'The case signed in and reached the plan page; the save was never confirmed.');
+    // Attributed to the model that wrote it, the way an automatic review ruling is.
+    assert.match(shown.lines[1]!, /^Written by claude-cli:opus from this run/);
+    // The verbatim notes are DROPPED from the rendered surface — not folded,
+    // not in a tooltip. They stay in the proof file.
+    for (const note of ['pre-run risk: medium', 'session note: signed in as MANAGER', 'diagnosed: agent — clicked Save twice']) {
+      assert.ok(!shown.lines.includes(note), `the verbatim note is not drawn: ${note}`);
+    }
+  });
+
+  it('falls back to the verbatim notes when no narrative was written, and draws nothing when there is neither', () => {
+    const block = notesBlockOf();
+    // --no-case-narrative / WOWLIDATOR_CASE_NARRATIVE=off / a role with no key.
+    const shown = block({ notes: ['pre-run risk: medium', 'session note: ok'] })!;
+    assert.equal(shown.cap, 'Run notes (2)');
+    assert.deepEqual(shown.lines, ['pre-run risk: medium', 'session note: ok']);
+    // An empty verifierNote is "nothing to say", not a summary.
+    assert.equal(block({ notes: ['pre-run risk: medium'], narrative: { verifierNote: '  ', by: 'm' } })!.cap, 'Run notes (1)');
+    assert.equal(block({ notes: [] }), null);
+    assert.equal(block({}), null);
+    // A narrative with no notes still speaks.
+    assert.equal(block({ narrative: { verifierNote: 'Nothing blocked the run.', by: 'm' } })!.cap, 'Run notes, summarised');
   });
 });

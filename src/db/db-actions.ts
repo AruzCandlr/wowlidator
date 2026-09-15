@@ -31,7 +31,7 @@ import {
   type DbSchema,
   type DbTable,
 } from './client.js';
-import { redactRows, redactWhereSummary } from './redact-row.js';
+import { redactRows, redactValue, redactWhereSummary } from './redact-row.js';
 
 /** A value a flow may compare a column against. */
 export type FlowDbValue = string | number | boolean | null;
@@ -93,6 +93,29 @@ export interface FlowDbCalledSpec {
 }
 
 /**
+ * One statement a check actually ran, as it was sent.
+ *
+ * The SQL is built here from identifiers that already passed the schema
+ * membership gate, so the text itself carries nothing secret — but a bound
+ * parameter is a value out of the flow, and a `where` keyed on a session
+ * token is exactly where a credential enters. So the parameters go through
+ * `redactValue` against the column they were bound to, the same rule
+ * `redactWhereSummary` follows: never emit a value we could not inspect.
+ *
+ * Placeholders are kept as placeholders. Inlining the values would produce a
+ * statement that reads like the one that ran and is not, and would put the
+ * unredacted value back into the report the redaction just took out of it.
+ */
+export interface DbStatementRecord {
+  /** The parameterized SQL, exactly as it was sent. */
+  sql: string;
+  /** The bound values in `$1…$n` order, each already redacted. */
+  params?: string[] | undefined;
+  /** The table(s) — or view — this statement read. */
+  tables?: string[] | undefined;
+}
+
+/**
  * The stored form of one DB check. Lives here because this module owns what
  * a check *is*; the bundle only carries it — the `RequestRecord` rule.
  * Everything in it is already redacted.
@@ -107,6 +130,21 @@ export interface DbCheckRecord {
   observed?: string | undefined;
   /** Redacted sample of matched/nearby rows, capped at `DB_EVIDENCE_MAX_ROWS`. */
   rows?: Record<string, string>[] | undefined;
+  /**
+   * How many rows the check counted, when it counted any — `rows` is a sample
+   * of at most `DB_EVIDENCE_MAX_ROWS`, and a reader must be able to tell a
+   * three-row result from the first three of forty-two.
+   */
+  rowsMatched?: number | undefined;
+  /**
+   * The statement(s) this check ran, in the order they were sent and deduped:
+   * a check that polled sent the same SQL again and again, which is not more
+   * evidence — `polledMs` is what says it polled. Absent on a check that was
+   * refused before any SQL was built (an undeclared table, an unparseable
+   * where, no connection): there is no statement to show, and inventing one
+   * would be a claim about evidence.
+   */
+  statements?: DbStatementRecord[] | undefined;
   durationMs: number;
   /** Set when the check only passed after polling — eventual consistency, on the record. */
   polledMs?: number | undefined;
@@ -266,6 +304,34 @@ interface SnapshotData {
   statements: Map<string, { query: string; calls: number }> | null;
 }
 
+/**
+ * The statements one check ran, in order, deduped.
+ *
+ * A row check polls: twenty iterations send the same two statements twenty
+ * times, and twenty copies of one SELECT is not twenty pieces of evidence.
+ * Deduping on the SQL and its bound values is what makes "record the
+ * statement once and let `polledMs` say it polled" true rather than merely
+ * intended. Nothing is capped: every statement here is short, ours, and
+ * built from validated identifiers, and a snapshot over twenty tables really
+ * did read twenty tables.
+ */
+class StatementLog {
+  readonly #seen = new Set<string>();
+  readonly #entries: DbStatementRecord[] = [];
+
+  add(entry: DbStatementRecord): void {
+    const key = `${entry.sql}\u0000${(entry.params ?? []).join('\u0000')}`;
+    if (this.#seen.has(key)) return;
+    this.#seen.add(key);
+    this.#entries.push(entry);
+  }
+
+  /** Undefined rather than an empty array — a check that ran no SQL has no field. */
+  get records(): DbStatementRecord[] | undefined {
+    return this.#entries.length > 0 ? [...this.#entries] : undefined;
+  }
+}
+
 function describe(error: unknown): string {
   if (error instanceof Error) return error.message.split('\n')[0] ?? error.message;
   return String(error);
@@ -342,12 +408,13 @@ export class DbActions {
     const name = spec.as ?? 'before';
     await this.#check('dbSnapshot', spec.intent, async () => {
       const client = await this.#ensureClient();
+      const log = new StatementLog();
       const counts = new Map<string, number>();
       for (const table of spec.tables) {
         const declared = await this.#requireTable(table);
-        counts.set(declared.name, await this.#countRows(client, declared.name, {}));
+        counts.set(declared.name, await this.#countRows(client, declared.name, {}, log));
       }
-      const statements = await this.#readStatements(client).catch(() => null);
+      const statements = await this.#readStatements(client, log).catch(() => null);
       this.#snapshots.set(name, { at: new Date().toISOString(), counts, statements });
 
       return {
@@ -355,6 +422,7 @@ export class DbActions {
           kind: 'snapshot',
           tables: [...counts.keys()],
           observed: [...counts.entries()].map(([t, n]) => `${t}=${n}`).join(', '),
+          statements: log.records,
           note:
             statements === null
               ? 'statement statistics were not readable (pg_stat_statements absent or not permitted) — expectDbCalled against this snapshot will be blocked'
@@ -383,6 +451,46 @@ export class DbActions {
     const declared = await this.#requireTable(table);
     this.#requireColumns(declared, Object.keys(where));
     return this.#countRows(client, declared.name, this.#variables.interpolateDeep({ ...where }));
+  }
+
+  /**
+   * Count rows for a CORROBORATION, and hand back the statement that did it.
+   *
+   * `probeCount` answers the number; a proof page has to be able to show the
+   * QUERY as well (2026-09-11, asked for after HIR-EC-029: the page counted
+   * four options where the sheet claimed three, and no surface could say what
+   * had been counted or what the data actually held). Same gate as every other
+   * read here — the table and every filter column must be in the introspected
+   * schema before anything reaches the database, and the values travel as
+   * parameters — so this adds a reader, never a new way in.
+   */
+  async corroborateCount(
+    table: string,
+    where: Record<string, string>,
+  ): Promise<{ count: number; record: DbCheckRecord }> {
+    const client = await this.#ensureClient();
+    const declared = await this.#requireTable(table);
+    this.#requireColumns(declared, Object.keys(where));
+    const log = new StatementLog();
+    const started = Date.now();
+    const count = await this.#countRows(client, declared.name, this.#variables.interpolateDeep({ ...where }), log);
+    return {
+      count,
+      record: {
+        kind: 'row',
+        table: declared.name,
+        observed: String(count),
+        durationMs: Date.now() - started,
+        ...(log.records === undefined ? {} : { statements: log.records }),
+      },
+    };
+  }
+
+  /** The introspected schema as names only — what a corroboration model may be shown. */
+  async schemaView(): Promise<{ tables: { name: string; columns: string[] }[] }> {
+    const client = await this.#ensureClient();
+    const schema = await this.#ensureSchema(client);
+    return { tables: schema.tables.map((t) => ({ name: t.name, columns: t.columns.map((c) => c.name) })) };
   }
 
   /** Assert row(s) matching `where` (and `values`) exist — polling through the budget. */
@@ -416,14 +524,15 @@ export class DbActions {
       const deadline = Date.now() + (spec.timeoutMs ?? DEFAULT_DB_TIMEOUT_MS);
       const started = Date.now();
       let polledMs: number | undefined;
+      const log = new StatementLog();
 
       for (;;) {
-        const whereCount = await this.#countRows(client, table.name, where);
+        const whereCount = await this.#countRows(client, table.name, where, log);
         let matches = whereCount;
         let rows: Record<string, unknown>[] = [];
 
         if (values !== undefined || whereCount > 0) {
-          rows = await this.#fetchRows(client, table.name, where);
+          rows = await this.#fetchRows(client, table.name, where, log);
         }
         if (values !== undefined) {
           if (whereCount > ROW_FETCH_LIMIT) {
@@ -465,6 +574,8 @@ export class DbActions {
               expected: expectedSummary,
               observed: observedSummary,
               rows: redactRows(rows),
+              rowsMatched: whereCount,
+              statements: log.records,
               polledMs,
               note: CORRELATION_NOTE,
             },
@@ -499,6 +610,8 @@ export class DbActions {
               expected: expectedSummary,
               observed: observedSummary,
               rows: redactRows(rows),
+              rowsMatched: whereCount,
+              statements: log.records,
               note: CORRELATION_NOTE,
             },
           );
@@ -524,8 +637,9 @@ export class DbActions {
 
       const deadline = Date.now() + (spec.timeoutMs ?? DEFAULT_DB_TIMEOUT_MS);
       const started = Date.now();
+      const log = new StatementLog();
       for (;;) {
-        const now = await this.#countRows(client, table.name, {});
+        const now = await this.#countRows(client, table.name, {}, log);
         const observed = now - prior;
         if (observed === spec.delta) {
           const waited = Date.now() - started;
@@ -535,6 +649,8 @@ export class DbActions {
               table: table.name,
               expected: `${spec.delta >= 0 ? '+' : ''}${spec.delta} row(s)`,
               observed: `${observed >= 0 ? '+' : ''}${observed} (${prior} → ${now})`,
+              rowsMatched: now,
+              statements: log.records,
               polledMs: waited > POLL_INTERVAL_MS ? waited : undefined,
               note: CORRELATION_NOTE,
             },
@@ -553,6 +669,8 @@ export class DbActions {
               table: table.name,
               expected: `${spec.delta >= 0 ? '+' : ''}${spec.delta} row(s)`,
               observed: `${observed >= 0 ? '+' : ''}${observed} (${prior} → ${now})`,
+              rowsMatched: now,
+              statements: log.records,
               note: CORRELATION_NOTE,
             },
           );
@@ -567,6 +685,7 @@ export class DbActions {
     await this.#check('expectDbUnchanged', spec.intent, async () => {
       const client = await this.#ensureClient();
       const before = this.#requireSnapshot(spec.since);
+      const log = new StatementLog();
       const changed: string[] = [];
       const observed: string[] = [];
       for (const name of spec.tables) {
@@ -578,7 +697,7 @@ export class DbActions {
               "dbSnapshot step's tables",
           );
         }
-        const now = await this.#countRows(client, table.name, {});
+        const now = await this.#countRows(client, table.name, {}, log);
         observed.push(`${table.name}=${now}`);
         if (now !== prior) changed.push(`${table.name} (${prior} → ${now})`);
       }
@@ -591,6 +710,7 @@ export class DbActions {
             tables: [...spec.tables],
             expected: 'no row-count change',
             observed: changed.join('; '),
+            statements: log.records,
             note: `${COUNT_NOTE}; ${CORRELATION_NOTE}`,
           },
         );
@@ -601,6 +721,7 @@ export class DbActions {
           tables: [...spec.tables],
           expected: 'no row-count change',
           observed: observed.join(', '),
+          statements: log.records,
           note: `${COUNT_NOTE}; ${CORRELATION_NOTE}`,
         },
         detail: {},
@@ -627,9 +748,10 @@ export class DbActions {
       const needle = spec.match.toLowerCase();
       const deadline = Date.now() + (spec.timeoutMs ?? DEFAULT_DB_TIMEOUT_MS);
       const started = Date.now();
+      const log = new StatementLog();
 
       for (;;) {
-        const now = await this.#readStatements(client);
+        const now = await this.#readStatements(client, log);
         let observed = 0;
         let resets = false;
         const matched: string[] = [];
@@ -663,6 +785,7 @@ export class DbActions {
                   : `at least ${target} execution(s) of "${spec.match}"`,
               observed: `${observed} execution(s)`,
               rows: matched.length > 0 ? matched.map((query) => ({ statement: query })) : undefined,
+              statements: log.records,
               polledMs: waited > POLL_INTERVAL_MS ? waited : undefined,
               note,
             },
@@ -686,6 +809,7 @@ export class DbActions {
                   ? `exactly ${spec.delta} execution(s) of "${spec.match}"`
                   : `at least ${target} execution(s) of "${spec.match}"`,
               observed: `${observed} execution(s)`,
+              statements: log.records,
               note,
             },
           );
@@ -773,30 +897,41 @@ export class DbActions {
     return snapshot;
   }
 
-  #buildWhere(where: Record<string, FlowDbValue>): { clause: string; params: unknown[] } {
+  /**
+   * The bound values carry the display form beside the real one: the
+   * parameter a report shows is redacted against the column it was bound to,
+   * and the parameter the driver receives is untouched.
+   */
+  #buildWhere(where: Record<string, FlowDbValue>): {
+    clause: string;
+    params: unknown[];
+    shown: string[];
+  } {
     const parts: string[] = [];
     const params: unknown[] = [];
+    const shown: string[] = [];
     for (const [column, value] of Object.entries(where)) {
       if (value === null) {
         parts.push(`${quoteIdent(column)} IS NULL`);
       } else {
         params.push(value);
+        shown.push(redactValue(column, value));
         parts.push(`${quoteIdent(column)} = $${params.length}`);
       }
     }
-    return { clause: parts.length > 0 ? ` WHERE ${parts.join(' AND ')}` : '', params };
+    return { clause: parts.length > 0 ? ` WHERE ${parts.join(' AND ')}` : '', params, shown };
   }
 
   async #countRows(
     client: DbClient,
     table: string,
     where: Record<string, FlowDbValue>,
+    log?: StatementLog,
   ): Promise<number> {
     const built = this.#buildWhere(where);
-    const result = await client.query(
-      `SELECT count(*)::text AS n FROM ${quoteTable(table)}${built.clause}`,
-      built.params,
-    );
+    const sql = `SELECT count(*)::text AS n FROM ${quoteTable(table)}${built.clause}`;
+    log?.add({ sql, params: built.shown, tables: [table] });
+    const result = await client.query(sql, built.params);
     return Number(result.rows[0]?.['n'] ?? 0);
   }
 
@@ -804,22 +939,23 @@ export class DbActions {
     client: DbClient,
     table: string,
     where: Record<string, FlowDbValue>,
+    log?: StatementLog,
   ): Promise<Record<string, unknown>[]> {
     const built = this.#buildWhere(where);
-    const result = await client.query(
-      `SELECT * FROM ${quoteTable(table)}${built.clause} LIMIT ${ROW_FETCH_LIMIT}`,
-      built.params,
-    );
+    const sql = `SELECT * FROM ${quoteTable(table)}${built.clause} LIMIT ${ROW_FETCH_LIMIT}`;
+    log?.add({ sql, params: built.shown, tables: [table] });
+    const result = await client.query(sql, built.params);
     return result.rows;
   }
 
   async #readStatements(
     client: DbClient,
+    log?: StatementLog,
   ): Promise<Map<string, { query: string; calls: number }>> {
-    const result = await client.query(
-      'SELECT queryid::text AS queryid, query, calls::text AS calls FROM pg_stat_statements',
-      [],
-    );
+    const sql =
+      'SELECT queryid::text AS queryid, query, calls::text AS calls FROM pg_stat_statements';
+    log?.add({ sql, tables: ['pg_stat_statements'] });
+    const result = await client.query(sql, []);
     const out = new Map<string, { query: string; calls: number }>();
     for (const row of result.rows) {
       out.set(String(row['queryid']), {

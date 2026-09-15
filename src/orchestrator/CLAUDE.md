@@ -84,43 +84,108 @@ Both halves were the harness's own:
 
 **And the goal was never the agent's to answer.** `verificationOnlyGoal` (`goal-evidence.ts`): a goal carrying a verify verb and no action verb asks the agent to be the oracle, which it structurally cannot be — an agent produces an account of itself, never evidence, which is this module's whole premise. Such a leg now **hands off**: `goalEvidence` returns `verification-deferred`, the step passes, and whatever the flow asserts next is the proof (a leg with nothing after it is caught at authoring time by `unsettledWorkflowClaim`, never invented into a defect at runtime). It still files the `low` usability finding, worded for this case: write the leg as the assertion it is, and keep the agent for the navigation that reaches the page. Deliberately narrow — any action verb anywhere disqualifies it, so "open the dialog and verify the title" stays a real leg whose failure is real.
 
-## The queue governor (`queue-governor.ts`, 2026-08-28)
+## The queue governor, and why it is gone (retired 2026-09-11)
 
-One agent per suite run governing parallel queuing (docs/parallel-run-spec.md
-§2.4): role `governor` (default groq; point at claude-cli opus via
-`WOWLIDATOR_GOVERNOR_*` — the TURN BUDGET bounds the spend, not the model).
-Event-driven (`suite-start`, `case-ended` on a non-pass, `queue-blocked` after
-~25 refused dispatch polls), hard-budgeted (`WOWLIDATOR_GOVERNOR_TURNS`, 12),
-compact observation, one structured action per turn. It may NARROW on its own
-authority (hold, shrink pool, note); the deterministic section rules are the
-floor. `db-read` = one SELECT; `db-write` = one INSERT/UPDATE on a declared
-table, only with `WOWLIDATOR_DB_ADMIN_URL`, logged BEFORE execution, DELETE
-refused outright. Absent/off/erroring/out-of-budget → the deterministic
-scheduler runs exactly as it would alone (the capture-pilot containment rule).
-`WOWLIDATOR_GOVERNOR=off` disables. Tests: `tests/queue-governor.test.ts`.
+One agent per suite run governed parallel queuing from 2026-08-28
+(docs/parallel-run-spec.md §2.4) — event-driven turns, a hard budget, hold /
+shrink-pool / db-read / db-write tools. From 2026-08-31 its DEFAULT was
+already deterministic (`RuleGovernorModel`), because across two live suites
+every LLM turn concluded `idle` while restating a set-intersection the
+scheduler had already computed. The whole subsystem was removed on
+2026-09-11, along with the `governor` role.
+
+**The reason to record is that its own contract predicted this.** It was
+written as *"an OPTIMISER, never a dependency: absent, disabled, erroring or
+out of budget, the deterministic scheduler runs exactly as it would alone"* —
+so removal could only cost advice, never a verdict. The measurement matched:
+in 18,704 recorded model calls the `governor` role had **zero** real turns,
+every one of its 35 ledger rows being `wowlidator doctor` proving the model
+id still resolved, and the rules governor's own output was a restatement of
+what `case-plan.ts` already knew.
+
+What went with it: `heldCases` (nothing else ever wrote to it), the pool
+override (the pool is `--concurrency` again), the `queue-blocked` and
+`case-ended` events, and the db-read/db-write tools — the only place in this
+repo where a model could issue SQL, now absent rather than gated. What
+stayed: every deterministic rule it advised — the section scheduler, the data
+locks, the interference detector and the dependency gate below.
+
+**The lesson for the next optimiser.** A containment rule strong enough to
+make a subsystem safe ("nothing changes if it is absent") is also strong
+enough to make it removable, and the usage ledger is what turns that from an
+argument into a measurement. Build the rule; then check whether the thing
+inside it ever fires.
 
 ## A finish is accepted on the page's word (S1 of the 2026-08-28 agent-flaw audit)
 
 Audit of be100's latest run: 20 of 22 agent legs on PASSED cases were settled by the agent's own `finish` text — "shows 1–75 of 75, *meaning* 100 was selected"; "picked, *as confirmed by* the successful clicks" — inference presented as observation, never checked. The "what the agent claims is never the evidence" rule had been enforced on failures only. Now: `goalOutcome` (`goal-evidence.ts`, pure) reads the checkable end state a goal names (`set X to Y`, `X = "Y"`); on `finish` the loop re-reads the live tree and `outcomeShown` must find it — on one line (`button "Status: Inactive"`) or as a label→value neighbour within three lines. A miss is refused ONCE with what the tree shows; a second insistence records `claimed finish, but the page does not show X = Y` and `success: false`. A goal naming no state falls through, and the record says so: `AgentRecord.settledBy` is `observed-state` (with the evidencing line) or `agent-claim` (with the bare reasoning), so an all-claim run is visible as one in the report. New action **`read`** (idle, never progress): the harness reports a control's text/value/checked/expanded/disabled into the history at $0, so the agent learns whether a choice took instead of clicking again to find out — the repeat-guard stalls on Country and Rows-per-page were exactly that.
 
+## A separator the page pads is the same value (2026-09-11, PL_06_10)
+
+Live (`be-sit-high-opusheal-th-20260911-175757`, HUMI SIT). The agent set
+Benefit Type correctly and the re-read tree said so —
+`text "Reimbursement : Employee/HR"` — but the goal spelled the value
+`Reimbursement: Employee/HR`, without the space humi draws before the colon.
+`foldValue` folded case, dash variants and whitespace *around dashes* and
+nothing around a colon, so `shownAs`' bounded-substring test failed and the
+finish was refused twice: `agent claimed finish, but the page does not show
+Benefit Type = "Reimbursement: Employee/HR"`. The agent's own reasoning had
+already noted the two spellings were one value.
+
+What it cost, and why a false "not seen" is not a cheap error: the case sealed
+**ERROR at 14 of 20 steps**, with no verdict on the application at all;
+`closesDependentTail('workflow', …)` — correct, and not the bug — inherited the
+false premise and skipped steps 13–17, one of whose intents read *"Independent
+of the agent: the duplicate Plan ID is still the value being submitted"*; and
+the post-run diagnosis filed **the navigation agent at 72% confidence** for a
+value it had applied.
+
+**The rule.** `foldValue` now canonicalises the spacing around a colon
+(`a:b`, `a :b`, `a : b` → `a: b`) and unifies the full-width `：` a Thai or CJK
+page draws, exactly as it has folded dash spacing and dash variants since the
+ec10 reruns.
+
+**Why a fold of this shape cannot loosen the page side.** `shownAs` bounds a
+spelling on anything that is not a letter or digit, so `:` is already a word
+boundary on both of its sides; normalising whitespace next to such a mark
+cannot move a single boundary, because no letter or digit is ever brought next
+to another and nothing but whitespace changes. The only way a punctuation fold
+could join two tokens into a value the page does not hold is a canonical form
+that **deletes** a space — so both canonical forms here keep one (` - `, `: `).
+The fold also makes a padded page answer exactly as an unpadded one, no looser:
+where the whole-word rule already conceded `Reimbursement: Employee` inside
+`Reimbursement: Employee/HR`, it now concedes it for the padded spelling too —
+the same concession, not a new one.
+
+**Weighed and left out** (the reasons are in the function's comment, so the
+next person does not re-derive them): `/` — the canonical `/` would delete a
+space, and `valueAppearsAnywhere` folds the whole tree into one line, so it
+could join two lines' tokens; the alternative ` / ` would break
+`valueSpellings`' `code - label` parse, whose code class holds `/`. Both sides
+of this case write the slash tight, so it costs nothing today. `,` and
+`(`/`)` — no observed padding, and both carry meaning the number and alias
+parses read. `;` — no observed case. `%` — a unit, not a separator; number and
+currency shaping is `src/engine/normalise.ts`' job and it already does it.
+
+**The duplicate normaliser, unedited.** `src/engine/normalise.ts` has its own
+`foldValue`, documented and pinned (`tests/engine-helpers.test.ts`, "foldValue
+is a superset of goal-evidence's") as a superset of this one. Its corpus holds
+no colon, so it is still green — but the superset claim is now false for a
+padded colon, and the execution plane's comparators (`expectText`,
+`expectValue`, the entry rung's read-back, the listbox pick's read-back) still
+score `Reimbursement : Employee/HR` against `Reimbursement: Employee/HR` as a
+mismatch. Same live bug, one plane over. Left to `src/engine/`.
+
+Pinned in `tests/goal-evidence.test.ts` ("a padded colon is the same value").
+
 ## The judge may not overrule a human record (S2)
 
 `runFlow`'s auto-review: when the sheet's own Actual Result (`generation.knownResult`) exists and the judge's ruling contradicts it, the ruling is withheld with the disagreement on `notes` and the run stays `needs-review` for a person. PL_04_08: a human passed the case by hand; the judge ruled "failed" at 0.9 on "still visible contradicts hidden" without asking whether "not shown" meant hidden, disabled or inert. A machine's confident reading of two strings does not outrank a tester's hands.
 
-Since 2026-08-31 the DEFAULT governor is deterministic (`RuleGovernorModel`,
-same `GovernorModel` seam, effectively unbudgeted): measured across two live
-suites, every LLM turn concluded `idle` while restating a set-intersection the
-scheduler had already computed. The rules: name a fully-conflicting blocked
-queue as a real conflict (once per distinct blockage), call out a compatible
-case that is not dispatching, and shrink the pool one step after 3
-timeout-shaped failures in 5 minutes (never below 2). `WOWLIDATOR_GOVERNOR=
-model` restores the LLM governor — its remaining unique power is judging and
-seeding a starved fixture (`db-write`); `off` disables both.
-
-## A dependency wait is the scheduler's; the governor explains it (2026-09-04, EC catalog run `ec-runtest-csv@…09-33-38`)
+## A dependency wait is the scheduler's (2026-09-04, EC catalog run `ec-runtest-csv@…09-33-38`)
 
 Read from the panel's job-16 log and its ledger (39 cases, 10 lanes). Two shapes
-of "depends on" refusal, neither the governor's:
+of "depends on" refusal, neither of them the scheduler's fault:
 
 - **PRB-EC-021 ← HIR-EC-064.** HIR-EC-064 ran in `[c31]`, its sign-in did not
   take (a runtime error, 22 s), and it was recorded `blocked`; PRB-EC-021
@@ -145,180 +210,6 @@ pure) is the whole rule — wait while a prerequisite queued ahead is unfinished
 ready when every one passed, blocked with the prerequisite's own outcome line
 otherwise (failed / review / never ran / could not run / not in this run /
 queued after it / a cycle) — and `runCases` only supplies its lookups. It is
-in the deterministic scheduler and not here because a dependent's verdict is
-correctness, and this module's governor is an optimiser that may be absent,
-off, erroring or out of budget without any verdict changing (the containment
-rule at the top of the governor section). The governor OBSERVES the gate:
-`GovernorCaseFact.waitingOn` carries the prerequisite a pending case is
-parked on (set from `dependencyStanding`, never inferred here), the WAITING
-prose line shows ` waits-for:X`, and the rules governor's queue-blocked rule
-says `"B" is waiting on prerequisite A, in flight in lane N` (or "queued
-ahead of it and not yet started" / "not yet queued") once per pair, keeps
-such cases out of the "looks compatible yet has not dispatched" diagnosis —
-which had misread every parked dependent as a scheduler fault — and answers
-idle when the whole queue is parked on prerequisites.
-
-**The queue defect this found.** `runQueue` dispatches in index order, and a
-dependent's `false` from `canRunWith` held the HEAD of the queue: a ten-lane
-pool drained to the one lane running the prerequisite while every case behind
-the dependent waited on nothing. `canRunWith` may now answer `'defer'` (what
-a dependency wait answers): the item is parked, the loop goes on, and parked
-items are re-offered before each take, whenever a lane ends while a streaming
-queue waits for its next authored row (the take races the lanes), and after
-close until none is left; an exclusive dependent is parked the same way
-instead of draining the pool to wait. A suite that never answers `'defer'`
-takes exactly the path it always did — pinned by `tests/case-plan.test.ts`
-("a suite that never answers defer takes the old path exactly"). The wait
-still counts toward the queue-blocked event (25 polls), so a long one reaches
-the governor and is explained rather than silent.
-
-Tests: `tests/case-plan.test.ts` (`runQueue parks a deferred item…`,
-`dependencyStanding…`, `dependencyCycles / dependsBackOn /
-unresolvedReferences…`), `tests/queue-governor.test.ts` (`the rules governor
-explains a dependency wait`). Live before/after on the EC catalog still to be
-recorded: the 09:33 run never hit the wait (HIR-EC-064 ended before PRB-EC-021
-was authored), so the number to watch on the next run is lanes in flight while
-a `waits for` line is open — previously 1, expected the pool size.
-
-## A readOnly run's finish is the answer, never a claim to refuse (2026-08-31)
-
-The observed-state finish settlement (`goalOutcome`/`outcomeShown`) is skipped
-when the run is `readOnly`: such a run cannot act, so refusing its finish to
-make it "set" the state burns a turn by construction — and the triage look's
-verdict travels IN its finish. Found live: the look's goal text parses as an
-outcome, the settlement refused the verdict once, and every `fail` verdict
-cost two model calls instead of one (tests/smoke.test.ts pins one call).
-
-## The model copies the tree's notation back as a selector (2026-09-02)
-
-`region "Dependents Dependents"`, `spinbutton "Day Day"`, `heading "National ID
-/ Tax ID"` — the AX tree's own line shape, handed back as a selector and read by
-Playwright as a CSS tag with a stray string. Live (ec10 HIR-EC-003) five such
-misses in a row ended a leg as a stall while the same model had written the
-correct `role=…[name=… i]` two turns earlier. `normaliseAgentSelector`
-(`src/engine/selector.ts`) rewrites the line to the role selector before the
-grounding guard sees it, in `LlmAgentModel.decide`, for the decision and every
-planned step alike — see the engine CLAUDE.md for the rule and its siblings.
-
-## A leg off its page has a small allowance (`wanderedOffPage`, `AGENT_OFF_PAGE_TURNS`, 2026-09-03)
-
-Live (HIR-EC-002, 2026-09-03 13:00 run): steps 16 "Reopen the saved New Hire"
-and 19 "Leave the New Hire form" burned 903 s of a 1,377 s case. Each leg left
-the step's page (/en/admin/hire/draft → /en/requests → on through the admin
-area) and every goto or click onto a fresh page was progress by the no-progress
-judge's own rule (`advanced`: an ok interaction, or a goto to an unvisited
-URL), so nothing but `DEFAULT_AGENT_MAX_STEPS` (60) ended them, at ~7 s a
-turn. The judge that should have fired did not exist: no rule distinguished a
-journey from a wander.
-
-`wanderedOffPage(goal, startUrl, url)` (`goal-evidence.ts`, pure): the page is
-on a different origin or path from the step's start (`differentPage` — a
-`?step=` change is the same page) **and** not at the destination the goal
-names (`goalDestination`/`atGoalDestination`; a goal naming none has nowhere
-off its page that counts). While that holds, the loop spends
-`AGENT_OFF_PAGE_TURNS` (8) — a turn counts when it moved the page again or only
-clicked; a turn that lands a **first-time form entry** (`FORM_ENTRY_ACTIONS`:
-fill, type, paste, selectOption, check, uncheck) off the page is free, because
-"open the form and fill it" legitimately lives off its start page for fifteen
-turns and a literal turn budget would cut a passing leg. Returning to the
-start page resets the allowance; a consent URL is the gate rung's to clear and
-is never counted (`CONSENT_GATE_URL_PATTERN`); arriving at a named destination
-still ends the leg by the destination rule before this one is consulted. Past
-the allowance the leg ends with `agent wandered: left the step's page … spent N
-turn(s) elsewhere … without reaching …`, naming the page it is on. Lifted to
-`AGENT_NO_PROGRESS_OFF_TURNS` when early-stop is off, like the other two
-judges (`#offPageTurns`). Why it cannot slow a passing leg: a journey to a
-named destination is two to four page moves and arrives before the eighth; a
-leg whose work is on one other page pays nothing for the entries. Tests:
-`tests/goal-evidence.test.ts` (`wanderedOffPage`), `tests/agent-guards.test.ts`
-(the constant's place among the ceilings). Measured on the HIR-EC-002
-benchmark (`e2e-02/02-…flow.json`, 2026-09-03 12:59 UTC, both rails, agent on
-opus): 558 s / 56 agent requests / 1.03M in-tokens / agent 296 s, longest
-leg 57 s — against the 13:00 run's 1,377 s / 182 requests / 3.55M / 1,188 s
-with steps 16 and 19 at 425 s and 478 s. The former wanderers (now steps 18
-and 20) ended in 56 s and 38 s by the agent's own `unreachable`; the
-allowance's stop message itself did not fire on either benchmark, and on ec09
-HIR-EC-009 (job-3, 12:39 UTC) no leg wandered at all.
-
-## The same control on the same page is not progress (`reactivation`, 2026-09-03)
-
-Live twice in one day. ec09 HIR-EC-009 job-3 leg [14]: 320 s / ~60 turns
-re-clicking section headers on one wizard page — every click ok, every ok
-click resetting the no-progress judge, and `repeatedToggleClick` (three per
-selector, whole run) worth thirty-six free turns across a dozen headers. Then
-job-2, the Position / Employee Sub-Group picker: 122 agent requests and 18
-minutes of ok `fill` into `role=textbox[name="Search options" i]` with a
-different search string each time ("40106337", "401063", "MKB12.12", "",
-"4010", …), between failed `selectOption`s on the button and ok re-clicks of
-it. The judge saw an ok interaction on every turn.
-
-`reactivation(decision, url, activatedHere)` (`agent-guards.ts`, pure) reads an
-ok activation (`ACTIVATION_ACTIONS`: click, press, hover, check, uncheck, fill,
-type, paste, selectOption) against the selectors already ok-activated **on
-that URL this leg** (`activationKey`; a miss records nothing, and the same
-selector on another page is a new control): `first`, `repeat` (a click-shaped
-re-activation), or `text-again` (another fill/type/paste into the same field).
-`reactivationAdvanced(kind, treeChanged)`: `first` is progress as before;
-`repeat` is progress **only if the full tree changed after it** — the loop
-re-reads the tree for that case alone and charges the credit to
-`AGENT_TREE_CHANGE_CREDITS`, shared with the scroll/wait looks, so a control
-that toggles forever still ends the leg; `text-again` is **never** progress,
-because the typed value is echoed into the tree's `value=` and would pass a
-change test on its own evidence (the picker's six strings would each have
-been credited). A turn not credited for this reason tells the model so in the
-history. `repeatedToggleClick` is untouched — it refuses the fourth activation
-outright; this rule only decides whether an ok one counted. Why it cannot slow
-a passing leg: a multi-select re-opened once per pick changes the tree and is
-credited; a search box used twice has a pick between the fills, and the pick
-is `first`. Tests: `tests/agent-guards.test.ts` (`reactivation`, with both
-legs' action sequences as fixtures). Measured on ec09 HIR-EC-009 (panel
-job-3, 2026-09-03 12:39 UTC, agent on opus): case 533 s / 55 agent calls /
-1.43M in-tokens, agent time 262 s, the five workflow legs 14–77 s each and
-every one ended by the agent's own honest `unreachable` — against the morning
-run's 1,090 s / 122 calls / 3.4M in / 763 s agent time (old prompt, old
-loop). The stall message itself never fired: the history note handed back
-on a re-activation was enough for the model to stop hunting. Job-2 in between
-(new prompt, old loop) had cut leg [14] to 40 s but was at 122 requests on
-the Position picker when it was interrupted.
-
-## The agent runs as whoever is active (2026-09-03)
-
-`SmartRunner.workflow` hands the agent `this.page`, and `page` is a view of the active `PersonaSession` — so after `signIn MANAGER_ACCOUNT` the leg runs in the manager's own Chrome, and the step's record carries `persona` and `browser`. Nothing in the loop changed; OA-15 stands: a goal naming two people is still refused, and the authored form is two legs with a `signIn` between them.
-
-## Two people, one address (2026-09-04)
-
-Two corrections to the loop, both from the same case shape: a catalog row that
-changes hands — the manager submits a probation review, the approver approves
-the same case — where both legs start on the same URL with near-identical goal
-wording.
-
-**The replay memory is keyed by persona.** `replayKey(startUrl, goal, persona)`
-takes the active persona's LABEL, fed from `RunOptions.persona`, which the
-runner supplies from `activePersona` at every `#agent.run` call site that passes
-`memory` (the `workflow` step, the entry rung, the heal pass). Without it the
-second leg replays the first person's recorded journey on the second person's
-browser, at zero model turns, and reports success — the very hazard
-`#deadResolutions` was already keyed by persona to avoid, its comment saying so
-outright: *an employee's 403 page and the manager's real page share a URL and
-nothing else*. The agent's memory had not been given the same treatment.
-
-The label is used for the key and for nothing else. It is never put in a
-prompt, never offered to the model, and carries no email and no password — the
-agent has no sign-in verb and no credentials by design, and this must not
-become the hole in that. A run with no personas passes `undefined` and its keys
-are byte-identical to before, so no cache entry written earlier is orphaned.
-The trade is deliberate: on a multi-persona run a leg that could have replayed
-another person's journey now pays the model instead. Correctness over a saved
-turn, and only where two people are actually involved.
-
-**A refused goal is an authoring fault, not a broken feature.**
-`multiPersonaSummary`'s `multi-persona goal:` prefix was declared to be "the
-protocol `run-cases` reads so it can file this as an authoring refusal" and had
-no reader anywhere in `src/`. The refused leg fell through to the ordinary
-failed-leg path and became `functional` / `high`, "Workflow goal not reached" —
-a fact about how the goal was worded, filed as a defect in the application under
-test. `personaRefusal(summary)` in `goal-evidence.ts` is the reader; the runner
-branches on it beside the provider refusal, records the step `error`, files **no
-defect**, and throws a message naming the fix. Like `agentModelUnavailable`, it
-can only be true of a summary produced by a return that happens before turn 1,
-so it can never change the outcome of a leg that actually ran.
+in the deterministic scheduler because a dependent's verdict is correctness,
+and nothing advisory has ever been allowed to move it — a rule that outlived
+the queue governor that first made it necessary.

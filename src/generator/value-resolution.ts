@@ -225,6 +225,7 @@ interface CompiledVocabulary {
 function compileVocabulary(v: Vocabulary): CompiledVocabulary {
   const d = v.dates;
   const f = v.formatWords;
+  const dateNoun = `(?:${alternation(d.dateNouns, escape)}\\s*)?`;
   const monthWord = `(${alternation([...d.thisMonth, ...d.nextMonth, ...d.previousMonth], escape)})`;
   const unit = alternation([...d.units.day, ...d.units.week, ...d.units.month, ...d.units.year]);
   const ageOp = alternation([...d.ageUnder, ...d.ageOver, ...d.ageAtLeast, ...d.ageAtMost, ...d.ageExact], symbolOrWord);
@@ -257,6 +258,7 @@ function compileVocabulary(v: Vocabulary): CompiledVocabulary {
       under: new RegExp(alternation(f.under, symbolOrWord), 'iu'),
     },
     date: {
+      // Optional, non-capturing: `(?:วันที่|วัน|date)\s*`
       today: new RegExp(`^${alternation(d.today)}`, 'iu'),
       tomorrow: new RegExp(`^${alternation(d.tomorrow)}`, 'iu'),
       yesterday: new RegExp(`^${alternation(d.yesterday)}`, 'iu'),
@@ -266,8 +268,12 @@ function compileVocabulary(v: Vocabulary): CompiledVocabulary {
       thisMonth: new RegExp(`^${alternation(d.thisMonth, escape)}$`, 'iu'),
       nextMonth: new RegExp(`^${alternation(d.nextMonth, escape)}$`, 'iu'),
       previousMonth: new RegExp(`^${alternation(d.previousMonth, escape)}$`, 'iu'),
-      before: new RegExp(`^${alternation(d.before, relationWord)}\\s*`, 'iu'),
-      after: new RegExp(`^${alternation(d.after, relationWord)}\\s*`, 'iu'),
+      // A relation may be preceded by the word for "date" itself
+      // (`วันที่ก่อน Hire Date` = `วันที่` + `ก่อน`). Optional, and it consumes
+      // nothing on its own: what follows must still be a relation WORD, so
+      // `วันที่ 20` — a bare day — is untouched and parses as it always did.
+      before: new RegExp(`^${dateNoun}${alternation(d.before, relationWord)}\\s*`, 'iu'),
+      after: new RegExp(`^${dateNoun}${alternation(d.after, relationWord)}\\s*`, 'iu'),
       atClause: new RegExp(`(?:^|\\s)${alternation(d.at)}\\s*([\\p{L}\\p{M}\\p{N} /().'*-]+?)(?=\\s*(?:${ageOp}|\\d)|\\s*$)`, 'iu'),
       prefix: new RegExp(`^${alternation(d.prefixes)}\\s*`, 'iu'),
       exactTail: new RegExp(`\\s*${alternation(d.exact)}\\s*$`, 'iu'),
@@ -299,7 +305,7 @@ function compileVocabulary(v: Vocabulary): CompiledVocabulary {
       phraseShapes: [
         new RegExp(`^${alternation([...d.today, ...d.tomorrow, ...d.yesterday, ...d.future, ...d.past])}`, 'iu'),
         new RegExp(`^${alternation(d.prefixes)}`, 'iu'),
-        new RegExp(`^${alternation([...d.before, ...d.after], relationWord)}\\s*\\S`, 'iu'),
+        new RegExp(`^${dateNoun}${alternation([...d.before, ...d.after], relationWord)}\\s*\\S`, 'iu'),
         new RegExp(`^${alternation(d.back)}`, 'iu'),
         new RegExp(`(?:^|\\s)${alternation(d.at)}\\s`, 'iu'),
         /วันนี้|วันถัดไป|วันพรุ่งนี้|พรุ่งนี้|เมื่อวาน|วันที่ปัจจุบัน|ย้อนหลัง|วันก่อน|ล่วงหน้า|ของเดือน|สิ้นเดือน|ต้นเดือน|วันสุดท้าย|วันแรก|ของปี|อายุ/u,
@@ -1164,6 +1170,23 @@ export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 
   const forwardRe = alternation(VOCABULARY.dates.forward);
 
   // --- relation: one day before or after the base
+  //
+  // The amount may be written on either side of the relation word, and the
+  // two orders are the same claim: English fronts it (`2 weeks after Hire
+  // Date`), Thai trails it (`ก่อน Hire Date 1 ปี`). Only the trailing order
+  // parsed, so every fronted phrase resolved to nothing at all. A leading
+  // amount is consumed here only when a relation word actually follows it —
+  // the lookahead leaves that word for the matcher below — so a phrase that
+  // merely starts with a quantity (`3 วันก่อน`, an offset in its own right)
+  // is untouched.
+  const relationAhead = `(?:${alternation(VOCABULARY.dates.dateNouns, escape)}\\s*)?${alternation(
+    [...VOCABULARY.dates.before, ...VOCABULARY.dates.after],
+    relationWord,
+  )}`;
+  let lead: { amount: number; unit: string } | null = null;
+  const led = take(new RegExp(`^(\\d+)\\s*(${unitRe})\\s+(?=${relationAhead})`, 'iu'));
+  if (led) lead = { amount: Number(led[1]), unit: led[2]! };
+
   let relation = 0;
   if (take(R.date.before)) relation = -1;
   else if (take(R.date.after)) relation = 1;
@@ -1242,9 +1265,13 @@ export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 
   // --- offsets, any number, in order
   let date = base;
   let o: RegExpExecArray | null;
-  if (relation !== 0 && (o = take(new RegExp(`^(\\d+)\\s*(${unitRe})(?=\\s|$)`, 'iu')))) {
-    // `วันที่ก่อน Hire Date 1 ปี`, `2 weeks after Today`: the relation names
-    // the direction and the amount follows the base.
+  if (relation !== 0 && lead !== null) {
+    // `2 weeks after Hire Date`: the amount was written before the relation.
+    date = applyOffset(base, relation, lead.amount, lead.unit);
+    notes.push(`${relation < 0 ? 'minus' : 'plus'} ${lead.amount} ${lead.unit}`);
+  } else if (relation !== 0 && (o = take(new RegExp(`^(\\d+)\\s*(${unitRe})(?=\\s|$)`, 'iu')))) {
+    // `วันที่ก่อน Hire Date 1 ปี`: the relation names the direction and the
+    // amount follows the base.
     date = applyOffset(base, relation, Number(o[1]), o[2]!);
     notes.push(`${relation < 0 ? 'minus' : 'plus'} ${o[1]} ${o[2]}`);
   } else if (relation !== 0) {
@@ -1262,7 +1289,18 @@ export function resolveDatePhrase(phrase: string, env: DateEnvironment, depth = 
       date = applyOffset(date, 1, Number(o[1]), o[2]!);
     } else if (take(/^(?:และ|and)\b/iu)) {
       continue;
-    } else if (gap && text.split(/\s+/).length >= 2 && !/[+\-−]\s*\d/.test(text) && !new RegExp(`^(?:${backRe}|${forwardRe})`, 'iu').test(text)) {
+    } else if (
+      gap &&
+      text.split(/\s+/).length >= 2 &&
+      // An offset's sign stands on its own: it opens the remark or follows a
+      // space. A sign GLUED to a word is part of that word — `E2E-41` is a
+      // case id, and reading its `-41` as "minus 41 days" rejected the whole
+      // phrase, so `14 เมษายน รันคู่กับ E2E-41` resolved to nothing rather
+      // than to 14 April with the remark set aside. Same rule `relationWord`
+      // already applies to `<`, and for the same reason.
+      !/(?:^|\s)[+\-−]\s*\d/.test(text) &&
+      !new RegExp(`^(?:${backRe}|${forwardRe})`, 'iu').test(text)
+    ) {
       // A complete date followed by words that are not an offset — `14 เมษายน
       // รันคู่กับ E2E-41` — is a date with a remark; the remark is set aside.
       // One trailing word (`ถึงสิ้นเดือน`, a range) is not understood, and
@@ -1426,21 +1464,98 @@ export async function fromRepo(need: ValueNeed, ctx: ValueResolutionContext): Pr
   return { need, value, source: { kind: 'repo', detail: `from the documents/repository: ${answer.evidence.slice(0, 120) || value}` } };
 }
 
-/** `schema.table` or `table` → the introspected table, case-insensitively. */
-function tableIn(schema: DbSchema, name: string): DbSchema['tables'][number] | null {
+/**
+ * What a table name the model wrote resolves to in the introspected schema.
+ * `ambiguous` is a deliberate outcome, not an error path — see `resolveTableIn`.
+ */
+export type TableResolution =
+  | { kind: 'found'; table: DbSchema['tables'][number] }
+  | { kind: 'ambiguous'; candidates: string[] }
+  | { kind: 'undeclared' };
+
+/**
+ * `schema.table` or `table` → the introspected table, case-insensitively, in
+ * BOTH directions — because both spellings are the harness's own.
+ *
+ * Live (2026-09-11, run `be-sit-high-opus-th-20260911-174323`, case PL_09_01):
+ * `DbClient.introspect` spells a table of `current_schema()` bare and every
+ * other table `schema.table` (`qualifiedName`, `src/db/client.ts`), so a DSN
+ * carrying `options=-csearch_path=benefit_management,public` returns
+ * `benefit_plan` — while the authoring inventory shows the model
+ * `benefit_management.benefit_plan`, the spelling the context graph holds
+ * because that schema was indexed from a `.sql` file. The model named the
+ * table the way the prompt spelled it, the old one-directional fallback
+ * (bare want → qualified entry) resolved to null, `fromDb` threw "the schema
+ * does not declare", the fixture went unproven and the row sealed `blocked`.
+ *
+ * Precedence is ordered and total: exact, then bare-want against a qualified
+ * entry, then qualified-want against a bare entry. Each tier is judged before
+ * the next is consulted, so widening the match can never move a name that
+ * already resolved.
+ */
+export function resolveTableIn(schema: DbSchema, name: string): TableResolution {
   const want = name.trim().toLowerCase();
-  return (
-    schema.tables.find((t) => t.name.toLowerCase() === want) ??
-    schema.tables.find((t) => t.name.toLowerCase().endsWith(`.${want}`)) ??
-    null
-  );
+
+  const exact = schema.tables.find((t) => t.name.toLowerCase() === want);
+  if (exact !== undefined) return { kind: 'found', table: exact };
+
+  // The model named a bare table the introspection qualified. **Ambiguity is
+  // refused, never resolved by position**: `public.benefit_plan` and
+  // `benefit_management.benefit_plan` are different tables, and reading a real
+  // value off whichever the introspection listed first would produce a lookup
+  // that LOOKS grounded — strictly worse than the miss this function was
+  // widened to fix, since nothing downstream can tell the two apart.
+  const qualified = schema.tables.filter((t) => t.name.toLowerCase().endsWith(`.${want}`));
+  if (qualified.length > 1) return { kind: 'ambiguous', candidates: qualified.map((t) => t.name) };
+  if (qualified[0] !== undefined) return { kind: 'found', table: qualified[0] };
+
+  // The model named a qualified table the introspection spelled bare — the
+  // PL_09_01 direction. A bare entry means "in `current_schema()`", which
+  // `DbSchema` does not carry, so the prefix is judged by the introspection's
+  // OWN usage: a schema prefix it writes anywhere is one it would have written
+  // here too, and the table really is undeclared then. Only a prefix it never
+  // writes can be the current schema whose tables it left bare. So on the live
+  // connection `benefit_management.benefit_plan` finds `benefit_plan` (no
+  // entry is spelled `benefit_management.`), while `public.benefit_plan` stays
+  // undeclared (`public.` is spelled out all over the same schema).
+  const dot = want.lastIndexOf('.');
+  const prefix = want.slice(0, dot + 1);
+  const bare = want.slice(dot + 1);
+  if (dot > 0 && !schema.tables.some((t) => t.name.toLowerCase().startsWith(prefix))) {
+    const unqualified = schema.tables.find((t) => t.name.toLowerCase() === bare);
+    if (unqualified !== undefined) return { kind: 'found', table: unqualified };
+  }
+
+  return { kind: 'undeclared' };
 }
 
-function qualifiedIdent(table: string): string {
+/** The resolution as the callers before it existed read it. Shared with `step-evidence.ts`. */
+export function tableIn(schema: DbSchema, name: string): DbSchema['tables'][number] | null {
+  const resolved = resolveTableIn(schema, name);
+  return resolved.kind === 'found' ? resolved.table : null;
+}
+
+/**
+ * The one wording for a table that did not resolve — `fromDb` here and
+ * `fromDatabase` in `step-evidence.ts` both throw it, so a reader of either
+ * log line is told the same thing about the same fact. The undeclared
+ * sentence is verbatim what both threw before this existed.
+ */
+export function tableLookupFailure(name: string, resolved: Exclude<TableResolution, { kind: 'found' }>): string {
+  if (resolved.kind === 'ambiguous') {
+    return (
+      `the model named table "${name}", which ${resolved.candidates.length} schemas declare ` +
+      `(${resolved.candidates.join(', ')}) — name it with the schema it means`
+    );
+  }
+  return `the model named table "${name}", which the schema does not declare`;
+}
+
+export function qualifiedIdent(table: string): string {
   return table.split('.').map(quoteIdent).join('.');
 }
 
-function schemaSummary(schema: DbSchema): string {
+export function schemaSummary(schema: DbSchema): string {
   return schema.tables
     .slice(0, 80)
     .map((t) => `${t.name}(${t.columns.map((c) => c.name).slice(0, 30).join(', ')})`)
@@ -1511,8 +1626,9 @@ export async function fromDb(need: ValueNeed, ctx: ValueResolutionContext): Prom
   const schema = await client.introspect();
   const choice = await ctx.model.chooseDbLookup({ field: need.field, token: need.token, caseText: ctx.caseText.slice(0, 3000), schema: schemaSummary(schema) });
   if (choice === null) return null;
-  const table = tableIn(schema, choice.table);
-  if (table === null) throw new Error(`the model named table "${choice.table}", which the schema does not declare`);
+  const resolved = resolveTableIn(schema, choice.table);
+  if (resolved.kind !== 'found') throw new Error(tableLookupFailure(choice.table, resolved));
+  const table = resolved.table;
   const columns = new Set(table.columns.map((c) => c.name.toLowerCase()));
   const column = table.columns.find((c) => c.name.toLowerCase() === choice.column.trim().toLowerCase());
   if (column === undefined) throw new Error(`the model named column "${choice.column}" on ${table.name}, which the schema does not declare`);

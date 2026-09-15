@@ -269,3 +269,59 @@ describe('the re-ask note carries the parser\'s own complaint', () => {
     assert.match(second, /not valid JSON \(parser: /);
   });
 });
+
+/**
+ * An open circuit is a judgement about the answers that opened it, never
+ * about the row in front of it now.
+ *
+ * 2026-09-11: an EC catalog put 138 rows into the ledger as
+ * `authoringRefused: 1` on one open `generator@claude-cli:sonnet` circuit.
+ * Not one of them had a call spent on it — the breaker refuses before the
+ * model is reached — and a second resume would have retired every one of
+ * them past `AUTHORING_REFUSAL_CAP`, unreachable without `--rerun-errors`.
+ * The refusal cap is for a row whose OWN re-ask budget was exhausted.
+ */
+describe('a row the open circuit turned away keeps its place', () => {
+  const request = {
+    modelLabel: 'mock:broken',
+    schema: Suite,
+    system: 'You write tests.',
+    prompt: 'Write one.',
+    task: 'generator',
+  };
+  /** Well-formed JSON the schema rejects — the shape 373/373 live failures took. */
+  const offSchema = () => jsonModel('broken', { name: 7, steps: 'nope' }, { inputTokens: 1, outputTokens: 1 });
+
+  it('charges the rows whose own budget was exhausted, and spares the rest', async () => {
+    resetStructuredBreaker();
+
+    // The two cycles that open the circuit: each spends its full re-ask
+    // budget, so each earned its refusal and must count against the row.
+    for (const cycle of [1, 2]) {
+      const model = offSchema();
+      await assert.rejects(generateStructured({ ...request, model }), (error: Error) => {
+        assert.equal(
+          (error as { providerRefused?: boolean }).providerRefused,
+          false,
+          `cycle ${cycle} answered and was rejected — that IS a judgement about the row`,
+        );
+        return true;
+      });
+      assert.equal(callsTo(model), 3, 'a cycle is the whole re-ask budget');
+    }
+
+    // The row after: refused without a call, so it says nothing about the row.
+    const spared = offSchema();
+    await assert.rejects(generateStructured({ ...request, model: spared }), (error: Error) => {
+      assert.match(error.message, /circuit is open/);
+      assert.equal(error.name, 'StructuredOutputUnavailableError');
+      assert.equal(
+        (error as { providerRefused?: boolean }).providerRefused,
+        true,
+        'a row the breaker turned away was never asked — it must keep its place for a resume',
+      );
+      return true;
+    });
+    assert.equal(callsTo(spared), 0, 'the breaker refuses before the model is reached');
+  });
+});

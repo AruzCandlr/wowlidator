@@ -293,6 +293,51 @@ const ENGINE_PREFIX = /^\s*(role|text|css|xpath|id|data-testid|internal:[a-z-]+)
  * engine does not accept — so a caller can tell "unchanged" from "rewritten"
  * without comparing strings.
  */
+/**
+ * A line of the accessibility tree pasted in as a selector (2026-09-09).
+ *
+ * The tree prints a node as `<role> "<name>"` — `dialog "Insert new changes
+ * for Benefit: QA-Import"`, `button "Insert"`, `tab "History"` — and an author
+ * that has just been handed a tree writes that shape back out as if it were a
+ * locator. It is not one, in any engine: Playwright reads it as CSS, where a
+ * bare quoted string after a tag is a syntax error, so the selector cannot
+ * match anything ever.
+ *
+ * The failure that produced this is the worst kind — a FALSE claim about a
+ * working application. Live, be-high-ctx PL_08_01 (2026-09-09): the flow
+ * clicked Insert, the app opened the dialog titled "Insert new changes for
+ * Benefit: QA-Import" exactly as the case required, and step 12 asserted
+ * `dialog "Insert New Changes for Benefit: QA-Import"`. It spent 35.6 s and
+ * reported `not visible (hidden or absent)` about a dialog filling the screen,
+ * and the case was filed as a dead end against the application.
+ *
+ * `fromTreeNotation` in the authoring plane already rewrites the BRACKETED
+ * mistakes (`StaticText[text="…"]`, `role=link[url="…"]`); this is the same
+ * move for the tree's plainest form, which had no bracket to catch it.
+ *
+ * Why it cannot make a selector worse: the input shape is invalid by
+ * construction — nothing that matches `<token> "<quoted>"` is a selector any
+ * engine resolves — and the rewrite only fires when the token is a REAL ARIA
+ * role (`ARIA_ROLES`, the W3C set already used by `qualifyBareRole`), so a
+ * CSS selector cannot be swept in. `StaticText` is the tree's word for a text
+ * node and is not a role, so it becomes the text engine's own form. Returns
+ * null when the selector is not tree notation.
+ */
+export function fromTreeLine(selector: string): string | null {
+  const m = /^\s*([A-Za-z]+)\s+"([^"]+)"\s*$/.exec(selector);
+  if (m === null) return null;
+  const token = m[1]!;
+  const name = m[2]!;
+  // The tree's own word for a text node — not an ARIA role, so the text
+  // engine's form is the honest translation.
+  if (token === 'StaticText') return `text="${name}"`;
+  if (!ARIA_ROLES.has(token.toLowerCase())) return null;
+  // Case-insensitive: the tree's rendering and the sheet's capitalisation
+  // disagree constantly ("Insert New Changes" against the page's "Insert new
+  // changes"), and an accessible name is matched whole either way.
+  return `role=${token.toLowerCase()}[name="${name}" i]`;
+}
+
 export function qualifyBareRole(selector: string): string | null {
   const trimmed = selector.trim();
   if (trimmed === '' || ENGINE_PREFIX.test(trimmed)) return null;

@@ -67,7 +67,7 @@ Two things in `proofs.ts` exist because a bundle is big:
 
 Two mechanisms, deliberately kept separate because confusing them would make the page lie.
 
-**Rotation happens by itself, inside a run, and predates wowUI.** `LlmFactory.callWithFailover` walks a provider's configured keys (`GROQ_API_KEY=key1,key2`) whenever a call fails in a way that looks like the *key* — auth, quota, rate limit, per `isKeyExhaustedError` — and stays on whichever answered. The move is **sticky and shared across every role on that provider**, so a healer and a data role pointed at the same exhausted Google key do not independently rediscover it, and the cursor advances *before* the retry so a concurrent call does not either. A failure that is not about the key never rotates: spending a second key on a call that was never going to succeed would waste it and hide which model actually failed. Every move is written to stderr, so it lands in the run's output and is visible in wowUI's run drawer.
+**Rotation happens by itself, inside a run, and predates wowUI.** `LlmFactory.callWithFailover` walks a provider's configured keys (`GROQ_API_KEY=key1,key2`) whenever a call fails in a way that looks like the *key* — auth, quota, rate limit, per `isKeyExhaustedError` — and stays on whichever answered. The move is **sticky and shared across every role on that provider**, so a healer and an agent role pointed at the same exhausted Google key do not independently rediscover it, and the cursor advances *before* the retry so a concurrent call does not either. A failure that is not about the key never rotates: spending a second key on a call that was never going to succeed would waste it and hide which model actually failed. Every move is written to stderr, so it lands in the run's output and is visible in wowUI's run drawer.
 
 **`ui/keys.ts` is the other half: where a run *starts*.** Three rules:
 
@@ -155,7 +155,7 @@ repeatable `--rerun-case` flag the catalog-run spec declares.
 
 The Machinery card carries a **Run gates** block: scenario gate
 (`WOWLIDATOR_SCENARIO_GATE`, new — off lets every row author as fast as the
-pool allows), data sections, queue governor, pre-run risk judge, system-error
+pool allows), data sections, pre-run risk judge, system-error
 diagnosis, auto-review judge. One mechanism, the `persistUsageCap` pattern: a
 flip writes `.env` AND `process.env`, so the NEXT spawned job inherits it — a
 suite in flight keeps the gates it launched with, and the card says so. The
@@ -503,6 +503,29 @@ the global `no-hardcode` scan; `tests/ledger-ui.test.ts` adds `accountPicker`,
 `rememberedAccounts`, `personaLabelKey` and `loadPersonaAccounts` to the
 ships-unchanged composition list.
 
+## Publishing a report as an artifact (`POST /api/publish-artifact`, 2026-09-08)
+
+The per-case report's own **publish to artifact** button asks the panel to
+publish it. The page cannot start a Claude session, and the panel is also the
+only place that can decide whether the path it was handed is one this UI may
+read — so the route does both. The logic lives in
+`reporter/publish-artifact.ts`; the route is the boundary.
+
+`reportPath` arrives from a page, so it is a request and never a permission: it
+is resolved against `CATALOG_REPORT_DIR` when relative (the shape
+`/reports/<name>` sends), then checked with `isAllowed` against the same roots
+every other read here uses, then `stat`ed. The same rule as `/view`, applied to
+a path a button produced.
+
+**It approves no upload.** The spawned session raises Claude Code's own publish
+prompt, and the route's answer says so: the button reports "approve it in the
+Claude session" with the `claude attach <id>` to get there. The panel starting a
+publish and a person allowing it are two separate acts, deliberately.
+
+The route returns as soon as the session is backgrounded — the publish then
+waits on a human, and holding an HTTP request open for that is how a panel route
+becomes a hung tab.
+
 ## The console reads the output; it does not rewrite it (2026-09-04)
 
 **Surface:** both pages — the command-output section under a live job row and
@@ -590,3 +613,87 @@ stderr marker, the glyph colours, the sticky label, the fold and the list, the
 guarded `localStorage` reads and writes, Copy raw, the `[hidden]` rule and
 `conApplyAll` re-reading views in place; `tests/ledger-ui.test.ts` pins the
 same composition on `/` so the guarantee does not leave with `/wow`.
+
+## The catalog form names the case page's language (2026-09-10)
+
+Two advanced fields on `catalog-run`, grouped under Output on the Ledger page: `report-lang` (enum `en`|`th`, the CLI's `--report-lang`) and `no-case-narrative` (the CLI's `--no-case-narrative`). Both are plain flags the whitelist already declares; the panel states the choice and the CLI records it on the ledger's launch block, so a resume or a `wowlidator report` rebuild started from the panel writes each case's own page (`src/reporter/case-page.ts`, linked from the case's name in the catalog report) in the language the run chose. The page and its four DB sidecars sit flat in `<runKey slug>-media/`, two path levels under the reports folder, which is exactly what the `/reports/` route serves.
+
+## The live monitor at `/monitor` (`src/ui/monitor.ts`, 2026-09-11)
+
+The `/wowlidate` skill's monitor page, served by the panel. Two entry points,
+one surface: the page is **the same file** (`.claude/skills/wowlidate/monitor/
+index.html`, read from disk), and its state comes from **the same projector**
+(`src/monitor/run-state.ts`) the skill's `watch.mjs` imports rather than
+duplicating. A panel that drew its own version of this would be a second thing
+to keep true about a run, and the first symptom of the drift would be two
+monitors disagreeing about one catalog.
+
+- `GET /monitor` serves the page with its one state tag re-pointed
+  (`'run-state.js?t=' + Date.now()` → `'/monitor/run-state.js?…t=' + Date.now()`).
+  Nothing else about the page changes — its timer, its byte-offset log
+  bookkeeping and its filters are the page's own.
+- `GET /monitor/run-state.js` answers JS, not JSON, because the same file has
+  to load from a `file://` page in a run folder where a fetch of a sibling is
+  blocked and a `<script src>` is not.
+- **`?ledger=` is a request, never a permission.** The path is matched against
+  what `listCatalogRuns` itself discovered; anything else falls back to the
+  newest run. The same "make the question not arise" shape as addressing a
+  proof by `runId`.
+- **View-only, by construction.** Both routes are GETs that read. There is no
+  control on the page, and none here, that can touch a run — which is what
+  makes it safe to leave open on a second screen for five hours.
+
+`catalogRunRoots` gained `<report-dir>/runs/<slug>-<stamp>/catalogs` for this:
+a run launched by the skill keeps its ledger inside its own folder, so the
+panel had listed nothing for it and Continue, Rerun and the monitor were all
+blind to a run the terminal could see perfectly well.
+
+The page's **API providers** card is fed by the same projector: calls and
+refusals today, the split by provider and role, the last calls with any
+refusal's own words, and the providers dispatch is held for. It renders only
+when the API usage ledger has something to say, so a `claude-*` run does not
+grow an empty card — see `src/providers/CLAUDE.md`.
+
+## The proof card shows a summary of the run notes, not the notes (2026-09-11)
+
+**Surface:** both pages — `notesBlock(bundle)` in `WOW_SCRIPT`
+(`wow-ui-html.ts`), drawn under the checks table on a proof card and in the
+run-timeline detail. Ledger redeclares nothing here, so the change lands on
+`/` and `/wow` at once.
+
+The block used to draw everything the run wrote onto `bundle.notes`,
+verbatim: the session note, the sign-in POST evidence, the pre-run risk line,
+a cross-case interference stamp and the full system-error diagnosis with the
+agent's click trail and its suggested fix — about 300 words for one case, and
+so nobody read them. It now renders **`bundle.narrative.verifierNote`**, the
+model-written summary of those same notes (at most 70 words, in the run's
+report language, written by `generator/case-narrative.ts` with no extra model
+call), **attributed** — "Written by `<narrative.by>` from this run's notes …
+it explains; it decides nothing" — the same way `reviewBlock` attributes an
+automatic ruling. The verbatim notes are DROPPED from the rendered surface:
+not folded, not in a tooltip. They stay in the proof-bundle JSON, which is one
+click away as Raw proof.
+
+**The verbatim fallback stays and is not dead code.** `--no-case-narrative`,
+`WOWLIDATOR_CASE_NARRATIVE=off` and a role with no key each produce a bundle
+that has notes and no narrative; drawing nothing there would delete the only
+evidence the reader has. So: summary when the note is non-empty, the verbatim
+lines unattributed when it is not, `null` when there is neither. An empty or
+whitespace `verifierNote` is "nothing to say", never a blank summary.
+
+`narrative` already reached the page — no widening was needed. `readBundle`
+caches the raw `JSON.parse` result (`parseProofBundle` is a loose schema and
+`parseArtifact` hands back the ORIGINAL value), and `GET /api/proofs/<runId>`
+answers `{ proof, verdict }` with the whole bundle, which the client stores as
+`S.bundles[runId]`. Only the LIST projection (`toCard`) narrows, and the
+notes block is never drawn from a card.
+
+The same rule is applied by the reporter surfaces from a TypeScript
+projection. `notesBlock` is client script composed into a string and cannot
+import it, so the two are kept in agreement by hand and both say so at the
+site. Tests: `tests/wow-ui.test.ts` ("the run-notes block on a proof card" —
+the shipped function is extracted from the page string and evaluated with
+`el()` stubbed, asserting the attributed summary, that no verbatim note is
+drawn beside it, the fallback, the empty-note case and both `null` cases);
+`tests/ledger-ui.test.ts` adds `notesBlock` to the ships-unchanged
+composition list.

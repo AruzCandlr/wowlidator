@@ -25,7 +25,6 @@ import { describe, it } from 'node:test';
 
 import { LlmHealerModel } from '../src/healer/jit-healer.js';
 import { LlmAgentModel } from '../src/orchestrator/workflow-agent.js';
-import { LlmDataModel } from '../src/data/data-model.js';
 import { jsonModel } from './helpers.js';
 
 /** Every prompt the mock saw, flattened to searchable text. */
@@ -93,25 +92,4 @@ describe('role calls are stateless', () => {
     }
   });
 
-  it('a second data value is generated with no memory of the first field', async () => {
-    const model = jsonModel(
-      'mock-data',
-      { value: 'EMP-0099', reasoning: 'r' },
-      { inputTokens: 10, outputTokens: 5 },
-    );
-    const data = new LlmDataModel({ model, id: 'mock:data' });
-
-    await data.generate({
-      description: 'FIRST-FIELD-MARKER employee id',
-      attempt: 2,
-      previousValue: 'PREV-VALUE-GHOST',
-      observedError: 'CONFLICT-GHOST already exists',
-    });
-    await data.generate({ description: 'a SKU', attempt: 1 });
-
-    const second = promptTexts(model)[1]!;
-    for (const residue of ['FIRST-FIELD-MARKER', 'PREV-VALUE-GHOST', 'CONFLICT-GHOST']) {
-      assert.ok(!second.includes(residue), `second data prompt leaked "${residue}"`);
-    }
-  });
 });

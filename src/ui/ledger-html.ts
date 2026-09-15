@@ -129,6 +129,8 @@ body { background: var(--bg); }
   padding: 0 var(--s5); background: var(--panel); border-bottom: 1px solid var(--line);
 }
 .topbar .brand { padding: 0; gap: var(--s2); flex: 0 0 auto; }
+/* The Monitor link wears the button style; an anchor needs the underline off. */
+.topbar a.btn { text-decoration: none; flex: 0 0 auto; }
 .topbar .brand-word { font-size: var(--fs-md); }
 .tabs { display: flex; align-items: stretch; gap: 2px; height: var(--top-h); overflow-x: auto; scrollbar-width: none; }
 .tabs::-webkit-scrollbar { display: none; }
@@ -1185,7 +1187,7 @@ var ADV_GROUPS = [
   ['Recording', ['video', 'screenshots', 'capture-delay', 'step-delay', 'no-target-highlight']],
   ['Behaviour', ['no-heal', 'no-agent', 'no-agent-early-stop', 'no-reconstruct', 'no-network', 'no-history', 'quarantine-flaky', 'update-baselines', 'no-author-review', 'no-agent-capture', 'no-value-resolution', 'concurrency', 'author-concurrency', 'author-attempts', 'sheet-order', 'db-baseline']],
   ['Chrome', ['headless', 'browsers', 'no-ensure-chrome', 'stop-chrome', 'wait-for', 'cdp']],
-  ['Output', ['report', 'no-report', 'junit', 'ctrf', 'suite', 'flow', 'catalog-out', 'claims-out', 'context-out', 'cache', 'out']]
+  ['Output', ['report', 'no-report', 'report-lang', 'no-case-narrative', 'junit', 'ctrf', 'suite', 'flow', 'catalog-out', 'claims-out', 'context-out', 'cache', 'out']]
 ];
 var VERB = { doctor: 'Run the doctor', 'context-list': 'List saved repositories', 'cache-list': 'List healed selectors', 'history-clear': 'Clear run history', 'context-build': 'Build the index', 'context-show': 'Show the index', 'context-add': 'Scan and save', 'cache-forget': 'Forget', watch: 'Start watching' };
 
@@ -1739,6 +1741,13 @@ export function renderLedger(): string {
   </div>
   <nav class="tabs" id="tabs" aria-label="Sections"></nav>
   <div class="topstatus" id="status" aria-live="polite"></div>
+  <!-- The live monitor, in its own tab: the same page the /wowlidate skill
+       opens beside a run, so a run watched from the terminal and a run watched
+       from here are watched on one surface. A link, not a tab, because the
+       page owns the whole viewport and is meant to be left open on a second
+       screen. -->
+  <a class="btn" href="/monitor" target="_blank" rel="noopener"
+     title="The live monitor for the newest catalog run — the same page /wowlidate opens">Monitor</a>
   <div id="start-host"></div>
 </header>
 <main class="main" id="main"></main>

@@ -1,0 +1,345 @@
+/**
+ * Persisted artifacts are parsed at their read seam (Phase C, 2026-09-05).
+ *
+ * Six readers, one rule each: a file that would change a verdict or trigger
+ * an action is rejected the documented way when its authority-bearing
+ * shapes are wrong, and read when they are right. Every fixture here is
+ * HAND-WRITTEN — never produced by the artifact's own writer — because a
+ * reader tested only against its writer proves nothing (the repo's rule).
+ * Unit tier: no browser, no model, temp files only.
+ */
+
+import { after, before, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import {
+  AGENT_ENDED_BY_VALUES,
+  BaselineSchema,
+  FlowFileSchema,
+  HealedSelectorEntrySchema,
+  HistoryEntrySchema,
+  ProofBundleSchema,
+  ProjectGraphSchema,
+  SuiteLedgerSchema,
+  firstIssue,
+  parseArtifact,
+  parseProofBundle,
+} from '../src/artifacts/schemas.js';
+import { AGENT_ENDED_BY } from '../src/engine/proof-bundle.js';
+import { CacheManager } from '../src/cache/cache-manager.js';
+import { loadAuthoredFlow, readLedger, LEDGER_VERSION } from '../src/cli/suite-progress.js';
+import { ContextEngine } from '../src/context/context-engine.js';
+import { readBaseline } from '../src/db/baseline.js';
+import { RunHistory } from '../src/history/run-history.js';
+
+let dir: string;
+before(async () => {
+  dir = await mkdtemp(join(tmpdir(), 'wow-artifacts-'));
+});
+after(async () => {
+  await rm(dir, { recursive: true, force: true });
+});
+
+async function file(name: string, content: unknown | string): Promise<string> {
+  const path = join(dir, name);
+  await writeFile(path, typeof content === 'string' ? content : JSON.stringify(content), 'utf8');
+  return path;
+}
+
+// --- proof bundle ------------------------------------------------------------
+
+const BUNDLE = {
+  runId: 'run-9', name: 'PL_03_18', status: 'error',
+  startedAt: '2026-09-05T09:00:00.000Z', finishedAt: '2026-09-05T09:00:02.000Z', durationMs: 2000,
+  cdpUrl: 'http://localhost:9222', cachePath: null, healerModel: null,
+  summary: { totalSteps: 2, passed: 1, failed: 1, extraCounterFromANewerBuild: 7 },
+  steps: [
+    { index: 0, action: 'goto', selector: null, resolvedSelector: null, resolution: null, status: 'passed', startedAt: 'x', durationMs: 1, url: 'http://x.test/' },
+    { index: 1, action: 'workflow', selector: null, resolvedSelector: null, resolution: null, status: 'error', startedAt: 'x', durationMs: 1, url: 'http://x.test/',
+      blocked: { kind: 'blocked', reason: 'capability', rule: 'policy-deny', message: 'held', category: 'delete', target: 'PL_03_18', policySource: 'test' } },
+  ],
+  defects: [],
+};
+
+describe('proof bundles are parsed before the panel scores them', () => {
+  it('accepts a hand-written bundle and keeps every field, known or not', () => {
+    const parsed = parseProofBundle(BUNDLE);
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) {
+      assert.equal(parsed.value.steps[1]?.blocked?.reason, 'capability');
+      assert.equal((parsed.value.summary as unknown as { extraCounterFromANewerBuild: number }).extraCounterFromANewerBuild, 7, 'unknown fields survive');
+    }
+  });
+
+  it('rejects a step status, a run status or a hold reason outside the engine vocabulary', () => {
+    const badStep = { ...BUNDLE, steps: [{ ...BUNDLE.steps[0], status: 'banana' }] };
+    const badRun = { ...BUNDLE, status: 'kind-of-passed' };
+    const badHold = { ...BUNDLE, steps: [{ ...BUNDLE.steps[1], blocked: { ...BUNDLE.steps[1]!.blocked, reason: 'whatever' } }] };
+    for (const [label, value] of [['step', badStep], ['run', badRun], ['hold', badHold]] as const) {
+      const parsed = parseProofBundle(value);
+      assert.equal(parsed.ok, false, label);
+      if (!parsed.ok) assert.match(parsed.issue, /status|reason/);
+    }
+    assert.equal(parseProofBundle({ runId: 'r', name: 'n', steps: 'not-an-array', summary: {} }).ok, false);
+    assert.equal(parseProofBundle('a string').ok, false);
+  });
+
+  it('names the first issue by path', () => {
+    const result = ProofBundleSchema.safeParse({ ...BUNDLE, steps: [{ ...BUNDLE.steps[0], status: 'banana' }] });
+    assert.equal(result.success, false);
+    if (!result.success) assert.match(firstIssue(result.error), /^steps\.0\.status: /);
+  });
+
+  // The agent record's typed stop (task C3): descriptive fields an older
+  // build never wrote, so a bundle with them and a bundle without them both
+  // read — but `endedBy` steers the exit contract's wording, so a value
+  // outside the loop's vocabulary is refused like any other authority field.
+  const AGENT_STEP = {
+    index: 1, action: 'workflow', selector: null, resolvedSelector: null, resolution: null, status: 'error',
+    startedAt: 'x', durationMs: 1, url: 'http://x.test/en/form',
+    detail: { goal: 'set Employee Group to "Z - Nothing"', expected: 'Z - Nothing', actual: '"Employee Group" offered 9 option(s): "A - Alpha"' },
+    agent: {
+      goal: 'set Employee Group to "Z - Nothing"', model: 'stub', success: false,
+      summary: 'agent reported the goal is unreachable: no such group', turns: 2, maxSteps: 12, latencyMs: 700,
+      endedBy: 'fail',
+      unreachable: { claim: 'no such group', urlAfter: 'http://x.test/en/form', headingsAfter: ['Employment', 'Reporting'] },
+      actions: [
+        { index: 0, action: 'selectOption', selector: 'role=button[name="Employee Group" i]', value: 'Z - Nothing', url: 'http://x.test/en/form',
+          reasoning: 'pick', ok: false, error: 'opened "Employee Group" but no option named "Z - Nothing" appeared', durationMs: 40,
+          outcome: { kind: 'failed', message: 'miss' },
+          listbox: { trigger: 'Employee Group', value: 'Z - Nothing', shownCount: 9, shownHead: ['A - Alpha', 'B - Bravo'], filtered: false, searchedEmpty: null } },
+        { index: 1, action: 'fail', selector: null, value: null, url: 'http://x.test/en/form', reasoning: 'no such group', ok: false, durationMs: 0 },
+      ],
+      aFieldFromANewerBuild: true,
+    },
+  };
+
+  it('accepts a bundle whose agent record carries endedBy, unreachable and listbox facts, and one without them', () => {
+    const withTyped = parseProofBundle({ ...BUNDLE, steps: [BUNDLE.steps[0], AGENT_STEP] });
+    assert.equal(withTyped.ok, true, withTyped.ok ? '' : withTyped.issue);
+    if (withTyped.ok) {
+      const agent = withTyped.value.steps[1]?.agent;
+      assert.equal(agent?.endedBy, 'fail');
+      assert.equal(agent?.unreachable?.claim, 'no such group');
+      assert.deepEqual(agent?.actions[0]?.listbox?.shownHead, ['A - Alpha', 'B - Bravo']);
+      assert.equal((agent as unknown as { aFieldFromANewerBuild: boolean }).aFieldFromANewerBuild, true, 'unknown agent fields survive');
+    }
+    // An older build's record: no endedBy, no unreachable, actions without listbox.
+    const { endedBy: _e, unreachable: _u, ...olderAgent } = AGENT_STEP.agent;
+    const older = parseProofBundle({
+      ...BUNDLE,
+      steps: [BUNDLE.steps[0], { ...AGENT_STEP, agent: { ...olderAgent, actions: [AGENT_STEP.agent.actions[1]] } }],
+    });
+    assert.equal(older.ok, true, older.ok ? '' : older.issue);
+    // And the fixture that predates the field entirely still reads.
+    assert.equal(parseProofBundle(BUNDLE).ok, true);
+  });
+
+  it('refuses an endedBy outside the loop vocabulary, and a malformed listbox or claim', () => {
+    const badEnded = parseProofBundle({ ...BUNDLE, steps: [{ ...AGENT_STEP, agent: { ...AGENT_STEP.agent, endedBy: 'gave-up' } }] });
+    assert.equal(badEnded.ok, false);
+    if (!badEnded.ok) assert.match(badEnded.issue, /^steps\.0\.agent\.endedBy: /);
+
+    const badListbox = parseProofBundle({
+      ...BUNDLE,
+      steps: [{ ...AGENT_STEP, agent: { ...AGENT_STEP.agent, actions: [{ ...AGENT_STEP.agent.actions[0], listbox: { trigger: 'x', value: 'y', shownCount: 'nine', shownHead: [], filtered: false, searchedEmpty: null } }] } }],
+    });
+    assert.equal(badListbox.ok, false);
+    if (!badListbox.ok) assert.match(badListbox.issue, /listbox\.shownCount/);
+
+    const badClaim = parseProofBundle({ ...BUNDLE, steps: [{ ...AGENT_STEP, agent: { ...AGENT_STEP.agent, unreachable: { claim: 42 } } }] });
+    assert.equal(badClaim.ok, false);
+    if (!badClaim.ok) assert.match(badClaim.issue, /unreachable\.claim/);
+  });
+
+  it('mirrors the engine vocabulary exactly', () => {
+    assert.deepEqual([...AGENT_ENDED_BY_VALUES], [...AGENT_ENDED_BY]);
+  });
+});
+
+// --- suite ledger ------------------------------------------------------------
+
+const LEDGER = {
+  version: LEDGER_VERSION, title: 'EC', planned: ['A', 'B'],
+  startedAt: '2026-09-05T09:00:00.000Z', updatedAt: '2026-09-05T09:00:01.000Z', generatedAt: null,
+  outcomes: {
+    A: { verdict: 'passed', status: 'passed', reason: null, reportPath: null, at: '2026-09-05T09:00:01.000Z', browsers: ['http://localhost:9222'] },
+  },
+  ended: null,
+};
+
+describe('the suite ledger is parsed before a resume carries its verdicts', () => {
+  it('reads a hand-written ledger and backfills a missing run key', async () => {
+    const ledger = await readLedger(await file('ok.progress.json', LEDGER));
+    assert.ok(ledger);
+    assert.equal(ledger.runKey, null);
+    assert.equal(ledger.outcomes['A']?.verdict, 'passed');
+  });
+
+  it('refuses a verdict outside the four the suite scores, and the wrong version', async () => {
+    const maybe = { ...LEDGER, outcomes: { A: { ...LEDGER.outcomes.A, verdict: 'maybe' } } };
+    assert.equal(await readLedger(await file('maybe.progress.json', maybe)), null);
+    assert.equal(await readLedger(await file('v0.progress.json', { ...LEDGER, version: LEDGER_VERSION + 1 })), null);
+    assert.equal(await readLedger(await file('list.progress.json', { ...LEDGER, outcomes: [] })), null);
+    assert.equal(await readLedger(await file('text.progress.json', '{not json')), null);
+    assert.equal(parseArtifact(SuiteLedgerSchema, LEDGER).ok, true);
+  });
+});
+
+// --- context graph -----------------------------------------------------------
+
+const GRAPH = {
+  version: 1, rootDir: '/proj', generatedAt: '2026-09-05T09:00:00.000Z', signature: 'sig',
+  nodes: [{ id: 'route:/en/plans', kind: 'route', name: '/en/plans', file: 'app/plans/page.tsx', meta: { locale: 'en' } }],
+  edges: [{ from: 'route:/en/plans', to: 'component:X', kind: 'renders' }],
+  sources: [{ id: 'next-routes', nodes: 1, edges: 1, warnings: [] }],
+};
+
+describe('the context graph is parsed before the generator reads it', () => {
+  it('loads a hand-written graph', async () => {
+    const engine = new ContextEngine({ rootDir: dir, cacheFile: await file('graph.json', GRAPH) });
+    const graph = await engine.load();
+    assert.equal(graph?.nodes[0]?.kind, 'route');
+  });
+
+  it('returns null for nodes that are not a list, or a node of an unknown kind', async () => {
+    const stringNodes = new ContextEngine({ rootDir: dir, cacheFile: await file('graph-str.json', { ...GRAPH, nodes: 'route:/x' }) });
+    assert.equal(await stringNodes.load(), null);
+    const badKind = new ContextEngine({ rootDir: dir, cacheFile: await file('graph-kind.json', { ...GRAPH, nodes: [{ ...GRAPH.nodes[0], kind: 'widget' }] }) });
+    assert.equal(await badKind.load(), null);
+    assert.equal(parseArtifact(ProjectGraphSchema, GRAPH).ok, true);
+  });
+});
+
+// --- database baseline -------------------------------------------------------
+
+const BASELINE = {
+  version: 1, takenAt: '2026-09-05T09:00:00.000Z', runKey: 'ec@1',
+  tables: [{ table: 'benefit_management.benefit_plan', why: ['named'], columns: ['id', 'name'], pk: ['id'], references: [], rowCount: 1, hash: 'h', restorable: true, rows: [{ id: 1, name: 'Dental' }] }],
+};
+
+describe('the db baseline is parsed before a restore writes it back', () => {
+  it('reads a hand-written baseline', async () => {
+    const baseline = await readBaseline(await file('base.json', BASELINE));
+    assert.equal(baseline.tables[0]?.pk[0], 'id');
+  });
+
+  it('throws, naming the issue, when tables is not a list or a table lacks its rows', async () => {
+    await assert.rejects(readBaseline(await file('base-str.json', { ...BASELINE, tables: 'benefit_plan' })), /not a wowlidator db baseline \(tables/);
+    await assert.rejects(readBaseline(await file('base-rows.json', { ...BASELINE, tables: [{ ...BASELINE.tables[0], rows: undefined }] })), /tables\.0\.rows/);
+    await assert.rejects(readBaseline(await file('base-v2.json', { ...BASELINE, version: 2 })), /version/);
+    assert.equal(parseArtifact(BaselineSchema, BASELINE).ok, true);
+  });
+});
+
+// --- healed-selector cache ---------------------------------------------------
+
+const GOOD_ENTRY = {
+  original: '#old', healed: 'role=button[name="Save"]', strategy: 'role', url: 'http://x.test/en/plans',
+  confidence: 0.9, reasoning: 'renamed', model: 'm', healedAt: 'x', lastUsedAt: 'x', hits: 2,
+};
+
+describe('the healed-selector cache drops a corrupt entry and keeps the rest', () => {
+  it('keeps the good entry beside a corrupt one', async () => {
+    const path = await file('cache.json', {
+      version: 1, updatedAt: 'x',
+      entries: { good: GOOD_ENTRY, corrupt: { healed: 42, strategy: 'role' }, halfway: { healed: 'role=x' } },
+    });
+    const cache = new CacheManager({ filePath: path, warn: false });
+    await cache.load();
+    assert.equal(cache.get('good')?.healed, GOOD_ENTRY.healed);
+    assert.equal(cache.get('corrupt'), undefined);
+    assert.equal(cache.get('halfway'), undefined, 'an entry missing the fields the replay reads is not replayed');
+    assert.equal(parseArtifact(HealedSelectorEntrySchema, GOOD_ENTRY).ok, true);
+  });
+
+  it('treats a file that is not an object as unreadable — empty, never a crash', async () => {
+    const cache = new CacheManager({ filePath: await file('cache-list.json', ['not', 'a', 'cache']), warn: false });
+    await cache.load();
+    assert.equal(cache.get('good'), undefined);
+  });
+});
+
+// --- run history -------------------------------------------------------------
+
+const HISTORY_LINE = {
+  runId: 'r1', name: 'login', status: 'passed', finishedAt: '2026-09-05T09:00:00.000Z', durationMs: 10,
+  passed: 2, failed: 0, jitHeals: 0, defects: 0, failedSteps: [],
+};
+
+describe('run history skips a line whose status is not one the engine writes', () => {
+  it('reads two good lines around a corrupt one and a mis-statused one', async () => {
+    const lines = [
+      JSON.stringify(HISTORY_LINE),
+      '{"runId": "r2", "name": "login", "status": "maybe", "finishedAt": "x", "durationMs": 1, "passed": 0, "failed": 0}',
+      '{not json at all',
+      JSON.stringify({ ...HISTORY_LINE, runId: 'r3', status: 'failed', failedSteps: ['click:#x'] }),
+    ];
+    const history = new RunHistory(await file('history.jsonl', lines.join('\n')));
+    const entries = await history.load();
+    assert.deepEqual(entries.map((e) => e.runId), ['r1', 'r3']);
+    assert.deepEqual(entries[1]?.failedSteps, ['click:#x']);
+    assert.equal(parseArtifact(HistoryEntrySchema, HISTORY_LINE).ok, true);
+  });
+});
+
+// --- flow file (a resume replays it) -----------------------------------------
+
+describe('a flow file is parsed before a resume replays it', () => {
+  it('accepts a hand-written flow whose steps each name an action, and keeps every other field', async () => {
+    const flow = {
+      name: 'C_1 opens the page',
+      steps: [{ action: 'goto', url: '/x' }, { action: 'expectVisible', selector: 'role=heading', note: 'from a newer build' }],
+      authoredBy: { model: 'm', generatedAt: 'x', sourceUrl: 'http://x.test/', kind: 'catalog', rationale: 'r' },
+      caseContext: 'the card',
+    };
+    assert.equal(parseArtifact(FlowFileSchema, flow).ok, true);
+    const loaded = await loadAuthoredFlow(await file('c1.flow.json', flow));
+    assert.equal(loaded.ok, true);
+    if (loaded.ok) {
+      assert.equal(loaded.flow.steps.length, 2);
+      assert.equal(loaded.flow.caseContext, 'the card');
+      assert.equal((loaded.flow.steps[1] as unknown as { note: string }).note, 'from a newer build');
+    }
+  });
+
+  it('rejects steps that are not a list, a step without an action, and a missing name — by path', async () => {
+    const nope = parseArtifact(FlowFileSchema, { name: 'C_2', steps: 'nope' });
+    assert.equal(nope.ok, false);
+    if (!nope.ok) assert.match(nope.issue, /^steps: /);
+    const noAction = parseArtifact(FlowFileSchema, { name: 'C_2', steps: [{ url: '/x' }] });
+    assert.equal(noAction.ok, false);
+    if (!noAction.ok) assert.match(noAction.issue, /^steps\.0\.action: /);
+    assert.equal(parseArtifact(FlowFileSchema, { steps: [] }).ok, false);
+    assert.equal(parseArtifact(FlowFileSchema, { name: 'C_2', steps: [], setup: 'nope' }).ok, false);
+    // Through the reader: a typed refusal naming what was wrong, never a throw.
+    const bad = await loadAuthoredFlow(await file('c2.flow.json', { name: 'C_2', steps: 'nope' }));
+    assert.equal(bad.ok, false);
+    if (!bad.ok) assert.match(bad.reason, /not a flow file \(steps: /);
+    const missing = await loadAuthoredFlow(join(dir, 'never-written.flow.json'));
+    assert.equal(missing.ok, false);
+    if (!missing.ok) assert.match(missing.reason, /missing/);
+    const text = await loadAuthoredFlow(await file('c3.flow.json', '{not json'));
+    assert.equal(text.ok, false);
+    if (!text.ok) assert.match(text.reason, /not valid JSON/);
+  });
+});
+
+describe('the suite ledger carries the flows a stopped pass authored', () => {
+  it('accepts an `authored` map and refuses an entry without its flowPath', async () => {
+    const withAuthored = {
+      ...LEDGER,
+      authored: { B: { flowPath: '/flows/b.flow.json', authoredAt: '2026-09-05T09:00:00.500Z', scenarioId: 'S', risk: { likelihood: 0.2 } } },
+    };
+    assert.equal(parseArtifact(SuiteLedgerSchema, withAuthored).ok, true);
+    const ledger = await readLedger(await file('authored.progress.json', withAuthored));
+    assert.equal(ledger?.authored?.['B']?.flowPath, '/flows/b.flow.json');
+    const noPath = parseArtifact(SuiteLedgerSchema, { ...LEDGER, authored: { B: { authoredAt: 'x' } } });
+    assert.equal(noPath.ok, false);
+    if (!noPath.ok) assert.match(noPath.issue, /^authored\.B\.flowPath: /);
+    assert.equal(await readLedger(await file('authored-nopath.progress.json', { ...LEDGER, authored: { B: { authoredAt: 'x' } } })), null);
+  });
+});

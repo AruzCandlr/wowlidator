@@ -723,3 +723,105 @@ describe('a failed DB check is attributed by what the page actually sent', () =>
     assert.doesNotMatch(filed[0]?.detail ?? '', /no POST/);
   });
 });
+
+/**
+ * The statement a check ran is evidence too (2026-09-08).
+ *
+ * A reader could see the redacted `where` summary and a row sample but not
+ * WHAT SQL answered the claim. It is captured here, at the source, where the
+ * statement is built from identifiers that already passed the schema
+ * membership gate — and the bound values go through the same `redactValue`
+ * rules on the way in, because a `where` keyed on a session token is exactly
+ * where a credential enters. The report renders this record and never
+ * re-derives a value, so redacting here is what makes the report safe.
+ */
+describe('the statement on the record', () => {
+  it('records the SQL with its placeholders and the redacted bound values', async () => {
+    const client = new StubDbClient();
+    client.rows['orders'] = [{ id: '42', status: 'done', password_hash: 'hunter2-secret' }];
+
+    const { db, bundle } = harness(client);
+    await db.expectDbRow({ table: 'orders', where: { id: '42', password_hash: 'hunter2-secret' } });
+
+    const step = bundle.steps[bundle.steps.length - 1]!;
+    const statements = step.db?.statements ?? [];
+    assert.equal(statements.length, 2, 'the count and the row read, once each');
+    assert.equal(
+      statements[0]?.sql,
+      'SELECT count(*)::text AS n FROM "orders" WHERE "id" = $1 AND "password_hash" = $2',
+    );
+    assert.ok(statements[1]?.sql.startsWith('SELECT * FROM "orders" WHERE'));
+    assert.deepEqual(statements[0]?.tables, ['orders']);
+    // The placeholder stays a placeholder, and the value beside it is the
+    // redacted one — the raw secret is in the driver's parameters and nowhere
+    // in the record.
+    assert.deepEqual(statements[0]?.params, ['42', REDACTED]);
+    assert.equal(JSON.stringify(step.db).includes('hunter2-secret'), false);
+    assert.equal(step.db?.rowsMatched, 1, 'the sample is capped; the true count is not');
+
+    const html = renderReport(bundle.finish());
+    assert.ok(html.includes('SELECT count(*)::text AS n FROM &quot;orders&quot;'), 'the query reaches the report');
+    assert.ok(!html.includes('hunter2-secret'));
+  });
+
+  it('records a polled check\'s statement ONCE — polledMs is what says it polled', async () => {
+    const client = new StubDbClient();
+    client.rows['orders'] = [];
+    setTimeout(() => {
+      client.rows['orders'] = [{ id: '9', status: 'done' }];
+    }, 400);
+
+    const { db, bundle } = harness(client);
+    await db.expectDbRow({ table: 'orders', where: { id: '9' }, timeoutMs: 3_000 });
+
+    const step = bundle.steps[bundle.steps.length - 1]!;
+    assert.ok(client.queries.length > 2, 'it really did poll');
+    assert.equal(step.db?.statements?.length, 2, 'the same SQL is one piece of evidence');
+    assert.ok((step.db?.polledMs ?? 0) >= 300);
+  });
+
+  it('a failed check carries the statement that disproved it', async () => {
+    const client = new StubDbClient();
+    client.rows['orders'] = [];
+    const { db, bundle } = harness(client);
+    await assert.rejects(db.expectDbRow({ table: 'orders', where: { id: '9' }, timeoutMs: 10 }));
+
+    const step = bundle.steps[bundle.steps.length - 1]!;
+    assert.equal(step.status, 'failed');
+    assert.equal(step.db?.statements?.length, 1, 'nothing was fetched — no rows matched the where');
+    assert.match(step.db?.statements?.[0]?.sql ?? '', /count\(\*\)/);
+  });
+
+  it('every kind that runs a statement records one, and the snapshot names what it read', async () => {
+    const client = new StubDbClient();
+    client.counts['orders'] = 1;
+    client.counts['users'] = 2;
+    client.statements = [{ queryid: '1', query: 'INSERT INTO orders (id) VALUES ($1)', calls: 1 }];
+
+    const { db, bundle } = harness(client);
+    await db.dbSnapshot({ tables: ['orders', 'users'] });
+    client.counts['orders'] = 2;
+    client.statements = [{ queryid: '1', query: 'INSERT INTO orders (id) VALUES ($1)', calls: 2 }];
+    await db.expectDbDelta({ table: 'orders', delta: 1 });
+    await db.expectDbUnchanged({ tables: ['users'] });
+    await db.expectDbCalled({ match: 'INSERT INTO orders' });
+
+    const [snapshot, delta, unchanged, called] = bundle.steps;
+    assert.deepEqual(
+      snapshot?.db?.statements?.map((s) => s.tables?.[0]),
+      ['orders', 'users', 'pg_stat_statements'],
+    );
+    assert.match(delta?.db?.statements?.[0]?.sql ?? '', /count\(\*\)::text AS n FROM "orders"$/);
+    assert.match(unchanged?.db?.statements?.[0]?.sql ?? '', /FROM "users"$/);
+    assert.match(called?.db?.statements?.[0]?.sql ?? '', /FROM pg_stat_statements$/);
+  });
+
+  it('a check refused before any SQL ran has no statement — none is invented for it', async () => {
+    const client = new StubDbClient();
+    const { db, bundle } = harness(client);
+    await assert.rejects(db.expectDbRow({ table: 'not_a_table', where: {} }), DbGroundingError);
+    const step = bundle.steps[bundle.steps.length - 1]!;
+    assert.equal(step.db, undefined, 'a grounding refusal carries no evidence record at all');
+    assert.equal(client.queries.length, 0);
+  });
+});

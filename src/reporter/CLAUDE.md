@@ -133,18 +133,26 @@ The report shows this as a **filmstrip above the timeline, assembled in the brow
 
 ## The catalog report (`catalog-report.ts`, `reports/`, 2026-08-31)
 
-One self-contained HTML per catalog RUN in the local `reports/` folder
+One HTML report per catalog RUN in the local `reports/` folder
 (`reports/<runKey slug>.html` — stable per key, so a resume overwrites its own
 file), generated at the suite roll-up from the LEDGER, never fatally. Every
 planned case is a row — never-ran included — grouped by scenario with
 passed-of-N counts and the two-family chips. A case opens into a two-pane
 view: LEFT expandable steps (intent, selector, resolution, error, heal, agent
 turns, screenshot) plus history explanations (`analyseTrend`/`formatTrend`
-over `RunHistory.forFlow` + heal pressure) and the bundle's run notes; RIGHT
+over `RunHistory.forFlow` + heal pressure) and the run's notes as
+`runNotesSummary` gives them; RIGHT
 the time record — a bar per step against the 2s fast-path budget, slowest
-named. Screenshots embed as data URIs: failure stills always, routine stills
-until `SCREENSHOT_BUDGET_BYTES` (15MB) is spent, then omitted with a note
-naming the proof bundle.
+named. Screenshots embed as data URIs: failure stills take priority, routine
+stills until `SCREENSHOT_BUDGET_BYTES` (15MB) is spent. Past that budget the
+artifact writer spills shots beside the report; a sink-less pure render omits
+them with a note naming the proof bundle.
+
+- **Self-contained while the evidence fits (2026-09-06).** When nothing
+  spills, the catalog report is still one file. Past the inline budgets, the
+  artifact writer puts shots in `<runKey slug>-media/shots/` and recordings
+  in `<runKey slug>-media/` beside the HTML; the report says how many of each
+  went there. A sink-less pure render keeps the old behaviour.
 
 **The film is here too, and it is the evidence a passing case has.** The
 runner's screenshot default is video-aware (`runner.ts`: filming ⇒
@@ -152,29 +160,29 @@ runner's screenshot default is video-aware (`runner.ts`: filming ⇒
 be100-rip's 32 bundles, that is exactly what they hold — all 13 non-passing
 cases carry stills, 18 of 19 passing ones carry none — so a report that
 dropped the recording left a reader with **no evidence at all for every case
-that worked**. Each case now carries its own `<video>`, on the same rules as
-the stills — except that **recordings have no size cap** (2026-09-03; there
-was a 25MB per-report budget spent non-passing-first, and a 24MB per-recording
-ceiling in `engine/video.ts` that left `video.omitted` in the bundle — both
-removed after a long run's film was dropped as "too large", which is worse
-than a large report). Every recording is embedded whatever it weighs; what
-bounds the file now is the run, not the reporter. Three mechanics are
-load-bearing: **the base64 rides on
+that worked**. Each case now carries its own `<video>`. Recordings use a
+deliberately small 20MB inline budget (2026-09-06), because they are the
+largest single value a bundle carries. Past it they spill as relative `.webm`
+files in the media folder; inline screenshots and recordings also draw down
+one shared 350MB ceiling, so their separate budgets cannot combine into an
+unbuildable document. Three mechanics are load-bearing: **inline base64 rides on
 `data-webm` and becomes a Blob URL in the page** (Chrome will not load a
 `data:` video — `readyState 0` forever, no error, reads exactly like a corrupt
 file); **it is decoded when the case is opened, not at load** (dozens of
 recordings, and building every Blob on first paint stalls the page to make
 players nobody opened); and **the attribute is never removed**, because a Blob
 URL means nothing in another document and every export here is another
-document. Each filmed step carries a `play from here` cue **on its summary**,
+document; a spilled recording is a real file-backed `src` and needs no Blob
+shim. Each filmed step carries a `play from here` cue **on its summary**,
 not in its body — measured in a browser, in the body it is inside a collapsed
 `<details>` and a reader has to expand every step to discover seeking exists;
 the handler's `preventDefault` is what stops a button inside a `<summary>`
 from toggling the step open as a side effect.
 
-Whole-catalog export is client-side (`Blob` + anchor, Blob `src`s stripped so
-the base64 on `data-webm` is what travels). Per-case export is the case's
-Excel workbook — see below — not an HTML clone.
+Whole-catalog export is client-side (`Blob` + anchor): Blob `src`s are stripped
+from inline recordings so `data-webm` travels, while relative file-backed
+`src`s stay. Per-case export is the case's Excel workbook — see below — not an
+HTML clone.
 
 **The report is live (`cli/catalog-live-report.ts`, 2026-09-02).** It is
 written when the run STARTS — every planned case a `never ran` row, or the
@@ -235,6 +243,130 @@ everything above, plus one CDP-gated test that the recording ACTUALLY PLAYS
 pass on a report whose every player spins forever, which is the bug this
 exists to fix.
 
+## Publish to artifact, from the report itself (`publish-artifact.ts`, 2026-09-08)
+
+A report is a file, so handing one over means attaching it or naming a path on
+a machine the reader does not have. The verdict block grew a **publish to
+artifact** button that turns the page into a URL.
+
+**The mechanism was measured, because the obvious choice is the wrong one.**
+Publishing needs the `Artifact` tool, and `claude -p` does NOT have it — not in
+its tool list, not as a deferred tool through `ToolSearch`, and not when named
+in `--allowedTools`, which grants a tool that exists rather than registering one
+that does not. `claude --bg` does have it. So `publishArgv` backgrounds a full
+session; a test asserts `--bg` and refuses `-p`, because a flag changed here
+breaks publishing silently.
+
+**The publish still asks.** Uploading to Anthropic's servers raises Claude
+Code's own permission prompt in that session, and nothing here approves it: the
+argv carries `--permission-mode acceptEdits` (so the session does not stall on
+the reads it makes on the way) and a test refuses any `dangerously` flag or
+`bypassPermissions`. The button starts a publish; a person allows it.
+
+**The film is dropped only when the page does not otherwise fit.** A recording
+is the most direct evidence a report holds, so `stripToFit` keeps it under
+`ARTIFACT_BUDGET_BYTES` (15 MB, under the platform's 16) and drops it past that,
+leaving a `p.video-missing` saying where it went — a silently empty `<video>`
+reads as a broken report, which is a lie about the run rather than a fact about
+the size limit. The stripped page is written BESIDE the report
+(`artifactPathFor`, `<name>.artifact.html`), never over it: the run's own
+evidence is not edited to suit a publish. Measured on a real 24.8 MB HIR-EC-001
+report — 21.7 MB of it film — which comes out at 3.0 MB with the filmstrip, all
+65 steps and all 19 findings intact.
+
+**The film is found by scanning, not by a regex.** `data-webm="[A-Za-z0-9+/=]{1000,}"`
+reads correctly and dies on the only input that matters: a 21 MB payload
+overflows V8's stack inside `RegExp.test`, so the one report that needs
+stripping would be the one that crashes. Two `indexOf` calls have no such limit.
+The test that feeds it an over-budget payload is what found this.
+
+**The button carries no path.** A report is copied and mailed, and an absolute
+path from the machine that made it is both a leak and a lie anywhere else — so
+the page works out what to publish from its own URL (`/view?path=` or
+`/reports/<name>`), which is meaningful only where the panel is serving it. Off
+the panel — a `file://` page, which has no server to ask — the button is
+disabled and says to open the report from `npm run ui`, rather than failing into
+a dead fetch. The panel re-validates the path against its own roots before
+touching it (`POST /api/publish-artifact`), on the same rule as every other read
+there: a path from a page is a request, never a permission.
+
+Per-case reports only. The catalog report is not in scope: it spills its media
+beside itself already and is a different size problem.
+
+Tests: `tests/publish-artifact.test.ts` — the strip (fits, over-budget, nothing
+to drop, bytes not characters), the title (Thai, absent, past the 8 KB head),
+the sibling path, and the argv (`--bg`, the model, no permission bypass, the
+path and title as argv elements). Starting a real session is deliberately not
+tested: it uploads, and a suite that publishes is one nobody can run twice.
+
+## Findings: the catalog report leads with N root causes (`findings.ts`, `findings-export.ts`, 2026-09-05)
+
+A run whose 70 non-passing cases shared five root causes read as 70
+independent verdicts, and 252 `never ran` rows each rendered a full section.
+`buildFindingsSummary(cases)` is the deterministic projection that leads the
+catalog report instead — under the tally, `N findings account for M of K
+non-passing cases · U unclustered`, one `<details class="finding">` per root
+cause with its title, the member case ids linked to their sections
+(`#case-<slug>`), the statuses AS SEALED counted per status, where/asked/
+offered, and the typed evidence lines of the first member. No model call, no
+I/O, no imports from the control plane; `tests/findings.test.ts` greps the two
+source files for that.
+
+**The signature is computed only from typed fields of the first
+non-superseded failing step** — `firstFailingStep`, then `signatureOf`:
+`api:<METHOD> <pathname> → <status>` from the latest `request` step before a
+failed `expectStatus`/`expectJson` (`step.request.{method,url,status}`,
+`detail.expected/actual`); `url:<expected> → <pathname(actual)>` from a failed
+`expectUrl`; `hold:<reason>/<rule>` from `ProofStep.blocked` (checked first —
+a hold is not a finding about the application); `agent:<endedBy>:<trigger> @
+<pathname(urlAfter ?? step.url)>` for a failed `workflow`, reading the
+OPTIONAL `agent.endedBy` and `agent.actions[i].listbox` fields through a
+local structural type so the module compiles and behaves with or without them
+(no trigger → the coarse `agent:workflow @ <path>`); `control:<selector> @
+<pathname>` for a dead-end or a selector no rung resolved;
+`other:<action> <selector> @ <pathname>` for a resolved control whose claim
+failed; `authoring:<first 60 chars of the reason, attempt counter removed>`
+for a bundle-less case whose reason begins `authoring refused`. **Never from
+`summary`, `error` or `reasoning`** — the same cause is worded in Thai on one
+case and English on the next, and a key built from prose splits one cause into
+as many findings as there are wordings. A case with no signature is
+`unclustered`, counted, never dropped; a case whose reason begins `depends on
+<X>` is listed under X's finding when X (or, through a bounded chain, X's own
+prerequisite) has one, marked `↳ depends on X`, and is unclustered otherwise.
+`never ran` cases are not non-passing: the report folds them into ONE
+`<details class="never-ran">` with the count on its summary line and every id
+as its own `span.nid` carrying the case anchor — nothing leaves the DOM, the
+scenario counts still speak for them, and no full section is rendered for
+them. **No status is rewritten anywhere**: a member sealed `error` reads
+`error` (`<code class="sealed">`), and the projection groups, it never
+relabels.
+
+**The export** (`findings-export.ts`) writes `<base>-findings.md` and
+`<base>-findings.xlsx` beside the HTML from `writeCatalogArtifacts`, so
+`wowlidator report` rebuilds both from the ledgers with no re-run. The
+Markdown states the severity rule at the top (`SEVERITY_RULE`: high when a
+finding covers ≥3 cases or blocks a dependency chain; medium for 1–2; low when
+every member is harness-only — a system error, a hold, an authoring refusal),
+then one section per finding with its members, the sealed statuses, evidence,
+and **steps to reproduce** drawn from the first non-dependent member's own
+flow up to the failing step, through `stepTarget` / `describeTarget` /
+`visibleDetail` so a credential the engine recorded never reaches the file — a
+value typed into a control whose selector or intent names a password is
+withheld outright (and says so) even when its key is an innocent `value`. The
+workbook goes through `buildTextWorkbook` in `excel-export.ts` (the same
+hand-written zip writer as the proof workbooks: a preface row, a bold header,
+wrapped cells) with the columns Finding · Cases · Where · Asked/Offered ·
+Evidence · Status as sealed · Suggested severity · Owner, and is read back in tests
+through `catalog/extract.ts`'s independent reader. Tests:
+`tests/findings.test.ts` (hand-built bundles for every kind, the prose-only
+difference that still clusters, the source grep, the credential that never
+appears), `tests/catalog-report.test.ts` ("findings lead the report": the exact
+count line, every member linked, `error` shown as error, 252 never-ran rows as
+one block), `tests/catalog-live-report.test.ts` (the `.md` exists after
+`writeCatalogArtifacts` over a fixture ledger).
+
+**The export names who owns each cause and leads with dependency roots (2026-09-06).** `ownerOf` assigns `application`, `harness`, or `catalog` from the finding kind and sealed member fields only: holds, agent failures, and all-system-error findings belong to the harness; authoring refusals belong to the catalog; reached application behaviour belongs to the application team. Markdown states that rule, shows `blockedChains` before three owner sections, and the workbook adds Owner after Suggested severity and uses the same owner order. A blocked chain follows `depends on X` transitively to the first case that is not waiting, lists nearer dependents first, and folds a cycle once under its alphabetically first member. Authoring keys still use their one permitted prose input, but normalise the authored-flow id, quoted runs, step number, problem count, and whitespace before taking 60 characters, so one lint cause remains one finding.
+
 ## The target on every step (2026-09-02)
 
 `ProofStep.target` (see `src/engine/CLAUDE.md`, "The step's target") is shown
@@ -251,3 +383,462 @@ escaped like every other string.
 ## A rescued step shows once, as it ended (2026-09-04)
 
 A failed attempt that an in-run reconstruction later rescued (`ProofStep.superseded`) used to sit in the per-run report's step list as a red row of its own, one line above the green rebuilt step with the same headline — the same step twice, once failed and once passed, and only the `superseded` badge said the red one was not a failure. `stepList` in `html-reporter.ts` now folds each run of superseded attempts under the next step carrying a `ReconstructionRecord` (the one that finally held), behind a closed `details.replaced` disclosure; preparation the reconstruction inserted renders as an ordinary step in between. The attempt is still a full row inside the disclosure — error, screenshot, trace, the badge — because what was tried is evidence, just not the outcome. Three companions: the first failure that puts later absence checks "in doubt" is the first LIVE failure (a superseded one is history); the page script neither auto-opens a folded attempt nor films it (`.step:not(.attempt)`, and a step's own screenshot is read with `:scope`, never an attempt's); and `agentBlock` is framed by the STEP's status — an assist-rung agent that stalled after its first action had already opened the panel reports `success: false` on a step that passed, and the callout now says the page was prepared and the step passed on the flow's own selector, in the ordinary colour with the trace closed, rather than "goal not reached" in red. An attempt with no rescue after it (a shape the runner never writes) renders in place rather than vanishing. The catalog report and the Excel export already filtered superseded rows. Tests: `tests/reporter-wave2.test.ts` ("folds a superseded attempt").
+
+## Provider failures in the suite roll-up (2026-09-07)
+
+`LlmFactory` counts a logical model call only after its configured failover is
+exhausted, keyed by role. `runCases` prints the non-zero counts once at close as
+`provider failures: generator N · healer N · agent N (each degraded one step,
+never the verdict)`. It changes neither retry policy nor verdicts: the tally
+only makes the previously logged degradation countable. With no recorded
+failure the line is absent. Tests: `tests/api-keys.test.ts`.
+
+## A model's sentence beside the run's own facts (`ProofStep.narration`, 2026-09-07)
+
+`--narrate` has the healer role write one or two plain sentences per step onto
+`ProofStep.narration` after the run (`src/generator/step-narration.ts`, off by
+default). The reporter RENDERS it and never produces it: `src/reporter/`
+imports nothing from the control plane, and every sentence stays a pure
+function of the bundle.
+
+**One projection, three surfaces.** `stepNarration` in `step-facts.ts` is the
+only reading of the field — `{ text, by, label, attribution, note }` — plus
+`narrationProofLine` for surfaces with no colour and no hover. `NARRATION_LABEL`
+(`in plain language`) and `NARRATION_NOTE` are the one wording; the per-run
+report, the catalog report and the workbook cannot describe the same sentence
+three ways. It is defensive like the rest of the module: an absent record, an
+empty string, a `by` that is missing and a value that is not an object all
+render nothing, never a placeholder that reads like a fact. Whitespace is
+folded, so a two-line answer is one line everywhere.
+
+**It is a reading of the record and never precedes the record.** Per-run report
+(`narrationLine` in `html-reporter.ts`): the LAST of the step's always-visible
+lines, after the intent headline, the action/selector sub-line, the kind facts
+and the expected-vs-actual line. Catalog report (`stepDetail`): after every
+recorded fact of the step — intent, selector, resolution, target, url, error,
+heal, agent, observed — and before the media. Workbook (`stepProof`): the last
+line of the Proof cell, after `error:`. No new column: the Proof column already
+IS "the step's own log", a column of its own would sit empty on every run that
+did not ask for a narration, and an empty column beside a full one reads like a
+missing fact rather than an absent option.
+
+**It is attributed where it is read, not on hover.** `— written by
+<provider:model>` is visible on the line; the rule that makes it safe to sit
+there is the label's `GLOSSARY` entry (per-run report) or its `title` (catalog
+report), so it is one greppable wording rather than a long sentence repeated
+down a page. The workbook, which has neither, carries label and attribution
+inside the cell text itself. Set apart visually by a left rule, muted and
+italic — it must never scan as another recorded line. `NARRATION_NOTE` is kept
+to two facts on purpose: it is a `title` on EVERY narrated step, and a 400-case
+catalog narrating twenty steps each repeats it eight thousand times.
+
+**`captured()` in the per-run report, `esc()` in the catalog report.** The model
+quotes application text inside its sentences verbatim, so a Thai plan name in a
+narration is marked `lang=""` exactly like the same string in a selector or a
+comparison. The catalog report has no `captured()` at all and marks no captured
+text anywhere; adding the marking for narration alone would be inconsistent
+within that file. The model id is our own string, escaped and never marked.
+
+**A step with no narration renders exactly the bytes it did before this
+existed** — asserted, not asserted-about: one bundle is rendered twice with the
+field deleted in between, and the two differ by the narration line and nothing
+else. `${compare}${narration}` shares one source line for that reason.
+
+**It reaches no signature.** `findings.ts` keys off typed fields precisely so
+one cause stays one finding whatever language it is worded in; narration is
+prose and would split it. The existing source grep now refuses `.narration` in
+`findings.ts` and `findings-export.ts` alongside `.summary`, `.error` and
+`.reasoning`, and a behavioural test clusters two cases whose only difference
+is a narration in two languages.
+
+**Not rendered in the machine outputs** (`machine-report.ts`, `suite-index.ts`)
+and not in the MCP tool result: layer 3 and every machine surface keep the
+precise terms so nothing downstream has to care, and a model's prose inside a
+JUnit failure message would be read by CI as the harness's finding.
+
+**Credentials.** The report-level filter is key-based (`CREDENTIAL_DETAIL_KEYS`
+over the generic detail dump) and cannot filter prose — the same is already true
+of `step.error`, `heal.reasoning` and `agent.reasoning`, which the report has
+always quoted verbatim. Narration is in that class, and its input is narrower
+than theirs: `formatStepLine` is built from `stepTarget`/`stepKindFacts`
+(which withhold an account) and never dumps `detail`, so the model is not shown
+a credential to repeat. No scrubber was added here: silently rewriting quoted
+text would make the report a claim about evidence rather than evidence.
+
+Tests: `tests/reporter-wave2.test.ts` ("a step narrated in plain language" —
+the always-visible position, the order against the deterministic lines, the
+script tag and the `lang=""` marking, the byte-identical un-narrated render,
+the null cases), `tests/catalog-report.test.ts` (same section name — the row,
+its position after the recorded facts, escaping, byte-identical),
+`tests/excel-export.test.ts` ("the narration in the Proof column" — last line
+of the cell, read back through `catalog/extract.ts`'s independent reader, still
+ten columns), `tests/findings.test.ts` (the source grep and the clustering).
+
+## An agent leg that decided nothing is folded, never dropped (2026-09-08)
+
+A `workflow` leg that neither rescued its step nor broke it sat at full height
+between the failure evidence above it and the recorded facts below it, on a
+step that had passed. `inconsequentialAgentLeg` in `step-facts.ts` is the ONE
+predicate — the per-run report, the catalog report and the workbook all ask it,
+so no surface can decide on its own which legs are noise. It reads typed
+fields only, structurally, and returns `null` for every other leg (which is
+every leg on a run that has no such shape).
+
+**Two shapes, both requiring a PASSING step** (`isPassing(step.status)` — the
+same rule every consumer follows; no step is ever `passed-with-issues`, so this
+is exactly "the step passed"):
+
+- `looked-only` — `AgentRecord.lookedOnly`.
+- `did-not-decide` — `agent.success === false` and the step passed anyway, on
+  the flow's own selector. The 2026-09-04 re-wording of `agentBlock` for
+  exactly this shape ("A rescued step shows once") carried one step further.
+
+**Four shapes are never folded, and the passing requirement is why.** A leg on
+a step that did NOT pass IS the evidence of the failure; a held action
+(`ProofStep.blocked`, `AgentRecord.blocked`) is the harness withholding a
+mutation; `endedBy: 'fail'` is the model's own claim it could not proceed; and
+a leg whose actions changed the page and whose step then passed did decide the
+outcome. The brief that asked for this listed `lookedOnly` as sufficient on its
+own AND listed "a step that did not pass" as excluded — a contradiction on a
+shape the engine can write. It was resolved toward the exclusion: folding the
+only account of what was tried on a broken step is the one thing this rule must
+never do.
+
+**Measured before it was written**, over this workspace's 722 sealed bundles
+(10,247 steps, 988 agent legs, `valst-output/proofs/`): 112 legs in 70 bundles
+fold — 85 `looked-only`, 27 `did-not-decide`. 7 further candidates were held
+open by `endedBy: 'fail'`, 0 by a hold. A predicate matching thousands would
+have been wrong.
+
+**The wording is not the field's doc comment, because the doc comment is not
+true.** `WorkflowAgent` raises `lookedOnly` on TWO branches — `onlyLooked`
+(every action idle) and `missedEveryInteraction` (it clicked, and nothing was
+ever engaged) — and on these bundles the second is **76 of the 85**. So the
+printed clause is `it never engaged a control the goal names`, the one sentence
+both branches make true; "every action was a scroll or a wait" would have been
+a false statement about 76 real steps. (The runner's own
+`verification-deferred` reason carries the narrower wording — engine-owned, not
+fixed here.) `AGENT_LEG_ASIDE_LABEL` + one clause per kind is the whole
+composition: it is built from constants only, so no application text and no
+credential can reach it.
+
+**Folding is layout, never a verdict.** Nothing leaves the DOM, the same rule
+`details.replaced` follows: the leg is a full record inside a CLOSED
+`<details class="aside-leg">` in the ordinary colour, never red. The step keeps
+its status and does not auto-expand — the page script keys expansion off the
+step's status class, and a folded leg only ever sits on a passing step, so no
+script change was needed. `agentBlock` was already framed by the step's status,
+so a folded leg was already un-reddened and its trace already closed. The
+workbook has no disclosure, so there the leg is MARKED instead: one line
+directly above `agent:`, in the same words, and not one recorded line is
+removed — a workbook is the proof handed over.
+
+Status, verdict, `isPassing`, defect count, findings clustering and exit codes
+are all untouched; the drift signal a `jit` heal or an assist rung raises is
+exactly what it was.
+
+Tests pin it three ways, each with hand-built bundles: `reporter-wave2.test.ts`
+("an agent leg that did not decide its step" — both shapes, the four
+exclusions, the escaping, and a byte-identity check that renders ONE bundle
+twice with `endedBy` flipped in between, so the run id and timestamps hold
+still and the fold is proved to be a wrapper and nothing else, defect rows
+included), `catalog-report.test.ts` (same name; the catalog `esc` leaves the
+apostrophe, and its `doesNotMatch` must target `<details class="aside-leg"`
+because the stylesheet always carries the rule), `excel-export.test.ts` ("the
+agent leg that decided nothing, in the Proof column" — the mark sits directly
+above `agent:`, the cell is otherwise identical, still ten columns, read back
+through `catalog/extract.ts`'s independent reader).
+
+wowUI's own step panel mirrors these projections by hand and does NOT fold —
+that surface is `ui-expert`'s.
+
+## A database validation shows the query it ran and the rows it got back (2026-09-08)
+
+A DB check rendered as a `where` summary, an expected/observed pair and an
+unlabelled grid of `col = value` cells: a reader could see the claim and the
+verdict but not **what SQL answered it**, and could not tell a three-row
+result from the first three of forty-two. The statement is now captured at
+its source (`src/db/db-actions.ts` — see `src/api/CLAUDE.md`, "The statement a
+DB check ran is on its record"), redacted there, and read here through ONE
+projection so no surface can describe one check its own way.
+
+**`dbEvidence` in `step-facts.ts` is that projection** — kind, target,
+where/expected/observed/note, duration, polled, the statements, and the row
+sample as a header row plus aligned cells — with `dbProofLines` for the
+surfaces that have no table. It reads structurally and defensively like the
+rest of the module: a record that is not an object, a statement with no `sql`,
+a row that is not a row and a column one row lacks all render nothing rather
+than a placeholder that reads like a fact.
+
+**Three surfaces, one wording.** `DB_QUERY_LABEL` / `DB_PARAMS_LABEL` /
+`DB_ROWS_LABEL` are the greppable constants. The per-run report's `dbBlock`
+keeps the summary `dl` it always had and adds the SQL in a wrapping `pre`
+inside an `http-part` (the report must never scroll its body horizontally),
+the bound parameters as `$n = value`, and the sample as a real `<table>` with
+a header row of column names. The catalog report gains `db query`, `db
+parameters` and a `.dbrows` table in the step detail — it showed the baseline
+diff (`describeDbChanges`) and NOT the check itself before this. The workbook
+puts the same lines in the Proof column, which already IS the step's own log;
+no new column, because it would sit empty on every run that never touched a
+database.
+
+**The sample says what it is showing.** `showing 1 of 42 row(s) — the sample
+is capped at 3` when the check counted more than it kept (`rowsMatched`
+against `DB_EVIDENCE_MAX_ROWS`), plain `1 row(s)` otherwise, and `matching
+statement(s)` for a `called` check — its sample is statements, not rows of a
+table, and the same caption would read as a result set.
+
+**A bundle sealed before this renders exactly the summary it did.** No query
+section, no empty one, nothing invented — which is also the shape of every
+check refused before any SQL ran. Nine live DB steps in this workspace's 908
+bundles are all of that kind, so the no-statement path is the common one, not
+the edge case.
+
+Tests: `tests/reporter-wave2.test.ts` ("a database check shows the query it
+ran" — the SQL, the parameters, the header row, the capped-sample caption,
+the escaping of both the statement and every cell, the redacted parameter,
+the older bundle, and the `called` caption), `tests/catalog-report.test.ts`
+and `tests/excel-export.test.ts` (same section name; the workbook read back
+through `catalog/extract.ts`'s independent reader, still ten columns),
+`tests/db.test.ts` (the capture and its redaction, at the source).
+
+## A step that broke without deciding the outcome is folded, never dropped (2026-09-08)
+
+The sibling of `inconsequentialAgentLeg`, one wave later and the same
+constitution: **this decides only how a step is LAID OUT.** It is not a
+status, not a verdict, not a defect, not a count — no run status, case
+verdict, tally, defect table, `harnessOnly()` or exit code moves, and nothing
+leaves the document.
+
+`passed-with-issues` is the engine's own name for the run this happens on:
+the claims held, the path did not. Inside such a run an *action* step that
+broke sat red beside real failures, and a reader who learns that red does not
+mean a finding stops reading red at all.
+
+**`inconsequentialBrokenStep(step, run)` in `step-facts.ts`** is the ONE
+predicate the per-run report, the catalog report and the workbook ask. Every
+condition is structural over typed fields, and all must hold:
+
+- the action is **not** an assertion (`isAssertionStepAction`) — it makes no
+  claim, so it has no expected-result verdict to fail;
+- the status is `failed` or `dead-end` — **never `error`** (that says the
+  harness could not proceed and `harnessOnly()` in `cli/exit.ts` depends on it
+  being visible) and never a step carrying `blocked` (a withheld action is a
+  finding about the run);
+- the run reached a passing outcome anyway — status `passed` or
+  `passed-with-issues`, at least one assertion, and every assertion passed;
+- nothing downstream depended on it — at least one later step ran and passed,
+  and no later step was skipped or ended the harness. A later *action* step
+  that also broke does not make this one consequential; a step the run never
+  reached does.
+
+A superseded attempt returns null: it is already folded under the step that
+replaced it (`details.replaced`), and folding it twice would hide the rescue
+as well as the attempt.
+
+**`isAssertionStepAction` mirrors `ASSERTION_ACTIONS`** for the same reason
+`proof-bundle.ts` restates it — the reporter cannot import the runner without
+importing the whole execution plane. `tests/reporter-wave2.test.ts` pins the
+mirror against the runner's own exported list, so it cannot drift quietly.
+
+**Measured before it was written**, over this workspace's 908 sealed bundles
+(`valst-output/proofs/`): 40 steps in 14 bundles fold — 21 `dead-end`, 19
+`failed`, all of them `click`, `fill`, `waitFor`, `selectOption` and
+`saveText`. A predicate matching hundreds would have been wrong.
+
+**Folded, and the fold names the sealed status.** The per-run report wraps the
+whole `<li>` in a closed `<details class="aside-step">` inside an
+`li.step-aside`, summary `<idx> <intent> <action> — failed — did not decide
+this run's outcome: …`; the row inside is byte for byte the row that rendered
+before, red dot, badges, error and screenshot included, and the page script
+needs no change because it keys auto-expansion off the step's own status
+class. The catalog report's steps are already closed disclosures, so there it
+is the ordinary colour (`details.step.aside`, dashed rule) plus one
+`span.saside` on the summary. The workbook has no disclosure, so the step is
+MARKED: the summary is the first line of its own Proof cell, the Result
+column still says `failed`, and not one recorded line is removed — a workbook
+is the proof handed over.
+
+`BROKEN_STEP_ASIDE_LABEL` plus one why-clause is the whole composition, built
+from constants and the sealed status alone, so no application text and no
+credential can reach it.
+
+Tests: `tests/reporter-wave2.test.ts` ("a step that broke without deciding the
+outcome" — the fold, a byte comparison of the step list with only the run
+status flipped in between, the four exclusions, and the assertion mirror),
+`tests/catalog-report.test.ts` and `tests/excel-export.test.ts` (same section
+name; the workbook's Result column untouched, read back through the
+independent reader).
+
+## A case gets its own page, and the queries behind its DB evidence are on it (`case-page.ts`, 2026-09-10)
+
+The catalog index stayed the one place a case could be read, and reading one
+meant expanding a row inside a page that carries every other row. Asked for on
+2026-09-10, after a hand-written verifier report (a mast, a pre-read summary, a
+coverage bar, suggested tickets, the test data, the DB before and after, the
+approval history, the open questions, the outcomes, the film, the stills) was
+held up as the shape a person wants to open: **every case with a bundle now
+gets a standalone page**, and for a catalog run **that page IS the case's
+report** — the file the ledger's `reportPath` names, in the run's own folder,
+which is what the panel's card opens and what a person browsing the run
+folder finds (the first cut put it only in `<runKey slug>-media/` beside the
+workbook, and the person opened the per-run report at `reportPath` and saw
+the old page). `writeCasePageAt` in `cli/catalog-live-report.ts` is the one
+writer: the run loop calls it the moment a catalog case seals (in place of
+`writeHtmlReport`, which stays for `run`/`go`/`generate` suites), and
+`writeCasePages` from `writeCatalogArtifacts` rewrites it on every live
+refresh and every `wowlidator report` rebuild, so the two cannot differ. A
+case whose ledger record has no `reportPath` (a rebuilt older ledger) gets
+its page in the media folder. The case's **name in the index row is the
+link** (`a.open-case`, `event.stopPropagation()` like the export button;
+relative to the catalog report through `CatalogReportInput.casePageHref`,
+and carrying `data-report` — the absolute path — so that under the panel,
+where `/reports/<file>` cannot follow a relative href into another tree, the
+page script re-points it at `/view?path=`). A case with no bundle keeps plain
+text and no page; a stale media-folder page from an earlier pass is removed.
+
+**Two kinds of sentence, kept apart on the page.** Every table, chip, pill,
+query, still and film frame is a pure function of the bundle, the rule every
+renderer here follows; a section with no evidence is omitted, never padded.
+The lede, the pre-read summary, the ticket wording, the verifier's note and
+the open questions are `bundle.narrative` — written by a model AFTER the run
+(`src/generator/case-narrative.ts`, the sibling of step narration: one
+`generator`-role call per case, on by default, `--no-case-narrative` /
+`WOWLIDATOR_CASE_NARRATIVE=off` to skip, attributed by model id, dropped
+whole rather than partially applied). On the page every such sentence wears
+the `ai` class (a violet left rule) and the mast says once whose words they
+are; a bundle with no narrative renders the evidence alone, and there is a
+test that such a page carries no `ai` class at all. A ticket the model words
+keeps the defect id it restates; a ticket naming a defect the run never filed
+loses that reference at the trust boundary, never on the page.
+
+**The "Query used for DB evidence" section is one block per DB step**: kind,
+table and where, expected against observed, the SQL as sent with each bound
+value as a `-- $n = value` comment above it, the rows returned as a real table
+with the sample caption, polled time and the check's disclosed note — all
+through `dbEvidence`, so this page, the per-run report, the catalog row and the
+workbook cannot describe one check four ways. A check refused before any SQL
+ran shows its summary and no code block. HTTP `request` steps get their own
+"backend calls" section with request and response bodies. Above the blocks sit
+**four chips for four sidecar files** beside the page — `<case>-db-query.sql`
+(every statement in a `BEGIN TRANSACTION READ ONLY … ROLLBACK` wrapper),
+`<case>-db-before.csv` and `<case>-db-after.csv` (the baseline counts and the
+redacted sample rows from `dbChanges`, deleted rows on the before side,
+inserted and updated on the after side), `<case>-db-evidence.csv` (one line
+per returned field of every check). `caseSidecars` builds them from the same
+projection; a file that would be empty is not written and its chip is plain
+text, never a dead link. Nothing in them was not already in the bundle: no
+DSN, no credential, parameters as redacted at the source.
+
+**Labels come in the run's language, values never do.** `ReportLang` (`en` |
+`th`) is chosen at launch (`--report-lang`, `WOWLIDATOR_REPORT_LANG`, the
+panel's "Case page language" field), recorded on the ledger's launch block
+and read back by the live report and by a rebuild, so the language is the
+run's and not the rebuilder's. `caseLabels` holds both dictionaries; ids,
+SQL, selectors and application text are shown exactly as recorded whichever
+is chosen, and the narrative is asked for in the same language.
+
+**Self-contained, like every report here.** The template it was drawn from
+linked a web font; the page does not — the font stack names IBM Plex first and
+falls through to the system, so the page opens off a USB stick unchanged.
+Stills are inline `data:` JPEGs; the film rides on `data-webm` through the
+same Blob shim the catalog report uses (Chrome will not load a `data:`
+video), or is a relative `src` when the catalog already spilled the recording
+as a file. The video and the sidecars are flat in the media folder on purpose:
+the panel's `/reports/` route serves two path levels.
+
+Tests: `tests/case-page.test.ts` (names, the query section and its chips,
+each sidecar's exact content, every evidence section, the narrative's marking
+and attribution, Thai labels, escaping, a typed value that never reaches the
+page, byte-identical rendering), `tests/catalog-live-report.test.ts` ("each
+case with a bundle gets its own page" — the files on disk, the index link, the
+language off the ledger, the stale page removed), `tests/case-narrative.test.ts`
+(the model seam).
+
+## The pre-read table says each thing once, and a list reads as one (2026-09-11)
+
+Measured on a real page (`PRB-EC-053`, the EC spot run of 2026-09-11): the
+Test case row read `<code>PRB-EC-053</code> · PRB-EC-053 พนักงานกลุ่ม C …`,
+the id printed twice, while the mast one screen above had already stripped it.
+The mast's own derivation is now `caseTitle` and `preRead`, the mast and the
+blocked-case page all call it: the sheet's own id through `displayCaseId`, and
+the name with a leading repeat of **either** id removed (the qualified one and
+the shown one — a name that repeats the sheet's spelling was the same bug from
+the other side). The qualified id keeps its one place, the mast's id line.
+
+**An enumerated narrative field renders as an ordered list.** The same page's
+Expected result was one run-on paragraph over a source text the model wrote as
+`1. … 2. … 3. … 4. …`. `enumeratedItems` splits it, and the rules exist so that
+restructuring can never become rewriting: the run must START at `1.`/`1)` with
+nothing before it, the numbers must ascend by one (a mark that does not is left
+inside the item it sits in, never dropped), an empty item or fewer than two
+items means "not a list", and the marker needs trailing whitespace — which is
+what keeps `120,000 THB`, `2026-10-08` and `1.5s` out of it. Text with no
+enumeration renders exactly the bytes it did before. `narrative()` is the one
+reader of a model-written field on this page and marks `ai` on either shape:
+the words stay the model's, the layout is ours.
+
+**An absent value is a note, not a value.** Test data with no recorded
+variables rendered `<code>none recorded</code>` — a label dressed as evidence.
+It is a `span.det` now, the same shape Expected result already used for the
+same absence; a recorded value still sits in `code`.
+
+Tests: `tests/case-page.test.ts` — "the pre-read table names the case exactly
+as the mast does" (the qualified id, the stripped name, the name that is only
+an id) and "an enumerated narrative field becomes a real list" (the `<ol>`, the
+one-sentence field left alone, three shapes that must not split, a `det` field,
+and the escaping inside a list item).
+
+## The run's notes are summarised, not recited (`runNotesSummary`, 2026-09-11)
+
+A reader opened PL_06_10's case page and found the paragraph under the coverage
+bar unreadable: roughly 300 words in ONE `·`-joined line — the session note, the
+sign-in POST evidence, a pre-run dead-end/expected-fail risk line, a three-case
+cross-case-interference stamp and a full system-error diagnosis with the agent's
+click trail and a suggested `--repair-investigate`. Decided by the person
+running this: **the reader is shown a summary of at most 70 words and the
+verbatim notes are dropped from the page** — not behind a disclosure, not in a
+tooltip. `bundle.notes` is untouched in the JSON; it stops being rendered.
+
+**`runNotesSummary` in `step-facts.ts` is the ONE reading**, and the per-case
+page, the catalog report and the per-run report all ask it — the same rule as
+`stepNarration` and `inconsequentialAgentLeg`: a surface that decides on its own
+how to describe the run's notes is a surface that will describe them
+differently. It reads two recorded fields and picks one; it derives nothing and
+calls no model. The summary itself is `CaseNarrative.verifierNote`, written and
+bounded in `generator/case-narrative.ts` from the notes it is already given, so
+this costs no extra model call.
+
+- narrative with a non-empty `verifierNote` → that text, `by`/`attribution`
+  set, `lines` EMPTY (the summary replaces the notes, it never precedes them).
+- notes with no narrative → the notes, joined for `text` and per-entry in
+  `lines`, unattributed. **This degraded path is not an edge case and must not
+  be deleted**: `--no-case-narrative`, `WOWLIDATOR_CASE_NARRATIVE=off` and a
+  generator role with no key all seal a bundle with notes and no narrative, and
+  that page already degrades "to the evidence alone". Rendering nothing there
+  would delete the only account of the run a reader has.
+- neither → null, and no block is rendered at all.
+
+Defensive like the rest of the module: an empty or whitespace note, a narrative
+from an older build and a `narrative` that is not an object all fall through to
+the notes rather than to a placeholder; a summary with no `by` is attributed to
+`a model`, never left reading as the harness's own sentence.
+
+**Attribution stays with the sentence, in each file's own idiom** — `ai(…, 'p',
+'caveat')` on the case page (whose mast already says once whose words the violet
+bars are), `— written by <provider:model>` in a `span.narr-by` in the per-run
+report's callout and an `em.narr-by` on the catalog report's `hline`. The
+per-run callout keeps its `(N)` count only on the raw-notes path, where there is
+a count to give.
+
+**Site 3 is the per-run report's `Run notes` callout inside `<details
+class="diagnostics">`** — collapsed, and its section is by charter the raw
+material a person debugs from. It was changed with the other two on instruction,
+and it is the one worth re-deciding: reverting it is one call site
+(`runNotes()` in `html-reporter.ts`) and its test.
+
+Tests: `tests/reporter-wave2.test.ts` ("the run notes a reader is shown" — the
+projection's exact shape, the callout, no raw note text on the summarised path,
+the `(2)` count on the degraded one, the fall-throughs, and escaping on both
+paths), `tests/catalog-report.test.ts` and `tests/case-page.test.ts` (same
+section name, each surface's own markup).

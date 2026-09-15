@@ -29,7 +29,11 @@ import type { AddressInfo } from 'node:net';
 import {
   MAX_STEP_TIMEOUT_MS,
   StepResolutionError,
+  ARIA_STATE_ATTRIBUTES,
+  ariaStateMatches,
   describeAttempt,
+  closesDependentTail,
+  dependentTail,
   fieldNamesIn,
   isStateContradiction,
   isoDateOf,
@@ -38,6 +42,8 @@ import {
   resolvePersona,
   runFlow,
   signsInItself,
+  skipAfterFailedLeg,
+  stopAfterFirstIssue,
   stepPatience,
   valueMatches,
   type Flow,
@@ -49,6 +55,71 @@ const CDP_URL = process.env['WOWLIDATOR_CDP_URL'] ?? 'http://localhost:9222';
 // --- Unit tier -------------------------------------------------------------
 
 describe('state contradictions the wave-2 rungs read off an attempt line', () => {
+  it('finds only the steps that depend on a failed workflow leg', () => {
+    const workflow = { action: 'workflow', goal: 'open the order' } as const;
+    const tail = [
+      { action: 'expectVisible', selector: 'text=Order' },
+      { action: 'saveText', selector: 'text=ID', as: 'id' },
+      { action: 'expectText', selector: 'text=Status', value: 'Open' },
+    ] as const;
+    assert.deepEqual(dependentTail([workflow, ...tail, { action: 'goto', url: '/app' }] as Flow['steps'], 0), [1, 2, 3]);
+    assert.deepEqual(dependentTail([workflow] as Flow['steps'], 0), []);
+    assert.deepEqual(dependentTail([workflow, { action: 'workflow', goal: 'recover' }] as Flow['steps'], 0), []);
+    // A request reads nothing off the page: it and its own assertions still run.
+    assert.deepEqual(
+      dependentTail(
+        [workflow, ...tail, { action: 'request', method: 'GET', url: '/api/status' }, { action: 'expectStatus', status: 200 }] as Flow['steps'],
+        0,
+      ),
+      [1, 2, 3],
+    );
+    for (const action of ['goto', 'signIn', 'signOut', 'workflow', 'back', 'forward', 'setClock', 'clearStorage'] as const) {
+      const reset = action === 'goto'
+        ? { action, url: '/app' }
+        : action === 'signIn'
+          ? { action, as: 'TEST_ACCOUNT' }
+          : action === 'workflow'
+            ? { action, goal: 'recover' }
+            : action === 'setClock'
+              ? { action, now: '2026-09-05T00:00:00Z' }
+              : { action };
+      assert.deepEqual(dependentTail([workflow, tail[0], reset] as Flow['steps'], 0), [1], action);
+    }
+  });
+
+  it('runs dependent tails only when the kill-switch restores the old behavior', () => {
+    assert.equal(skipAfterFailedLeg({}), true);
+    assert.equal(skipAfterFailedLeg({ WOWLIDATOR_SKIP_AFTER_FAILED_LEG: 'off' }), false);
+  });
+
+  it('closes the tail after any failed workflow leg or goto, but a click only when it dead-ended (RC-6, 2026-09-10)', () => {
+    // workflow/goto: unconditional, whatever the failure's own kind — there is
+    // no in-between state where the leg failed yet the run is somewhere useful.
+    assert.equal(closesDependentTail('workflow', 'error'), true);
+    assert.equal(closesDependentTail('workflow', 'failed'), true);
+    assert.equal(closesDependentTail('workflow', 'dead-end'), true);
+    assert.equal(closesDependentTail('goto', 'error'), true);
+    assert.equal(closesDependentTail('goto', 'dead-end'), true);
+    // click: only a dead end — the ladder never actually touched anything —
+    // gives that same certainty. A click that resolved and acted, disagreeing
+    // only on content or state afterwards, changed something real, and the
+    // steps after it keep their own verdict.
+    assert.equal(closesDependentTail('click', 'dead-end'), true);
+    assert.equal(closesDependentTail('click', 'failed'), false);
+    assert.equal(closesDependentTail('click', 'error'), false);
+    assert.equal(closesDependentTail('click', undefined), false);
+    // No other action ever closes a tail — an assertion or a form field
+    // failing is never evidence the run left the page it was already on.
+    for (const action of ['expectVisible', 'expectText', 'fill', 'check', 'selectOption', 'type'] as const) {
+      assert.equal(closesDependentTail(action, 'dead-end'), false, action);
+    }
+  });
+  it('enables first-issue triage only when explicitly requested', () => {
+    assert.equal(stopAfterFirstIssue({}), false);
+    assert.equal(stopAfterFirstIssue({ WOWLIDATOR_STOP_AFTER_FIRST_ISSUE: 'on' }), true);
+    assert.equal(stopAfterFirstIssue({ WOWLIDATOR_STOP_AFTER_FIRST_ISSUE: 'ON' }), true);
+  });
+
   it('a missing option, a disabled control and an out-of-range day are verdicts', () => {
     assert.ok(isStateContradiction('fast "#grp": opened "Employee Group" but no option named "Z" appeared (looked for role=option, menuitem, menuitemradio; 3 shown: A, B, C)'));
     assert.ok(isStateContradiction('fast "#submit": locator.click: Timeout 400ms exceeded. (element is not enabled)'));
@@ -93,6 +164,40 @@ describe('the comparators concede the sheet\'s own spelling last (EH-05)', () =>
     assert.ok(!valueMatches('New Hire', 'Rehire'));
     assert.ok(valueMatches('A - Permanent', 'A — Permanent'));
     assert.ok(valueMatches('CDS (C001)', 'C001'));
+  });
+});
+
+describe('expectAttribute answers an ARIA state from either spelling (RC, 2026-09-10, PL_06_05)', () => {
+  it('lists exactly the six ARIA states the AX tree unifies with a bare attribute', () => {
+    assert.deepEqual(
+      [...ARIA_STATE_ATTRIBUTES].sort(),
+      ['checked', 'disabled', 'expanded', 'readonly', 'required', 'selected'],
+    );
+    // Everything else — title, href, aria-label, data-*, and the raw
+    // aria-* spelling itself — keeps reading only the literal attribute.
+    assert.ok(!ARIA_STATE_ATTRIBUTES.has('title'));
+    assert.ok(!ARIA_STATE_ATTRIBUTES.has('aria-pressed'));
+  });
+
+  it('a bare-attribute boolean claim is satisfied by aria-<name>="true" (the live miss)', () => {
+    // aria-required="true", the claim written as `required` with `expected: ''`
+    // (the idiom flows already use for a present-but-valueless HTML boolean
+    // attribute) — the exact PL_06_05 shape.
+    assert.equal(ariaStateMatches('', 'true'), true);
+  });
+
+  it('a genuinely absent or false state still fails, whichever spelling was asked for', () => {
+    assert.equal(ariaStateMatches('', null), false, 'no aria attribute at all is not evidence of the state');
+    assert.equal(ariaStateMatches('', 'false'), false, 'an explicit false is not the state holding');
+    assert.equal(ariaStateMatches('true', null), false);
+  });
+
+  it('a claim already spelling out the ARIA token compares directly, including the tri-state aria-checked', () => {
+    assert.equal(ariaStateMatches('true', 'true'), true);
+    assert.equal(ariaStateMatches('false', 'false'), true);
+    assert.equal(ariaStateMatches('mixed', 'mixed'), true);
+    assert.equal(ariaStateMatches('true', 'mixed'), false);
+    assert.equal(ariaStateMatches('false', 'true'), false);
   });
 });
 
@@ -672,5 +777,101 @@ describe('the wave-2 rungs and steps against a real page (CDP)', { skip: skipBro
     assert.equal(bundle.steps[2]?.status, 'passed', bundle.steps[2]?.error ?? '');
     assert.equal(bundle.steps[2]?.detail?.['relaxation'], 'normalised');
     assert.equal(bundle.steps[3]?.status, 'failed', 'a different value is still a failure');
+  });
+});
+
+/**
+ * A dead-ended `click` closing its own dependent tail — the same protection
+ * `dependentTail` already gave a failed `workflow` leg, extended to the plain
+ * shape both of be-sit-high-20260909-170213's largest defect clusters shared
+ * (RC-6, 2026-09-10): a `click` that never actually resolved, followed by
+ * assertions that only made sense on the record it was meant to open.
+ */
+const TAIL_HTML = `<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>dependent tail fixture</title></head>
+  <body>
+    <h1 id="heading">List</h1>
+    <button type="button">Edit</button>
+    <button type="button">Edit</button>
+    <button type="button">Edit</button>
+    <button id="locked" type="button" disabled>Locked</button>
+    <div id="detail" hidden>
+      <p id="detail-status">Detail loaded</p>
+    </div>
+  </body>
+</html>`;
+
+describe('a dead-ended click closes its dependent tail, an independent assertion never does (RC-6, CDP)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin: string;
+  let dir: string;
+
+  before(async () => {
+    server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(TAIL_HTML);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    dir = await mkdtemp(join(tmpdir(), 'wowlidator-tail-'));
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('marks the assertions after an ambiguous, unhealed click as skipped, not as three fresh dead ends', async () => {
+    const bundle = await runFlow(
+      {
+        name: 'ambiguous click closes its tail',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'click', selector: 'role=button[name="Edit"]', intent: 'open the record' },
+          { action: 'expectVisible', selector: '#detail' },
+          { action: 'expectText', selector: '#detail-status', value: 'Detail loaded' },
+          { action: 'expectText', selector: '#detail-status', value: 'Detail loaded' },
+        ],
+      },
+      { cdpUrl: CDP_URL, cachePath: join(dir, 'ambiguous.json'), healer: null, video: 'off', screenshots: 'off', fastTimeoutMs: 400 },
+    );
+
+    const click = bundle.steps.find((s) => s.action === 'click');
+    assert.equal(click?.status, 'dead-end', 'a strict-mode violation never touched anything');
+    const tail = bundle.steps.slice(bundle.steps.indexOf(click!) + 1);
+    assert.equal(tail.length, 3);
+    for (const step of tail) {
+      assert.equal(step.status, 'skipped', `${step.action} should be a consequence, not its own defect`);
+      assert.match(step.error ?? '', /not run: depends on step/);
+      assert.match(step.error ?? '', /never resolved/);
+    }
+    // Skipped steps count as neither passed nor failed.
+    assert.equal(bundle.summary.passed, 1, 'only the goto passed');
+  });
+
+  it('never swallows an independent assertion after a click that resolved and genuinely disagreed', async () => {
+    const bundle = await runFlow(
+      {
+        name: 'disabled click keeps the tail',
+        baseUrl: origin,
+        steps: [
+          { action: 'goto', url: '/' },
+          { action: 'click', selector: '#locked', intent: 'try to use a disabled control' },
+          // Unrelated to the click, on the SAME page, and genuinely wrong —
+          // this must still be judged on its own evidence.
+          { action: 'expectText', selector: '#heading', value: 'Something else entirely' },
+        ],
+      },
+      { cdpUrl: CDP_URL, cachePath: join(dir, 'disabled.json'), healer: null, video: 'off', screenshots: 'off', fastTimeoutMs: 400 },
+    );
+
+    const click = bundle.steps.find((s) => s.action === 'click');
+    assert.equal(click?.status, 'failed', 'a disabled control is a verdict, not a dead end');
+    const assertion = bundle.steps.find((s) => s.action === 'expectText');
+    assert.notEqual(assertion?.status, 'skipped', 'an independent, genuinely-wrong assertion must still be its own finding');
+    assert.match(assertion?.error ?? '', /Something else entirely/);
   });
 });

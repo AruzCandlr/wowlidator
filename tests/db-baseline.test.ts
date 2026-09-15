@@ -23,6 +23,8 @@ import {
   restoreBaseline,
   restorePlan,
   takeBaseline,
+  restoreScript,
+  sqlLiteral,
   type Baseline,
   type BaselineTable,
 } from '../src/db/baseline.js';
@@ -361,5 +363,64 @@ describe('restore end to end (stub)', () => {
     assert.equal(result.ok, false);
     assert.match(result.detail, /nothing restorable/);
     assert.deepEqual(result.skipped.map((s) => s.table), ['audit_log']);
+  });
+});
+
+describe('the undo is written down whether or not the run may perform it (2026-09-09)', () => {
+  const baseline = (rows: Record<string, unknown>[]): any => ({
+    version: 1,
+    takenAt: '2026-09-09T07:00:00.000Z',
+    runKey: 'be-high@2026',
+    tables: [
+      {
+        table: 'benefit_management.benefit_plan',
+        why: ['named by the plan'],
+        columns: ['id', 'name'],
+        pk: ['id'],
+        references: [],
+        rowCount: rows.length,
+        hash: 'abc',
+        restorable: true,
+        rows,
+      },
+    ],
+  });
+
+  it('renders a pasteable script — no $1 holes survive', () => {
+    const sql = restoreScript(baseline([{ id: 1, name: 'QA-Import' }]));
+    assert.doesNotMatch(sql, /\$\d/, 'a parameter hole is not pasteable');
+    assert.match(sql, /DELETE FROM "benefit_management"\."benefit_plan"/);
+    assert.match(sql, /INSERT INTO "benefit_management"\."benefit_plan"/);
+    assert.match(sql, /'QA-Import'/);
+    assert.match(sql, /^-- wowlidator: restore/m);
+  });
+
+  it('escapes a quote rather than ending the literal', () => {
+    // These values came out of this database, but a script that mis-quotes one
+    // is a broken restore, and a broken restore is worse than none.
+    assert.equal(sqlLiteral("O'Brien"), "'O''Brien'");
+    assert.equal(sqlLiteral(null), 'NULL');
+    assert.equal(sqlLiteral(true), 'TRUE');
+    assert.equal(sqlLiteral(42), '42');
+    const sql = restoreScript(baseline([{ id: 1, name: "O'Brien" }]));
+    assert.match(sql, /'O''Brien'/);
+  });
+
+  it('names the tables it will NOT put back, so the residue is stated', () => {
+    const b = baseline([{ id: 1, name: 'x' }]);
+    b.tables.push({
+      table: 'benefit_management.audit_log',
+      why: [], columns: ['id'], pk: [], references: [],
+      rowCount: 9, hash: 'z', restorable: false, reason: 'no primary key', rows: [],
+    });
+    const sql = restoreScript(b);
+    assert.match(sql, /NOT restored: benefit_management\.audit_log — no primary key/);
+    assert.doesNotMatch(sql, /INSERT INTO "benefit_management"\."audit_log"/);
+  });
+
+  it('says what it assumes and what it does not cover', () => {
+    const sql = restoreScript(baseline([]));
+    assert.match(sql, /standard_conforming_strings/);
+    assert.match(sql, /not undone by this script/);
   });
 });
