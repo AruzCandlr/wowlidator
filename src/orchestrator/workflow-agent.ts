@@ -35,6 +35,7 @@ import { revealHidden } from '../engine/reveal.js';
 import { approach, humanClick, humanFill, humanKeys, humanScrollBy, humanScrollTo } from '../engine/humanize.js';
 import { ListboxOptionMissingError, selectFromListbox } from '../engine/listbox.js';
 import { isoDateOf } from '../engine/dates.js';
+import { pickDateInDialog } from '../engine/calendar.js';
 import { scopeUrl, type CacheManager } from '../cache/cache-manager.js';
 import type { AxNode } from '../healer/jit-healer.js';
 import {
@@ -43,7 +44,12 @@ import {
   formGaps,
   formatFormGaps,
   goalAlreadyShowing,
+  heldAsTyped,
+  indexElements,
+  interceptionOf,
   listboxCannotOffer,
+  refsFromAriaSnapshot,
+  withRefs,
   menuNodeScore,
   menuPathOf,
   multiPersonaGoal,
@@ -57,6 +63,7 @@ import {
   selectorGrounded,
   selectorName,
   unscopedDestructiveClick,
+  type IndexedElement,
   type MenuSegment,
   type Reactivation,
 } from './agent-guards.js';
@@ -529,6 +536,9 @@ const ReplayScriptSchema = z.array(ReplayStepSchema).max(REPLAY_MAX_STEPS);
  */
 const ENTRY_VALUE_ACTIONS: ReadonlySet<string> = new Set(['fill', 'type', 'paste']);
 
+/** Where an entry action's date goes when its target is a date control rather than a text field. */
+type DateEntry = { via: 'date-input'; input: Locator } | { via: 'calendar'; trigger: Locator };
+
 /**
  * Did this journey type a credential into a field?
  *
@@ -602,6 +612,21 @@ export interface AgentObservation {
    * re-ask within one turn; the loop never re-asks twice.
    */
   feedback?: string | undefined;
+  /**
+   * The numbered table of the SAME focused nodes `axTree` renders
+   * (`indexElements`, 2026-09-18) — what an indexed policy (`jev-policy.ts`)
+   * chooses a row from, so its answer is an index the loop maps to that row's
+   * own canonical selector, never a selector the model wrote. Built every
+   * turn at $0; `LlmAgentModel` ignores it.
+   */
+  elements?: readonly IndexedElement[] | undefined;
+  /**
+   * Whether this run may only look (`RunOptions.readOnly` — the engine's
+   * triage rung). Carried so a policy whose vocabulary is fixed per question
+   * set can ask the verdict question instead of the action one; the loop
+   * still enforces the restriction on whatever comes back.
+   */
+  readOnly?: boolean | undefined;
 }
 
 export interface AgentDecision {
@@ -616,6 +641,29 @@ export interface AgentDecision {
   outputTokens?: number | undefined;
   /** Input tokens the provider served from its prompt cache, when it says. */
   cachedInputTokens?: number | undefined;
+  /**
+   * How sure the model was, when it says so (a decision model's calibrated
+   * confidence and the chosen option's probability, 0..1 — `jev-policy.ts`).
+   * Descriptive only: copied onto the action record, read by no judge.
+   */
+  confidence?: number | undefined;
+  probability?: number | undefined;
+  /**
+   * The exact node to act on, as this turn's aria-snapshot ref (`e12`), when
+   * the policy chose a row that had one. An execution hint for THIS turn
+   * only: `#act` acts through `aria-ref=` while the guards, the history, the
+   * record and the replay script keep reading `selector`. Never persisted —
+   * a ref is valid only against the snapshot it came from.
+   */
+  ref?: string | undefined;
+  /**
+   * Who is speaking when the action is `fail`: the model (its own judgement
+   * that the goal is unreachable — the default) or the harness (an indexed
+   * policy had no value to type for the field the model chose, after one
+   * re-ask). The loop records the second as the typed stop `no-value`, a
+   * harness limit, never as the model's `unreachable` claim.
+   */
+  origin?: 'model' | 'harness' | undefined;
 }
 
 /**
@@ -703,6 +751,15 @@ const ROUTE_WORDS = /\b(via|through|menu|sidebar|side bar|nav|breadcrumb|tab|cli
 export interface AgentModel {
   readonly id: string;
   decide(observation: AgentObservation): Promise<AgentDecision>;
+  /**
+   * The policy chooses rows of `AgentObservation.elements` rather than
+   * writing selectors (`jev-policy.ts`). The loop then also takes one
+   * AI-mode aria snapshot per turn and attaches exact-node refs to the rows,
+   * so the chosen row is acted on as the node it is, not as a name that may
+   * match several. Off for a selector-writing model: the snapshot would buy
+   * it nothing.
+   */
+  readonly indexed?: boolean | undefined;
 }
 
 const BASE_SYSTEM_PROMPT = `You are driving a real web browser to reach a stated goal, one action at a time.
@@ -1341,6 +1398,37 @@ export function deploymentAwareAgentUrl(targetUrl: string, currentUrl: string): 
   }
 }
 
+/**
+ * The settle that runs IN THE PAGE after an action (`#settleAfter`). Built
+ * with `new Function` from a plain string so the serialised source carries
+ * no esbuild `__name` helper: `requestAnimationFrame` twice or 50 ms; for a
+ * typed-into editable combobox, its first visible option under the
+ * controlled list, capped at 200 ms.
+ */
+const settleInPage = new Function(
+  'el',
+  'typed',
+  `return new Promise(function (resolve) {
+    var combo = typed && (el.getAttribute('role') === 'combobox' || el.getAttribute('aria-autocomplete') !== null);
+    var ids = (el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '').split(/\\s+/).filter(Boolean);
+    var roots = ids.length ? ids.map(function (id) { return document.getElementById(id); }).filter(Boolean) : [document];
+    var frames = 0, stopped = false;
+    var finish = function () { stopped = true; resolve(); };
+    setTimeout(finish, combo ? 200 : 50);
+    var ready = function () {
+      if (stopped) return;
+      var option = roots.some(function (root) {
+        return Array.prototype.some.call(root.querySelectorAll('[role="option"]'), function (o) {
+          var r = o.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+        });
+      });
+      if (++frames >= 2 && (!combo || option)) finish(); else requestAnimationFrame(ready);
+    };
+    requestAnimationFrame(ready);
+  });`,
+) as (el: unknown, typed: boolean) => Promise<void>;
+
 /** Every origin an absolute URL in the goal's text points at. */
 function originsNamedIn(goal: string): string[] {
   const out: string[] = [];
@@ -1442,6 +1530,7 @@ export class WorkflowAgent {
     this.#unreachable = null;
     this.#skills = null;
     this.#cachedInputTokens = 0;
+    this.#refStats = null;
     this.#policy = runOptions.mutationPolicy === undefined ? this.#defaultPolicy : runOptions.mutationPolicy;
     this.#approve = runOptions.approveMutation ?? this.#defaultApprove;
     this.#onMutation = runOptions.onMutation ?? this.#defaultOnMutation;
@@ -1747,7 +1836,14 @@ export class WorkflowAgent {
         }
         return treeChangedThisTurn;
       };
-      const axTree = renderTree(focusTree(all, goal, maxNodes), all.length);
+      const focused = focusTree(all, goal, maxNodes);
+      const axTree = renderTree(focused, all.length);
+      // The same nodes, numbered — an indexed policy's table (jev-policy.ts).
+      // For an indexed policy the rows also carry this turn's exact-node
+      // refs (Phase 3): one AI-mode aria snapshot, matched by role and name
+      // in duplicate order; a row the snapshot does not name keeps no ref
+      // and takes the selector path. Never persisted.
+      const elements = this.model.indexed === true ? await this.#withRefs(page, indexElements(focused, all)) : indexElements(focused, all);
       if (lastTreeSeen !== null && axTree !== lastTreeSeen) doneHere.clear();
       lastTreeSeen = axTree;
       // The required controls still empty (OA-6) — a separate observation
@@ -1849,6 +1945,8 @@ export class WorkflowAgent {
             stepsRemaining: effectiveMaxSteps - turns,
             dbCount: this.#dbProbe !== null,
             skills: this.#skills ?? [],
+            elements,
+            readOnly: runOptions.readOnly === true,
             ...(feedback === undefined ? {} : { feedback }),
           });
         } catch (error) {
@@ -2000,6 +2098,17 @@ export class WorkflowAgent {
         break;
       }
 
+      if (decision.action === 'fail' && decision.origin === 'harness') {
+        // Not the model's word: the policy could not supply a value for the
+        // field the model chose, twice. A harness limit beside `value-hunt`
+        // and `budget` — worded as one by the runner, never filed as the
+        // agent's account of the application.
+        summary = `agent stopped: ${decision.reasoning}`;
+        actions.push(this.#record(actions.length, decision, page.url(), false, 0));
+        this.#endedBy = 'no-value';
+        break;
+      }
+
       if (decision.action === 'fail') {
         summary = `agent reported the goal is unreachable: ${decision.reasoning}`;
         actions.push(this.#record(actions.length, decision, page.url(), false, 0));
@@ -2098,6 +2207,8 @@ export class WorkflowAgent {
             }
           }
         }
+
+        if (ok) await this.#settleAfter(page, current, current.ref === undefined ? current.selector : `aria-ref=${current.ref}`);
 
         const record = this.#record(
           actions.length,
@@ -2686,6 +2797,7 @@ export class WorkflowAgent {
       ...(this.#lookedOnly ? { lookedOnly: true } : {}),
       ...(success && this.#settledBy !== null ? { settledBy: this.#settledBy.rule, settledEvidence: this.#settledBy.evidence } : {}),
       ...(this.#observations.length > 0 ? { observations: [...this.#observations] } : {}),
+      ...(this.#refStats === null ? {} : { refs: { ...this.#refStats } }),
       ...(!success && this.#blocked !== null ? { blocked: this.#blocked } : {}),
       ...(this.#skills !== null && this.#skills.length > 0 ? { skills: [...this.#skills] } : {}),
       ...(this.#cachedInputTokens > 0 ? { cachedInputTokens: this.#cachedInputTokens } : {}),
@@ -2879,6 +2991,15 @@ export class WorkflowAgent {
   }
 
   async #act(page: Page, decision: AgentDecision, allowed: string[]): Promise<void> {
+    // **The node the policy chose, when it chose one** (Phase 3 of the jev
+    // port): a fresh ref is acted on as `aria-ref=eN` — the exact element,
+    // not the first of several with that name — while the gate below and
+    // every guard, history line and record keep reading `decision.selector`,
+    // because the gate scopes identifiers off the NAME selector and a ref
+    // carries none. A stale ref (the page re-rendered since the snapshot)
+    // fails the action here, before anything is touched, and the next turn
+    // re-observes — jev's own "page changed, choose again".
+    const act = await this.#actingSelector(page, decision);
     // **Every mutation passes the gate before the browser is touched.** This
     // is the one choke point every path shares — the model's decision, its
     // planned follow-ups, a replayed script, the menu walker — so a policy,
@@ -2889,11 +3010,21 @@ export class WorkflowAgent {
     // snapshot" is the page as it is at the moment of the click, not as it
     // was when the turn began.
     if ((decision.action === 'click' || decision.action === 'press') && decision.selector !== '') {
-      const observedControlName = await page.locator(decision.selector).first()
-        .ariaSnapshot({ timeout: Math.min(TARGET_ATTACH_MS, this.#actionTimeoutMs) })
-        .then(controlNameFromAriaSnapshot)
-        .catch(() => null);
-      const dialog = await this.#dialogFor(page, decision, observedControlName);
+      // The live control's name. For a ref decision it is the name this
+      // turn's AI-mode snapshot gave that exact node — the same harness
+      // observation the ref came from — and NOT a fresh default-mode
+      // `ariaSnapshot`: that call regenerates Playwright's ref map and
+      // restarts its numbering (measured 2026-09-18), so every ref of the
+      // turn would be orphaned or, worse, alias another node.
+      const refName = decision.ref === undefined ? undefined : this.#refNames.get(decision.ref);
+      const observedControlName =
+        refName !== undefined
+          ? refName === '' ? null : refName
+          : await page.locator(decision.selector).first()
+              .ariaSnapshot({ timeout: Math.min(TARGET_ATTACH_MS, this.#actionTimeoutMs) })
+              .then(controlNameFromAriaSnapshot)
+              .catch(() => null);
+      const dialog = await this.#dialogFor(page, decision, observedControlName, act);
       const held = await gateMutation({
         decision,
         goal: this.#goal,
@@ -2921,23 +3052,23 @@ export class WorkflowAgent {
         });
       }
     }
-    switch (decision.action) {
+    // `acting` is the decision with the ref selector swapped in; the same
+    // object as `decision` when there is no ref, so a goto's rewritten url
+    // still lands on the record.
+    const acting = act === decision.selector ? decision : { ...decision, selector: act };
+    switch (acting.action) {
       case 'click':
-        if (!decision.selector) throw new Error('click decision carried no selector');
-        await this.#target(page, decision.selector);
-        await humanClick(page, page.locator(decision.selector).first(), this.#actionTimeoutMs, { enabled: this.#humanize });
+        if (!acting.selector) throw new Error('click acting carried no selector');
+        await this.#target(page, acting.selector);
+        await humanClick(page, page.locator(acting.selector).first(), this.#actionTimeoutMs, { enabled: this.#humanize });
         break;
 
       case 'fill': {
-        if (!decision.selector) throw new Error('fill decision carried no selector');
-        await this.#target(page, decision.selector);
-        const dateInput = await this.#writable(page, decision.selector);
-        if (dateInput !== null) {
-          await this.#writeDate(dateInput, decision.value);
-          break;
-        }
-        const field = page.locator(decision.selector).first();
-        await humanFill(page, field, decision.value, this.#actionTimeoutMs, { enabled: this.#humanize });
+        if (!acting.selector) throw new Error('fill acting carried no selector');
+        await this.#target(page, acting.selector);
+        if (await this.#enteredAsDate(page, acting.selector, acting.value)) break;
+        const field = page.locator(acting.selector).first();
+        await humanFill(page, field, acting.value, this.#actionTimeoutMs, { enabled: this.#humanize });
         // **A fill the framework reverts is the quietest false negative in
         // the loop.** A controlled React input that has not finished
         // hydrating takes the value, then resets it on its next render — the
@@ -2949,13 +3080,15 @@ export class WorkflowAgent {
         // a field that STILL disagrees throws, so the model is told the
         // truth instead of planning on a value that is not there. Password
         // fields are exempt — they often read back empty by design.
-        if (decision.value !== '' && !/password/i.test(decision.selector)) {
+        if (acting.value !== '' && !/password/i.test(acting.selector)) {
           const readBack = await field.inputValue({ timeout: 1_000 }).catch(() => null);
-          if (readBack !== null && readBack !== decision.value) {
+          if (readBack !== null && readBack !== acting.value && heldAsTyped(acting.value, readBack)) {
+            this.#note(`the field shows it as ${JSON.stringify(readBack.slice(0, 40))}`);
+          } else if (readBack !== null && readBack !== acting.value) {
             await page.waitForLoadState('networkidle', { timeout: NETWORK_SETTLE_MS }).catch(() => undefined);
-            await field.fill(decision.value, { timeout: this.#actionTimeoutMs });
+            await field.fill(acting.value, { timeout: this.#actionTimeoutMs });
             const second = await field.inputValue({ timeout: 1_000 }).catch(() => null);
-            if (second !== null && second !== decision.value) {
+            if (second !== null && second !== acting.value && !heldAsTyped(acting.value, second)) {
               throw new Error(
                 `the field did not keep the typed value (holds ${JSON.stringify(second.slice(0, 40))}) — ` +
                   'it may be read-only, masked, or controlled by the page; try another way to set it',
@@ -2968,10 +3101,10 @@ export class WorkflowAgent {
 
       case 'check':
       case 'uncheck': {
-        if (!decision.selector) throw new Error(`${decision.action} decision carried no selector`);
-        await this.#target(page, decision.selector);
-        const box = page.locator(decision.selector).first();
-        const want = decision.action === 'check';
+        if (!acting.selector) throw new Error(`${acting.action} acting carried no selector`);
+        await this.#target(page, acting.selector);
+        const box = page.locator(acting.selector).first();
+        const want = acting.action === 'check';
         try {
           // Native checkbox/radio — Playwright verifies the resulting state.
           await box.setChecked(want, { timeout: this.#actionTimeoutMs });
@@ -2994,7 +3127,7 @@ export class WorkflowAgent {
             const after = await read();
             if (after !== want) {
               throw new Error(
-                `clicked ${JSON.stringify(decision.selector)} but it still reports ` +
+                `clicked ${JSON.stringify(acting.selector)} but it still reports ` +
                   `${after === null ? 'no state' : after ? 'checked' : 'unchecked'} — try another control`,
               );
             }
@@ -3004,10 +3137,10 @@ export class WorkflowAgent {
       }
 
       case 'selectOption': {
-        if (!decision.selector) throw new Error('selectOption decision carried no selector');
-        if (!decision.value) throw new Error('selectOption decision carried no option label (put it in value)');
-        await this.#target(page, decision.selector);
-        const control = page.locator(decision.selector).first();
+        if (!acting.selector) throw new Error('selectOption acting carried no selector');
+        if (!acting.value) throw new Error('selectOption acting carried no option label (put it in value)');
+        await this.#target(page, acting.selector);
+        const control = page.locator(acting.selector).first();
         const tag = await control
           .evaluate((el) => ((el as unknown as { tagName?: string }).tagName ?? '').toLowerCase(), undefined, { timeout: TARGET_ATTACH_MS })
           .catch(() => '');
@@ -3015,13 +3148,13 @@ export class WorkflowAgent {
           try {
             // Native <select> — by visible label, then by value/text as a
             // fallback for a label that is really the option's value attribute.
-            await control.selectOption({ label: decision.value }, { timeout: this.#actionTimeoutMs });
+            await control.selectOption({ label: acting.value }, { timeout: this.#actionTimeoutMs });
           } catch (nativeError) {
             try {
-              await control.selectOption(decision.value, { timeout: 1_000 });
+              await control.selectOption(acting.value, { timeout: 1_000 });
             } catch {
               throw new Error(
-                `could not choose ${JSON.stringify(decision.value)} in the <select> ${JSON.stringify(decision.selector)} — ` +
+                `could not choose ${JSON.stringify(acting.value)} in the <select> ${JSON.stringify(acting.selector)} — ` +
                   `no option with that label or value (${describe(nativeError)})`,
               );
             }
@@ -3039,7 +3172,7 @@ export class WorkflowAgent {
         // report know what the list offered. The read-back is recorded, not
         // required: a trigger whose text is its label (not its value) is a
         // shape this loop meets, and the next turn's tree shows the pick.
-        const picked = await selectFromListbox(page, control, decision.value, {
+        const picked = await selectFromListbox(page, control, acting.value, {
           timeout: this.#actionTimeoutMs,
           readBack: 'record',
         });
@@ -3072,32 +3205,24 @@ export class WorkflowAgent {
         // appends. Both are best-effort: a control that cannot be cleared is
         // still worth pasting into, and the read-back the caller does is what
         // decides whether it took.
-        if (!decision.selector) throw new Error('paste decision carried no selector');
-        await this.#target(page, decision.selector);
-        const dateInput = await this.#writable(page, decision.selector);
-        if (dateInput !== null) {
-          await this.#writeDate(dateInput, decision.value);
-          break;
-        }
-        const target = page.locator(decision.selector).first();
+        if (!acting.selector) throw new Error('paste acting carried no selector');
+        await this.#target(page, acting.selector);
+        if (await this.#enteredAsDate(page, acting.selector, acting.value)) break;
+        const target = page.locator(acting.selector).first();
         await target.click({ timeout: this.#actionTimeoutMs }).catch(() => undefined);
         await target.fill('', { timeout: this.#actionTimeoutMs }).catch(async () => {
           // Not a fillable control: select everything and let the insert replace it.
           await page.keyboard.press('ControlOrMeta+a').catch(() => undefined);
         });
-        await page.keyboard.insertText(decision.value);
+        await page.keyboard.insertText(acting.value);
         break;
       }
 
       case 'type': {
-        if (!decision.selector) throw new Error('type decision carried no selector');
-        await this.#target(page, decision.selector);
-        const dateInput = await this.#writable(page, decision.selector);
-        if (dateInput !== null) {
-          await this.#writeDate(dateInput, decision.value);
-          break;
-        }
-        const field = page.locator(decision.selector).first();
+        if (!acting.selector) throw new Error('type acting carried no selector');
+        await this.#target(page, acting.selector);
+        if (await this.#enteredAsDate(page, acting.selector, acting.value)) break;
+        const field = page.locator(acting.selector).first();
         // Focus and clear the way a user would, then type key by key so a
         // field that reacts per keystroke (autocomplete, typeahead, masked
         // input) actually wakes. No read-back guard: such a field routinely
@@ -3107,46 +3232,46 @@ export class WorkflowAgent {
         await humanKeys(
           page,
           field,
-          decision.value,
+          acting.value,
           25,
-          Math.max(this.#actionTimeoutMs, decision.value.length * 25 + 1_000),
+          Math.max(this.#actionTimeoutMs, acting.value.length * 25 + 1_000),
           { enabled: this.#humanize },
         );
         break;
       }
 
       case 'press': {
-        if (!decision.value) throw new Error('press decision carried no key');
-        if (decision.selector) {
+        if (!acting.value) throw new Error('press acting carried no key');
+        if (acting.selector) {
           await page
-            .locator(decision.selector)
+            .locator(acting.selector)
             .first()
-            .press(decision.value, { timeout: this.#actionTimeoutMs });
+            .press(acting.value, { timeout: this.#actionTimeoutMs });
         } else {
-          await page.keyboard.press(decision.value);
+          await page.keyboard.press(acting.value);
         }
         break;
       }
 
       case 'hover':
-        if (!decision.selector) throw new Error('hover decision carried no selector');
-        await this.#target(page, decision.selector);
-        if (this.#humanize) await approach(page, page.locator(decision.selector).first(), this.#actionTimeoutMs);
+        if (!acting.selector) throw new Error('hover acting carried no selector');
+        await this.#target(page, acting.selector);
+        if (this.#humanize) await approach(page, page.locator(acting.selector).first(), this.#actionTimeoutMs);
         await page
-          .locator(decision.selector)
+          .locator(acting.selector)
           .first()
           .hover({ timeout: this.#actionTimeoutMs });
         break;
 
       case 'scroll':
-        if (decision.selector) {
+        if (acting.selector) {
           // The attach check first, as for a click: a row a virtualised
           // table has not rendered is "no element matches" in 1.5 s, not a
           // 5 s scrollIntoViewIfNeeded timeout the next turn cannot read.
-          await this.#target(page, decision.selector);
-          await humanScrollTo(page.locator(decision.selector).first(), this.#actionTimeoutMs, { enabled: this.#humanize });
+          await this.#target(page, acting.selector);
+          await humanScrollTo(page.locator(acting.selector).first(), this.#actionTimeoutMs, { enabled: this.#humanize });
           await page
-            .locator(decision.selector)
+            .locator(acting.selector)
             .first()
             .scrollIntoViewIfNeeded({ timeout: this.#actionTimeoutMs });
         } else {
@@ -3173,15 +3298,15 @@ export class WorkflowAgent {
       }
 
       case 'goto': {
-        if (!decision.url) throw new Error('goto decision carried no url');
-        decision.url = deploymentAwareAgentUrl(decision.url, page.url());
-        const target = originOf(decision.url);
+        if (!acting.url) throw new Error('goto acting carried no url');
+        acting.url = deploymentAwareAgentUrl(acting.url, page.url());
+        const target = originOf(acting.url);
         if (target === null || !allowed.includes(target)) {
           throw new Error(
-            `refusing to navigate off-origin to ${decision.url} (allowed: ${allowed.join(', ') || 'none'})`,
+            `refusing to navigate off-origin to ${acting.url} (allowed: ${allowed.join(', ') || 'none'})`,
           );
         }
-        await page.goto(decision.url, {
+        await page.goto(acting.url, {
           waitUntil: 'domcontentloaded',
           timeout: this.#actionTimeoutMs,
         });
@@ -3189,16 +3314,16 @@ export class WorkflowAgent {
       }
 
       case 'read': {
-        if (!decision.selector) throw new Error('read decision carried no selector');
-        await this.#target(page, decision.selector);
-        const loc = page.locator(decision.selector).first();
+        if (!acting.selector) throw new Error('read acting carried no selector');
+        await this.#target(page, acting.selector);
+        const loc = page.locator(acting.selector).first();
         const observed = await this.#observe(loc);
         // The observation is the deliverable of a record-what-the-system-
         // shows leg (OA-14): it rides the history line for the model AND the
         // action's own record for the report, at the full cap rather than
         // the 120 characters the line alone used to carry.
         this.#lastObserved = observed;
-        this.#observations.push({ selector: decision.selector, text: observed, url: page.url() });
+        this.#observations.push({ selector: acting.selector, text: observed, url: page.url() });
         this.#note(`observed ${observed}`);
         break;
       }
@@ -3208,11 +3333,11 @@ export class WorkflowAgent {
         // text, a leading "<label>:" stripped when the label is the control's
         // own name or a word of the goal ("Employee ID: 20001234" → the id),
         // handed to the run's variable store under the name the model chose.
-        if (!decision.selector) throw new Error('save decision carried no selector');
-        const name = decision.value.trim();
-        if (name === '') throw new Error('save decision carried no variable name (put it in value)');
-        await this.#target(page, decision.selector);
-        const loc = page.locator(decision.selector).first();
+        if (!acting.selector) throw new Error('save acting carried no selector');
+        const name = acting.value.trim();
+        if (name === '') throw new Error('save acting carried no variable name (put it in value)');
+        await this.#target(page, acting.selector);
+        const loc = page.locator(acting.selector).first();
         let text = (await loc.inputValue({ timeout: 500 }).catch(() => '')).trim();
         if (text === '') {
           text = await loc
@@ -3223,16 +3348,16 @@ export class WorkflowAgent {
         const labelled = /^([^:：]{1,60}?)\s*[:：]\s*(\S.*)$/u.exec(text);
         if (labelled) {
           const label = foldValue(labelled[1] as string);
-          const own = selectorName(decision.selector);
+          const own = selectorName(acting.selector);
           if ((own !== null && foldValue(own) === label) || (label !== '' && foldValue(this.#goal).includes(label))) {
             text = (labelled[2] as string).trim();
           }
         }
-        if (text === '') throw new Error(`"${decision.selector}" shows no text or value to save — read the tree for the node that shows it`);
+        if (text === '') throw new Error(`"${acting.selector}" shows no text or value to save — read the tree for the node that shows it`);
         if (this.#saveVariable !== null) this.#saveVariable(name, text);
         const shown = text.length > READ_OBSERVATION_CHARS ? `${text.slice(0, READ_OBSERVATION_CHARS - 1)}…` : text;
         this.#lastObserved = `${name} = ${JSON.stringify(shown)}`;
-        this.#observations.push({ selector: decision.selector, text: this.#lastObserved, url: page.url() });
+        this.#observations.push({ selector: acting.selector, text: this.#lastObserved, url: page.url() });
         this.#note(`saved ${name} = ${JSON.stringify(shown.slice(0, 120))}${this.#saveVariable === null ? ' — no variable store on this run, recorded only' : ''}`);
         break;
       }
@@ -3248,7 +3373,7 @@ export class WorkflowAgent {
       }
 
       case 'dbCount': {
-        if (!decision.selector) throw new Error('dbCount decision carried no table (name it in selector)');
+        if (!acting.selector) throw new Error('dbCount acting carried no table (name it in selector)');
         if (this.#dbProbe === null) {
           throw new Error(
             'no database is configured for this run — do not retry dbCount; verify through the page instead',
@@ -3257,17 +3382,82 @@ export class WorkflowAgent {
         // The observed number rides the history line as the action's note —
         // the model reasons from what the database actually said, and the
         // record shows the evidence, never just the claim.
-        const count = await this.#dbProbe(decision.selector, parseWherePairs(decision.value));
+        const count = await this.#dbProbe(acting.selector, parseWherePairs(acting.value));
         this.#lastTargetNote = `observed ${count} row(s)`;
         break;
       }
 
       default:
-        throw new Error(`unhandled agent action: ${decision.action}`);
+        throw new Error(`unhandled agent action: ${acting.action}`);
     }
 
     // Interstitials frequently need a beat to settle before the next observation.
     await page.waitForLoadState('domcontentloaded', { timeout: this.#actionTimeoutMs }).catch(() => undefined);
+  }
+
+  /** Refs matched / missed over the leg — `AgentRecord.refs`. Reset per run. */
+  #refStats: { matched: number; missed: number } | null = null;
+  /** This turn's ref → accessible name, from the same snapshot the refs came from. */
+  #refNames: ReadonlyMap<string, string> = new Map();
+
+  /**
+   * The selector `#act` acts through: the decision's ref as `aria-ref=eN`
+   * when it has one and the node is still there, else the name selector. A
+   * ref that no longer resolves is a page that changed since the snapshot;
+   * the action fails here, before the browser is touched, worded so the next
+   * turn — which re-observes anyway — knows why.
+   */
+  async #actingSelector(page: Page, decision: AgentDecision): Promise<string> {
+    if (decision.ref === undefined || decision.ref === '') return decision.selector;
+    const ref = `aria-ref=${decision.ref}`;
+    const present = await page.locator(ref).count().catch(() => 0);
+    if (present === 0) {
+      throw new StaleRefError(
+        `the page changed since you looked: ${JSON.stringify(decision.selector)} is no longer where the snapshot ` +
+          'placed it — nothing was done; look again',
+      );
+    }
+    return ref;
+  }
+
+  /** One AI-mode aria snapshot for this turn, its refs attached to the table's targetable rows. */
+  async #withRefs(page: Page, elements: IndexedElement[]): Promise<IndexedElement[]> {
+    const snapshot = await page
+      .locator('body')
+      .ariaSnapshot({ mode: 'ai', timeout: TARGET_ATTACH_MS })
+      .catch(() => null);
+    if (snapshot === null || snapshot === '') return elements;
+    const refs = refsFromAriaSnapshot(snapshot);
+    this.#refNames = refs.names;
+    const attached = withRefs(elements, refs);
+    const stats = (this.#refStats ??= { matched: 0, missed: 0 });
+    stats.matched += attached.matched;
+    stats.missed += attached.missed;
+    return attached.elements;
+  }
+
+  /**
+   * Let the page catch up with an action before the next observation
+   * (jev-ultrafast's "wait for useful state", 2026-09-18): two animation
+   * frames or 50 ms, so a tree read next turn is not a mid-animation one;
+   * and after typing into an editable combobox, its first visible option,
+   * capped at 200 ms, so the next decision is not asked over an incomplete
+   * popup. A floor, not a ceiling — the networkidle-capped settle the
+   * judges already pay is untouched, and nothing here waits longer than a
+   * fifth of a second. The callback is `settleInPage`, built from a string
+   * body: a string handed to `locator.evaluate` is evaluated as an expression
+   * and never CALLED, and a TypeScript arrow with named inner closures is
+   * rewritten by esbuild into `__name(fn, …)`, which does not exist in the
+   * page — both measured 2026-09-18, both silent under the catch.
+   */
+  async #settleAfter(page: Page, decision: AgentDecision, act: string): Promise<void> {
+    if (!INTERACTION_ACTIONS.has(decision.action) || act === '') return;
+    const typed = decision.action === 'fill' || decision.action === 'type' || decision.action === 'paste';
+    await page
+      .locator(act)
+      .first()
+      .evaluate(settleInPage, typed, { timeout: 1_000 })
+      .catch(() => undefined);
   }
 
   /**
@@ -3325,7 +3515,7 @@ export class WorkflowAgent {
    * error, because it is the same shape every time: the input the label
    * points at sits beside the display.
    */
-  async #writable(page: Page, selector: string): Promise<Locator | null> {
+  async #writable(page: Page, selector: string): Promise<DateEntry | null> {
     const state = await page
       .locator(selector)
       .first()
@@ -3344,6 +3534,7 @@ export class WorkflowAgent {
             readOnly: node.readOnly === true || node.getAttribute?.('aria-readonly') === 'true',
             disabled: node.disabled === true || node.getAttribute?.('aria-disabled') === 'true',
             editable: tag === 'input' || tag === 'textarea' || tag === 'select' || node.isContentEditable === true,
+            haspopup: (node.getAttribute?.('aria-haspopup') ?? '').toLowerCase(),
             label,
           };
         },
@@ -3360,7 +3551,7 @@ export class WorkflowAgent {
       const beside = await this.#dateInputBeside(page, selector);
       if (beside !== null) {
         this.#note('read-only display — wrote to the date input beside it');
-        return beside;
+        return { via: 'date-input', input: beside };
       }
       throw new Error(
         `"${selector}" is a READ-ONLY field — a display, not the input; writing into it changes nothing. ` +
@@ -3373,6 +3564,29 @@ export class WorkflowAgent {
       throw new Error(`"${selector}" is DISABLED — nothing can be entered until whatever enables it is done first.`);
     }
     if (!state.editable) {
+      // The same shape as the read-only display, on a trigger instead: a
+      // date picker rendered as a BUTTON over its `input[type=date]` (HUMI's
+      // Thai hire form, 2026-09-18). A control that cannot take text but has
+      // a date input in its own container is that date's display.
+      const beside = await this.#dateInputBeside(page, selector);
+      if (beside !== null) {
+        this.#note('a picker trigger — wrote to the date input beside it');
+        return { via: 'date-input', input: beside };
+      }
+      // The control's own `aria-haspopup` says what it is, so the refusal can
+      // too (picks25 run, 2026-09-21: told only "cannot take typed text", the
+      // model spent the leg inventing `role=textbox[name=<the label>]`).
+      // Never for a control whose name the mutation gate classes: opening
+      // that dialog is a `click` the goal must have named, not an entry.
+      if (state.haspopup === 'dialog' && mutationCategoryOf({ action: 'click', selector, value: '', url: '' }) === null) {
+        return { via: 'calendar', trigger: page.locator(selector).first() };
+      }
+      if (state.haspopup === 'listbox' || state.haspopup === 'menu' || state.haspopup === 'tree') {
+        throw new Error(
+          `"${selector}" is a dropdown trigger (aria-haspopup="${state.haspopup}"), not a text field, and this field has no ` +
+            'textbox of its own — use selectOption on this same selector with the option label as the value.',
+        );
+      }
       throw new Error(
         `"${selector}" is not an input, textarea, select or editable region — it cannot take typed text. ` +
           'If it is a dropdown, use selectOption; if it opens a picker, click it and act on what opens.',
@@ -3463,6 +3677,48 @@ export class WorkflowAgent {
   }
 
   /**
+   * The one date route of `fill` / `type` / `paste`: true when the target is a
+   * date control the harness entered deterministically, false when it is an
+   * ordinary field the action should write into itself.
+   */
+  async #enteredAsDate(page: Page, selector: string, value: string): Promise<boolean> {
+    const entry = await this.#writable(page, selector);
+    if (entry === null) return false;
+    if (entry.via === 'date-input') await this.#writeDate(entry.input, value);
+    else await this.#pickDate(entry.trigger, selector, value);
+    return true;
+  }
+
+  /**
+   * A calendar behind a button (`button[aria-haspopup=dialog]`) — the engine's
+   * own driver (`pickDateInDialog`, ladder rung 1.03), reached from the
+   * agent's entry actions. What the TRIGGER DISPLAYS afterwards decides: a
+   * pick the control does not render as that date is a failed action, and a
+   * disabled day is the page's rule, handed to the next turn in its words.
+   */
+  async #pickDate(trigger: Locator, selector: string, value: string): Promise<void> {
+    const iso = isoDateOf(value) ?? isoDateOf(value, 'th');
+    if (iso === null) {
+      throw new Error(
+        `"${selector}" opens a dialog (aria-haspopup="dialog"): it is not a text field, and the field has no textbox of ` +
+          `its own. ${JSON.stringify(value)} is not a date this harness can pick — if this is a date picker, fill this ` +
+          'same selector with the date as YYYY-MM-DD (work a relative date out yourself) and the harness drives its ' +
+          'calendar; otherwise click it and act on what opens.',
+      );
+    }
+    const picked = await pickDateInDialog(trigger.page(), trigger, iso, { timeout: this.#actionTimeoutMs });
+    if (!picked.confirmed) {
+      throw new Error(
+        `picked ${iso} in the calendar of "${selector}", but the control shows ${JSON.stringify(picked.shown ?? '')}, ` +
+          'which does not read as that date — read the control before relying on it',
+      );
+    }
+    this.#note(
+      `a calendar trigger — picked ${iso} in its dialog (${picked.via}); the control now shows ${JSON.stringify((picked.shown ?? '').slice(0, 80))}`,
+    );
+  }
+
+  /**
    * Write a date into a `type=date` input as ISO, converting what the model
    * gave (`15/09/2027`, `1 Sep 2027`, a Buddhist-era `2570`) through
    * `isoDateOf`; the read-back must hold it, or the turn is told the truth.
@@ -3522,6 +3778,8 @@ export class WorkflowAgent {
       ok,
       error,
       durationMs,
+      ...(decision.confidence === undefined ? {} : { confidence: decision.confidence }),
+      ...(decision.probability === undefined ? {} : { probability: decision.probability }),
       // The instant the action landed: the moment the run's film keeps for
       // it once the idle around it is dropped (`ProofBundleBuilder.videoMoments`).
       finishedAt: new Date().toISOString(),
@@ -3600,15 +3858,33 @@ export class WorkflowAgent {
    * which is the conservative answer: the click is treated as an `open`, and
    * an `open` is gated at least as strictly as a `commit`.
    */
-  async #dialogFor(page: Page, decision: AgentDecision, observedControlName: string | null): Promise<DialogContext | null> {
+  async #dialogFor(
+    page: Page,
+    decision: AgentDecision,
+    observedControlName: string | null,
+    act: string = decision.selector,
+  ): Promise<DialogContext | null> {
     if (mutationCategoryFromName(observedControlName ?? '') === null && mutationCategoryOf(decision) === null) return null;
-    return await page.locator(decision.selector).first()
+    return await page.locator(act).first()
       .evaluate((el) => {
         const node = el as unknown as { closest?: (s: string) => { textContent?: string | null } | null };
         const dialog = node.closest?.('[role="dialog"], [role="alertdialog"], dialog') ?? null;
         return dialog === null ? null : { text: (dialog.textContent ?? '').slice(0, 400) };
       }, undefined, { timeout: TARGET_ATTACH_MS })
       .catch(() => null);
+  }
+}
+
+/**
+ * Thrown by `#act` before anything is touched when the decision's ref no
+ * longer resolves — the page changed since the snapshot it came from. An
+ * ordinary failed action for the loop (no progress, the next turn
+ * re-observes); typed so a test can tell it from a miss.
+ */
+export class StaleRefError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StaleRefError';
   }
 }
 
@@ -3627,8 +3903,13 @@ export class MutationBlockedError extends Error {
 }
 
 function describe(error: unknown): string {
-  if (error instanceof Error) return error.message.split('\n')[0] ?? error.message;
-  return String(error);
+  if (!(error instanceof Error)) return String(error);
+  const first = error.message.split('\n')[0] ?? error.message;
+  const blocker = interceptionOf(error.message);
+  return blocker === null
+    ? first
+    : `${first} The control is on the page, but ${blocker} is over it and took the pointer — ` +
+        'close or dismiss that first (its own Close/OK control, or press Escape), then act on the control again.';
 }
 
 /** How many options a listbox record keeps verbatim — the same head the error message prints. */

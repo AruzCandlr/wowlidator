@@ -20,12 +20,14 @@ import {
   generateObject,
   type LanguageModel,
 } from 'ai';
+import type { LanguageModelV4 } from '@ai-sdk/provider';
 import { z } from 'zod';
 
 import {
   PROVIDER_META,
   PROVIDERS,
   SERIAL_PROVIDERS,
+  isDecisionModel,
   loadConfig,
   localLlmBaseUrl,
   type LlmRole,
@@ -163,10 +165,30 @@ export type ModelBuilder = (
 ) => LanguageModel;
 
 /**
+ * The `LanguageModel` a decision model resolves to: one that refuses to be
+ * asked. TypeSafe's Jev answers typed questions through
+ * `providers/decisions.ts` and cannot generate text or fill a schema; this
+ * stub keeps `createModelForRole`, `labelFor`, `canResolve` and the key
+ * failover uniform over every provider, and turns a call that should never
+ * happen (a chat-style `generateStructured` on the agent role while it is on
+ * Jev) into one sentence naming the seam instead of a provider 4xx.
+ */
+function decisionsOnlyModel(provider: ProviderName, modelId: string): LanguageModelV4 {
+  const refuse = async (): Promise<never> => {
+    throw new Error(
+      `${provider}:${modelId} is a decision model (TypeSafe Jev): it answers typed questions through ` +
+        'src/providers/decisions.ts and cannot generate text or fill a schema',
+    );
+  };
+  return { specificationVersion: 'v4', provider, modelId, supportedUrls: {}, doGenerate: refuse, doStream: refuse };
+}
+
+/**
  * One entry per provider. Each returns a `LanguageModel` — the AI SDK's
  * common denominator — so nothing downstream knows which vendor answered.
  */
 const FACTORIES: Record<ProviderName, ModelBuilder> = {
+  typesafe: (_apiKey, modelId) => decisionsOnlyModel('typesafe', modelId),
   'agy-cli': (_apiKey, modelId, options) =>
     createAgyCli({
       modelId,
@@ -300,11 +322,13 @@ export function createModelForRole(
   const apiKey = keys[keyIndex];
   if (apiKey === undefined) throw new MissingApiKeyError(role, entry.provider);
 
-  return {
-    role,
-    provider: entry.provider,
-    modelId: entry.modelId,
-    model: builders[entry.provider](apiKey, entry.modelId, {
+  // A decision model on EITHER route resolves to the refusing stub: the
+  // `openrouter` builder would otherwise hand back a live chat model for
+  // `~typesafe/jev-latest`, and a chat-style call on it would post to
+  // completions and feed the breaker (review 2026-09-18).
+  const model = isDecisionModel(entry.provider, entry.modelId)
+    ? decisionsOnlyModel(entry.provider, entry.modelId)
+    : builders[entry.provider](apiKey, entry.modelId, {
       baseUrl: entry.baseUrl,
       effort: entry.effort,
       tools: entry.tools,
@@ -319,7 +343,12 @@ export function createModelForRole(
       // a value, and grounding it in the repo would be over-thinking a fill.
       retrieval: role === 'generator' || role === 'healer' || role === 'agent',
       role,
-    }),
+    });
+  return {
+    role,
+    provider: entry.provider,
+    modelId: entry.modelId,
+    model,
     id: modelIdFor(entry),
     keyIndex,
     keyCount: keys.length,
@@ -1264,12 +1293,38 @@ function withReasoningCap<T>(
   };
 }
 
+/** The roles whose structured questions were lent to `data`, said once each. */
+const borrowedRolesNoted = new Set<LlmRole>();
+
 export async function generateStructuredForModel<T>(
   source: ModelSource,
   request: Omit<StructuredRequest<T>, 'model'>,
 ): Promise<StructuredResponse<T>> {
   if ('model' in source) {
     return generateStructured({ ...request, model: source.model });
+  }
+  // **A decision model answers no schema, so a role on one lends its
+  // structured questions to the `data` role** (2026-09-18, measured on the
+  // first HUMI SIT run with the agent on Jev): the value resolver, the
+  // authoring reviewer and the risk judge all ask the agent role a
+  // structured question, and every one failed on the refusing stub. `data`
+  // is the role for a small structured answer, and config guarantees it is
+  // a chat model (only `agent` may be a decision model). Said once per
+  // process, so the substitution is visible without being noisy.
+  const configured = source.factory.config.roles[source.role];
+  if (isDecisionModel(configured.provider, configured.modelId)) {
+    if (!borrowedRolesNoted.has(source.role)) {
+      borrowedRolesNoted.add(source.role);
+      process.stderr.write(
+        `[wowlidator] the ${source.role} role is on ${configured.provider}:${configured.modelId}, a decision model that answers ` +
+          "no schema — its structured questions (value resolution, review, risk) are answered by the data role\n",
+      );
+    }
+    source = { factory: source.factory, role: 'data' };
+    // The log and any error name the model that ANSWERED, not the one the
+    // caller was built for — "data · openrouter:~typesafe/jev-latest" read
+    // as a decision model producing 9,410 tokens of review (run 2).
+    request = { ...request, modelLabel: source.factory.labelFor('data') };
   }
   const entry = source.factory.config.roles[source.role];
   // A provider that answers one call at a time is entered through its gate:

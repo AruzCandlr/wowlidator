@@ -50,6 +50,7 @@ import {
   LLM_ROLES,
   PROVIDERS,
   PROVIDER_META,
+  decisionModelRefusal,
   type LlmRole,
   localLlmBaseUrl,
   localBaseUrlForPort,
@@ -76,7 +77,8 @@ const FETCH_TIMEOUT_MS = 8_000;
  * newline in it is not a model id, and accepting one would produce a failure
  * inside a run that reads like a provider problem.
  */
-const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:\-/]{0,120}$/;
+// A leading `~` is OpenRouter's alias namespace (`~typesafe/jev-latest`).
+const MODEL_ID = /^[~A-Za-z0-9][A-Za-z0-9._:\-/]{0,120}$/;
 
 export interface ProviderModelsView {
   provider: ProviderName;
@@ -157,6 +159,11 @@ export class ModelSelection {
         'that does not look like a model id — expected something like "llama-3.3-70b-versatile"',
       );
     }
+    // The same refusal `loadConfig` makes at startup: the panel builds its
+    // effective config by hand, and a healer put on Jev here would otherwise
+    // probe as ready and then kill the next run at startup.
+    const refusal = decisionModelRefusal(role as LlmRole, provider as ProviderName, trimmed);
+    if (refusal !== null) throw new ModelSelectionError(refusal);
     // A port is only meaningful for a server on this machine; for any other
     // provider it is dropped rather than recorded as a setting that does nothing.
     let baseUrl: string | undefined;
@@ -452,7 +459,25 @@ const REQUESTS: Record<ProviderName, (key: string | undefined) => ModelRequest> 
   openrouter: (key) => ({
     url: 'https://openrouter.ai/api/v1/models',
     headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
-    parse: (body) => openAiShape(body),
+    // TypeSafe's Jev is served by OpenRouter in beta and is absent from the
+    // public catalogue (`/models/~typesafe/jev-latest/endpoints` answers the
+    // card, `/models` does not list it), so the id is added here rather than
+    // lost — the same move `zai` makes for its free tier. Agent role only.
+    parse: (body) => [...openAiShape(body), '~typesafe/jev-latest'],
+  }),
+  // The native route to the same decision model. `GET /v1/models` lists the
+  // aliases the account may send; versioned ids are accepted whether or not
+  // they appear.
+  typesafe: (key) => ({
+    url: 'https://api.typesafe.ai/v1/models',
+    headers: key === undefined ? {} : { authorization: `Bearer ${key}` },
+    parse: (body) => {
+      const models = (body as { models?: unknown }).models;
+      if (!Array.isArray(models)) return [];
+      return models
+        .map((entry) => String((entry as { name?: unknown }).name ?? ''))
+        .filter((name) => name !== '');
+    },
   }),
   zai: (key) => ({
     url: 'https://api.z.ai/api/paas/v4/models',

@@ -23,7 +23,7 @@ Three more stops, all free, all born from PB-02-01's post-mortem (`docs/tester-e
 
 - **Known dead end** (rung 1.05): a selector that already exhausted the whole ladder on this exact page earlier *in this run* gets one fresh fast attempt and then fails with "identical failure at step N" — never a second ladder walk or healer call. Per-run only; never persisted.
 - **Denied surface** (rung 2.6): if the page's headings match `DENIAL_HEADING_PATTERN` ("Access Denied", "ไม่มีสิทธิ์เข้าถึง", 403…), healing is skipped — it could only repair onto the denial page's own furniture — and the heading becomes an `authorization`/`high` defect plus `ProofStep.pageContext`. A flow that means to test the denial page never reaches this rung: its assertions resolve on the fast path.
-- **Timing re-check** (in `close()`): every dead-ended selector is re-probed once at the end of the run, on the page the run ended on. One that resolves *now* was never absent — its defect downgrades to `medium` "TIMING, not absence". The mirror of `#flagTimingHeal`, pointed at failures.
+- **Timing re-check** (in `close()`): every dead-ended selector is re-probed once at the end of the run, on the page the run ended on. One that resolves *now* was never absent — its defect downgrades to `medium` "TIMING, not absence". The mirror of `#flagTimingHeal`, pointed at failures. A failure whose own account says the selector resolved is never re-probed (`resolvedAtFailure`, widened 2026-09-21): a text, value or attribute the element answered with, a "resolved, but …" header, a memoed content mismatch, a named interceptor. Live: `expected value "40106337", got "Search position..."` had been downgraded to timing about a control read on the spot. Test: `tests/runner-wave2.test.ts`.
 
 **A dead browser is fatal and environmental** (`BrowserGoneError`): `Target page/context/browser has been closed` stops the run like `SessionLostError` does, but *skips* teardown (there is no browser to run it in) and exits `EXIT.environment` — the predecessor PB-02-01 run filed fourteen "defects" against an app it could no longer reach.
 
@@ -48,6 +48,8 @@ The short fast-path timeout is deliberate: a selector that is going to work work
 **Form interaction is four actions beyond `click`/`fill`, all deterministic, all through the ladder.** `selectOption` picks a dropdown option by its visible label — a native `<select>` via Playwright's own `selectOption` (label first, value attribute second), anything else the way a user does it via `selectFromListbox` (`src/engine/listbox.ts`, EH-01 2026-09-03): click to open, wait for the list to hold something, type the value's stable head into a search box when the list offers one, match by whole name then whole word (never a substring), tick each row of a multi-value, and read the trigger back. `check`/`uncheck` verify the state actually moved — Playwright's `setChecked` for native inputs, an `aria-checked`/`aria-pressed` read-click-reread fallback for styled toggles, and a control exposing no state at all is refused rather than clicked blind. `type` presses keys one at a time (`pressSequentially`) for the fields `fill` cannot wake — autocomplete, typeahead, masked input — with the typing itself charged to the healed budget, not the rung's: resolving the field is the race the ladder times, typing N characters at a human pace is not. These existed because the old vocabulary could complete no form containing a dropdown: `fill` throws on a `<select>` and `click` can only open one.
 
 **A search box can be all a trigger opens onto — the list itself does not exist until something is typed (RC-5, 2026-09-10, be-sit-high-20260909-170213 PL_06_10).** `selectFromListbox`'s `openList()` looks for a `role=listbox`/`menu`/`tree` (or the trigger's own `aria-controls` target) becoming visible; `HumiSearchableSelect` — `<button aria-haspopup="listbox">` and nothing else, already named in this file's ec10 post-mortem below — opens onto a bare search input with no ARIA container anywhere in the DOM yet, so `openList()` had nothing to find and the ladder reported "no listbox or menu became visible within 10000 ms of opening" about a control that genuinely held the value. The duplicate-ID validation the case existed to test never ran, and the missing message was filed as a `high` functional defect against a working application. The fix stays inside the same universal, ARIA-informed shape the rest of this module uses: when `openList()` finds nothing, count the page's visible search-shaped inputs (`SEARCH_INPUT`) before the trigger was clicked and after; a new one that appeared **as a result of the click** — never one already on the page, which searching page-wide unconditionally could grab by coincidence — gets one probe keystroke (the value's code head, or the whole value) before giving up, the way a person facing an apparently-empty dropdown starts typing. The probe need not be the exact match; it only has to cause the real `role=listbox`/`option` tree to render, and the existing per-part loop re-types the correct head into it once a container exists to scope that search to. A control that still offers nothing after the probe — the value genuinely absent, or no search box ever appeared — fails exactly as before, naming what the list held: this rung can only heal onto the right thing or fail identically, never manufacture a match. Tests: `tests/form-actions.test.ts` (a lazily-rendered `HumiSearchableSelect`-shaped fixture, picked correctly, and a companion proving a value the list never offers still fails and still names it).
+
+**A typed search head is believed only once it has been answered (2026-09-21, hrsit-1001-pos-20260921-121407 step 57).** `selectOption role=button[name="Position" i]` = `40106337` failed in 1,181 ms on both `fast` and `late` with "no option named "40106337" appeared (… 20 shown: "40001067 - Building Pallet Staff", …)" about a position the server holds. The application's source says why (`StepJob.tsx`, `HumiSearchableSelect.tsx`): the list opens on a preload of the first 20 rows; typing filters THAT preload client-side at once — "No options found" — and, 300 ms later, a debounced fetch replaces the options with the server's matches; an emptied search box **cancels the pending fetch**. The loop typed the head, settled 250 ms, read the list's own empty row as the answer, cleared the box — which dropped the search 50 ms before it would have fired — and enumerated the stale preload. Bank and Pay Group on the same page pass because their whole list is in memory. The same loop has a second blind shape, a list that simply keeps showing its preload until the answer lands: `waitForListToFill` returns at once on any non-empty list. The rule covers both without knowing which it faces: after a head is typed and the list read, a list that **already holds the value** (`listHolds` — the pick's own whole-name / whole-word / unique-prefix rules, asked of the names just read) goes straight on, so nothing that passes today waits; one that does not is re-read every 50 ms while the head may still be being answered (`searchStillAnswering`): until `SEARCH_DEBOUNCE_MS` (750) since the keystroke when the page has made no xhr/fetch request since it, and once one has started until it lands plus one `settleMs` for the render — never past the step's own `timeout`. The signal is the page's own traffic (`page.on('request')`, armed before the fill, removed in `finally`), not a phrase or a component name. It cannot pick a different option: the wait only decides WHEN the list is read, and the pick still goes through `findOption` and the trigger read-back. `searchedEmpty` and `filtered` are now what the list said after its search answered, not during it. Cost, disclosed: a head that matches nothing in a client-filtered list (the code half of a value whose list shows only labels) pays up to ~500 ms once per head before the label half is typed, and a genuine miss on a page with a request permanently in flight waits out the rung's budget. Tests: `tests/engine-helpers.test.ts` — pure always (`listHolds`, `searchStillAnswering`); CDP-gated, both red before the change: a fixture that filters its preload to "No options found", drops a pending search on clear and answers a debounced fetch after 400 ms, and its stale-preload twin; plus a code the server does not hold still failing on the list's own answer, and a value already in the preload picked with no wait.
 
 `use` and `when` are the two actions that never reach `#resolve` *or* `#bareStep` in the usual way — `use` is gone before the run starts, and `when` records itself while its condition deliberately bypasses healing. When adding an ordinary action (e.g. `hover`), it must go through `#step` → `#resolve`, or it silently loses healing. **Five** places to touch: the method on `SmartRunner`, the `FlowStep` union, the `switch` in `executeStep` (the dispatch moved out of `executeFlow`; there is a second, browser-free switch in `executeApiSteps`), `flowStepSchema` in `src/mcp/server.ts`, and the `GENERATOR_ACTIONS` list plus `toFlowStep` in `src/generator/test-generator.ts` (otherwise the generator can never produce it). An HTTP action has a sixth place: `API_GENERATOR_ACTIONS`/`toApiFlowStep` in `src/generator/api-test-generator.ts`. An *assertion* has a seventh: `ASSERTION_ACTIONS` in the runner, or `hasAssertion()` silently rejects every generated case that relies on it. And an action the *catalog* path should be able to author has an eighth: `AUTHOR_ACTIONS` plus `flow-author.ts`'s own `toFlowStep` — catalogs author through `flow-author.ts`, not `test-generator.ts`.
 
@@ -75,6 +77,8 @@ Two step types, both execution-plane, no model anywhere near them. They exist be
 `back`/`forward` turn a list page into a journey — open a card, check it, come back — without re-navigating and losing the state the journey was testing. Two traps, both found live: **`goBack` must use `waitUntil: 'commit'`**, because a back navigation restored from the bfcache fires no load event and the default wait times out on exactly the pages where going back worked; and **it must let an in-flight navigation settle first** (`#settleNavigation`), or a `back` immediately after a click steps past the entry the click was about to create, landing on whatever preceded the test — usually `about:blank`.
 
 `expectScrollable` asks whether a user can reach the content, which is not the same as whether content exists below the fold. Two halves, both required: the content overflows **and** the scroll position moves. **`element.scrollTop = n` works on `overflow: hidden`**, so movement alone proves nothing — script can scroll what a user cannot — which is why the computed `overflow-y` decides. It polls through hydration for the same reason `expectUrl` does: a shell that has not rendered is exactly one viewport tall, and a single reading called a 2806px page unscrollable. The scroll position is restored afterwards, because an assertion that moves the page changes what the next step tests.
+
+**`scrollTo` leaves its target in the middle of its scroller, filmed or not (2026-09-21).** Until then only the film's smooth scroll (`humanScrollTo`, `block: 'center'`) centred it and the bare path was `scrollIntoViewIfNeeded` alone — the nearest edge — so `humanize`, documented as "never changes what a step resolves", changed the geometry the next step met. The bare path now does one instant `scrollIntoView({block:'center'})`; the filmed path is unchanged (one smooth movement, never a second scroll); `scrollIntoViewIfNeeded` stays the action of record in both, a no-op once in view and the error a hidden element is refused with. A `scrollTo` is still no guarantee for the step after it — see "An option found below the fold". Test: `tests/crawl-scroll.test.ts` ("scrollTo ends with the target mid-viewport, filmed or not").
 
 ## Modal and dialog detection (`src/engine/modal.ts`)
 
@@ -372,6 +376,20 @@ attached match rather than silently recording 0 off a bogus selector — a
 legitimately-empty listing is saved via `saveText` of the page's own readout
 ("0 of 0") instead. A save is not an assertion (not in `ASSERTION_ACTIONS`):
 the compare carries the claim.
+
+**The step records enough of the reading to be evidence (2026-09-21).** A
+validation dialog was saved to prove WHY a submit was refused; `detail.saved`
+was `text.slice(0, 200)` and ended mid-sentence, before the dialog's list of
+missing fields (786 characters; the run's variable, and so `bundle.variables`,
+held all of it). `savedTextRecord` keeps `SAVED_TEXT_MAX` (2,000) characters
+and marks a cut with `…`. It also closes a gap the cap had been hiding: the
+step's copy followed no masking rule at all, while `bundle.variables` shows no
+value for a credential-shaped name — the record now follows the same rule
+(`isSensitiveName`), and a password the run was given is masked wherever it
+appears in the text. Nothing downstream constrains the length: the artifact
+schema leaves `detail` loose, the HTML report escapes it, and the findings
+export already skips any inline value over 80 characters. Test:
+`tests/runner-wave2.test.ts`.
 
 ## A near-name on the right role is evidence, not absence (2026-08-31)
 
@@ -1331,3 +1349,296 @@ BUTTON, a named layer, a layer with text, a 60 px sticky bar, an absolute
 layer covering only the width → not; open-at-start + click → intended,
 appeared mid-ladder + click → blocker) and the two CDP cases in
 `tests/modal.test.ts` above.
+
+## Every page keeps rendering in the background, and an action settles before the next look (2026-09-18)
+
+Two rails from the jev-ultrafast port (`src/orchestrator/CLAUDE.md`, "The
+runtime rails"), both in this plane because they touch every page:
+
+- `enableFocusEmulation` in `applyViewport` sends
+  `Emulation.setFocusEmulationEnabled` once per page the runner creates.
+  Chrome throttles `requestAnimationFrame` and CSS animation in an unfocused
+  tab, and under `--browsers`/`--concurrency` every lane but one is such a
+  tab; the page now believes it is focused without being activated in the
+  window. A browser that refuses the call is left as it was.
+- The agent loop's `#settleAfter` waits two animation frames (≤ 50 ms), and
+  after typing into an editable combobox up to 200 ms for its first visible
+  option, before the next tree is read. A floor under the networkidle settle
+  the judges already pay; nothing got shorter.
+
+## A leg that begins on the sign-in page after a `signIn` goes where the application went (2026-09-18, HIR-EC-001 under the Jev engine)
+
+**Incident.** HUMI SIT lands a successful local sign-in back on `/th/login`
+with the form re-mounted (the 2026-09-10 rule above: the sign-in page going
+away is never a login proof, and `signIn` deliberately navigates nowhere —
+"the next navigation is what proves the session"). Every LLM-authored flow
+has a `goto` after its `signIn`; the programmatic catalog author
+(`src/generator/jev-catalog-author.ts`) has no route to write, so its next
+step is the first `workflow` leg. That leg's $0 menu walker found no "EC" in
+the login page's tree and handed the turn to the decision model, which —
+literal, and shown a page whose only buttons sign people in — chose `CLICK
+"เข้าสู่ระบบด้วย Microsoft"`, then `TYPE_TEXT` into Microsoft's email box, then
+`Next`, then `BLOCKED`. The session was valid the whole time. Six legs
+blocked in 18 s; the diagnosis blamed the environment.
+
+**Rule.** `sign-in.ts` now records, on the accepted-submit path, the first
+main-frame URL off the sign-in pattern the application went to between the
+POST and the bounce (`SignInResult.signedInSurface`; HUMI: `/th` →
+`/th/me/home` → `/th/login`). The session keeps it as
+`PersonaSession.signedInSurface` — the landing URL itself when the sign-in
+landed off the sign-in page. `SmartRunner.workflow` calls
+`#leaveSignInPageForLeg` before the agent's first turn: on a sign-in URL, with
+a session this `signIn` established, for a goal that is not itself about
+signing in (`goalMentionsSignIn`), it opens the recorded surface, waits for
+network idle, and records `detail.movedTo` plus a note. The surface is
+**evidence the application produced**, never a guessed route; when it bounces
+straight back to the sign-in URL the leg runs where it was going to run and
+the note says so. The ladder's agent-assist rung is untouched: it runs at a
+step the author placed on a page, and the session guard already decides what
+a sign-in URL means there.
+
+**Why it cannot make a result worse.** The move happens only where the
+alternative was an agent turn on login furniture with a session held — the
+one page on which a signed-in leg can do nothing right. A surface that
+bounces is a failure identical to before; a goal about signing in is left on
+the sign-in page; a flow whose next step is a `goto` never reaches this code.
+`#lastGotoPath` is set to the surface so the session guard judges the leg's
+own end against the page it was moved to.
+
+Tests: `tests/session-bootstrap.test.ts` ("a workflow leg that starts on
+the sign-in page goes to the signed-in surface first" — a fixture whose home
+bounces its FIRST render after a sign-in, the surface on the record, the
+agent's first observation on the app, and a sign-in goal staying put).
+
+## A control that is the open list is picked from, never clicked (`selectFromListbox`, 2026-09-18)
+
+HUMI SIT under the indexed agent: the Province field is `button "จังหวัด"`
+with `listbox "จังหวัด"` revealed by the click. The model opened the button
+and, next turn, chose SELECT on the listbox — the right control by name, and
+the procedure's first move was to click it open: an open listbox has
+nothing to open, the click timed out at 5 s, and five turns went the same way
+before the stall judge stopped the leg. `selectFromListbox` now reads the
+control's role first: a visible `listbox` / `menu` / `tree` is the list
+itself, taken as the opened container with no click; every other control
+still opens as before (`aria-expanded` respected, `openList` found). Nothing
+changes for a trigger; a list is picked from. Test:
+`tests/engine-helpers.test.ts` ("a control that IS the open list is picked
+from, never clicked").
+
+## A century-scale jump goes through the month view by ASSUMED shape, and humi's is a different one (EH-DOB, 2026-09-14, e2e01-dedup-20260914-154219 hir-ec-001-key-in-60)
+
+**Incident.** Hire Date (a small delta from "now") resolves via plain
+month-nav in ~12 clicks, ~0.7 s. Date of Birth for `1968-03-01` — ~702 months
+back from ~September 2026 — spent **121,231 ms** across four ladder rungs and
+failed completely: `fast` walked `MAX_MONTH_STEPS` (240) month-by-month clicks
+and stopped at "September 2006", 240 short; `jit` was disabled; the agent's
+look correctly diagnosed nothing actionable; `agent-enter` clicked `Next
+month` until the loop's own no-progress guard stopped it, still short. The
+module's own doc comment already claimed the long-jump shortcut existed ("a
+month view behind the heading… a `select` for the month, a number input for
+the year") — so on paper this should have been unreachable.
+
+**Root cause, found live** (`humi-sit-int.central.co.th/humi/en/admin/hire`,
+the real Date of Birth `DateField`, DOM read directly, not guessed): the
+assumption behind `jumpViaMonthView` was written from a WRITER's idea of the
+widget, never from the widget — the same failure shape this file has already
+named twice (the multi-select `role=listbox` fixture, the searchable-select
+panel with no list role). Two divergences, both fatal on their own:
+
+1. **The month-view toggle's accessible name is not its visible text.** The
+   heading is `<button aria-label="Choose month and year">September 2026</button>`.
+   `jumpViaMonthView` looked up the toggle with `getByRole('button', { name:
+   <regex of the heading text> })` — an ACCESSIBLE-NAME match — which can never
+   find a button whose `aria-label` says something else entirely. The toggle
+   was never clicked; the month view never opened.
+2. **There is no `select` and no year input at all.** Once opened (confirmed
+   by driving it directly with `el.click()`), the month view renders a plain
+   grid of month BUTTONS (`Jan`…`Dec`, no `aria-label`, matched by their own
+   text) and a year row of `Previous year`/`Next year` icon buttons flanking a
+   bare, roleless `<p>2026</p>` — no `combobox`, no `spinbutton`, no
+   `textbox`. `jumpViaMonthView`'s existing combobox/year-field branch had
+   nothing to find even had the toggle been reached.
+
+Measured live before writing anything: the year-nav buttons update the `<p>`
+in ~4 ms/click with no artificial wait (53 clicks, 222 ms, no minimum-year
+bound encountered down to 1900); clicking a month button both sets the month
+AND returns to day view, with the header re-reading "March 2021" correctly —
+but that header text is FROZEN during year navigation (it kept reading
+"August 2026" through five year-back clicks), so it cannot be used to poll
+progress the way the day-view heading can.
+
+**Fix, `jumpViaMonthView` (`src/engine/calendar.ts`).** Two independent
+mechanisms, chosen by what the DOM actually renders, not by which one was
+assumed:
+
+- The heading TOGGLE is now found by `dialog.getByRole('button').filter({
+  hasText: <the heading's own rendered text> })` — Playwright's `hasText`
+  matches `textContent`, never the accessible name, so an `aria-label`
+  override can no longer hide it. This can only turn a guaranteed miss into a
+  match: a button whose accessible name already equalled its own text (every
+  existing fixture) is found exactly as before.
+- The YEAR is set through a fillable field when one is visible (unchanged,
+  Case A); otherwise `stepYearButtons()` clicks `Previous year`/`Next year` in
+  a loop, reading the displayed year off whichever ancestor of the nav button
+  (up to four levels up) carries a bare 4-digit number — no id, no testid, no
+  label assumed, the same "understate, never overstate" discipline the rest
+  of this module already uses for CSS/ARIA detection. Bounded to the actual
+  distance plus five clicks of slack (`YEAR_NAV_SLACK`), not a flat ceiling —
+  a Date of Birth ~58 years back costs ~58 clicks, not `MAX_MONTH_STEPS`'s 240
+  and not an unbounded loop either; a button that stops moving the year (a
+  min/max bound) or offers no visible nav in the needed direction stops the
+  walk and the function returns `false`, falling through to the caller's
+  existing month-nav loop exactly as a `jumpViaMonthView` failure always has.
+- The MONTH is picked from a `select` when one is visible (unchanged, Case A);
+  otherwise `findMonthButton()` scans the dialog's buttons for the one whose
+  OWN text (not accessible name) parses via `monthNumberOf` to the target
+  month, and clicks it — the same day-grid idiom (`dayButtons` matched by
+  their own rendered number) applied one level up.
+- The function's final check is untouched: it re-reads the dialog's own
+  heading and only reports success when it names the target month AND year —
+  the same "re-run the author's own read" contract every rung in this module
+  already gives, so a partial or wrong navigation still fails honestly rather
+  than "successfully" landing on the wrong month.
+
+**Why this cannot heal onto the wrong date.** Every step is either a read
+(the heading text, the year `<p>`, a button's own text) or a click on a
+control matched by what the read just found — never a guess at a day, a
+month, or a year. A stalled year walk or an unfound month button returns
+`false` and the caller's existing plain month-nav loop and its own bound
+(`MAX_MONTH_STEPS`) are the fallback, unchanged; the day-picking phase (the
+disabled-day verdict, the last/first match by day ≥ 15) is untouched entirely.
+`MAX_MONTH_STEPS` itself was not raised — a jump this month-view path cannot
+resolve still fails in the same bounded way it always did, it does not fail
+slower.
+
+**Measured, live** (`humi-sit-int.central.co.th`, the real Date of Birth
+field, VPN-connected, headless Chrome on `:9333`): before, 121,231 ms,
+`failed`, nothing entered. After, driving `pickDateInDialog` directly against
+the same live field with the fix applied: **2,192 ms**, `via: "month-view"`,
+`navigated: 0`, `confirmed: true`, trigger reads `"1 Mar 1968"`. Near-term
+Hire Date is unaffected (`MONTH_VIEW_THRESHOLD` still gates `jumpViaMonthView`
+to jumps over 13 months; the existing month-nav CDP tests still pass
+byte-for-byte, see below).
+
+**Measured, CDP fixture** (`tests/engine-helpers.test.ts`, a new `#dob-date`
+`DateField` built from the live widget's exact shape — button-grid month
+view, no combobox, no year input, a toggle whose `aria-label` differs from
+its text): a ~700-month jump (`1968-03-01`) resolves via `month-view` in
+~2.6 s, confirmed; the SAME widget's near-term date (`2026-11-10`, 2 months
+out) still resolves via plain `month-nav` with `navigated: 2`, unaffected;
+every pre-existing calendar test (the combobox+year-input Case A fixtures,
+the Buddhist heading, the disabled-day verdict) stays green, unchanged.
+
+**Pinned by** `tests/engine-helpers.test.ts`: "calendar: a century-scale jump
+(Date of Birth) drives a button-grid month view, not 700+ month-nav clicks
+(EH-DOB)" and "calendar: the same button-grid widget still resolves a
+near-term date via plain month-nav (unaffected)", both CDP-gated against the
+new fixture; the four pre-existing calendar tests (Case A: combobox+year
+input) are unchanged and still pass.
+
+## A calendar popover the page closes under the driver is reopened once, and a failed jump says which step (HR-SIT-E2E-V01-1-001, 2026-09-21)
+
+**Incident.** Two live runs, same step (`fill role=button[name="Date of Birth" i]`
+= `1968-03-01`, trigger low in the viewport at (652,891), directly after a
+`workflow` leg that typed into Phone/Email), same run's Hire Date (12 months,
+484 ms, `calendar-month-nav`) passing. Without EH-DOB the attempt read
+`locator.click: Timeout 10000ms exceeded`; with EH-DOB it read `the dialog
+under "September 2026" offers no previous-month control to reach 1968-03-01`.
+The application's source (`cnext/organisms/DateField.tsx`, `calendar-core.tsx`,
+`molecules/popover-panel.tsx`) rules out the obvious reading: `CalendarNav`
+renders its Previous/Next-month buttons in BOTH views, so "no previous-month
+control" can only mean the dialog itself was no longer visible. `PopoverPanel`
+closes on Escape, on a mousedown outside panel and anchor, and — the one a
+driver cannot see coming — **whenever a scrolling ancestor of its anchor fires
+a scroll event**. A fixture with the widget's exact shape (flipped above a low
+trigger, bottom-anchored, year kept in picker-local state) passes both through
+`pickDateInDialog` and through the whole runner with filming on, so the driver
+is right about the widget; a fixture whose popover is dismissed once 60 ms
+after opening reproduces the live message verbatim under the EH-DOB driver.
+Both live messages are one fact: the popover closed under the driver, and the
+next click waited on (old) or the next lookup missed (new) a dialog that was
+gone. What closed it on the live page is NOT established — see below.
+
+**Rule.** `jumpViaMonthView` returns the sub-step that did not land (toggle
+not found, toggle click refused — with the line of Playwright's call log that
+names an interceptor or a detached element, `whyClickFailed` — year controls
+short, no month button, the heading afterwards) or `null`. When the jump
+failed AND the dialog is no longer visible, `pickDateInDialog` opens the
+trigger once more and repeats the same procedure; a second failure carries
+both reasons. A month view left open is toggled back (`button[aria-expanded=
+"true"]` inside the dialog) before month stepping, which needs the day grid.
+And a target further than `MAX_MONTH_STEPS` whose jump failed is a
+`CalendarDriveError` there and then, naming the jump's reason — not 240 clicks
+and not a sentence about a missing control.
+
+**Why it cannot resolve onto the wrong thing.** Nothing about success moved:
+the jump still reports `null` only when the dialog's own heading reads the
+target month and year, the day is still clicked by its number under that
+heading, and the trigger is still read back. A reopen is the driver's own
+first move repeated. **Why it cannot slow a passing step:** every new branch
+is behind a jump that already failed.
+
+**Open, and the one observation that settles it.** Whether the live closer is
+the ancestor-scroll dismissal (a reflow after the previous field's blur moving
+the shell's scroller) or something else. The next live failure now says so in
+the attempt line; if it passes on the reopen, a `scroll` capture listener on
+`window` armed before the trigger click names the scroller.
+
+**Pinned by** `tests/engine-helpers.test.ts`: "a popover the page dismissed
+once is reopened, and the jump still lands" and "a popover dismissed every
+time fails naming the month view step" (both CDP-gated; both red under the
+EH-DOB driver with the live message as the failure).
+
+## An option found below the fold is reached by centring its trigger, and "found, could not be clicked" is never worded "no option appeared" (`selectFromListbox`, 2026-09-21, batch-1.001-20260921-132022 steps 77–80)
+
+HUMI SIT hire form: `scrollTo role=button[name="Employee Group" i]` passed
+`fast` in 1,137 ms and the proof's `target.box` has the trigger at y 613 —
+centred, by the film's smooth scroll. The next step's box has it at y 1001 of
+1080: between the two the previous pick's dependent fetch landed, the form
+grew above the control, and the pick's own `trigger.click()` scrolled it back
+in to the NEAREST edge — the pane's last line. So the `scrollTo` was not a
+no-op and no `scrollTo` could have held: a layout shift after it undoes it.
+The application's listbox is a `position: fixed` panel portaled to `<body>`,
+placed under the trigger and dismissed when the pane scrolls
+(`popover-panel.tsx`); with the search box above the options every option sat
+below the viewport, where Playwright's scroll-into-view cannot move a fixed
+element. `selectOption` cost 21,549 ms — 10 s on `fast`, 10 s on `late` — and
+both lines read `no option named "A - Permanent" appeared (… 4 shown:
+"A - Permanent", …)`. Province, Pay Group and Bank had the same shape and
+passed only when the control happened to land mid-pane.
+
+The rule, local to the pick (step 4½ in `listbox.ts`): once the option is
+FOUND, one geometry read asks whether its box is inside the viewport. Inside —
+every pick that works today — nothing else happens. Outside: the option's own
+`scrollIntoViewIfNeeded` (500 ms, a long list scrolled inside its panel);
+still outside, and the control is a trigger rather than the list itself: the
+trigger is centred, the list reopened if that scroll closed it, the typed
+search head put back, and the option located again by the SAME rules — taken
+only when its name equals the one first found. Anything else leaves the first
+hit to fail as it would have. It cannot pick another option (name equality),
+cannot slow a working pick (one `evaluate`), and never presses Escape on the
+way (a parent dialog would take it).
+
+A click that still fails throws `ListboxOptionUnclickableError`: `opened "T"
+and found option "X" for "V", but it could not be clicked (N shown): <Playwright's
+line> — the option sat at y a–b of a H px viewport, and again after the
+trigger was centred and the list reopened`. `isStateContradiction` and the
+healer-skip (`popupTarget`) are keyed on the new wording too, so the ladder
+stops exactly where it did — `fast`, `late`, verdict — and no rung is added.
+The class is NOT a `ListboxOptionMissingError`: the agent loop's
+enumerated-listbox judge reads that class as "the list cannot offer the value",
+which is false of an option that was in it.
+
+Tests: `tests/engine-helpers.test.ts` (`/fold` fixture — pane scroller, trigger
+on the last line, fixed panel with no flip that closes on pane scroll: picked in
+under 2 s with the trigger mid-viewport; a pick already in reach is not moved; an
+option under a transparent sheet fails as found-and-unclickable and picks
+nothing), `tests/runner-wave2.test.ts` (the new line is a state contradiction).
+
+Open, seen in the same bundle and NOT fixed here: reconstruction replaced the
+failed pick with `click text=A - Permanent`, and `jit` healed that selector
+onto `role=button[name="Employee Group"]` — the trigger — so step 80 is green
+having clicked the dropdown, not the option. That is a heal resolving onto a
+different element than the author named (premise 1); it belongs to the healer's
+acceptance check. The multi-select tick gets the geometry step but still throws
+Playwright's own error on a failed tick.

@@ -98,6 +98,13 @@ async function cmdRecall(ref: string | undefined, json: boolean): Promise<number
   return main(preset.argv);
 }
 
+/** `--author-mode auto|jev|llm`; anything else is refused before a browser is spent. */
+function parseAuthorMode(raw: string | undefined): 'auto' | 'jev' | 'llm' {
+  const value = (raw ?? 'auto').trim().toLowerCase();
+  if (value === 'auto' || value === 'jev' || value === 'llm') return value;
+  throw new Error(`--author-mode must be auto, jev or llm (got ${JSON.stringify(raw)})`);
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   // Handled before `parseArgs` because the panel has its own two flags
   // (`--port`, `--no-open`) and adding them to the shared option table would
@@ -132,6 +139,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       concurrency: { type: 'string' },
       'author-concurrency': { type: 'string' },
       'author-attempts': { type: 'string' },
+      'author-mode': { type: 'string' },
       'author-lookahead': { type: 'string' },
       'follow-buttons': { type: 'boolean', default: false },
       'no-ensure-chrome': { type: 'boolean', default: false },
@@ -456,6 +464,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         : Number(values['author-concurrency']),
     authorAttempts:
       values['author-attempts'] === undefined ? undefined : Number(values['author-attempts']),
+    authorMode: parseAuthorMode(values['author-mode']),
     authorLookahead:
       values['author-lookahead'] === undefined
         ? undefined

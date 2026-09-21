@@ -42,9 +42,9 @@ import {
   type ExpectedCall,
   type FlowExpectCallsSpec,
 } from '../api/expect-calls.js';
-import { isSecretStepValue, maskSecret } from '../api/redact.js';
+import { REDACTED, isSecretStepValue, maskSecret } from '../api/redact.js';
 import type { RedactionPolicy } from '../api/redact.js';
-import { VariableStore } from '../api/variables.js';
+import { VariableStore, isSensitiveName } from '../api/variables.js';
 import { DbActions } from '../db/db-actions.js';
 import type {
   FlowDbCalledSpec,
@@ -109,6 +109,7 @@ import {
   personaRefusal,
   differentPage,
   goalEvidence,
+  goalMentionsSignIn,
   looksLikeSignIn,
   queryAndHash,
   verificationOnlyGoal,
@@ -899,6 +900,7 @@ export const AGENT_HARNESS_STOPS: ReadonlySet<AgentEndedBy> = new Set<AgentEnded
   'stalled',
   'no-progress',
   'value-hunt',
+  'no-value',
   'wandered',
   'model-error',
 ]);
@@ -933,6 +935,8 @@ function harnessLimitOf(endedBy: AgentEndedBy, record: AgentRecord): string {
       return 'consecutive turns in which nothing advanced';
     case 'value-hunt':
       return "the value hunt — the goal's values never appeared";
+    case 'no-value':
+      return 'the goal names no value for the field the agent chose';
     case 'wandered':
       return 'the off-page allowance';
     case 'model-error':
@@ -1048,6 +1052,22 @@ export function isContentMiss(line: string): boolean {
 }
 
 /**
+ * Does a failed step's own account say its selector RESOLVED — the element
+ * answered with a text, a value or an attribute, the ladder's header says
+ * "resolved, but …", the memo says the element was already read, or
+ * Playwright named what covered it? Such a failure is never "timing": the
+ * end-of-run re-probe of the selector proves only what was never in doubt.
+ * Live (HUMI SIT, 2026-09-21): `expected value "40106337", got "Search
+ * position..."` was downgraded to "TIMING, not absence" about a control that
+ * was read on the spot and held the wrong value. Pure.
+ */
+export function resolvedAtFailure(error: string): boolean {
+  return /expected text to contain|expected value .*, got |expected @\S+ to be .*, got |known content mismatch:|resolved, but |intercepts pointer events/i.test(
+    error,
+  );
+}
+
+/**
  * A rung that RESOLVED the element(s) and found the claim about their STATE
  * contradicted: the wrong count (of a non-empty match — zero is absence, and
  * absence may still be selector drift), the wrong enabled/disabled state, or
@@ -1070,6 +1090,11 @@ export function isStateContradiction(line: string): boolean {
     // cannot put an option into one. The read IS the verdict — "the option
     // set is wrong" is what HIR-EC-027/029's Failed rows mean.
     /no option named .* appeared/.test(line) ||
+    // The option was read, found and could not be clicked, after the pick
+    // had already centred its trigger and reopened the list once (HUMI SIT
+    // Employee Group, 2026-09-21): the same verdict — no healer can open a
+    // list and no other rung moves a panel.
+    /and found option .* but it could not be clicked/.test(line) ||
     // A click on a disabled control (EH-14): Playwright waits for "enabled"
     // until the timeout and names the state in its call log. The sheets'
     // "ทดลองกด … ไม่มีการเปลี่ยนแปลง" (MC_02_02, ML_01_05/06, PL_06_05, RU_07_02)
@@ -1239,9 +1264,33 @@ async function inheritSession(browser: Browser): Promise<SessionInheritance> {
 
 /** Apply the configured viewport. Best-effort — a page that refuses stays as it is. */
 async function applyViewport(page: Page): Promise<void> {
+  await enableFocusEmulation(page);
   const size = configuredViewport();
   if (size === null) return;
   await page.setViewportSize(size).catch(() => undefined);
+}
+
+/**
+ * Keep a background page rendering (jev-ultrafast's rail, 2026-09-18). Chrome
+ * throttles `requestAnimationFrame` and CSS animation in a tab that is not
+ * focused, and under `--browsers`/`--concurrency` every lane but one is such a
+ * tab — so a menu that animates open, a listbox that fades in, a spinner that
+ * clears, all take longer to reach the tree than they would in front of a
+ * person. Focus emulation makes the page believe it is focused without
+ * activating it in the window. One CDP call per page, at creation; a browser
+ * that refuses it (not Chromium, a detached page) is left exactly as it was.
+ */
+async function enableFocusEmulation(page: Page): Promise<void> {
+  try {
+    const session = await page.context().newCDPSession(page);
+    try {
+      await session.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    } finally {
+      await session.detach().catch(() => undefined);
+    }
+  } catch {
+    // Not a CDP browser, or the page is already gone: nothing to keep rendering.
+  }
 }
 
 /**
@@ -1768,6 +1817,27 @@ export const ARIA_STATE_ATTRIBUTES: ReadonlySet<string> = new Set([
   'expanded',
 ]);
 
+/** How much of a `saveText` reading the step records — enough to hold a whole dialog. */
+export const SAVED_TEXT_MAX = 2_000;
+
+/**
+ * What a `saveText` step records of the text it read (`detail.saved`). The
+ * run's variable keeps the whole reading; the record is evidence, and it was
+ * cut at 200 characters — a validation dialog saved to prove WHY a submit was
+ * refused ended before its list of missing fields (HUMI SIT, 2026-09-21).
+ * A cut is marked with `…`. The record follows the rule the bundle's
+ * `variables` already does — a credential by name shows no value — and a
+ * password the run was given is masked wherever it appears. Pure.
+ */
+export function savedTextRecord(text: string, as: string, secrets: ReadonlySet<string> = new Set<string>()): string {
+  if (isSensitiveName(as)) return REDACTED;
+  let safe = text;
+  for (const secret of [...secrets].sort((a, b) => b.length - a.length)) {
+    if (secret !== '') safe = safe.replaceAll(secret, maskSecret(secret));
+  }
+  return safe.length > SAVED_TEXT_MAX ? `${safe.slice(0, SAVED_TEXT_MAX)}…` : safe;
+}
+
 /**
  * Whether `expected` is satisfied by the `aria-<name>` spelling of a state
  * `expectAttribute`'s raw attribute comparison already missed (PL_06_05,
@@ -1874,6 +1944,14 @@ type PersonaSession = {
   sessionBootstrapTried: boolean;
   /** The account the last `signIn` on this session established, for the suite's vault. */
   signedInAs: string | null;
+  /**
+   * Where this session stands signed in: the page the last `signIn` landed
+   * on, or — for an application that lands a successful sign-in back on
+   * its sign-in page — the surface it went to in between (`sign-in.ts`,
+   * `signedInSurface`). A leg that starts on the sign-in page goes here
+   * first, so an agent never acts on login furniture with a session held.
+   */
+  signedInSurface: string | null;
   /** How the recording was sealed, once `close()` has run. */
   sealed: VideoRecording | null;
 };
@@ -2385,6 +2463,7 @@ export class SmartRunner {
       signInDidNotTake: false,
       sessionBootstrapTried: false,
       signedInAs: null,
+      signedInSurface: null,
       sealed: null,
     };
   }
@@ -3167,9 +3246,17 @@ export class SmartRunner {
    */
   async scrollTo(selector: string, intent?: string): Promise<void> {
     await this.#step('scrollTo', selector, intent, async (locator, timeout) => {
-      // A smooth scroll first, for the film; the instant one is the action
-      // of record and a no-op once the element is already in view.
+      // The target ends in the MIDDLE of its scroller with or without the
+      // film: smoothly when humanised, instantly otherwise — never both, so
+      // the film shows one movement. Before 2026-09-21 only the film centred
+      // it and the bare path stopped at the nearest edge, where a control on
+      // the last visible line opens its list below the fold. The
+      // `scrollIntoViewIfNeeded` stays the action of record: a no-op once
+      // the element is in view, and the error a hidden one is refused with.
       await humanScrollTo(locator, timeout, { enabled: this.#humanize });
+      if (!this.#humanize) {
+        await locator.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }), undefined, { timeout });
+      }
       await locator.scrollIntoViewIfNeeded({ timeout });
     });
   }
@@ -4298,11 +4385,18 @@ export class SmartRunner {
       }
       if (outcome.acceptedSubmit !== undefined) {
         detail['submitAccepted'] = outcome.acceptedSubmit;
+        this.#active.signedInSurface = outcome.signedInSurface ?? null;
+        if (outcome.signedInSurface !== undefined) detail['signedInSurface'] = outcome.signedInSurface;
         this.bundle.note(
           `signIn as ${persona.label}: the credential submit was accepted (${outcome.acceptedSubmit}) and ` +
             `the page returned to the sign-in URL ${this.page.url()} — the application's landing after ` +
-            'signing in, not a lost session; the next navigation is what proves the session',
+            'signing in, not a lost session; the next navigation is what proves the session' +
+            (outcome.signedInSurface === undefined
+              ? ''
+              : ` (on the way it showed ${outcome.signedInSurface}; an agent leg that starts here goes there first)`),
         );
+      } else {
+        this.#active.signedInSurface = this.page.url();
       }
       const consentSettled =
         this.#consentPolicy === 'accept'
@@ -4326,6 +4420,56 @@ export class SmartRunner {
       this.bundle.setActor({ persona: persona.label, browser: this.#active.cdpUrl });
       detail['urlAfter'] = this.page.url();
     });
+  }
+
+  /**
+   * A `workflow` leg that begins on the sign-in page while this session is
+   * signed in is moved to the session's signed-in surface before the agent's
+   * first turn, and the URL it was moved to is returned; null when nothing
+   * was done.
+   *
+   * Live driver (HUMI SIT, HIR-EC-001 under the Jev engine, 2026-09-18): the
+   * application lands a successful local sign-in back on `/th/login` with
+   * the form re-mounted. The authored flow's next step was the first agent
+   * leg; its $0 menu walker found no "EC" in the login page's tree and
+   * handed the turn to a decision model, which — literal — clicked
+   * "เข้าสู่ระบบด้วย Microsoft" and had an email typed into Microsoft's
+   * form. The session was valid the whole time.
+   *
+   * Three guards keep this from ever doing the agent's work for it: the page
+   * must actually be on a sign-in URL; the session must have been established
+   * by a `signIn` that recorded where the application went (evidence, never a
+   * guessed route); and a goal that is itself about signing in is left on the
+   * sign-in page. If the surface bounces back to the sign-in URL the leg runs
+   * where it was going to run, and the note says so — a failure identical to
+   * before, never a pass against the wrong page.
+   */
+  async #leaveSignInPageForLeg(goal: string): Promise<string | null> {
+    if (!looksLikeSignIn(this.page.url())) return null;
+    const surface = this.#active.signedInSurface;
+    if (surface === null || this.#lastSignedInAs === null || goalMentionsSignIn(goal)) return null;
+    if (looksLikeSignIn(surface)) return null;
+    await this.page.goto(surface, { waitUntil: 'domcontentloaded' });
+    await this.page.waitForLoadState('networkidle', { timeout: this.#fastTimeoutMs }).catch(() => undefined);
+    const landed = this.page.url();
+    if (looksLikeSignIn(landed)) {
+      this.bundle.note(
+        `workflow: the leg began on the sign-in page after a signIn; opening ${surface} bounced back to ` +
+          `${landed}, so the leg runs on the sign-in page as authored`,
+      );
+      return null;
+    }
+    try {
+      this.#lastGotoPath = new URL(landed).pathname;
+    } catch {
+      this.#lastGotoPath = null;
+    }
+    this.#lastGotoAskedSignIn = false;
+    this.bundle.note(
+      `workflow: the leg began on the sign-in page after a signIn, so it was moved to ${landed} — the surface ` +
+        'the application went to when the sign-in was accepted — before the first turn',
+    );
+    return landed;
   }
 
   /**
@@ -4455,7 +4599,7 @@ export class SmartRunner {
         const first = locator.first();
         await first.waitFor({ state: 'visible', timeout });
         const text = ((await first.innerText()) ?? '').trim();
-        detail['saved'] = text.slice(0, 200);
+        detail['saved'] = savedTextRecord(text, as, this.#secretValues);
         this.variables.set(as, text);
       },
       detail,
@@ -5006,6 +5150,7 @@ export class SmartRunner {
     // still never the verdict (see below), but the changes it caused are on
     // the record for a person to judge, and the film shows the rest.
     const netMark = this.#takeNetMark();
+    const movedTo = await this.#leaveSignInPageForLeg(goal);
     const urlBefore = this.page.url();
     const headingsBefore = await this.#headingsNow();
     // `saveVariable` (OA-8): the agent's `save` action puts a value the page
@@ -5179,6 +5324,7 @@ export class SmartRunner {
       detail: {
         goal: safeRecord.goal,
         turns: record.turns,
+        ...(movedTo === null ? {} : { movedTo }),
         // Phase C telemetry: which tactics the model was sent, and how much
         // of the prompt the provider served from cache.
         ...(record.skills === undefined ? {} : { skills: record.skills }),
@@ -6574,7 +6720,7 @@ export class SmartRunner {
       'medium',
       `Step reconstructed in-run: ${step.action}${'selector' in step ? ` ${(step as { selector?: string }).selector ?? ''}` : ''}`,
       `This step only passed after ${failures} failed attempt(s) and an in-run rebuild by the ` +
-        'repair model. The run is green, but the flow as written no longer matches the ' +
+        'repair model. The step is green, but the flow as written no longer matches the ' +
         'application — update the step (see the reconstruction record on it) so the suite ' +
         'stops paying a model every run.',
       'selector' in step ? (step as { selector?: string }).selector : undefined,
@@ -7694,7 +7840,7 @@ export class SmartRunner {
     // repair onto the trigger — HIR-EC-029 measured 70 s per such miss.
     const popupTarget =
       targetsPopupContent(selector) ||
-      (action === 'selectOption' && attempts.some((line) => /opened .* but no option named/.test(line)));
+      (action === 'selectOption' && attempts.some((line) => /opened .* (?:but no option named|and found option)/.test(line)));
 
     if (!contentMiss && popupTarget) {
       attempts.push('jit: skipped — the target lives inside a listbox the healer cannot open');
@@ -8402,7 +8548,9 @@ export class SmartRunner {
           // live: a failed `expectText body` (content absent because the
           // journey never created it) downgraded to timing because `body`,
           // of course, resolves.
-          !/expected text to contain|intercepts pointer events/i.test(step.error ?? '')
+          // (`resolvedAtFailure`: the same rule for a value, an attribute, a
+          // state contradiction and a memoed content mismatch.)
+          !resolvedAtFailure(step.error ?? '')
         ) {
           deadEnded.add(step.selector);
         }

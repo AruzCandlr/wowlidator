@@ -1,0 +1,653 @@
+{
+  "$comment": "HUMI SIT new-hire key-in form. Every selector here resolved against the live page on 2026-09-18 (run hrsit-jev-direct-20260918170710); a selector that has never resolved does not belong in this file. Sheet field names are matched case-insensitively after stripping punctuation. Employee ID is not a form field: it exists only after Submit, on the profile, and the DB evidence carries it.",
+  "app": "HUMI SIT",
+  "route": {
+    "login": "/en/login",
+    "menu": {
+      "Hire & Onboard": "/en/admin/hire",
+      "New Hire": "/en/admin/hire",
+      "New Hire (Manual Key-in)": "/en/admin/hire",
+      "Manage Pending Recruits": "/en/admin/hire?tab=rcm"
+    },
+    "entry": {
+      "keyin": "/en/admin/hire"
+    }
+  },
+  "opensOn": "text=Step 1 of 2 - Personal",
+  "fields": {
+    "first name (en)": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"First Name (EN)\" i]"
+    },
+    "last name (en)": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"Last Name (EN)\" i]"
+    },
+    "first name (th)": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"Firstname (TH)\" i]"
+    },
+    "last name (th)": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"Lastname (TH)\" i]"
+    },
+    "national id": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"National ID / Tax ID\" i]",
+      "mask": "#-####-#####-##-#"
+    },
+    "national id / tax id": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"National ID / Tax ID\" i]",
+      "mask": "#-####-#####-##-#"
+    },
+    "house no": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"House No.\" i]"
+    },
+    "date of birth": {
+      "action": "fill",
+      "selector": "role=button[name=\"Date of Birth\" i]",
+      "kind": "date",
+      "display": "%-d %b %Y",
+      "$note": "fill (not selectOption) on the BUTTON with an ISO value: that is the only path that reaches engine/calendar.ts. It reads back as e.g. '1 Mar 1968'."
+    },
+    "hire date": {
+      "action": "fill",
+      "selector": "role=button[name=\"Hire Date\" i]",
+      "kind": "date",
+      "display": "%-d %b %Y",
+      "$note": "fill (not selectOption) on the BUTTON with an ISO value: that is the only path that reaches engine/calendar.ts. It reads back as e.g. '1 Mar 1968'."
+    },
+    "gender": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Gender\" i]"
+    },
+    "nationality": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Nationality\" i]",
+      "values": {
+        "TH": "Thai",
+        "Thailand": "Thai",
+        "ไทย": "Thai"
+      }
+    },
+    "event reason": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Event Reason\" i]"
+    },
+    "province": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Province\" i]",
+      "$note": "The list renders English ('— Select Province —', options 'Bangkok'). Thai matched via the search box in the 11:25 run but not once the form was filled deterministically; English is what the page shows.",
+      "sample": "Bangkok",
+      "alt": "Chiang Mai",
+      "values": {
+        "กรุงเทพมหานคร": "Bangkok",
+        "เชียงใหม่": "Chiang Mai",
+        "ชลบุรี": "Chon Buri"
+      },
+      "clearedShows": "— Select Province —"
+    },
+    "district": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"District\" i]",
+      "sample": "Bang Rak",
+      "alt": "Phaya Thai",
+      "clearedShows": "— Select Province first —"
+    },
+    "sub-district": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Sub-District\" i]",
+      "sample": "Si Lom",
+      "alt": "Sam Sen Nai",
+      "clearedShows": "— Select District first —"
+    },
+    "postal code": {
+      "action": "read",
+      "selector": "role=textbox[name=\"Postal code\" i]",
+      "clearedShows": "— Select Postal code —",
+      "$note": "Once a Sub-District is chosen the code fills itself and the control is a read-only TEXTBOX, not the button the empty state shows (healer proposal on every pass-3 case, 2026-09-21)."
+    },
+    "salutation": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Salutation (EN)\" i]"
+    },
+    "country of birth": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Country of Birth\" i]"
+    },
+    "company": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Company\" i]"
+    },
+    "holiday calendar": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Holiday Calendar\" i]",
+      "codeOnly": true,
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. Options '<code> - <name>'."
+    },
+    "time management status": {
+      "action": "read",
+      "selector": "role=textbox[name=\"Time Management Status\" i]",
+      "readOnly": true
+    },
+    "o.t. flag": {
+      "action": "read",
+      "selector": "role=textbox[name=\"O.T. Flag\" i]",
+      "readOnly": true
+    },
+    "minimum job grade": {
+      "action": "read",
+      "selector": "role=textbox[name=\"Minimum Job Grade\" i]"
+    },
+    "maximum job grade": {
+      "action": "read",
+      "selector": "role=textbox[name=\"Maximum Job Grade\" i]"
+    },
+    "payroll frequency": {
+      "action": "read",
+      "selector": "role=textbox[name=\"Payroll Frequency\" i]"
+    },
+    "employee subgroup": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Employee Sub-Group\" i]",
+      "codeOnly": true,
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. Empty until an Employee Group is chosen; options '<code> - <name>'. A sheet writes '10 ตามชุดข้อมูล' — only the leading code is the value."
+    },
+    "country of id card": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Country\" i]"
+    },
+    "pay group": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Pay Group\" i]",
+      "$note": "238 options labelled like CDH:MJT:01-31:EOM16D; the DB code (ES) is not the label. Verified present 2026-09-21."
+    },
+    "bank": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Bank\" i]",
+      "$note": "Searchable list; options read '229 - Kasikornbank (KBANK)'. Found by search 2026-09-21; the click failed only because the list opened below the viewport."
+    },
+    "account number": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"Account Number\" i]",
+      "$note": "unverified until first live run"
+    },
+    "payment method": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Payment Method\" i]",
+      "$note": "unverified until first live run"
+    },
+    "position": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Position\" i]",
+      "$note": "HumiSearchableSelect id=position (humi-SIT StepJob.tsx). Server-searched: the first list holds 20 rows, the rest arrive 300 ms after typing; options read '<code> - <name>', so the sheet's code matches by prefix. Choosing it fills Organization, Cost Center, Division, Business Unit, HR District, Work Location, Zone, SSO Location from employee_foundation.positions."
+    },
+    "employee group": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Employee Group\" i]",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. Options read '<code> - <name>' (A - Permanent). Choosing A/B/C sets Contract Type to R1 and hides Contract End Date."
+    },
+    "employee sub group": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Employee Sub-Group\" i]",
+      "codeOnly": true,
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. Empty until an Employee Group is chosen; options '<code> - <name>'. A sheet writes '10 ตามชุดข้อมูล' — only the leading code is the value."
+    },
+    "contract type": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Contract Type\" i]",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it."
+    },
+    "contract end date": {
+      "action": "fill",
+      "selector": "role=button[name=\"Contract End Date\" i]",
+      "kind": "date",
+      "display": "%-d %b %Y",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it."
+    },
+    "supervisor id": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Supervisor ID\" i]",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. Server-searched from 2 characters; options '<employeeId> - <First Last> (<title>)'. The validation modal calls this Direct Manager."
+    },
+    "original start date": {
+      "action": "fill",
+      "selector": "role=button[name=\"Original Start Date\" i]",
+      "kind": "date",
+      "display": "%-d %b %Y",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. Does NOT default from Hire Date."
+    },
+    "seniority date": {
+      "action": "fill",
+      "selector": "role=button[name=\"Seniority Date\" i]",
+      "kind": "date",
+      "display": "%-d %b %Y",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. The modal calls it Seniority Start Date."
+    },
+    "time status": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Time Status\" i]",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. The auto-derive never fires (it waits on job.branch, which the wizard never writes), so it is picked by hand."
+    },
+    "work schedule": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Work Schedule\" i]",
+      "codeOnly": true,
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. Options read 'D05H0830 (5 days × 8.5 hrs)'. Picking one fills Work Schedule Template with its default."
+    },
+    "pay component": {
+      "action": "selectOption",
+      "selector": "role=button[name=\"Pay Component\" i]",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it."
+    },
+    "amount": {
+      "action": "fill",
+      "selector": "role=spinbutton[name=\"Amount\" i]",
+      "$note": "Control read from humi-SIT source 2026-09-21 (label via htmlFor; the asterisk span is aria-hidden); unverified live until the first run that reaches it. input type=number. This is what 'Base Salary must be greater than 0' means; there is no field labelled Base Salary."
+    },
+    "phone number": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"Phone Number 1\" i]",
+      "$note": "Seen live 2026-09-21 in the Phone/Email leg's own evidence: textbox \"Phone Number 1\" / \"Email Address 1\", both required. Deterministic since then: that leg was the only agent call before Submit, and three cases died on it when the agent's upstream answered 503. The textbox does not exist until '+ Add Phone' is pressed (the healer named that button on every pass-3 case, 2026-09-21); the fill failed in 1.7 s and only the reconstruction rung rescued it.",
+      "revealedBy": "role=button[name=\"+ Add Phone\" i]"
+    },
+    "email": {
+      "action": "fill",
+      "selector": "role=textbox[name=\"Email Address 1\" i]",
+      "$note": "Seen live 2026-09-21 in the Phone/Email leg's own evidence: textbox \"Phone Number 1\" / \"Email Address 1\", both required. Deterministic since then: that leg was the only agent call before Submit, and three cases died on it when the agent's upstream answered 503. Same shape as Phone; the '+ Add Email' name is inferred, unverified until first live run.",
+      "revealedBy": "role=button[name=\"+ Add Email\" i]"
+    }
+  },
+  "controls": {
+    "next": "role=button[name=\"Next\" i]",
+    "submit": "role=button[name=\"Save & Submit\" i]",
+    "expandAll": "role=button[name=\"Expand all\" i]"
+  },
+  "$agentOnly": {
+    "$comment": "Fields the sheet names but the page reaches only through a picker the deterministic rungs cannot drive. These ride a workflow leg, which is where Jev earns its place.",
+    "fields": [
+      "business group",
+      "business unit",
+      "department",
+      "personnel grade",
+      "policy profile"
+    ]
+  },
+  "$notOnStep1": {
+    "$comment": "Named on the sheet but living on Step 2 of 2; the flow must click Next first.",
+    "fields": [
+      "business group",
+      "business unit",
+      "department",
+      "position",
+      "employee group",
+      "employee sub group",
+      "personnel grade",
+      "pay group",
+      "bank",
+      "account number",
+      "payment method",
+      "employee subgroup",
+      "contract type",
+      "contract end date",
+      "supervisor id",
+      "original start date",
+      "seniority date",
+      "time status",
+      "work schedule",
+      "holiday calendar",
+      "pay component",
+      "amount"
+    ]
+  },
+  "$sections": {
+    "identity": [
+      "salutation",
+      "first name (en)",
+      "last name (en)",
+      "first name (th)",
+      "last name (th)",
+      "date of birth",
+      "national id",
+      "national id / tax id",
+      "gender",
+      "nationality",
+      "hire date",
+      "event reason",
+      "country of birth",
+      "country of id card",
+      "company"
+    ],
+    "address": [
+      "province",
+      "district",
+      "sub-district",
+      "postal code",
+      "house no"
+    ],
+    "position": [
+      "business group",
+      "business unit",
+      "department",
+      "position",
+      "employee group",
+      "employee sub group",
+      "personnel grade",
+      "supervisor id",
+      "contract type",
+      "contract end date"
+    ],
+    "compensation": [
+      "pay group",
+      "pay component",
+      "amount",
+      "bank",
+      "account number",
+      "payment method"
+    ],
+    "employment": [
+      "original start date",
+      "seniority date"
+    ],
+    "time": [
+      "time status",
+      "work schedule",
+      "holiday calendar"
+    ],
+    "contact": [
+      "phone number",
+      "email"
+    ]
+  },
+  "$otherKeys": [
+    "branch",
+    "sso location",
+    "work location",
+    "job code",
+    "policy profile",
+    "cost center",
+    "division",
+    "pay group",
+    "dvt project",
+    "entry route",
+    "special benefit group flag",
+    "personnel grade (pg)",
+    "minimum job grade",
+    "maximum job grade",
+    "payroll frequency",
+    "time status",
+    "o.t. flag",
+    "cost centre",
+    "zone",
+    "hr district",
+    "frequency",
+    "currency"
+  ],
+  "$required": {
+    "hire date": {
+      "from": "today",
+      "why": "Identity requires a Hire Date; the sheet states none (it points at a data set by name). The day of the run"
+    },
+    "event reason": {
+      "value": "New Hire",
+      "why": "Identity requires an Event Reason; the sheet states none"
+    },
+    "date of birth": {
+      "from": "hire date",
+      "plusDays": -10958,
+      "why": "Identity requires a Date of Birth; the sheet states none. Thirty years before the hire date"
+    },
+    "gender": {
+      "value": "Male",
+      "why": "Personal Information requires a Gender; the sheet states none"
+    },
+    "nationality": {
+      "value": "Thai",
+      "why": "Personal Information requires a Nationality; the sheet states none. Thai keeps the Work Permit section optional"
+    },
+    "first name (th)": {
+      "value": "เจฟคิวเอ",
+      "why": "form requires a Thai first name; the sheet states none"
+    },
+    "last name (th)": {
+      "value": "คีย์อิน",
+      "why": "form requires a Thai last name; the sheet states none"
+    },
+    "national id": {
+      "generate": "thai-national-id",
+      "why": "form requires a National ID; the sheet states none. Mod-11 valid and derived from this run's probe name, so no two cases share a person"
+    },
+    "salutation": {
+      "value": "Mr.",
+      "why": "form requires a Salutation; the sheet states none"
+    },
+    "country of birth": {
+      "value": "Thailand",
+      "why": "form requires Country of Birth; the sheet states none"
+    },
+    "country of id card": {
+      "value": "Thailand",
+      "why": "form requires Country of ID Card; the sheet states none"
+    },
+    "company": {
+      "value": "C001",
+      "why": "the app's identity rule requires companyCode as an INPUT on page 1, even though the sheet's Expected also lists Company among the values pulled from Position; the sheet's own value wins when stated"
+    },
+    "phone number": {
+      "value": "0812345678",
+      "why": "Contact requires at least one phone number; the sheet states none"
+    },
+    "email": {
+      "value": "qa.jev@example.com",
+      "why": "Contact requires at least one valid email; the sheet states none"
+    },
+    "house no": {
+      "value": "99/1",
+      "why": "the address section requires a house number; the sheet states none"
+    },
+    "province": {
+      "value": "Bangkok",
+      "why": "Contact requires a Permanent Address and the sheet states none; an observed option"
+    },
+    "district": {
+      "value": "Bang Rak",
+      "why": "Permanent Address: a district of the province above"
+    },
+    "sub-district": {
+      "value": "Si Lom",
+      "why": "Permanent Address: a sub-district of the district above; Postal Code then fills itself"
+    },
+    "position": {
+      "value": "40106337",
+      "why": "Job requires a Position; the sheet states none. The TD-01 position, a real C001 row of employee_foundation.positions"
+    },
+    "employee group": {
+      "value": "A - Permanent",
+      "why": "page 2 requires an Employee Group; the sheet states none. A also sets Contract Type R1 and hides Contract End Date"
+    },
+    "employee sub group": {
+      "byField": {
+        "field": "employee group",
+        "map": {
+          "A": "07",
+          "B": "07",
+          "C": "07",
+          "D": "07",
+          "E": "P1",
+          "F": "D1",
+          "G": "T1",
+          "H": "C1"
+        }
+      },
+      "why": "page 2 requires a Sub-Group valid for the chosen group; the first row of view_employee_group_mappings for that group"
+    },
+    "contract type": {
+      "value": "C3",
+      "skipWhen": {
+        "field": "employee group",
+        "matches": "^[ABC]\\b"
+      },
+      "why": "Contract Type is required; groups A/B/C get R1 from the app, and C3 on H/E/G hides Contract End Date"
+    },
+    "contract end date": {
+      "from": "hire date",
+      "plusDays": 365,
+      "skipWhen": {
+        "field": "employee group",
+        "matches": "^[ABCEFGH]\\b"
+      },
+      "why": "only group D still shows a required Contract End Date; one year after the hire date"
+    },
+    "supervisor id": {
+      "value": "21300050",
+      "why": "Direct Manager is required and no longer derived from the Position; an active C001 employee in department 30042174 (SIT, read 2026-09-21)"
+    },
+    "original start date": {
+      "from": "hire date",
+      "why": "required and not defaulted by the UI; the hire date"
+    },
+    "seniority date": {
+      "from": "hire date",
+      "why": "required and not defaulted by the UI; the hire date"
+    },
+    "time status": {
+      "value": "01 - Clocking",
+      "why": "required; the app's auto-derive never fires. 01 - Clocking is what the sheet's Expected names"
+    },
+    "work schedule": {
+      "value": "D05H0830",
+      "why": "required; the sheet's usual value, a real row of time_management.work_schedule"
+    },
+    "holiday calendar": {
+      "value": "01",
+      "why": "required; 01 - HO Calendar, the sheet's usual value"
+    },
+    "pay component": {
+      "value": "TH_1000",
+      "why": "required; TH_1000 Salary-T/P/S from employee_foundation.pay_components"
+    },
+    "amount": {
+      "value": "30000",
+      "why": "Base Salary must be greater than 0; the sheet states none"
+    },
+    "pay group": {
+      "value": "CDS:01-31:EOM16D",
+      "why": "Compensation requires a Pay Group; the sheet states none. Code ES in employee_foundation.pay_groups — the most used pay group for company C001 — whose UI label is CDS:01-31:EOM16D, matching the case's CDS policy profile"
+    },
+    "bank": {
+      "value": "Kasikornbank",
+      "why": "Compensation requires a Bank; the sheet states none. A real row of master_banks"
+    },
+    "account number": {
+      "value": "0123456789",
+      "why": "Compensation requires an Account Number; the sheet states none"
+    },
+    "payment method": {
+      "value": "Bank Transfer",
+      "why": "Compensation requires a Payment Method; the sheet states none. A real row of master_payment_methods"
+    }
+  },
+  "$requiredViaAgent": {
+    "$comment": "Empty since 2026-09-21: Phone Number and Email have observed selectors and are entered as verified steps."
+  },
+  "$identityGate": {
+    "field": "country of birth",
+    "why": "the form reveals the Address section only once Identity is complete; the run that reached the address (2026-09-18 11:25) asserted this first"
+  },
+  "$advance": {
+    "controls": [
+      "next",
+      "submit"
+    ],
+    "leavesBehind": "text=Step 1 of 2 - Personal",
+    "$comment": "After pressing an advance control the page must no longer show the marker that proved the old page, and no dialog may be open. A press that merely succeeded mechanically is not an advance: on 2026-09-21 Next 'passed' in 526 ms while a validation modal listed Company, Date of Birth and an identity format error, and the flow carried on as if it were on page 2.",
+    "errorDialog": "role=dialog",
+    "$submitNote": "The control is labelled 'Save & Submit' (healed from 'Submit' at 11.8 s on 2026-09-21)."
+  },
+  "$engineActions": [
+    "back",
+    "check",
+    "clearStorage",
+    "click",
+    "closeModal",
+    "dbSnapshot",
+    "download",
+    "expectAnyVisible",
+    "expectAttribute",
+    "expectCalls",
+    "expectDbCalled",
+    "expectDbDelta",
+    "expectDbRow",
+    "expectDbUnchanged",
+    "expectDisabled",
+    "expectEnabled",
+    "expectFieldError",
+    "expectFocused",
+    "expectHeader",
+    "expectHidden",
+    "expectJson",
+    "expectModal",
+    "expectNotScrollable",
+    "expectScrollable",
+    "expectStatus",
+    "expectTabOrder",
+    "expectText",
+    "expectUrl",
+    "expectValue",
+    "expectVisible",
+    "fill",
+    "fillEach",
+    "fillRetry",
+    "forward",
+    "goto",
+    "press",
+    "saveCount",
+    "saveText",
+    "scrollTo",
+    "selectOption",
+    "setClock",
+    "setLocalStorage",
+    "signIn",
+    "signOut",
+    "snapshot",
+    "type",
+    "uncheck",
+    "upload",
+    "use",
+    "waitFor",
+    "when",
+    "workflow"
+  ],
+  "$appDerived": {
+    "$comment": "Fields the sheet lists as Test Data that the APPLICATION fills and renders read-only. Evidence: humi-SIT StepJob.tsx renders Business Unit `disabled readOnly` and sets it from the chosen Position (setBusinessUnit(posData.businessUnitCode)); a leg told to set it answered BLOCKED at p=0.68, correctly. Never typed; the report records them as derived. Department likewise: StepJob.tsx has no Department input — setOrganization(posData.departmentCode) fills a read-only Organization box from the Position (positions.department_code 30042174 for 40106337, verified 2026-09-21). Division, Cost Center, Work Location, SSO Location, Zone, HR District and Store/Branch are set by the same Position onChange (StepJob.tsx safeSet calls; seen filled live as 1733 / T153 on 2026-09-21); Frequency and Currency are disabled read-only inputs the app fills (StepCompensation.tsx: 'MON', THB).",
+    "fields": [
+      "branch",
+      "business group",
+      "business unit",
+      "cost center",
+      "cost centre",
+      "currency",
+      "department",
+      "division",
+      "frequency",
+      "hr district",
+      "job code",
+      "policy profile",
+      "sso location",
+      "work location",
+      "zone"
+    ]
+  },
+  "$afterAdvance": {
+    "$comment": "Step 2 opens with every section but Position collapsed; a collapsed section keeps its controls hidden and never fetches its options (ClusterJob.tsx, CollapsibleSectionCard.tsx), so every dropdown below is empty until this is pressed.",
+    "next": [
+      {
+        "action": "click",
+        "control": "expandAll",
+        "intent": "เปิดทุก section ของหน้า 2 — section ที่ยังพับอยู่จะซ่อน control และไม่โหลดตัวเลือก"
+      }
+    ]
+  }
+}

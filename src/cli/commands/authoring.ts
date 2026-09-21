@@ -94,7 +94,6 @@ import {
   DEFAULT_AUTHOR_MAX_NODES,
   FlowAuthor,
   LOGIN_URL_PATTERN,
-  LlmFlowAuthorModel,
   caseFlows,
   type AuthoredFlow,
 } from '../../generator/flow-author.js';
@@ -148,6 +147,8 @@ import { lookupPersona, personaEmails, personaLabelOf, type CliOptions } from '.
 import { pauseRequested } from '../pause.js';
 import { awaitQuotaRelease, ensureQuotaHold } from '../quota-hold.js';
 import {
+  authorModeOf,
+  buildAuthorModel,
   assertRolesResolvable,
   buildAgent,
   buildCapturePilot,
@@ -3109,8 +3110,11 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
   const valueResolution = buildValueResolution(options, contextDocs);
   const retryModel = buildAuthorRetryModel(options);
   const declaredStrings = declaredRenderings(repoContextGraph);
+  const authorMode = authorModeOf(options);
+  if (authorMode === 'jev') log?.('authoring for the indexed engine: the catalog author writes each row from its own cells; the generator role is asked only for the Expected lines it cannot read');
   const author = new FlowAuthor({
-    model: new LlmFlowAuthorModel({ factory: options.factory }),
+    model: buildAuthorModel(options, log ?? undefined),
+    ...(authorMode === 'jev' ? { indexed: true } : {}),
     ...(retryModel === null ? {} : { retryModel }),
     policy: options.policy,
     probe: options.probe,
@@ -3212,6 +3216,7 @@ export async function cmdCatalog(file: string | undefined, options: CliOptions):
           ...(options.categories.length === 0 ? {} : { categories: [...options.categories] }),
           ...(options.includeBlocked ? { includeBlocked: true } : {}),
           reportLang: options.reportLang,
+          authorMode,
         },
       };
   let rows = allRows;
@@ -3951,7 +3956,7 @@ export async function cmdAuthor(prompt: string | undefined, options: CliOptions)
   const retryModel = buildAuthorRetryModel(options);
   const declaredStrings = declaredRenderings(repoContextGraph);
   const authorOptions = {
-    model: new LlmFlowAuthorModel({ factory: options.factory }),
+    model: buildAuthorModel(options, log ?? undefined),
     ...(retryModel === null ? {} : { retryModel }),
     policy: options.policy,
     probe: options.probe,

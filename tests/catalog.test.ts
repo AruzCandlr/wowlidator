@@ -483,6 +483,24 @@ describe('the test-case table, read whole', () => {
     assert.equal(rows[0]?.preconditions, 'dev server on :3200; seed applied');
   });
 
+  it('reads a one-row-per-scenario sheet: a title row above the header, Scenario ID as the identity', () => {
+    // The HR SIT E2E workbook's shape, hand-written: no Test Case ID column,
+    // "Test Step" singular, "Titile" as the sheet spells it. Unrecognised, it
+    // fell to the general extractor, which truncated at 120k characters and
+    // gave the first of 25 rows 24 of its 34 claims.
+    const rows = parseTestCaseTable(
+      '1. HIRING & ONBOARDING,,,,,,\n' +
+        'No.,Scenario ID,Titile,Priority, Test Data,Test Step, Expected result\n' +
+        '1.001,E2E-01,Hire a permanent employee,High,- Company = C001,1. Login,- Employee Status = Active\n' +
+        ',,,,,,\n' +
+        '1.002,E2E-02,Hire an intern,Medium,- Company = C001,1. Login,- Employee Group = G\n',
+    );
+    assert.ok(rows);
+    assert.deepEqual(rows.map((row) => row.caseId), ['E2E-01', 'E2E-02']);
+    assert.equal(rows[0]?.testCase, 'Hire a permanent employee');
+    assert.equal(rows[1]?.steps, '1. Login');
+  });
+
   it('carries the Note column into the claim text — the caveats decide the assertion', () => {
     const rows = parseTestCaseTable(
       `${HEADER}\n` +

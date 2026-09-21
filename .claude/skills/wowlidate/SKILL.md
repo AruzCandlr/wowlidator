@@ -1,6 +1,6 @@
 ---
 name: wowlidate
-description: Start a wowlidator catalog validation run end to end — collect the catalog, app URL, credentials and lane settings, predict persona coverage before spending a browser, then launch and watch it. Use this whenever the user says "/wowlidate", "run the catalog", "validate this sheet", "start a wowlidator run", "run the EC cases against <app>", or hands over a test-case workbook/CSV and an application URL. Also use it when they name only a catalog file and expect a run — ask for the missing parameters rather than guessing them.
+description: Start a wowlidator catalog validation run end to end — collect the catalog, app URL, credentials and lane settings, predict persona coverage before spending a browser, then launch and watch it. Use this whenever the user says "/wowlidate", "run the catalog", "validate this sheet", "start a wowlidator run", "run the EC cases against <app>", or hands over a test-case workbook/CSV and an application URL. Also use it when they name only a catalog file and expect a run — ask for the missing parameters rather than guessing them. A single case's report from a finished run ("the report for PL_09_01") goes through §7 here, which hands it to grim-qa-report.
 ---
 
 # Start a validation run
@@ -207,6 +207,30 @@ npm run cli -- catalog "$CATALOG" --url "$APP_URL" --run --resume \
 Run it in the background and tell the user the log path. A catalog run outlives
 any single command, and holding the foreground blocks the conversation for hours.
 
+**The Jev engine** (TypeSafe's decision model, 2026-09-18) is a per-launch
+choice of the agent role, never an edit to `.env`: put the two variables on
+the command itself. Authoring then selects the programmatic catalog author on
+its own (`--author-mode auto` reads the agent role), so no flag is needed;
+`--author-mode llm` keeps the LLM author under Jev, `--author-mode jev`
+forces the programmatic one under any agent.
+
+```bash
+WOWLIDATOR_AGENT_PROVIDER=openrouter WOWLIDATOR_AGENT_MODEL='~typesafe/jev-latest' \
+npm run cli -- catalog "$CATALOG" --url "$APP_URL" --run --resume \
+  --concurrency 8 --browsers 8 --headless --video on \
+  > "$WOW_RUN_LOG" 2>&1 &
+```
+
+Needs `OPENROUTER_API_KEY` in `.env` (`TYPESAFE_API_KEY` with
+`WOWLIDATOR_AGENT_PROVIDER=typesafe` for the native endpoint). The `data` role
+must stay a chat model: Jev answers no schema, and the value resolver, the
+review and the risk judge borrow `data` for their structured questions. Say in
+the report that the agent was Jev — its turns carry `p=` and `confidence` on
+every action line, and the ledger's `launch.authorMode` records the author.
+Measured 2026-09-18 on HUMI SIT: a leg reaches its form in four turns at
+~0.4 s each; date pickers and open listboxes are handled by the engine's own
+rungs, not by the model.
+
 Every case's own report — the file the catalog index links from the case's name
 and the panel's card opens — is the case page (`src/reporter/case-page.ts`:
 summary, coverage, tickets, the DB evidence and the queries behind it, film,
@@ -396,6 +420,67 @@ reporter change gets the new page at the same address it always had. Add
 without it the rebuild spends no model call. Re-export the run's
 `WOWLIDATOR_REPORT_DIR` first (re-run the `newrun.mjs` eval, which reuses the
 folder) or the rebuilt report is written outside the run it describes.
+
+## 7. An individual case report
+
+The case page from §4 and §6 is what the harness writes for every row, and it
+stays the link the catalog index and the monitor open. When the user asks for
+**one case's report as a deliverable** — a package a reviewer can pick up by
+test case id, "the report for PL_09_01", "write up EC-026", a ticket
+attachment — do not hand-write it and do not point them at the case page.
+Invoke the `grim-qa-report` skill (the Skill tool, `/grim-qa-report`) and
+feed it from the run folder; it owns the naming, the evidence contract and the
+delivery checks, so a report written any other way is the one that will not
+validate.
+
+What it needs and where a run keeps it (the ledger's outcome for the case
+names the exact files):
+
+| Grim input | Source in `$WOW_RUN_DIR` |
+|---|---|
+| Test case, test data, expected result | the row in the catalog the run was launched from (`catalogs/<slug>.claims.json` → `catalog` names the file; `claims[].source` is the case id). The claim text is a summary, not the row. |
+| Verdict, status, reason | `catalogs/<slug>.claims.progress.json` → `outcomes[<id>]` — the seal, never re-derived from the proof |
+| Steps, defects, per-step DB checks (`db`, `dbChanges`, `dbProbeError`) | the proof bundle at `outcomes[<id>].proofPath` (`proofs/<uuid>.json`) |
+| Screenshots | `steps[].screenshot` — base64 JPEG, failure stills only when video is on; decode to `<ID>-evidence-NN.jpg` (they are JPEG bytes) and embed a `sips -Z 440` thumbnail, not the full frame |
+| Recording | `video.data` in the same bundle — base64 webm; decode to `<ID>-run-01.webm` and give it a still as `poster` |
+| DB before / after | `dbBaseline.tables` + each step's `dbChanges` sample against the baseline; a value the run never measured is `NOT_CAPTURED`, never inferred |
+| The authored flow | `outcomes[<id>].flowPath`, for the exact selectors and DB queries the run performed |
+
+Two things the harness's ids do that the validator does not accept: the sheet
+writes `PL_09_01` and the validator wants uppercase hyphen-separated
+(`PL-09-01`), so the file prefix is the id with `_` → `-`, and the report's
+own header keeps the sheet's spelling so a reader can search the catalog for
+it. And a bundle carries a `summary.session` cost line — leave it out of the
+package, it is not evidence of the case.
+
+**Do not hand-write the page.** `grim-qa-report` ships
+`scripts/build_report.py`, which reads exactly the files in the table above and
+writes the whole package in the layout its `reference/layout.md` fixes: sticky
+contents, lead verdict card, one card per Expected line, tickets, the case as
+the sheet states it, what actually ran, the DB table, the screenshot timeline
+and the file list. Adapt its two per-case parts — the Expected-line list and
+the DB field map — and leave the rest. Three rules from that contract bite
+here in particular:
+
+- **Label every count's unit.** Expected occurrences, the harness's own step
+  results and catalog outcomes are three different numbers and are never added
+  together. Zero failed outcomes means nothing was observed failing, not that
+  the run passed.
+- **Embed thumbnails, link the full frames.** A page with forty full-resolution
+  stills inline runs to tens of megabytes and the embedded film never gets the
+  decode budget to become playable. `sips -Z 440` for the embed, the anchor
+  points at the full file beside it.
+- **A step the reconstruction rung rescued did not stop the run**, so it stays
+  out of the blocking list and is counted on its own.
+
+Write the package beside the run, not inside it:
+`$WOW_RUN_DIR/../<slug>-grim/<ID>-report.html` and siblings, so `report`
+rebuilds (§6) never overwrite it and the run folder stays what the CLI wrote.
+Then run the bundled validator and open the prefixed report before handing
+over the path — that is the skill's own last step. The validator checks
+structure, not rendering, so open the page as well; Chrome may refuse a
+`file://` navigation from a new tab, and a loopback `http.server` in the
+package folder answers the same question.
 
 ## Reporting back to the user
 

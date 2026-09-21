@@ -204,6 +204,15 @@ export interface CliOptions {
   /** Total authoring asks per row including the first (`--author-attempts`). */
   authorAttempts: number | undefined;
   /**
+   * Who writes a catalog row's flow (`--author-mode`): `llm` — the generator
+   * role, as always; `jev` — the programmatic catalog author for the indexed
+   * engine (`src/generator/jev-catalog-author.ts`), the LLM asked only for
+   * the Expected lines it cannot read; `auto` (the default) — `jev` whenever
+   * the agent role is on a decision model, `llm` otherwise. One config
+   * decides both halves of the Jev path.
+   */
+  authorMode: 'auto' | 'jev' | 'llm';
+  /**
    * How far authoring may run ahead of the runs on a pipelined catalog
    * (`--author-lookahead`): the number of scenarios beyond the one currently
    * being run, `'all'` to author eagerly as before. Default 0 — authoring

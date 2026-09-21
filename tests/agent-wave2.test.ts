@@ -331,6 +331,54 @@ const DATE = PAGE(
    </form>`,
 );
 
+// The application's date field as the picks25 run met it (2026-09-21): a
+// BUTTON with aria-haspopup="dialog" and NO input anywhere near it, opening a
+// portaled role=dialog calendar — Thai month heading with a Buddhist year,
+// month nav, day buttons named by their number, days before `min` disabled.
+const CALENDAR = PAGE(
+  `<h1>พนักงานใหม่</h1>
+   <div class="field"><span>วันเกิด</span>
+     <button id="dob" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="วันเกิด">เลือกวันที่</button>
+   </div>
+   <script>
+     var TH = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+     var THS = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+     var btn = document.getElementById('dob'), popup = null, view = { y: 2026, m: 8 }, min = new Date(2026, 0, 1);
+     function close() { if (popup) { popup.remove(); popup = null; } btn.setAttribute('aria-expanded', 'false'); }
+     function nav(name, step) {
+       var b = document.createElement('button'); b.type = 'button'; b.setAttribute('aria-label', name); b.textContent = step < 0 ? '‹' : '›';
+       b.addEventListener('click', function () { view.m += step; if (view.m < 0) { view.m = 11; view.y -= 1; } if (view.m > 11) { view.m = 0; view.y += 1; } render(); });
+       return b;
+     }
+     function render() {
+       popup.innerHTML = '';
+       var head = document.createElement('div');
+       head.appendChild(nav('เดือนก่อนหน้า', -1));
+       var title = document.createElement('span'); title.textContent = TH[view.m] + ' ' + (view.y + 543); head.appendChild(title);
+       head.appendChild(nav('เดือนถัดไป', 1));
+       popup.appendChild(head);
+       var days = new Date(view.y, view.m + 1, 0).getDate();
+       for (var d = 1; d <= days; d++) (function (day) {
+         var date = new Date(view.y, view.m, day), b = document.createElement('button');
+         b.type = 'button'; b.textContent = String(day); b.setAttribute('aria-label', String(day)); if (date < min) b.disabled = true;
+         b.addEventListener('click', function () { btn.textContent = day + ' ' + THS[view.m] + ' ' + (view.y + 543); close(); });
+         popup.appendChild(b);
+       })(d);
+     }
+     btn.addEventListener('click', function () {
+       if (popup) { close(); return; }
+       popup = document.createElement('div'); popup.setAttribute('role', 'dialog'); popup.setAttribute('aria-label', 'ปฏิทิน');
+       popup.style.position = 'fixed'; popup.style.top = '60px'; popup.style.left = '40px';
+       document.body.appendChild(popup); btn.setAttribute('aria-expanded', 'true'); render();
+     });
+     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+   </script>`,
+);
+
+const COVERED = PAGE(
+  `<button>Company</button><div id="veil" class="validation-veil" style="position:fixed;inset:0;background:rgba(0,0,0,.4)"></div>`,
+);
+
 const WIZARD = PAGE(`<h1>New Hire</h1><p>Step 1 of 2</p><label>First name <input></label><button>Next</button>`);
 
 const FORM = PAGE(
@@ -379,6 +427,8 @@ describe('the agent wave-2 hub halves (CDP)', { skip: skipBrowser }, () => {
         '/shell/rules': PAGE('<h1>Rules</h1>'),
         '/select': SELECT,
         '/date': DATE,
+        '/calendar': CALENDAR,
+        '/covered': COVERED,
         '/wizard': WIZARD,
         '/form': FORM,
         '/save': SAVE,
@@ -544,6 +594,85 @@ describe('the agent wave-2 hub halves (CDP)', { skip: skipBrowser }, () => {
     });
     assert.equal(result.actions[0]?.ok, false);
     assert.match(result.actions[0]?.error ?? '', /READ-ONLY field/);
+  });
+
+  // ---- a calendar behind a button (picks25 run, 2026-09-21) ---------------
+
+  it('a paste of an ISO date at a calendar trigger drives the calendar, and what the control shows decides', async () => {
+    const { model, seen } = scripted([
+      { action: 'paste', selector: 'role=button[name="วันเกิด" i]', value: '2026-05-15', reasoning: 'date of birth' },
+      { action: 'finish', reasoning: 'done' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 3 });
+    const result = await withPage(async (page) => {
+      await page.goto(`${origin}/calendar`, { waitUntil: 'domcontentloaded' });
+      const r = await agent.run(page, 'enter the date of birth');
+      return { r, shown: await page.locator('#dob').innerText(), dialogs: await page.locator('[role=dialog]').count() };
+    });
+    assert.equal(result.r.actions[0]?.ok, true, result.r.actions[0]?.error);
+    assert.equal(result.shown, '15 พ.ค. 2569', 'the page, not the agent, says which date the control holds');
+    assert.equal(result.dialogs, 0, 'the calendar is closed again');
+    assert.equal(seen.length, 2, 'one model turn for the date — none spent hunting a textbox');
+    const line = seen[1]!.history.find((h) => h.startsWith('paste')) ?? '';
+    assert.match(line, /a calendar trigger — picked 2026-05-15 in its dialog \(month-nav\)/);
+    assert.match(line, /the control now shows "15 พ\.ค\. 2569"/);
+  });
+
+  it('a fill and a type take the same calendar route as a paste', async () => {
+    for (const action of ['fill', 'type'] as const) {
+      const { model } = scripted([
+        { action, selector: 'role=button[name="วันเกิด" i]', value: '2026-10-02', reasoning: 'date' },
+        { action: 'finish', reasoning: 'done' },
+      ]);
+      const agent = new WorkflowAgent({ model, maxSteps: 3 });
+      const result = await withPage(async (page) => {
+        await page.goto(`${origin}/calendar`, { waitUntil: 'domcontentloaded' });
+        const r = await agent.run(page, 'enter the date of birth');
+        return { r, shown: await page.locator('#dob').innerText() };
+      });
+      assert.equal(result.r.actions[0]?.ok, true, `${action}: ${result.r.actions[0]?.error ?? ''}`);
+      assert.equal(result.shown, '2 ต.ค. 2569', action);
+    }
+  });
+
+  it('a day the calendar disables is the page\'s answer, and a value that is no date is told what the control is', async () => {
+    const { model, seen } = scripted([
+      { action: 'paste', selector: 'role=button[name="วันเกิด" i]', value: '2025-12-20', reasoning: 'before the minimum' },
+      { action: 'paste', selector: 'role=button[name="วันเกิด" i]', value: 'a future date', reasoning: 'words' },
+      { action: 'fail', reasoning: 'stop' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 4 });
+    const result = await withPage(async (page) => {
+      await page.goto(`${origin}/calendar`, { waitUntil: 'domcontentloaded' });
+      const r = await agent.run(page, 'enter the date of birth');
+      return { r, shown: await page.locator('#dob').innerText() };
+    });
+    const [disabled, words] = result.r.actions;
+    assert.equal(disabled?.ok, false);
+    assert.match(disabled?.error ?? '', /outside the picker's allowed range/);
+    assert.equal(words?.ok, false);
+    assert.match(words?.error ?? '', /aria-haspopup="dialog"/);
+    assert.match(words?.error ?? '', /no textbox of\s+its own/);
+    assert.match(words?.error ?? '', /YYYY-MM-DD/);
+    assert.equal(result.shown, 'เลือกวันที่', 'nothing was entered by either');
+    assert.ok(seen[2]!.history.some((h) => /FAILED: .*no textbox of/.test(h)), 'the next turn reads what the control is');
+  });
+
+  it('a click something else swallowed says what is over the control, not only that it timed out', async () => {
+    const { model, seen } = scripted([
+      { action: 'click', selector: 'role=button[name="Company" i]', reasoning: 'open' },
+      { action: 'fail', reasoning: 'stop' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 3, actionTimeoutMs: 1_200, humanize: false });
+    const result = await withPage(async (page) => {
+      await page.goto(`${origin}/covered`, { waitUntil: 'domcontentloaded' });
+      return agent.run(page, 'open the Company dropdown');
+    });
+    const click = result.actions[0];
+    assert.equal(click?.ok, false);
+    assert.match(click?.error ?? '', /^locator\.click: Timeout/);
+    assert.match(click?.error ?? '', /validation-veil.* is over it and took the pointer/);
+    assert.ok(seen[1]!.history.some((h) => /FAILED: .*validation-veil/.test(h)), 'the next turn reads the blocker');
   });
 
   // ---- OA-11 ------------------------------------------------------------

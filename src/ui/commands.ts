@@ -220,6 +220,22 @@ const REPORT_LANG_FIELD: Field = {
   advanced: true,
 };
 
+/**
+ * Who writes each catalog row (`--author-mode`). `auto` follows the agent
+ * role: on a decision model (TypeSafe Jev) the programmatic catalog author
+ * writes the row from its own cells and the generator role is asked only
+ * for the Expected lines it cannot read.
+ */
+const AUTHOR_MODE_FIELD: Field = {
+  name: 'author-mode',
+  label: 'Who writes the flows',
+  type: 'enum',
+  choices: ['auto', 'jev', 'llm'],
+  default: 'auto',
+  help: 'auto: the programmatic catalog author when the agent role is on Jev, the generator role otherwise. jev / llm force one.',
+  advanced: true,
+};
+
 const NO_CASE_NARRATIVE_FIELD: Field = {
   name: 'no-case-narrative',
   label: 'Case pages without the narrative',
@@ -999,6 +1015,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       DB_URL_FIELD,
       REPORT_LANG_FIELD,
       NO_CASE_NARRATIVE_FIELD,
+      AUTHOR_MODE_FIELD,
       ...COMMON_BROWSER_FIELDS,
     ],
   },

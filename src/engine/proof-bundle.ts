@@ -392,6 +392,14 @@ export interface AgentAction {
    */
   finishedAt?: string | undefined;
   /**
+   * How sure the model was of this decision, 0..1, when the model says so —
+   * a decision model's calibrated confidence and the chosen option's
+   * probability (the jev policy, 2026-09-18). Descriptive: read by no judge,
+   * absent on every other model's records.
+   */
+  confidence?: number | undefined;
+  probability?: number | undefined;
+  /**
    * What a `read` (or a `save`) actually read off the page — the agent's
    * evidence, not its claim. 179 rows of the QA workbook ask for a value to
    * be RECORDED rather than asserted ("ยังไม่มีคำตอบ ให้บันทึกค่าที่ระบบแสดงจริง"),
@@ -538,6 +546,9 @@ export const AGENT_ENDED_BY = [
   'stalled',
   'no-progress',
   'value-hunt',
+  // An indexed policy (the jev port) had no value to type for the field the
+  // model chose, after one re-ask — a harness limit, not the model's claim.
+  'no-value',
   'cannot-offer',
   'fixture-present',
   'wandered',
@@ -687,6 +698,15 @@ export interface AgentRecord {
    * prompt order is paying. Absent when the provider does not say.
    */
   cachedInputTokens?: number | undefined;
+  /**
+   * How often the exact-node refs (Playwright's AI-mode aria snapshot, the
+   * jev port's Phase 3) matched a targetable row of the loop's own table
+   * across the leg, and how often a row had to fall back to its name
+   * selector. The divergence between Playwright's and Chrome's accessible
+   * names is a number here rather than a belief. Absent when the policy did
+   * not ask for refs.
+   */
+  refs?: { matched: number; missed: number } | undefined;
   /**
    * Why the leg ended — see `AgentEndedBy`. The typed form of the stop the
    * `summary` narrates, so the runner, the exit contract and a report can

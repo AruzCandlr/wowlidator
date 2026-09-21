@@ -37,7 +37,8 @@
 
 import { APICallError, generateText } from 'ai';
 
-import { PROVIDER_META, type LlmRole, type ProviderName } from '../config.js';
+import { PROVIDER_META, decisionModelRefusal, type LlmRole, type ProviderName } from '../config.js';
+import { PROBE_DECISION_REQUEST, askDecisions, decisionsRouteFor, validateNoul } from './decisions.js';
 import { AllKeysExhaustedError, LlmFactory, MissingApiKeyError } from './llm-factory.js';
 
 /** Long enough for a cold free-tier model that thinks first; short enough not to hang a panel. */
@@ -131,6 +132,8 @@ export type ProbeGenerate = typeof generateText;
 
 export interface ProbeOptions {
   generate?: ProbeGenerate;
+  /** Test seam for a decisions route (`decisions.ts`), which has no `generateText`. */
+  fetch?: typeof fetch | undefined;
   timeoutMs?: number;
   now?: () => number;
 }
@@ -179,6 +182,49 @@ export async function probeRole(
     };
   }
 
+  // A decision model has no text to generate: the doctor asks it one noul
+  // question over the word "ok" and reads the probability back. Same key
+  // failover, same status classification, same shape of line.
+  const route = decisionsRouteFor(entry);
+  if (route !== null) {
+    // The same refusal `loadConfig` makes: a panel-built config can carry a
+    // healer on Jev, and a probe that then said `ready` would be a lie the
+    // next run pays for at startup.
+    const refusal = decisionModelRefusal(role, entry.provider, entry.modelId);
+    if (refusal !== null) {
+      return { ...base, status: 'failed', detail: refusal, latencyMs: 0, reply: null, usage: null, keyIndex: null, quota: null };
+    }
+    try {
+      const answer = await askDecisions(factory, role, PROBE_DECISION_REQUEST, {
+        task: 'doctor',
+        signalFor: () => AbortSignal.timeout(timeoutMs),
+        fetch: options.fetch,
+        onAttemptFailure: (keyIndex, error) => {
+          attempts.push({ keyIndex, ...classifyProbeError(error) });
+        },
+      });
+      const noul = validateNoul(answer.answers['probe']);
+      const latencyMs = now() - started;
+      const keyIndex = factory.activeKeyIndex(entry.provider);
+      for (const attempt of attempts) attempt.detail = scrubKeys(attempt.detail, keys);
+      const keyNote = keyCount > 1 ? `, key ${keyIndex + 1}/${keyCount}` : '';
+      return {
+        ...base,
+        status: 'ready',
+        detail:
+          `answered in ${latencyMs}ms, ${answer.usage.inputTokens ?? '?'} in / ${answer.usage.outputTokens ?? '?'} out` +
+          `${keyNote} — ${answer.model} (decisions route)`,
+        latencyMs,
+        reply: `noul=${noul.noul.toFixed(2)}`,
+        usage: { inputTokens: answer.usage.inputTokens, outputTokens: answer.usage.outputTokens },
+        keyIndex,
+        quota: null,
+      };
+    } catch (error) {
+      return probeFailure(base, error, keys, attempts, now() - started);
+    }
+  }
+
   try {
     const { text, usage, response } = await factory.callWithFailover(role, async (resolved) => {
       try {
@@ -224,43 +270,53 @@ export async function probeRole(
       quota,
     };
   } catch (error) {
-    const latencyMs = now() - started;
-    const scrub = (text: string): string => scrubKeys(text, keys);
-    for (const attempt of attempts) attempt.detail = scrub(attempt.detail);
-    if (error instanceof MissingApiKeyError) {
-      return {
-        ...base,
-        status: 'no-key',
-        detail: `no API key — ${PROVIDER_META[entry.provider].envKey} is unset`,
-        latencyMs,
-        reply: null,
-        usage: null,
-        keyIndex: null,
-        quota: null,
-      };
-    }
-    // Every key failed: the verdict is the last key's, and the trail above
-    // carries the rest. Otherwise the error is the one attempt's, unchanged.
-    const last =
-      error instanceof AllKeysExhaustedError
-        ? error.attempts[error.attempts.length - 1]?.error
-        : error;
-    const classified = classifyProbeError(last);
-    const detail =
-      error instanceof AllKeysExhaustedError
-        ? `all ${error.attempts.length} keys failed — last: ${classified.detail}`
-        : classified.detail;
+    return probeFailure(base, error, keys, attempts, now() - started);
+  }
+}
+
+/** The failed probe, worded by cause — shared by the chat and the decisions path. */
+function probeFailure(
+  base: Pick<RoleProbe, 'role' | 'provider' | 'modelId' | 'keyCount' | 'attempts' | 'checkedAt'>,
+  error: unknown,
+  keys: readonly string[],
+  attempts: ProbeAttempt[],
+  latencyMs: number,
+): RoleProbe {
+  const scrub = (text: string): string => scrubKeys(text, keys);
+  for (const attempt of attempts) attempt.detail = scrub(attempt.detail);
+  if (error instanceof MissingApiKeyError) {
     return {
       ...base,
-      status: classified.status,
-      detail: scrub(detail),
+      status: 'no-key',
+      detail: `no API key — ${PROVIDER_META[base.provider].envKey} is unset`,
       latencyMs,
       reply: null,
       usage: null,
       keyIndex: null,
-      quota: quotaFromHeaders(apiCallErrorOf(last)?.responseHeaders),
+      quota: null,
     };
   }
+  // Every key failed: the verdict is the last key's, and the trail above
+  // carries the rest. Otherwise the error is the one attempt's, unchanged.
+  const last =
+    error instanceof AllKeysExhaustedError
+      ? error.attempts[error.attempts.length - 1]?.error
+      : error;
+  const classified = classifyProbeError(last);
+  const detail =
+    error instanceof AllKeysExhaustedError
+      ? `all ${error.attempts.length} keys failed — last: ${classified.detail}`
+      : classified.detail;
+  return {
+    ...base,
+    status: classified.status,
+    detail: scrub(detail),
+    latencyMs,
+    reply: null,
+    usage: null,
+    keyIndex: null,
+    quota: quotaFromHeaders(apiCallErrorOf(last)?.responseHeaders),
+  };
 }
 
 const MODEL_MISSING_PATTERN =

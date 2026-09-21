@@ -28,7 +28,7 @@ import type { ScreenshotMode, VideoMode } from './engine/runner.js';
 export const LLM_ROLES = ['healer', 'generator', 'agent', 'data', 'governor'] as const;
 export type LlmRole = (typeof LLM_ROLES)[number];
 
-export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'agy-cli', 'codex-cli', 'claude-cli', 'claude-tty', 'claude-cloud', 'airforce', 'cerebras', 'requesty'] as const;
+export const PROVIDERS = ['google', 'groq', 'openrouter', 'emmiedev', 'zai', 'deepseek', 'local', 'agy-cli', 'codex-cli', 'claude-cli', 'claude-tty', 'claude-cloud', 'airforce', 'cerebras', 'requesty', 'typesafe'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 /** Which env var carries each provider's key, and where to get one. */
@@ -97,6 +97,20 @@ export const PROVIDER_META: Record<
     label: 'OpenRouter',
     consoleUrl: 'https://openrouter.ai/keys',
     freeTier: 'free `:free` model variants; broad model selection',
+  },
+  // TypeSafe's Jev is a DECISION model, not a chat model: it takes a state
+  // and typed questions and answers with a choice, a probability per option
+  // and a confidence — no text, no schema, nothing to parse. It therefore
+  // serves exactly one role, `agent`, through the indexed jev policy
+  // (`src/orchestrator/jev-policy.ts`), and `isDecisionModel` refuses every
+  // other role at config time. The same model is also served by OpenRouter as
+  // `~typesafe/jev-latest` on the `openrouter` provider — that route needs no
+  // TypeSafe account and is the one this checkout uses.
+  typesafe: {
+    envKey: 'TYPESAFE_API_KEY',
+    label: 'TypeSafe (Jev, decisions only)',
+    consoleUrl: 'https://console.typesafe.ai/settings/keys',
+    freeTier: 'paid, $0.042 per Mtok input and output free; the agent role only',
   },
   // OpenAI-compatible endpoint at chat.emmiedev.com — keys start `ek-`.
   // The server ignores the model field; `default` is its stable alias for
@@ -273,6 +287,40 @@ export function fixedModelFor(provider: ProviderName): string | undefined {
  */
 export const FIXED_MODEL_PROVIDERS: ReadonlySet<ProviderName> = new Set(['emmiedev', 'local']);
 
+/** OpenRouter's ids for TypeSafe's Jev: `~typesafe/jev-latest`, `typesafe/jev-1.13`. */
+const OPENROUTER_DECISION_MODEL = /^~?typesafe\//i;
+
+/**
+ * Whether a role's (provider, model) answers typed QUESTIONS instead of
+ * prompts — TypeSafe's Jev, natively or through OpenRouter's Decisions
+ * endpoint. Such a model cannot fill a schema, so it can serve only the
+ * `agent` role, through the indexed jev policy; `loadConfig` refuses it on
+ * any other role, and `src/cli/runtime.ts` picks the policy by this predicate.
+ * Pure and here, not in `src/providers/`, because config must stay free of
+ * SDK imports and the runtime needs the same answer.
+ */
+export function isDecisionModel(provider: ProviderName, modelId: string): boolean {
+  if (provider === 'typesafe') return true;
+  return provider === 'openrouter' && OPENROUTER_DECISION_MODEL.test(modelId);
+}
+
+/**
+ * The one sentence that refuses a decision model on a role other than
+ * `agent`, or null when the pairing is allowed. Shared by every place a
+ * `RoleConfig` is built or checked — `loadConfig`'s `role()`, the panel's
+ * model picker (`ModelSelection.select`) and the probe — so a refusal the
+ * config makes at startup cannot be bypassed by a panel that builds the same
+ * config by hand (review 2026-09-18).
+ */
+export function decisionModelRefusal(role: LlmRole, provider: ProviderName, modelId: string): string | null {
+  if (role === 'agent' || !isDecisionModel(provider, modelId)) return null;
+  return (
+    `${provider}:${modelId} is a decision model (TypeSafe Jev) and can serve only the "agent" role — it answers ` +
+    `typed questions, not prompts, so it cannot fill the "${role}" role's schema. ` +
+    `Point WOWLIDATOR_${role.toUpperCase()}_PROVIDER/_MODEL at a chat model.`
+  );
+}
+
 /**
  * The model a provider is known to run this codebase's structured calls on,
  * for a role whose provider was re-pointed without naming a model. Starting
@@ -292,6 +340,9 @@ export const DEFAULT_PROVIDER_MODELS: Record<ProviderName, string> = {
   local: 'default_model',
   'agy-cli': 'gemini-3.8-flash-medium',
   'codex-cli': 'gpt-5.6-terra',
+  // The alias TypeSafe's own SDKs default to; the response names the
+  // versioned id that answered, and the bundle records that one.
+  typesafe: 'jev-latest',
   // An alias, not a dated id: the CLI resolves `fable` to whatever the
   // current Fable is. A DEFAULT and not a fixed model — each role keeps its
   // own `WOWLIDATOR_<ROLE>_MODEL`, so a run can put the expensive model where
@@ -452,6 +503,7 @@ const envSchema = z.object({
   AIRFORCE_API_KEY: z.string().min(1).optional(),
   CEREBRAS_API_KEY: z.string().min(1).optional(),
   REQUESTY_API_KEY: z.string().min(1).optional(),
+  TYPESAFE_API_KEY: z.string().min(1).optional(),
   LOCAL_LLM_API_KEY: z.string().min(1).optional(),
   LOCAL_LLM_BASE_URL: z.string().url().optional(),
 
@@ -627,6 +679,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
       (resolvedProvider === DEFAULT_ROLE_MODELS[name].provider
         ? DEFAULT_ROLE_MODELS[name].modelId
         : DEFAULT_PROVIDER_MODELS[resolvedProvider]);
+    // A decision model answers questions, never a schema: the healer's
+    // suggestion, an authored flow, a data value and a governor turn are all
+    // structured objects it cannot produce. Refused here, in the same place a
+    // bad provider name fails, rather than thirty seconds into a run.
+    const refusal = decisionModelRefusal(name, resolvedProvider, resolvedModel);
+    if (refusal !== null) throw new ConfigError(refusal);
     return {
       role: name,
       provider: resolvedProvider,
@@ -648,6 +706,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WowlidatorConf
   const airforceKeys = parseApiKeys(e.AIRFORCE_API_KEY);
   const cerebrasKeys = parseApiKeys(e.CEREBRAS_API_KEY);
   const requestyKeys = parseApiKeys(e.REQUESTY_API_KEY);
+  const typesafeKeys = parseApiKeys(e.TYPESAFE_API_KEY);
+  if (typesafeKeys.length > 0) apiKeys.typesafe = typesafeKeys;
   if (googleKeys.length > 0) apiKeys.google = googleKeys;
   if (groqKeys.length > 0) apiKeys.groq = groqKeys;
   if (openrouterKeys.length > 0) apiKeys.openrouter = openrouterKeys;

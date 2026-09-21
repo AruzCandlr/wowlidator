@@ -17,6 +17,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import { runFlow, type Flow } from '../src/engine/runner.js';
+import { WorkflowAgent, type AgentDecision, type AgentModel, type AgentObservation } from '../src/orchestrator/workflow-agent.js';
 
 const CDP_URL = process.env['WOWLIDATOR_CDP_URL'] ?? 'http://localhost:9222';
 
@@ -554,5 +555,120 @@ describe('the signIn step: personas, sign-out first, the vault keyed by account 
     assert.equal(bundle.status, 'error');
     assert.match(bundle.steps[0]?.error ?? '', /no persona by that label/);
     assert.match(bundle.steps[0]?.error ?? '', /"HR_ADMIN_ACCOUNT", "MANAGER_ACCOUNT"/);
+  });
+});
+
+// --- A leg that begins on the sign-in page after a signIn (HIR-EC-001 under
+// the Jev engine, 2026-09-18) ------------------------------------------------
+
+describe('a workflow leg that starts on the sign-in page goes to the signed-in surface first (CDP)', { skip: skipBrowser }, () => {
+  let server: Server;
+  let origin = '';
+
+  // The live shape: the POST is accepted and the app goes to its home, whose
+  // FIRST render after a sign-in bounces back to /login with the form
+  // re-mounted (a client-side auth-state race). A later visit to /home stays.
+  let homeVisits = 0;
+
+  before(async () => {
+    server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://x');
+      const signedIn = (req.headers.cookie ?? '').includes('session=ok');
+      if (url.pathname === '/login') {
+        if (req.method === 'POST') {
+          let raw = '';
+          req.on('data', (chunk) => (raw += chunk));
+          req.on('end', () => {
+            const params = new URLSearchParams(raw);
+            if (params.get('password') === 'pw2026') {
+              homeVisits = 0;
+              res.writeHead(302, { 'set-cookie': 'session=ok; Path=/', location: '/home' });
+            } else {
+              res.writeHead(302, { location: '/login' });
+            }
+            res.end();
+          });
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(
+          PAGE(
+            '<h1>Sign in</h1><form method="post" action="/login"><input type="email" name="email">' +
+              '<input type="password" name="password"><button type="submit">Sign in</button></form>' +
+              '<button type="button">Sign in with Microsoft</button>',
+          ),
+        );
+        return;
+      }
+      if (url.pathname === '/home') {
+        if (!signedIn) {
+          res.writeHead(302, { location: '/login' });
+          res.end();
+          return;
+        }
+        homeVisits += 1;
+        const bounce = homeVisits === 1 ? '<script>setTimeout(() => location.replace("/login"), 150)</script>' : '';
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(PAGE(`<h1>Home</h1><nav><button type="button">EC</button><button type="button">Reports</button></nav>${bounce}`));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  class FinishWhereItIs implements AgentModel {
+    readonly id = 'stub-agent';
+    readonly seen: string[] = [];
+    async decide(observation: AgentObservation): Promise<AgentDecision> {
+      this.seen.push(observation.url);
+      return { action: 'finish', selector: '', value: '', url: '', reasoning: 'stub' };
+    }
+  }
+
+  const personas = { HR_ADMIN_ACCOUNT: { email: 'admin@b.test', password: 'pw2026' } };
+
+  it('records where the application went when the sign-in was accepted, and moves the leg there before the first turn', async () => {
+    const model = new FinishWhereItIs();
+    const bundle = await runFlow(
+      {
+        name: 'leg after a bounced sign-in',
+        steps: [
+          { action: 'signIn', as: 'HR_ADMIN_ACCOUNT', url: `${origin}/login` },
+          { action: 'workflow', goal: 'open EC > Reports via the menu' },
+        ],
+      },
+      { cdpUrl: CDP_URL, video: 'off', isolate: true, screenshots: 'off', healer: null, personas, agent: new WorkflowAgent({ model, maxSteps: 3 }) },
+    );
+    const [signIn, leg] = bundle.steps;
+    assert.equal(signIn?.status, 'passed', bundle.error ?? '');
+    assert.match(String(signIn?.detail?.['urlAfter']), /\/login$/, 'the application landed back on its sign-in page');
+    assert.equal(signIn?.detail?.['signedInSurface'], `${origin}/home`, `the surface the app went to in between is on the record: ${JSON.stringify(signIn?.detail)} ${JSON.stringify(bundle.notes)}`);
+    assert.equal(leg?.detail?.['movedTo'], `${origin}/home`);
+    assert.ok(model.seen.every((url) => url.startsWith(`${origin}/home`)), `the agent's first turn is on the app, never on the sign-in page: ${model.seen.join(', ')}`);
+    assert.ok((bundle.notes ?? []).some((n) => /the leg began on the sign-in page after a signIn, so it was moved to/.test(n)), (bundle.notes ?? []).join('\n'));
+  });
+
+  it('a leg whose goal is itself about signing in stays on the sign-in page', async () => {
+    const model = new FinishWhereItIs();
+    const bundle = await runFlow(
+      {
+        name: 'a sign-in leg',
+        steps: [
+          { action: 'signIn', as: 'HR_ADMIN_ACCOUNT', url: `${origin}/login` },
+          { action: 'workflow', goal: 'sign in again with the wrong password and read the error' },
+        ],
+      },
+      { cdpUrl: CDP_URL, video: 'off', isolate: true, screenshots: 'off', healer: null, personas, agent: new WorkflowAgent({ model, maxSteps: 3 }) },
+    );
+    assert.equal(bundle.steps[1]?.detail?.['movedTo'], undefined);
+    assert.ok(model.seen.every((url) => url.endsWith('/login')), model.seen.join(', '));
   });
 });

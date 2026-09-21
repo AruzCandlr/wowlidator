@@ -117,10 +117,11 @@ export const AGENT_SKILLS: readonly AgentSkill[] = [
   changes nothing. Its real input is beside it, named by the field's label
   (textbox "Hire Date" next to textbox "Select date" readonly) — fill or paste
   into THAT, and give a date input its value as YYYY-MM-DD. A date field shown
-  as a BUTTON (button "Start Date" that opens a calendar dialog) is a picker:
-  click it, then use the dialog's month/year controls and click the day button
-  (its name is the day number); paste YYYY-MM-DD instead only if the dialog
-  offers a textbox.`,
+  as a BUTTON (button "Start Date" that opens a calendar dialog) is a picker
+  with NO textbox of its own: fill that BUTTON's own selector with the date as
+  YYYY-MM-DD — the harness drives the calendar and the history says what the
+  control then shows. Only if that fill fails, click it and use the dialog's
+  month/year controls and the day button (its name is the day number).`,
   },
   {
     id: 'wizards',

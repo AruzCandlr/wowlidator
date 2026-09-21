@@ -110,6 +110,10 @@ per row. A claim is placed by its `source` (the id, or the words the model
 quoted) and only when exactly one block holds it; context claims and prose
 documents are untouched. Tests: `tests/catalog.test.ts`, both pure.
 
+## A sheet with one row per scenario is still the table (2026-09-21, HR_SIT_E2E)
+
+The HR SIT E2E workbook has no Test Case ID column: `Scenario ID` is each row's identity, the steps column is `Test Step` (singular) and the title is spelled `Titile`. None of that matched, so `parseTestCaseRows` returned null and the 25-row export went to the general extractor — which truncated it at `DEFAULT_MAX_CHARS` (120k of 130k characters) and, under `DEFAULT_MAX_CLAIMS` = 40, spent 24 of its 34 claims on the first row and gave most of the other 24 nothing. The fix is in recognition, not in the caps: a header with `scenarioId` and no `caseId` still qualifies, and each row's own Scenario ID cell becomes its `caseId` (read before the carry-down, so a blank row stays a spacer). After it: 25 rows, 25 claims, no model call. Test: "reads a one-row-per-scenario sheet" in `tests/catalog.test.ts`.
+
 ## A scenario id is a name the table may hold (2026-09-04, multirole PRB-EC-001)
 
 `linkDependencies` resolved `ต่อจากเคส E2E-01` against Test Case IDs only, so a

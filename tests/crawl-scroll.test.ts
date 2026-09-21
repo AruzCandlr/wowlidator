@@ -98,7 +98,7 @@ const SCROLL_HTML = `<!doctype html>
   <div id="pane"><div class="inner">scrollable pane</div></div>
   <div id="locked"><div class="inner">unreachable overflow</div></div>
   <div id="short">fits</div>
-  <div id="tall">long page</div>
+  <div id="tall">long page<div style="height:1500px"></div><span id="mid">mid</span></div>
   <a id="bottom" href="/alpha">Bottom link</a>
 </body></html>`;
 
@@ -426,6 +426,32 @@ describe('scrolling and history (CDP)', { skip: skipBrowser }, () => {
     );
     assert.equal(bundle.status, 'passed', bundle.error ?? 'scroll → click → back should work');
     assert.ok(bundle.steps.some((s) => s.action === 'back' && s.status === 'passed'));
+  });
+
+  it('scrollTo ends with the target mid-viewport, filmed or not — never on the nearest edge', async () => {
+    // HUMI SIT, 2026-09-21: only the film's smooth scroll centred the target;
+    // the bare path stopped at the nearest edge, the last visible line.
+    const seen: number[] = [];
+    for (const humanize of [false, true]) {
+      const bundle = await runFlow(
+        {
+          name: `scrollTo centres (humanize ${humanize})`,
+          baseUrl: origin,
+          steps: [
+            { action: 'goto', url: '/' },
+            { action: 'scrollTo', selector: '#mid', intent: 'Bring it into working position.' },
+          ],
+        },
+        { cdpUrl: CDP_URL, cachePath: join(dir, `centre-${humanize}.json`), healer: null, historyPath: null, humanize },
+      );
+      assert.equal(bundle.status, 'passed', bundle.error ?? '');
+      const box = bundle.steps.find((s) => s.action === 'scrollTo')?.target?.box;
+      assert.ok(box, 'the step recorded where its target sat');
+      seen.push(box.y);
+    }
+    const [bare, filmed] = seen as [number, number];
+    assert.ok(bare > 100, `the bare path left the target off the top edge (y ${bare})`);
+    assert.ok(Math.abs(bare - filmed) < 40, `filmed or not, the same place: bare y ${bare}, filmed y ${filmed}`);
   });
 
   it('leaves the scroll position where it found it', async () => {

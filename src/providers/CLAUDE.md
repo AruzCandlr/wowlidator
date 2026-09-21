@@ -74,3 +74,84 @@ The author prompt's procedure names the case by the request's own id **verbatim*
 **A failed quota read never erases a good one** (2026-08-28): the panel, its usage-cap guard and every claude-cli child poll the usage endpoint on their own 30 s TTL, and it answered 429 — at which point the Quota rows and the cap gauge vanished from Machinery ("the session usage guardrail is gone"). `fetchClaudeQuota` now keeps the last good snapshot when a read fails, notes it as stale with the reading's time, and after a 429 doubles the wait before the next real request. Stale-with-age beats blank: the cap keeps its last percentages, the page keeps its rows.
 
 **A claude-cli answer cut at the CLI's own output cap is `finish=length`, re-asked once at a raised cap, and never re-sent cold; and the two vectors share one answer timeout** (2026-09-04, from the multirole Thai catalog runs `05-46` and `07-10`, all read from `.wowlidator/claude-cli-usage.jsonl`). Three facts were measured before anything changed. (1) On CLI 2.1.260 a `--json-schema` answer is a TOOL CALL — `stop_reason: "tool_use"`, `num_turns: 2` for a three-item haiku answer with no tools — so `turns: 2` is the ordinary shape of every schema call and not a re-ask; retrieval use is `turns >= 3`. The ~250–320-token generator rows that read as "far too small for a flow" are in-run reconstruction asks on the generator role (job-3: `[c1] ✗ [4] selectOption` → `→ generator … 6736 in / 375 out`); the authoring answers on these rows were 4.1k–24.5k output tokens. (2) The envelope carries the validated object in `structured_output` beside a string `result`; `answerTextOf` (`claude-envelope.ts`) now prefers the object the CLI already checked, on both vectors, so a model that writes a sentence beside its tool call cannot fail on packaging. (3) When the CLI's cap (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, 32,000 default) is hit the event is `is_error: true, terminal_reason: "api_error"`, no `stop_reason`, and the whole answer is `"API Error: Claude's response exceeded the N output token maximum…"`; the model's real ceiling rides in `modelUsage.<id>.maxOutputTokens` (64,000 opus, 32,000 haiku). Before this the warm session rejected that as a dead pipe, `claude-cli.ts` re-sent the identical prompt cold (same cap, same cut, whole prompt paid twice), and the cold copy threw a plain "provider refused" error that `generateStructured` could not classify — advice "try a different model id". Now `ClaudeAnswerError` carries `finishReason: 'length'` structurally (so `wasCutAtBudget` / `describeGenerationFailure` put `finish=length` on line one through the seam that already existed), `doGenerate` re-asks ONCE with `CLAUDE_CODE_MAX_OUTPUT_TOKENS` doubled toward the ceiling (`raisedOutputCap`; the cap is part of the session key, so a pooled process never answers at the old one), at the ceiling it fails with the dial named and `describeStructuredFailure` gives budget advice, the cut is booked in the ledger with `finish: 'length'` (its thinking was billed), and the breaker is untouched (a budget is not a model that cannot do JSON). Any other `is_error` result keeps the exact "could not be asked — the provider refused the call" wording so `exit.ts` and `isKeyExhaustedError` classify it as before — but it is thrown, not re-sent cold. Separately: the warm session's 5 min answer budget was shorter than these answers (17k–24.5k tokens at 200–265 s warm); pid 34607 shows the cost — a warm ask abandoned at 300 s, the cold copy finishing 595.8 s later, 5 s under the one-shot's 10 min. `CLAUDE_CLI_ANSWER_TIMEOUT_MS` (15 min, `WOWLIDATOR_CLAUDE_CLI_TIMEOUT_MS`) is now the one budget for both vectors, and every warm-to-cold fallback writes its reason to stderr, because 23 cold authoring-sized rows in one day had no explanation on record. `reaskNote` also quotes the parser's own `SyntaxError` message now, so the complaint is exact where it can be. Pinned by `tests/claude-cli.test.ts` (`claude-envelope`, `re-asked once at a raised cap, never re-sent cold`) and `tests/structured-output.test.ts` (`an answer cut at the provider's own output cap`, `the re-ask note carries the parser's own complaint`). Not this directory's: the refusals in both reports (`authoring refused (attempt 1): 2 problems … expectValue needs a value`; `attempt 2: depends on E2E-01, which is not in this catalog`) are the generator's lints on answers that arrived whole — the model answered, and the authoring attempt budget (`1/1` in the log) is what stopped the informed re-ask.
+
+## A decision model is not a chat model (`decisions.ts`, `typesafe`, 2026-09-18)
+
+TypeSafe's Jev takes a `state` and a map of typed questions and answers each
+with a CHOICE (an option, a probability per option, a confidence) or a NOUL
+(the probability a yes/no holds). No text is generated, so there is no schema
+to fill and nothing for `generateStructured` to parse — which is why it lives
+beside the factory in `src/providers/decisions.ts` and not inside it, and why
+the "every model goes through the AI SDK" rule does not reach it: the SDK has
+no adapter for a model that answers questions, and a `LanguageModel` wrapping
+one would be a prompt pretending to be a question. It serves exactly ONE role,
+`agent`, through the indexed jev policy (`src/orchestrator/jev-policy.ts`, the
+jev-ultrafast port — see `src/orchestrator/CLAUDE.md`).
+
+Two routes, one body (`{model, state, questions}`), one answer shape, measured
+2026-09-18 (`docs/research/2026-09-18-jev-spike/README.md`):
+
+- **`typesafe`** — `POST api.typesafe.ai/v1/systemone`, `TYPESAFE_API_KEY`,
+  model `jev-latest`. $0.042 per Mtok input, output free, 64k context, text only.
+- **`openrouter` with a `~typesafe/…` id** — `POST openrouter.ai/api/alpha/decisions`,
+  the OpenRouter key, model `~typesafe/jev-latest`. Beta on an alpha path that
+  may move; its `usage` carries a `cost` in USD; the id is absent from the
+  public `/models` catalogue (the panel appends it). This checkout's route.
+
+`isDecisionModel(provider, modelId)` in `config.ts` is the one predicate: it
+selects the route, it makes `loadConfig` refuse the healer, generator, data
+and governor roles on such a model with a `ConfigError` at startup (they need
+a schema filled), and `src/cli/runtime.ts` picks the agent policy by it. It is
+in config, not here, because config must stay free of SDK imports.
+
+Everything else is the factory's, unchanged: `askDecisions` runs inside
+`callWithFailover`, so a 401/403/429 rotates keys exactly as a chat call
+would; HTTP failures are thrown as the SDK's `APICallError` (status, headers)
+so `classifyProbeError` and `isKeyExhaustedError` read them as they read a
+provider's; `createModelForRole` resolves a decision model on EITHER route to
+`decisionsOnlyModel`, a `LanguageModel` that refuses `doGenerate` with one
+sentence naming this seam, so `forRole`, `labelFor`, `canResolve` and the
+breaker stay uniform and the `openrouter` builder never hands back a live
+chat model for `~typesafe/…` (review 2026-09-18). A transient 429/503/529 is
+waited out per `retry-after` up to `DECISIONS_MAX_WAIT_MS` (10 s) on one key,
+racing the caller's abort signal; past the cap the status is thrown at once
+so the factory rotates — nothing here may hold a doctor click or an agent
+turn for the hour OpenRouter has answered. Every call is logged through
+`llm-log.ts` under `provider:model`; the key is in no message, log line or
+error (the response body is scrubbed of every configured key before it is
+kept). 429/503/529 are retried with backoff honouring `retry-after`.
+
+**The answer is validated before anything acts on it** (`validateChoice`,
+jev-ultrafast's `validate_choice` ported): the choice must be an offered
+option, the distribution must be over exactly the offered options, every
+number finite in 0..1 and summing to 1 ± 0.02, and the choice the argmax —
+else a typed `DecisionsAnswerError` and NO action. Confidence alone is
+clamped, never refused: it is a derived number a reader weighs, and a stray
+1.4 must not void a correct pick. `doctor` probes a decisions route with one
+noul over the word "ok" (`PROBE_DECISION_REQUEST`) and reads the probability
+back as the reply. **The role refusal is one function**, `decisionModelRefusal`
+in `config.ts`, called by `loadConfig`'s `role()`, by the panel's
+`ModelSelection.select` and by `probeRole` before any call — the panel builds
+its effective config by hand, and a healer put on Jev there would otherwise
+probe as `ready` and kill the next run at startup. Usage is `number | null`,
+never a row of zeros; OpenRouter's per-call `cost` rides `DecisionsResponse`
+and is **booked nowhere yet** (no ledger row, no `byRole`, not under the
+usage cap) — the same disclosure `claude-tty` carries for its missing usage. Tests: `tests/decisions.test.ts` (routes, config refusal,
+the stub, the contract, an injected fetch, failover through a real factory,
+the probe by status).
+
+**A role on a decision model lends its structured questions to `data`** (2026-09-18, the first HUMI SIT run with the agent on Jev). The value resolver, the authoring reviewer and the run's review judge all ask the AGENT role a structured question — a small answer-this-schema call, nothing to do with driving a page — and every one failed on the refusing stub the moment the agent role was `openrouter:~typesafe/jev-latest`. `generateStructuredForModel` now substitutes the `data` role for a source role whose config is a decision model, and says so once on stderr. `data` is the role for exactly that kind of call, and config guarantees it is a chat model (only `agent` may be a decision model). The agent's own turns never pass through here — `JevAgentModel` asks the decisions route directly — so nothing about what the agent answers changes. Test: `tests/decisions.test.ts` ("a structured question asked of a decision-model role is answered by the data role").
+
+### A choice within rounding of the maximum is not a contradiction (`ROUNDING_TOLERANCE`, 2026-09-18)
+
+`validateChoice` (the port of jev's `validate_choice`) refused any answer whose
+`choice` was below the most probable option, and a refused answer ends the
+agent's leg as a model failure. Live on HUMI SIT 1.001 the operation head came
+back `choice: CLICK` at 0.39 beside `SCROLL_DOWN` at 0.40 — the decisions route
+reports probabilities to two decimals, so that is one rounding step — and the
+hire wizard's data leg ended half filled, cascading into Submit and the profile
+search. A choice within `ROUNDING_TOLERANCE` (0.02) of the maximum is now the
+model's own answer and stands; one further below still refuses, because then
+the distribution genuinely contradicts the pick. Nothing is re-chosen: the
+harness never substitutes the argmax for what the model said. Test:
+`tests/decisions.test.ts` ("accepts a choice within the two-decimal rounding").

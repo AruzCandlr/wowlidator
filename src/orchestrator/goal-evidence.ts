@@ -437,7 +437,8 @@ const CONTROL_TAIL = /(?:\s+(?:control|dropdown|filter|field|selector|box|button
 // What is never a control: a number, a step/case reference, the sheet's own
 // column headers when a goal quotes a row ("Menu: EC > Hire & Onboard",
 // "Data: -", "Expected: 3.1 Country = TH"), a clock time ("at 10:30").
-const NOT_A_CONTROL =
+/** Exported for the catalog generator: a Test data key of this shape is sheet metadata, never a control. */
+export const NOT_A_CONTROL =
   /^(?:\d+|(?:test\s+)?(?:step|case|row|scenario)\s*\d*|menu(?:\s+path)?|steps?|data|test\s+data|expected(?:\s+result)?|actual(?:\s+result)?|note|login|persona|url|preconditions?|result|(?:at|by|from|until|before|after|around)\s+\d+)$/iu;
 
 // A COUNT is never a control (2026-09-08, PL_06_07 on HUMI SIT, run key

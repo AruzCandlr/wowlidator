@@ -13,6 +13,7 @@ import { zodSchema } from 'ai';
 
 import {
   AUTHOR_ATTEMPTS,
+  signInOnlyFlow,
   AuthoredFlowSchema,
   AuthoringError,
   FlowAuthor,
@@ -35,6 +36,10 @@ import {
   expectedItemsIn,
   unassertedExpectedItems,
   unreconciledMatchClaim,
+  matchClaimsIn,
+  unassertedStatedMatch,
+  settleStatedMatch,
+  appendStep,
   inventedControlInternals,
   workflowOverDeclaredControls,
   ungroundedCountRole,
@@ -653,6 +658,153 @@ describe('expected-output coverage', () => {
     it('says nothing about a case with no reconciliation wording', () => {
       assert.equal(unreconciledMatchClaim(presenceOnly, 'Expected output: the page shows the catalog.'), null);
     });
+  });
+});
+
+describe('a match against a value the case states is a stated-value claim, not a reconciliation (HR SIT E2E-01, 2026-09-18)', () => {
+  // The live prompt's shape (the free-form claims path: numbered claims, no
+  // caseText): the sheet cites a "Rule Table" the page never shows, and
+  // states the values itself two claims up. Attempt 1 was refused as an
+  // unreconciled match; the re-ask died on the provider and the row blocked.
+  const LIVE = [
+    'Create a runnable JSON flow that navigates the website exactly as the test steps say.',
+    '15. [high] ระบบ Auto-Derive Time Management Status = 01 - Clocking และ O.T. Flag = Yes ตาม Rule Table',
+    '16. [high] Time Management Status และ O.T. Flag เป็น Read-only และ HR ไม่สามารถแก้ไขเองได้',
+    '29. [high] Time Management Status / O.T. Flag ใน TM ตรงกับ Rule Table',
+  ].join('\n');
+  const signInOnly: FlowStep[] = [
+    { action: 'click', selector: 'role=button[name="Sign in" i]', intent: 'sign in' },
+    { action: 'expectHidden', selector: 'role=textbox[name="Username" i]', intent: 'the session took' },
+  ];
+
+  it('reads the subjects left of the agree word and finds the value the case states for each', () => {
+    const claims = matchClaimsIn(LIVE);
+    assert.equal(claims.length, 1);
+    const claim = claims[0]!;
+    assert.deepEqual(claim.subjects, ['Time Management Status', 'O.T. Flag ใน TM']);
+    assert.deepEqual(claim.stated, [
+      { field: 'Time Management Status', value: '01 - Clocking' },
+      { field: 'O.T. Flag', value: 'Yes' },
+    ]);
+    assert.equal(claim.statedValue, true);
+  });
+
+  it('the reconciliation lint is silent on it, and the weak stated-value lint names the unasserted pairs', () => {
+    assert.equal(unreconciledMatchClaim(signInOnly, LIVE), null);
+    const thin = unassertedStatedMatch(signInOnly, LIVE);
+    assert.deepEqual(thin?.missing, [
+      { field: 'Time Management Status', value: '01 - Clocking' },
+      { field: 'O.T. Flag', value: 'Yes' },
+    ]);
+  });
+
+  it('is satisfied by an assertion that names the field and carries the value — after an agent leg too', () => {
+    const asserted: FlowStep[] = [
+      ...signInOnly,
+      { action: 'workflow', goal: 'open the new employee in TM' },
+      { action: 'expectValue', selector: 'role=textbox[name="Time Management Status" i]', value: '01 - Clocking', intent: '29: Time Management Status ตรงกับ Rule Table' },
+      { action: 'expectText', selector: 'role=button[name="O.T. Flag" i]', value: 'Yes', intent: '29: O.T. Flag' },
+    ];
+    assert.equal(unassertedStatedMatch(asserted, LIVE), null);
+    // The value in the intent alone is an explanation, not a claim.
+    const explained: FlowStep[] = [...signInOnly, { action: 'expectVisible', selector: 'role=textbox[name="O.T. Flag" i]', intent: 'O.T. Flag = Yes' }];
+    assert.equal(unassertedStatedMatch(explained, LIVE)?.missing.length, 2);
+  });
+
+  it('a genuine two-surface claim still fires, in either language, and a stated subject in English is read the same way', () => {
+    const presence: FlowStep[] = [{ action: 'expectVisible', selector: 'role=table', intent: 'the table' }];
+    assert.equal(matchClaimsIn('Expected output: the Total Plans tile matches the table row count')[0]?.statedValue, false);
+    assert.ok(unreconciledMatchClaim(presence, 'Expected output: the Total Plans tile matches the table row count') !== null);
+    assert.ok(unreconciledMatchClaim(presence, 'Expected output:\n  - ยอดรวมในการ์ด ตรงกับ ตารางด้านล่าง') !== null);
+    const english = 'Test data:\n  Employee Group = A - Permanent\nExpected output:\n  - the Employee Group on the profile matches the master table';
+    assert.equal(unreconciledMatchClaim(presence, english), null);
+    assert.deepEqual(unassertedStatedMatch(presence, english)?.missing, [{ field: 'Employee Group', value: 'A - Permanent' }]);
+  });
+
+  it('a stated value is read from the case, never from a supporting document, and never an open question or an instruction', () => {
+    const withDoc = [
+      '--- SUPPORTING CONTEXT: spec.md ---',
+      'Time Management Status = 99 - Manual',
+      '--- END SUPPORTING CONTEXT ---',
+      '1. [high] Time Management Status ตรงกับ Rule Table',
+    ].join('\n');
+    assert.equal(matchClaimsIn(withDoc)[0]?.statedValue, false, 'the document\'s pair is not the case\'s');
+    const open = 'Expected output:\n  - Probation End Date = ? OQ-HIR-50\n  - Probation End Date ตรงกับ ตาราง Rule';
+    assert.equal(matchClaimsIn(open)[0]?.statedValue, false);
+    const instruction = 'Test data:\n  District = เลือกเขตที่อยู่ในกรุงเทพมหานคร\nExpected output:\n  - District ตรงกับ ตาราง Master';
+    assert.equal(matchClaimsIn(instruction)[0]?.statedValue, false);
+  });
+
+  it('the settle asserts the stated value from the tree at the end of the flow, and declines a field no tree names', () => {
+    const thin = unassertedStatedMatch(signInOnly, LIVE)!;
+    const login = { steps: signInOnly.map((s) => ({ ...s })), cases: undefined as undefined };
+    assert.equal(settleStatedMatch(login, thin.missing, 'textbox "Username"\nbutton "Sign in"'), null, 'the login tree names neither field');
+    assert.equal(login.steps.length, 2);
+    const flow = { steps: signInOnly.map((s) => ({ ...s })), cases: undefined as undefined };
+    const note = settleStatedMatch(flow, thin.missing, 'textbox "Time Management Status"\nbutton "O.T. Flag"\nmain "TM"');
+    assert.match(note ?? '', /expectValue role=textbox\[name="Time Management Status" i\] = "01 - Clocking", expectText role=button\[name="O.T. Flag" i\] = "Yes"/);
+    const [tms, ot] = flow.steps.slice(2) as (FlowStep & { selector: string; value: string; intent: string })[];
+    assert.equal(tms!.action, 'expectValue');
+    assert.equal(tms!.value, '01 - Clocking');
+    assert.equal(ot!.action, 'expectText');
+    assert.ok(tms!.intent.includes(GENERATED_STEP_MARKER));
+    assert.equal(unassertedStatedMatch(flow.steps, LIVE), null, 'the inserted assertions settle the lint');
+    // A container that holds no value of its own is never asserted over.
+    const region = { steps: signInOnly.map((s) => ({ ...s })), cases: undefined as undefined };
+    assert.equal(settleStatedMatch(region, thin.missing, 'region "Time Management Status"\ngroup "O.T. Flag"'), null);
+  });
+
+  it('appendStep keeps the body and the last case in step', () => {
+    const a: FlowStep[] = [{ action: 'click', selector: 'a' }];
+    const b: FlowStep[] = [{ action: 'click', selector: 'b' }];
+    const flow = { steps: [...a, ...b], cases: [{ name: 'A', steps: a }, { name: 'B', steps: b }] };
+    appendStep(flow, { action: 'expectVisible', selector: 'c' });
+    assert.equal(flow.steps.length, 3);
+    assert.equal(b.length, 2);
+    assert.equal(a.length, 1);
+    const folded = { steps: [...a], cases: undefined as undefined };
+    folded.cases = [{ name: 'only', steps: folded.steps }] as unknown as undefined;
+    appendStep(folded, { action: 'expectVisible', selector: 'c' });
+    assert.equal(folded.steps.length, 2, 'a folded case shares the array and is appended once');
+  });
+
+  it('the pipeline accepts the live shape on attempt 1 of 1 with the note, and inserts the assertion when a tree names the field', async () => {
+    const steps = (): FlowStep[] => [
+      { action: 'click', selector: 'role=link[name="Employees" i]', intent: 'open the listing' },
+      { action: 'expectVisible', selector: 'role=heading[name="Employees" i]', intent: 'the listing is shown' },
+    ];
+    const log: string[] = [];
+    const blind = new FlowAuthor({ model: stubModel({ name: 'E2E-01', steps: steps() }), journeyTree: 'main\n  link "Employees"\n  heading "Employees"', attempts: 1, onLog: (l) => log.push(l) });
+    const authored = await blind.author(LIVE);
+    assert.ok(log.some((l) => /weak claim, accepted with a note/.test(l)), 'accepted on the first ask, nothing refused');
+    assert.ok(!log.some((l) => /RECONCILIATION/.test(l)), 'the reconciliation refusal never fired');
+    assert.match(authored.notes, /the case states Time Management Status = "01 - Clocking", O\.T\. Flag = "Yes" for the claim "ตรงกับ Rule Table" and no step asserts it/);
+    assert.equal(authored.flow.steps.length, 2);
+
+    const seeing = new FlowAuthor({
+      model: stubModel({ name: 'E2E-01', steps: steps() }),
+      journeyTree: 'main\n  link "Employees"\n  heading "Employees"\n  textbox "Time Management Status"\n  button "O.T. Flag"',
+      attempts: 1,
+    });
+    const grounded = await seeing.author(LIVE);
+    assert.match(grounded.notes, /stated value\(s\) asserted from the tree at the end of the flow/);
+    const last = grounded.flow.steps.at(-1) as FlowStep & { value: string };
+    assert.equal(last.action, 'expectText');
+    assert.equal(last.value, 'Yes');
+    assert.equal((grounded.flow.steps.at(-2) as FlowStep & { value: string }).value, '01 - Clocking');
+  });
+
+  it('the two-surface claim settles at the last word as "not covered", never as a blocked row', async () => {
+    const log: string[] = [];
+    const author = new FlowAuthor({
+      model: stubModel({ name: 'PL', steps: [{ action: 'click', selector: 'role=link[name="Plans" i]', intent: 'open' }, { action: 'expectVisible', selector: 'role=table', intent: 'the table' }] }),
+      journeyTree: 'main\n  link "Plans"\n  table',
+      attempts: 1,
+      onLog: (l) => log.push(l),
+    });
+    const authored = await author.author('Expected output: the Total Plans tile matches the table row count');
+    assert.match(authored.notes, /not covered: the reconciliation claim "matches the table row" — no step saves one reading/);
+    assert.ok(log.some((l) => /settled 1 refusal\(s\) by rewriting instead of refusing/.test(l)));
   });
 });
 
@@ -2826,7 +2978,12 @@ describe('groundLoginProof', () => {
     });
     await assert.rejects(author.author('sign in as the HR Admin'), (error: unknown) => {
       assert.ok(error instanceof AuthoringError);
-      assert.match(error.message, /contains no assertion/);
+      // The rule, not the wording: the drop leaves a flow that asserts
+      // nothing, and it is refused rather than patched with a proof the
+      // harness invented. Since 2026-09-18 the sign-in-only rail states it
+      // (`asserts nothing at all`), because a flow that signed in and then
+      // asserted nothing is that shape with its one false assertion removed.
+      assert.match(error.message, /asserts nothing at all|contains no assertion/);
       assert.doesNotMatch(error.message, /expectHidden/);
       return true;
     });
@@ -4679,10 +4836,36 @@ describe('the last word is a rewrite, not a refusal (multirole HIR-EC-001, 2026-
         return { name: 'HIR-EC-001', rationale: '', setup: [], steps: [...throughSeven], teardown: [], notes: '', droppedSteps: 0 };
       },
     };
-    const author = new FlowAuthor({ model });
+    const author = new FlowAuthor({ model, settleFirst: false });
     const authored = await author.author(caseText, undefined, { caseText });
     assert.equal(calls, 2, 'one informed re-ask, then the rewrite');
     assert.match(authored.notes, /not covered: script step\(s\) 8/);
+  });
+
+  it('settle first: a first attempt whose every fatal complaint knows its rewrite is settled at once, with no re-ask (HR SIT E2E-01, 2026-09-18)', async () => {
+    let calls = 0;
+    const log: string[] = [];
+    const model: FlowAuthorModel = {
+      id: 'stub:author',
+      async author() {
+        calls += 1;
+        return { name: 'HIR-EC-001', rationale: '', setup: [], steps: [...throughSeven], teardown: [], notes: '', droppedSteps: 0 };
+      },
+    };
+    const authored = await new FlowAuthor({ model, onLog: (l) => log.push(l) }).author(caseText, undefined, { caseText });
+    assert.equal(calls, 1, 'the default: one ask, then the rewrite the last word would have made');
+    assert.match(authored.notes, /not covered: script step\(s\) 8/);
+    assert.ok(log.some((l) => /no re-ask: every complaint knew its rewrite/.test(l)), log.join('\n'));
+    const viaEnv = process.env['WOWLIDATOR_AUTHOR_SETTLE_FIRST'];
+    process.env['WOWLIDATOR_AUTHOR_SETTLE_FIRST'] = 'off';
+    try {
+      calls = 0;
+      await new FlowAuthor({ model }).author(caseText, undefined, { caseText });
+      assert.equal(calls, 2, 'the env switch restores the informed re-ask');
+    } finally {
+      if (viaEnv === undefined) delete process.env['WOWLIDATOR_AUTHOR_SETTLE_FIRST'];
+      else process.env['WOWLIDATOR_AUTHOR_SETTLE_FIRST'] = viaEnv;
+    }
   });
 
   it('a fatal complaint with no grounded rewrite still refuses — a false claim is never handed over', async () => {
@@ -5190,5 +5373,117 @@ describe('a tree line is not a selector (PL_08_01, 2026-09-09)', () => {
       fromTreeNotation('button "Insert" >> nth=7'),
       'role=button[name="Insert" i] >> nth=7',
     );
+  });
+});
+
+describe('a flow that stops at the sign-in (HR SIT E2E-01, 2026-09-18)', () => {
+  // The live shape, verbatim from the sealed run: goto the login page, fill
+  // the credentials, submit, goto the signed-in home, and assert that the
+  // Username field is gone. It passed 6/6 in 7.7 s about an end-to-end hire
+  // across four modules that it never attempted.
+  const LOGIN = 'https://app.test/humi/en/login';
+  const loginOnly = (): FlowStep[] =>
+    [
+      { action: 'goto', url: LOGIN, intent: 'the page under test' },
+      { action: 'fill', selector: 'role=textbox[name="Username" i]', value: 'automate01', intent: 'the username' },
+      { action: 'fill', selector: 'input[type="password"]', value: 'pw', intent: 'the password' },
+      { action: 'click', selector: 'role=button[name="Sign in" i]', intent: 'submit' },
+      { action: 'goto', url: 'https://app.test/humi/en/', intent: 'the signed-in home' },
+      { action: 'expectHidden', selector: 'role=textbox[name="Username" i]', intent: 'the session took' },
+    ] as FlowStep[];
+
+  it('is recognised by its two halves: sign-in furniture performed, and every assertion the sign-in surface', () => {
+    const verdict = signInOnlyFlow([{ action: 'goto', url: LOGIN } as FlowStep], loginOnly(), LOGIN);
+    assert.equal(verdict?.performed, 3, 'the two fills and the submit');
+    assert.deepEqual(verdict?.asserted, ['expectHidden role=textbox[name="Username" i]']);
+  });
+
+  it('leaves the shapes two older rails own: no assertion at all, no sign-in, and a journey', () => {
+    const noAssertion = loginOnly().slice(0, 5);
+    assert.deepEqual(
+      signInOnlyFlow([], noAssertion, LOGIN)?.asserted,
+      [],
+      'a signed-in flow left assertionless by the proof drop is still this shape, with nothing asserted',
+    );
+    const neverSignedIn = [
+      { action: 'click', selector: 'role=button[name="Open" i]' },
+      { action: 'expectUrl', value: '/en/plans' },
+    ] as FlowStep[];
+    assert.equal(signInOnlyFlow([], neverSignedIn, undefined), null, 'no sign-in and no known sign-in page: the plain vacuous rail\'s');
+    const travels = [...loginOnly(), { action: 'workflow', goal: 'open EC > Hire & Onboard' } as FlowStep];
+    assert.equal(signInOnlyFlow([], travels, LOGIN), null, 'a leg is the flow going somewhere');
+  });
+
+  it('the pipeline refuses the live shape and names the journey to write', async () => {
+    const author = new FlowAuthor({
+      model: stubModel({ name: 'E2E-01 new hire — login page only', steps: loginOnly() }),
+      attempts: 1,
+    });
+    await assert.rejects(author.author('E2E-01: hire a new employee and check the profile in EC'), (error: unknown) => {
+      assert.ok(error instanceof AuthoringError);
+      assert.match(error.message, /performs nothing beyond the sign-in and asserts only the sign-in surface/);
+      assert.match(error.message, /hand each uncaptured stretch of the journey to the navigation agent/);
+      assert.match(error.message, /Never assert that the sign-in form is gone/);
+      return true;
+    });
+  });
+
+  it('with the case\'s own script it settles into legs and assertions instead of blocking the row', async () => {
+    const caseText = [
+      'E2E-01: Hiring key-in',
+      'Menu path: EC > Hire & Onboard (New Hire)',
+      'Test data:',
+      '  Employee Group = A - Permanent',
+      'Steps:',
+      '  1. Login ด้วย <HR_ADMIN_ACCOUNT>',
+      '  2. กรอกข้อมูล Identity ตาม Test Data',
+      '  3. กด Submit เพื่อสร้างพนักงานใหม่',
+      'Expected output:',
+      '  - ระบบแสดงข้อความ "Employee created"',
+    ].join('\n');
+    const log: string[] = [];
+    const authored = await new FlowAuthor({
+      model: stubModel({ name: 'E2E-01', steps: loginOnly() }),
+      onLog: (line) => log.push(line),
+    }).author(caseText, undefined, { caseText });
+    const legs = authored.flow.steps.filter((step) => step.action === 'workflow') as (FlowStep & { goal: string; intent?: string })[];
+    assert.ok(legs.length >= 1, `the script's acting steps become legs:\n${JSON.stringify(authored.flow.steps, null, 1)}`);
+    assert.ok(legs.every((leg) => /\[generated: /.test(leg.intent ?? '')), 'every inserted leg says the harness wrote it');
+    assert.ok(!legs.some((leg) => /Login/i.test(leg.goal)), "the sign-in line is the flow's own sign-in, never a leg");
+    assert.ok(authored.flow.steps.some((step) => step.action.startsWith('expect')), 'the settled flow still carries an assertion');
+    assert.ok(log.some((line) => /settled \d+ refusal\(s\) by rewriting/.test(line)), log.join('\n'));
+  });
+});
+
+describe('a claims-path prompt is many claims, and one of them about wording does not make the flow one (HR SIT E2E-01, 2026-09-18)', () => {
+  // The live prompt: 35 claims about a hire, exactly one of which quotes an
+  // in-app message. Classified from the joined claims, the whole flow was a
+  // wording flow and the lint refused it twice for asserting a value the
+  // sheet states — the row blocked, no verdict, two opus calls spent.
+  const claims = [
+    '1. [ui] ระบบสร้าง Employee ID เป็นตัวเลข 8 หลัก',
+    '2. [ui] ระบบดึง Minimum / Maximum Job Grade จาก Job Code',
+    '3. [ui] ข้อความ In App = Congratulations! You have a new direct report',
+  ].join('\n');
+  const tree = 'main\n  heading "Hire & Onboard"\n  row "Minimum Job Grade 10"';
+
+  it('judges only the step whose own case or intent says it is about wording', () => {
+    const aboutTheHire = [
+      { action: 'expectVisible', selector: 'text="Minimum Job Grade"', case: 'Claim 2 job grade range', intent: 'Claim 2: the range the Job Code gives' },
+    ] as unknown as FlowStep[];
+    assert.equal(wordingClaimAssertsDataValue(claims, aboutTheHire, tree), null, 'a hire claim is not judged by a notification claim');
+
+    const aboutTheWording = [
+      { action: 'expectVisible', selector: 'text="Minimum Job Grade"', case: 'Claim 3 ข้อความ In App', intent: 'Claim 3: the notice wording' },
+    ] as unknown as FlowStep[];
+    const caught = wordingClaimAssertsDataValue(claims, aboutTheWording, tree);
+    assert.equal(caught?.value, 'Minimum Job Grade', 'the wording case is still judged as it always was');
+  });
+
+  it('a single-claim prompt and a case-text call are classified exactly as before', () => {
+    const one = '1. [ui] ข้อความ บนหน้า Plans สะกดถูกต้อง';
+    const step = [{ action: 'expectVisible', selector: 'text="Minimum Job Grade"', intent: 'the row' }] as FlowStep[];
+    assert.equal(wordingClaimAssertsDataValue(one, step, tree)?.value, 'Minimum Job Grade', 'one claim: the whole prompt still decides');
+    assert.equal(wordingClaimAssertsDataValue(claims, step, tree, undefined, 'HIR-EC-001: create a new hire'), null, 'the case text decides when the caller has it');
   });
 });

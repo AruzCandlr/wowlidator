@@ -25,20 +25,29 @@
  *    head of the value (its CODE half — "A" of "A - Permanent", "40106337"
  *    of "40106337 (Job Title)" — else the whole value); if that leaves the
  *    list empty, clear and type the LABEL half; if still empty, clear so
- *    the whole list is back;
+ *    the whole list is back; a list that does not yet hold the value is
+ *    given a debounce window to start a request and that request the time
+ *    to land before it is believed (a server-searched list answers late);
  * 4. match an option by WHOLE name, then whole word, for the whole value,
  *    then its code half, then its label half — never plain substring ("Male"
  *    is inside "Female"); a disabled match is a state verdict;
+ * 4½. an option found OUTSIDE the viewport that its own scroll cannot bring
+ *    in (a `position: fixed` panel opened below the fold by a trigger on the
+ *    last visible line) is a geometry fact, not a missing option: the trigger
+ *    is centred, the list reopened if the scroll closed it, and the SAME
+ *    option — by its own name — found again; otherwise nothing changes;
  * 5. multi-select: split on `,` / `;` / ` + `, tick each row's checkbox,
  *    Escape;
  * 6. read the trigger back and require it to show what was picked — a click
  *    that landed nowhere is a failure with evidence, not a green step.
  *
  * On a miss the list is closed and the error keeps the `no option named …
- * appeared` wording the runner's state-contradiction rung is keyed on.
+ * appeared` wording the runner's state-contradiction rung is keyed on; an
+ * option that was found and could not be clicked says exactly that
+ * (`ListboxOptionUnclickableError`), keyed on by the same rung.
  * Runner wiring is the runner's half.
  */
-import type { Locator, Page } from 'playwright';
+import type { Locator, Page, Request } from 'playwright';
 
 import { codeAndLabelOf, foldedMatch, type FoldedMatch } from './normalise.js';
 import { optionNamePatterns } from './selector.js';
@@ -136,6 +145,21 @@ export class ListboxOptionMissingError extends Error {
   }
 }
 
+/** The option was in the open list and the click on it failed — never worded as an option that did not appear. */
+export class ListboxOptionUnclickableError extends Error {
+  override readonly name = 'ListboxOptionUnclickableError';
+  readonly shown: string[];
+  readonly trigger: string;
+  constructor(trigger: string, value: string, option: string, shown: string[], detail: string) {
+    super(
+      `opened ${JSON.stringify(trigger)} and found option ${JSON.stringify(option)} for ${JSON.stringify(value)}, ` +
+        `but it could not be clicked (${shown.length} shown)${detail === '' ? '' : `: ${detail}`}`,
+    );
+    this.shown = shown;
+    this.trigger = trigger;
+  }
+}
+
 /** The option is there and cannot be chosen — a fact about the page, not the selector. */
 export class ListboxOptionDisabledError extends Error {
   override readonly name = 'ListboxOptionDisabledError';
@@ -176,6 +200,73 @@ export function optionCandidates(value: string): { text: string; by: 'whole' | '
     if (halves.label !== value.trim()) out.push({ text: halves.label, by: 'label' });
   }
   return out;
+}
+
+/**
+ * Do these option names hold `part` — by whole name or whole word for any
+ * candidate, or as the one prefix match? Pure; the same rules the pick
+ * applies, asked of names already read, so a list that holds the value is
+ * never made to wait. It decides only whether to keep waiting, never what is
+ * clicked.
+ */
+export function listHolds(options: readonly string[], part: string): boolean {
+  for (const candidate of optionCandidates(part)) {
+    const [exact, contains] = optionNamePatterns(candidate.text);
+    if (options.some((option) => exact.test(option) || contains.test(option))) return true;
+  }
+  return uniquePrefixMatch(options, part) !== null;
+}
+
+/** How long a typed head is given to START a request: a search debounce is 300–500 ms. */
+export const SEARCH_DEBOUNCE_MS = 750;
+
+/**
+ * Is a typed search head still being answered? Yes while a request it set
+ * off is in flight, for one settle after the last one landed (the render),
+ * and — with no request seen yet — until the debounce window closes. Never
+ * past the budget. Pure.
+ */
+export function searchStillAnswering(at: {
+  sinceTypedMs: number;
+  requests: number;
+  pending: number;
+  sinceLastLandedMs: number | null;
+  settleMs: number;
+  budgetMs: number;
+}): boolean {
+  if (at.sinceTypedMs >= at.budgetMs) return false;
+  if (at.pending > 0) return true;
+  if (at.requests === 0) return at.sinceTypedMs < SEARCH_DEBOUNCE_MS;
+  return at.sinceLastLandedMs !== null && at.sinceLastLandedMs < at.settleMs;
+}
+
+/** The page's own data requests (xhr/fetch) from now until `stop()`. */
+function watchRequests(page: Page): { requests(): number; pending(): number; lastLandedAt(): number | null; stop(): void } {
+  const inFlight = new Set<Request>();
+  let requests = 0;
+  let lastLandedAt: number | null = null;
+  const started = (request: Request): void => {
+    const type = request.resourceType();
+    if (type !== 'xhr' && type !== 'fetch') return;
+    inFlight.add(request);
+    requests += 1;
+  };
+  const landed = (request: Request): void => {
+    if (inFlight.delete(request)) lastLandedAt = Date.now();
+  };
+  page.on('request', started);
+  page.on('requestfinished', landed);
+  page.on('requestfailed', landed);
+  return {
+    requests: () => requests,
+    pending: () => inFlight.size,
+    lastLandedAt: () => lastLandedAt,
+    stop: () => {
+      page.off('request', started);
+      page.off('requestfinished', landed);
+      page.off('requestfailed', landed);
+    },
+  };
 }
 
 async function attr(locator: Locator, name: string, timeout: number): Promise<string | null> {
@@ -272,6 +363,12 @@ async function searchBoxOf(container: Locator, list: Locator): Promise<Locator |
   return null;
 }
 
+interface FoundOption {
+  option: Locator;
+  name: string;
+  disabled: boolean;
+}
+
 /** The first enabled option matching `name` in scope, with its accessible name; a disabled-only match is reported. */
 async function findOption(
   scope: Locator,
@@ -323,6 +420,31 @@ async function readTrigger(trigger: Locator, timeout: number): Promise<string | 
   }
 }
 
+/**
+ * Where the element's box sits when it is not wholly inside the window's
+ * viewport; null when it is, or when it cannot be read. One read.
+ */
+async function outsideViewport(locator: Locator): Promise<{ top: number; bottom: number; viewport: number } | null> {
+  return locator
+    .first()
+    .evaluate(
+      (el) => {
+        const node = el as unknown as {
+          getBoundingClientRect(): { top: number; bottom: number; left: number; right: number };
+          ownerDocument: { defaultView: { innerWidth: number; innerHeight: number } | null };
+        };
+        const view = node.ownerDocument.defaultView;
+        if (view === null) return null;
+        const r = node.getBoundingClientRect();
+        const inside = r.top >= 0 && r.left >= 0 && r.bottom <= view.innerHeight && r.right <= view.innerWidth;
+        return inside ? null : { top: Math.round(r.top), bottom: Math.round(r.bottom), viewport: view.innerHeight };
+      },
+      undefined,
+      { timeout: 250 },
+    )
+    .catch(() => null);
+}
+
 function describe(error: unknown): string {
   return error instanceof Error ? error.message.split('\n')[0] ?? '' : String(error);
 }
@@ -330,7 +452,8 @@ function describe(error: unknown): string {
 /**
  * Pick `value` from the listbox behind `trigger`. See the module comment for
  * the procedure. Throws `ListboxOptionMissingError` (list closed again),
- * `ListboxOptionDisabledError`, or `ListboxReadBackError`; any other error
+ * `ListboxOptionUnclickableError`, `ListboxOptionDisabledError`, or
+ * `ListboxReadBackError`; any other error
  * is Playwright's own, from the open click.
  */
 export async function selectFromListbox(
@@ -348,10 +471,20 @@ export async function selectFromListbox(
   // can tell "the click revealed one" from "one was already sitting there".
   const searchBoxesBefore = await page.locator(SEARCH_INPUT).filter({ visible: true }).count().catch(() => 0);
 
-  const expanded = await attr(trigger, 'aria-expanded', 250);
-  if (expanded !== 'true') await trigger.first().click({ timeout });
-
-  let opened = await openList(page, trigger, timeout);
+  // The control handed in may BE the open list (HUMI SIT, 2026-09-18: the
+  // indexed agent opened `button "จังหวัด"` and then chose SELECT on the
+  // `listbox "จังหวัด"` it revealed — a click on an open listbox has nothing
+  // to open and timed out five times). A list is picked from, never clicked.
+  const role = await attr(trigger, 'role', 250);
+  const isList = role === 'listbox' || role === 'menu' || role === 'tree';
+  let opened: { list: Locator; container: Locator } | null = null;
+  if (isList && (await trigger.first().isVisible().catch(() => false))) {
+    opened = { list: trigger.first(), container: trigger.first().locator('xpath=..') };
+  } else {
+    const expanded = await attr(trigger, 'aria-expanded', 250);
+    if (expanded !== 'true') await trigger.first().click({ timeout });
+    opened = await openList(page, trigger, timeout);
+  }
   if (opened === null && options.typeToFilter !== false) {
     // Some triggers (`aria-haspopup="listbox"` and nothing else — the
     // `HumiSearchableSelect` shape this module's header already names) open
@@ -385,7 +518,7 @@ export async function selectFromListbox(
     await page.keyboard.press('Escape').catch(() => undefined);
     throw new ListboxOptionMissingError(triggerName, value, [], `no listbox or menu became visible within ${timeout} ms of opening`);
   }
-  const { list, container } = opened;
+  let { list, container } = opened;
   const filled = await waitForListToFill(page, list, timeout);
   let state = filled.state;
   const isMulti = state.checkboxes > 0 && splitMultiValue(value).length > 1;
@@ -409,9 +542,35 @@ export async function selectFromListbox(
       if (label !== undefined && label !== heads[0]) heads.push(label);
       let found = false;
       for (const head of heads) {
-        await box.fill(head, { timeout }).catch(() => undefined);
-        await page.waitForTimeout(settleMs);
-        state = (await waitForListToFill(page, list, timeout)).state;
+        const traffic = watchRequests(page);
+        try {
+          await box.fill(head, { timeout }).catch(() => undefined);
+          const typedAt = Date.now();
+          await page.waitForTimeout(settleMs);
+          state = (await waitForListToFill(page, list, timeout)).state;
+          // A server-searched list answers after a debounce and a fetch: until
+          // then it shows its stale preload, or its own client-side filter of
+          // that preload — "No options found" about a value the server holds
+          // (HUMI SIT Position, 2026-09-21). A list that already holds the
+          // value is not made to wait; one that does not is read again while
+          // the typed head may still be being answered, and only then believed.
+          while (!listHolds(state.options, part)) {
+            const landedAt = traffic.lastLandedAt();
+            const answering = searchStillAnswering({
+              sinceTypedMs: Date.now() - typedAt,
+              requests: traffic.requests(),
+              pending: traffic.pending(),
+              sinceLastLandedMs: landedAt === null ? null : Date.now() - landedAt,
+              settleMs,
+              budgetMs: timeout,
+            });
+            if (!answering) break;
+            await page.waitForTimeout(50);
+            state = await listState(list, 250);
+          }
+        } finally {
+          traffic.stop();
+        }
         typed = head;
         if (state.options.length > 0 || state.checkboxes > 0) {
           found = true;
@@ -427,19 +586,6 @@ export async function selectFromListbox(
       }
     }
     // 4. Match: whole name, then whole word — for the whole value, then its halves.
-    let hit: { option: Locator; name: string; disabled: boolean } | null = null;
-    for (const candidate of candidates) {
-      const [exact, contains] = optionNamePatterns(candidate.text);
-      hit = (await findOption(container, exact)) ?? (await findOption(page.locator('body'), exact));
-      if (hit === null || hit.disabled) {
-        const word = (await findOption(container, contains)) ?? (await findOption(page.locator('body'), contains));
-        if (word !== null && (!word.disabled || hit === null)) hit = word;
-      }
-      if (hit !== null && !hit.disabled) {
-        matchedBy = candidate.by;
-        break;
-      }
-    }
     // Last resort before a miss: the ONE option that starts with the value.
     // Never a substring ("Male" is not "Female") and never one of several
     // ("New Hire" is not every "New Hire — …"): exactly one option, or
@@ -447,17 +593,28 @@ export async function selectFromListbox(
     // wrong guess is visible in the proof rather than silent. Measured live
     // (humi, 2026-09-05): "Thai" against a list whose only match was
     // "Thailand - Thailand" cost the agent a miss, a settle, and a turn.
-    if (hit === null || hit.disabled) {
+    const locate = async (): Promise<{ hit: FoundOption | null; by: 'whole' | 'code' | 'label' | 'prefix' }> => {
+      let found: FoundOption | null = null;
+      for (const candidate of candidates) {
+        const [exact, contains] = optionNamePatterns(candidate.text);
+        found = (await findOption(container, exact)) ?? (await findOption(page.locator('body'), exact));
+        if (found === null || found.disabled) {
+          const word = (await findOption(container, contains)) ?? (await findOption(page.locator('body'), contains));
+          if (word !== null && (!word.disabled || found === null)) found = word;
+        }
+        if (found !== null && !found.disabled) return { hit: found, by: candidate.by };
+      }
       const unique = uniquePrefixMatch(state.options, part);
       if (unique !== null) {
         const [exact] = optionNamePatterns(unique);
         const byPrefix = (await findOption(container, exact)) ?? (await findOption(page.locator('body'), exact));
-        if (byPrefix !== null && !byPrefix.disabled) {
-          hit = byPrefix;
-          matchedBy = 'prefix';
-        }
+        if (byPrefix !== null && !byPrefix.disabled) return { hit: byPrefix, by: 'prefix' };
       }
-    }
+      return { hit: found, by: 'whole' };
+    };
+    const located = await locate();
+    let hit = located.hit;
+    if (hit !== null && !hit.disabled) matchedBy = located.by;
     if (hit === null) {
       await page.keyboard.press('Escape').catch(() => undefined);
       throw new ListboxOptionMissingError(
@@ -472,6 +629,64 @@ export async function selectFromListbox(
       await page.keyboard.press('Escape').catch(() => undefined);
       throw new ListboxOptionDisabledError(part, hit.name);
     }
+    // 4½. The option is found; can a pointer reach it? A trigger on the last
+    // visible line opens its `position: fixed` panel below the fold, where
+    // no scroll of the option can bring it in and the click spends its whole
+    // budget (HUMI SIT Employee Group, 2026-09-21: 10 s on `fast`, 10 s on
+    // `late`, all four options read). One read for a pick that already
+    // works; otherwise the option's own scroll first, and only then the
+    // trigger is centred, the list reopened if that scroll closed it, the
+    // typed head put back, and the SAME option — by its own name — found
+    // again. Anything else leaves `hit` as it was, to fail as it would have.
+    let reach = await outsideViewport(hit.option);
+    if (reach !== null) {
+      await hit.option.scrollIntoViewIfNeeded({ timeout: 500 }).catch(() => undefined);
+      reach = await outsideViewport(hit.option);
+    }
+    let recentred = false;
+    if (reach !== null && !isList) {
+      await trigger
+        .first()
+        .evaluate(
+          (el) => (el as unknown as { scrollIntoView(o: { block: string; inline: string }): void }).scrollIntoView({ block: 'center', inline: 'nearest' }),
+          undefined,
+          { timeout: 1_000 },
+        )
+        .catch(() => undefined);
+      await page.waitForTimeout(settleMs);
+      if (!(await list.first().isVisible().catch(() => false))) {
+        if ((await attr(trigger, 'aria-expanded', 250)) !== 'true') await trigger.first().click({ timeout }).catch(() => undefined);
+        const reopened = await openList(page, trigger, timeout);
+        if (reopened !== null) ({ list, container } = reopened);
+        if (typed !== undefined) {
+          const again = await searchBoxOf(container, list);
+          if (again !== null) await again.fill(typed, { timeout }).catch(() => undefined);
+        }
+      }
+      const deadline = Date.now() + timeout;
+      for (;;) {
+        state = await listState(list, 250);
+        const again = (await locate()).hit;
+        if (again !== null && !again.disabled && again.name === hit.name) {
+          hit = again;
+          recentred = true;
+          break;
+        }
+        if (Date.now() >= deadline) break;
+        await page.waitForTimeout(100);
+      }
+    }
+    const optionName = hit.name;
+    const unclickable = (error: unknown): ListboxOptionUnclickableError =>
+      new ListboxOptionUnclickableError(
+        triggerName,
+        part,
+        optionName,
+        state.options,
+        `${describe(error)}${
+          reach === null ? '' : ` — the option sat at y ${reach.top}–${reach.bottom} of a ${reach.viewport} px viewport`
+        }${recentred ? ', and again after the trigger was centred and the list reopened' : ''}`,
+      );
     // 5. Tick or click.
     if (isMulti) {
       // The row's own checkbox, not the row: a click on the row's padding
@@ -487,7 +702,7 @@ export async function selectFromListbox(
         await hit.option.click({ timeout });
       } catch (error) {
         await page.keyboard.press('Escape').catch(() => undefined);
-        throw new ListboxOptionMissingError(triggerName, part, state.options, `the option was found but could not be clicked: ${describe(error)}`);
+        throw unclickable(error);
       }
     }
     picked.push(hit.name);

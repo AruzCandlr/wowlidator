@@ -65,6 +65,14 @@ export type SignInResult =
        * on a sign-in URL — the application's landing, not a lost session.
        */
       acceptedSubmit?: string | undefined;
+      /**
+       * The first URL off the sign-in page the application went to after the
+       * submit, when it then bounced back to a sign-in URL — the signed-in
+       * surface the application itself chose (HUMI: `/th` → `/th/me/home` →
+       * `/th/login`). Evidence, not a guess: a later leg that starts on the
+       * sign-in page may go there instead of acting on login furniture.
+       */
+      signedInSurface?: string | undefined;
       /** Credential submissions made, the first included. */
       attempts: number;
     }
@@ -159,7 +167,7 @@ async function firstVisible(scope: Page | Locator, selector: string): Promise<Lo
 /** One pass of the procedure: the form found, filled, submitted (and, on the first pass, replayed once for hydration). */
 type SignInPass =
   | { kind: 'no-form'; reason: string }
-  | { kind: 'submitted'; acceptedSubmit: string | null; submissions: number };
+  | { kind: 'submitted'; acceptedSubmit: string | null; signedInSurface: string | null; submissions: number };
 
 function onSignInPage(tab: Page): boolean {
   return SIGN_IN_URL_PATTERN.test(tab.url());
@@ -187,7 +195,12 @@ export async function performSignIn(
   if (first.kind === 'no-form') return { ok: false, reason: first.reason, attempts: 0 };
   // Written from inside the retry closure; an object so the narrowing
   // outside it reads the assignments.
-  const state = { acceptedSubmit: first.acceptedSubmit, attempts: first.submissions, noForm: null as string | null };
+  const state = {
+    acceptedSubmit: first.acceptedSubmit,
+    signedInSurface: first.signedInSurface,
+    attempts: first.submissions,
+    noForm: null as string | null,
+  };
 
   if (onSignInPage(tab) && state.acceptedSubmit === null) {
     const retried = await retrySignIn(
@@ -202,6 +215,7 @@ export async function performSignIn(
           return 'failed';
         }
         state.acceptedSubmit = pass.acceptedSubmit;
+        state.signedInSurface = pass.signedInSurface;
         return onSignInPage(tab) && state.acceptedSubmit === null ? 'not-yet' : 'signed-in';
       },
       state.attempts,
@@ -210,7 +224,7 @@ export async function performSignIn(
     state.attempts = retried.attempts;
   }
 
-  const { acceptedSubmit, attempts, noForm } = state;
+  const { acceptedSubmit, signedInSurface, attempts, noForm } = state;
   if (noForm !== null) {
     return { ok: false, reason: `${noForm} (on sign-in attempt ${attempts} of ${ceiling})`, attempts };
   }
@@ -222,7 +236,13 @@ export async function performSignIn(
         attempts,
       };
     }
-    return { ok: true, landedUrl: tab.url(), acceptedSubmit, attempts };
+    return {
+      ok: true,
+      landedUrl: tab.url(),
+      acceptedSubmit,
+      ...(signedInSurface === null ? {} : { signedInSurface }),
+      attempts,
+    };
   }
   return { ok: true, landedUrl: tab.url(), attempts };
 }
@@ -288,8 +308,25 @@ async function signInOnce(
     await password.fill(credentials.password);
   }
 
+  // The first main-frame URL off the sign-in path after the submit: for an
+  // application that lands a successful sign-in back on its sign-in page,
+  // this is where it went in between — its own signed-in surface.
+  let signedInSurface: string | null = null;
+  const onNavigated = (frame: { url(): string; parentFrame(): unknown }): void => {
+    if (signedInSurface !== null || frame.parentFrame() !== null) return;
+    const url = frame.url();
+    if (!/^https?:/.test(url)) return;
+    let pathname: string;
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      return;
+    }
+    if (!SIGN_IN_URL_PATTERN.test(pathname)) signedInSurface = url;
+  };
   const submitOnce = async (): Promise<string | null> => {
     const watch = watchAcceptedSubmit(tab);
+    tab.on('framenavigated', onNavigated);
     try {
       const submit = await firstVisible(scope, SUBMIT_CONTROL);
       if (submit !== null) await submit.click();
@@ -308,6 +345,7 @@ async function signInOnce(
       await tab.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
       return watch.first();
     } finally {
+      tab.off('framenavigated', onNavigated);
       watch.detach();
     }
   };
@@ -333,7 +371,7 @@ async function signInOnce(
     }
   }
 
-  return { kind: 'submitted', acceptedSubmit, submissions };
+  return { kind: 'submitted', acceptedSubmit, signedInSurface, submissions };
 }
 
 export type SignOutResult =

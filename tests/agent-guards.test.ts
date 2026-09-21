@@ -34,6 +34,8 @@ import {
   multiPersonaGoal,
   multiPersonaSummary,
   formGaps,
+  heldAsTyped,
+  interceptionOf,
   formatFormGaps,
   listboxCannotOffer,
 } from '../src/orchestrator/agent-guards.js';
@@ -717,28 +719,46 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
   });
 
   it('never presses an unscoped Delete, however the model insists, and still lets a scoped one through', async () => {
-    const { model, seen } = scripted([
-      { action: 'click', selector: 'role=button[name="Delete" i] >> nth=0' },
-      { action: 'click', selector: 'role=button[name="Delete" i] >> nth=0' },
-      // The scoped shape a real run used successfully: find the id's cell,
-      // step up to its row, press that row's own Delete.
-      { action: 'click', selector: 'text=PL_03_18 >> xpath=.. >> role=button[name="Delete" i]' },
-      { action: 'finish', reasoning: 'deleted' },
-    ]);
     // A delete is irreversible, so the mutation gate (Phase B, 2026-09-05)
     // asks the host even when no manifest is configured. This test is about
     // the scope guard, so the host says yes — and only for the row the goal
     // names, which the gate must have observed on the page first.
     const approvals: string[][] = [];
-    const agent = new WorkflowAgent({
-      model,
-      maxSteps: 4,
-      mutationPolicy: null,
-      approveMutation: (request) => {
-        approvals.push([...request.targets]);
-        return request.category === 'delete' && request.targets.includes('PL_03_18');
-      },
+    const approveMutation = (request: { category: string; targets: readonly string[] }): boolean => {
+      approvals.push([...request.targets]);
+      return request.category === 'delete' && request.targets.includes('PL_03_18');
+    };
+
+    // The model that insists. Since Phase B the second refusal is a typed
+    // `guardrail` hold that ENDS the leg — never acted on, the host never
+    // asked, the page untouched (pinned from the gate's side in
+    // tests/mutation-policy.test.ts).
+    const insisting = scripted([{ action: 'click', selector: 'role=button[name="Delete" i] >> nth=0' }]);
+    const held = await withPage(CDP_URL, async (page) => {
+      await page.goto(`${origin}/en/rows`, { waitUntil: 'domcontentloaded' });
+      const before = await page.title();
+      const result = await new WorkflowAgent({ model: insisting.model, maxSteps: 4, mutationPolicy: null, approveMutation }).run(
+        page,
+        'delete the plan PL_03_18',
+      );
+      return { result, before, after: await page.title() };
     });
+    assert.equal(held.after, held.before, 'nothing was deleted');
+    assert.equal(held.result.success, false);
+    assert.equal(held.result.blocked?.rule, 'destructive-unscoped');
+    assert.match(held.result.actions[0]?.error ?? '', /^destructive:/);
+    assert.equal(held.result.actions.filter((a) => a.ok).length, 0);
+    assert.equal(insisting.seen.length, 2, 'one corrective re-ask, then the hold');
+    assert.deepEqual(approvals, [], 'the host is never asked about an unscoped click');
+
+    // The model that takes the correction: the scoped shape a real run used —
+    // find the id's cell, step up to its row, press that row's own Delete.
+    const { model, seen } = scripted([
+      { action: 'click', selector: 'role=button[name="Delete" i] >> nth=0' },
+      { action: 'click', selector: 'text=PL_03_18 >> xpath=.. >> role=button[name="Delete" i]' },
+      { action: 'finish', reasoning: 'deleted' },
+    ]);
+    const agent = new WorkflowAgent({ model, maxSteps: 4, mutationPolicy: null, approveMutation });
     const { result, title } = await withPage(CDP_URL, async (page) => {
       await page.goto(`${origin}/en/rows`, { waitUntil: 'domcontentloaded' });
       const result = await agent.run(page, 'delete the plan PL_03_18');
@@ -747,12 +767,9 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
     assert.equal(title, 'deleted PL_03_18', 'only the row the goal named was deleted');
     assert.deepEqual(approvals, [['PL_03_18']], 'the host was asked once, for the scoped row only — never for the unscoped click');
     assert.equal(result.success, true, result.summary);
-    const refused = result.actions[0];
-    assert.equal(refused?.ok, false);
-    assert.match(refused?.error ?? '', /^destructive:/);
     assert.match(seen[1]?.feedback ?? '', /without naming which row/, 'told once, with the scoped shape');
-    // Refused twice in turn 1 (recorded once, never acted on); turn 2 is the scoped click; turn 3 finishes.
-    assert.equal(result.turns, 3);
+    // Turn 1: the unscoped ask refused, the scoped click acted on; turn 2 finishes.
+    assert.equal(result.turns, 2);
   });
 
   it('refuses a PRESSED stepper past TOGGLE_CLICK_LIMIT, the same as a clicked toggle (2026-09-02, HIR-EC-009 live: 15.6 minutes hammering "Previous year" via press before this existed)', async () => {
@@ -768,7 +785,11 @@ describe('the agent loop refuses a wasted turn (CDP)', { skip: skipBrowser }, ()
       return agent.run(page, 'press Previous year on the date picker until it reads 1995');
     });
     assert.equal(result.success, false);
-    assert.match(result.summary, /stalled/);
+    // A second insistence is a typed `guardrail` hold that ends the leg
+    // (Phase B, 2026-09-05) — it used to be left to the no-progress stall.
+    assert.equal(result.blocked?.reason, 'guardrail');
+    assert.equal(result.blocked?.rule, 'circling');
+    assert.match(result.summary, /^agent blocked \(guardrail\): circling:/);
     const landed = result.actions.filter((a) => a.ok && a.action === 'press');
     assert.equal(landed.length, TOGGLE_CLICK_LIMIT, 'exactly the tolerated number of presses landed before the guard closed');
     const refused = result.actions.find((a) => !a.ok && (a.error ?? '').startsWith('circling:'));
@@ -1298,6 +1319,49 @@ describe('multiPersonaGoal (OA-15, pure half)', () => {
 });
 
 // --- OA-6: required and still empty (pure half) -------------------------------------
+
+describe('interceptionOf — the blocker Playwright names reaches the next turn (picks25, 2026-09-21)', () => {
+  // Playwright's own click-timeout message, shape verbatim: the first line is
+  // all the agent's history used to keep.
+  const LOG = [
+    'locator.click: Timeout 5000ms exceeded.',
+    'Call log:',
+    '  - waiting for locator(\'role=button[name="บริษัท" i]\').first()',
+    '    - locator resolved to <button type="button" aria-haspopup="listbox">เลือกบริษัท</button>',
+    '  - attempting click action',
+    '    - <div class="fixed inset-0 bg-black/40"></div> intercepts pointer events',
+    '  - retrying click action',
+    '    - <p>กรุณากรอกข้อมูลให้ครบ</p> from <div role="alertdialog" class="modal open">…</div> subtree intercepts pointer events',
+  ].join('\n');
+
+  it('names the last interceptor of the log, without the resolved element above it', () => {
+    const blocker = interceptionOf(LOG);
+    assert.match(blocker ?? '', /role="alertdialog"/);
+    assert.doesNotMatch(blocker ?? '', /aria-haspopup="listbox"/, 'never the control the click resolved to');
+    assert.doesNotMatch(blocker ?? '', /intercepts pointer events/);
+  });
+
+  it('is null for a timeout that names no interceptor, and caps a long element', () => {
+    assert.equal(interceptionOf('locator.click: Timeout 5000ms exceeded.\nCall log:\n  - waiting for locator'), null);
+    const long = `    - <div class="${'x'.repeat(400)}"></div> intercepts pointer events`;
+    assert.ok((interceptionOf(long) ?? '').length <= 160);
+  });
+});
+
+describe('heldAsTyped — a mask is not a lost fill (picks25, 2026-09-21)', () => {
+  it('accepts the live read-back: the same characters with separators added', () => {
+    assert.equal(heldAsTyped('1234567890123', '1-2345-67890-12-3'), true);
+    assert.equal(heldAsTyped('0812345678', '081-234-5678'), true);
+  });
+
+  it('still refuses a dropped, changed or reordered character, and an empty field', () => {
+    assert.equal(heldAsTyped('1234567890123', '1-2345-67890-12'), false);
+    assert.equal(heldAsTyped('1234567890123', '1-2345-67890-12-4'), false);
+    assert.equal(heldAsTyped('ab', 'ba'), false);
+    assert.equal(heldAsTyped('Somchai', ''), false);
+    assert.equal(heldAsTyped('--', '--'), false, 'a value of separators alone proves nothing');
+  });
+});
 
 describe('formGaps (OA-6, pure half)', () => {
   it('lists the required controls still empty, by flag or by the asterisk in the label', () => {

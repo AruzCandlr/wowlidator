@@ -31,6 +31,9 @@ import {
   StepResolutionError,
   ARIA_STATE_ATTRIBUTES,
   ariaStateMatches,
+  savedTextRecord,
+  resolvedAtFailure,
+  SAVED_TEXT_MAX,
   describeAttempt,
   closesDependentTail,
   dependentTail,
@@ -48,6 +51,7 @@ import {
   valueMatches,
   type Flow,
 } from '../src/engine/runner.js';
+import { ListboxOptionUnclickableError } from '../src/engine/listbox.js';
 import { SessionVault } from '../src/engine/session-vault.js';
 
 const CDP_URL = process.env['WOWLIDATOR_CDP_URL'] ?? 'http://localhost:9222';
@@ -127,6 +131,13 @@ describe('state contradictions the wave-2 rungs read off an attempt line', () =>
     assert.equal(isStateContradiction('fast "#x": locator.click: Timeout 400ms exceeded.'), false);
   });
 
+  it('an option found and unclickable is the same verdict, in its own words (HUMI SIT Employee Group, 2026-09-21)', () => {
+    const line = `fast "#grp": ${new ListboxOptionUnclickableError('Select Employee Group', 'A - Permanent', 'A - Permanent', ['A - Permanent', 'B - Expat Outbound'], 'locator.click: Timeout 10000ms exceeded.').message}`;
+    assert.ok(isStateContradiction(line), line);
+    assert.doesNotMatch(line, /no option named/);
+    assert.match(line, /opened "Select Employee Group" and found option "A - Permanent"/);
+  });
+
   it('describeAttempt lifts the state out of Playwright\'s call log onto the first line', () => {
     const error = new Error(
       'locator.click: Timeout 400ms exceeded.\nCall log:\n  - waiting for locator(\'#submit\')\n  - locator resolved to <button disabled>…</button>\n  - element is not enabled\n  - retrying click action',
@@ -198,6 +209,44 @@ describe('expectAttribute answers an ARIA state from either spelling (RC, 2026-0
     assert.equal(ariaStateMatches('mixed', 'mixed'), true);
     assert.equal(ariaStateMatches('true', 'mixed'), false);
     assert.equal(ariaStateMatches('false', 'true'), false);
+  });
+});
+
+describe('a failure that read the element is never re-labelled timing (HUMI SIT, 2026-09-21)', () => {
+  it('knows a value, an attribute, a text, a memoed mismatch, a contradiction and an interception', () => {
+    const live =
+      'could not resolve "role=button[name="Position" i]" after 2 attempt(s):\n' +
+      '  - fast "role=button[name="Position" i]": expected value "40106337", got "Search position..."\n' +
+      '  - known content mismatch: step 57 already read this element on this same page';
+    assert.equal(resolvedAtFailure(live), true);
+    assert.equal(resolvedAtFailure('expected @required to be "", got null (aria-required is absent too)'), true);
+    assert.equal(resolvedAtFailure('expected text to contain "75", got "68"'), true);
+    assert.equal(resolvedAtFailure('"role=option" resolved, but the claim did not hold after 1 attempt(s):'), true);
+    assert.equal(resolvedAtFailure('<div class="scrim"> intercepts pointer events'), true);
+  });
+
+  it('leaves a selector that never resolved eligible for the re-check', () => {
+    assert.equal(resolvedAtFailure('could not resolve "text=Saved" after 3 attempt(s):\n  - fast "text=Saved": locator.waitFor: Timeout 2000ms exceeded.'), false);
+    assert.equal(resolvedAtFailure('not visible (hidden or absent)'), false);
+    assert.equal(resolvedAtFailure(''), false);
+  });
+});
+
+describe('a saveText step records enough of what it read to be evidence (HUMI SIT, 2026-09-21)', () => {
+  it('holds a whole dialog, and marks a cut', () => {
+    const dialog = `Validation errors or missing required fields detected\n\n${'Position\nDirect Manager\nCost Center\n'.repeat(20)}Cancel\nEdit`;
+    assert.ok(dialog.length > 200 && dialog.length < SAVED_TEXT_MAX);
+    assert.equal(savedTextRecord(dialog, 'refused_submit'), dialog, 'the list of missing fields is past character 200');
+    const long = 'x'.repeat(SAVED_TEXT_MAX + 50);
+    assert.equal(savedTextRecord(long, 'body'), `${'x'.repeat(SAVED_TEXT_MAX)}…`);
+    assert.equal(savedTextRecord('x'.repeat(SAVED_TEXT_MAX), 'body'), 'x'.repeat(SAVED_TEXT_MAX), 'exactly the cap is not a cut');
+  });
+
+  it('shows no value saved under a credential name, and masks a supplied password inside the text', () => {
+    assert.equal(savedTextRecord('eyJhbGciOi', 'auth_token'), '[redacted]');
+    const shown = savedTextRecord('Your temporary password is hunter2-long', 'banner', new Set(['hunter2-long']));
+    assert.doesNotMatch(shown, /hunter2/);
+    assert.match(shown, /^Your temporary password is /);
   });
 });
 

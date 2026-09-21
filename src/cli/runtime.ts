@@ -6,7 +6,8 @@
 import type { ExtractedDocument } from '../catalog/extract.js';
 import { connectDb, defaultDbConfig, type DbClient } from '../db/client.js';
 import { LlmFlowAuthorModel, type FlowAuthorModel, type FlowAuthorOptions } from '../generator/flow-author.js';
-import { createModelForRole } from '../providers/llm-factory.js';
+import { JevCatalogAuthorModel } from '../generator/jev-catalog-author.js';
+import { createModelForRole, type LlmFactory } from '../providers/llm-factory.js';
 import { LlmValueResolverModel } from '../generator/value-resolution.js';
 import { FlowReviewer, LlmFlowReviewModel } from '../generator/flow-review.js';
 import { LlmRiskModel, riskEnabled, type RiskModel } from '../generator/dead-end-risk.js';
@@ -14,7 +15,7 @@ import { LlmDiagnosisModel, diagnosisEnabled, type DiagnosisModel } from '../gen
 import { LlmNarrationModel, type NarrationModel } from '../generator/step-narration.js';
 import { LlmCaseNarrativeModel, type CaseNarrativeModel } from '../generator/case-narrative.js';
 import type { CacheManager } from '../cache/cache-manager.js';
-import { describeRouting } from '../config.js';
+import { describeRouting, isDecisionModel } from '../config.js';
 import { LlmDataModel } from '../data/data-model.js';
 import { formatAgentAction, formatStepLine, type ProofStep } from '../engine/proof-bundle.js';
 import type { RunPlan } from '../engine/runner.js';
@@ -24,7 +25,8 @@ import { LlmFlowRepairModel, type FlowRepairModel } from '../repair/flow-repair-
 import { LlmReviewJudge, type ReviewJudge } from '../engine/review-judge.js';
 import type { HealHintsProvider } from '../context/heal-hints.js';
 import { JitHealer, LlmHealerModel } from '../healer/jit-healer.js';
-import { LlmAgentModel, WorkflowAgent } from '../orchestrator/workflow-agent.js';
+import { LlmAgentModel, WorkflowAgent, type AgentModel } from '../orchestrator/workflow-agent.js';
+import { JevAgentModel } from '../orchestrator/jev-policy.js';
 import {
   mutationPolicyFromEnv,
   type MutationPolicy,
@@ -100,6 +102,19 @@ export function planLogger(
     : (plan) => emitTagged(tag, `  plan       ${plan.total} step(s)\n`);
 }
 
+/**
+ * The agent's policy is chosen by the agent role's MODEL (2026-09-18): a
+ * decision model — TypeSafe's Jev, natively or as `openrouter:~typesafe/…` —
+ * answers typed questions over a numbered element table (`JevAgentModel`,
+ * `src/orchestrator/jev-policy.ts`); every chat model keeps `LlmAgentModel`
+ * byte-for-byte. One switch, read off config, so "provider choice is config
+ * rather than code" holds for the policy too. Both resolve their key lazily.
+ */
+export function agentModelFor(factory: LlmFactory): AgentModel {
+  const entry = factory.config.roles.agent;
+  return isDecisionModel(entry.provider, entry.modelId) ? new JevAgentModel({ factory }) : new LlmAgentModel({ factory });
+}
+
 /** Live progress lines for generation/authoring/repair; suppressed under --json. */
 export function lineLogger(
   options: CliOptions,
@@ -130,7 +145,7 @@ export function buildAgent(
       ? base
       : { ...(base ?? {}), reversible };
   return new WorkflowAgent({
-    model: new LlmAgentModel({ factory: options.factory }),
+    model: agentModelFor(options.factory),
     earlyStop: options.agentEarlyStop,
     ...(policy === null ? {} : { mutationPolicy: policy }),
     // Per-turn live progress — a `workflow` step can run for several seconds
@@ -153,7 +168,7 @@ export function buildAgent(
  */
 export function buildInvestigationAgent(options: CliOptions): WorkflowAgent {
   return new WorkflowAgent({
-    model: new LlmAgentModel({ factory: options.factory }),
+    model: agentModelFor(options.factory),
     onAction: options.json
       ? undefined
       : async (_page, action) => {
@@ -243,7 +258,7 @@ export function buildCapturePilot(options: CliOptions): WorkflowAgent | null {
   if (!options.agentCapture) return null;
   if (!options.factory.canResolve('agent')) return null;
   return new WorkflowAgent({
-    model: new LlmAgentModel({ factory: options.factory }),
+    model: agentModelFor(options.factory),
     maxSteps: CAPTURE_PILOT_MAX_STEPS,
     onAction: options.json
       ? undefined
@@ -269,6 +284,33 @@ export function buildFlowReviewer(options: CliOptions): FlowReviewer | null {
     model: new LlmFlowReviewModel({ factory: options.factory }),
     onLog: lineLogger(options),
   });
+}
+
+/**
+ * Who writes a catalog row (`CliOptions.authorMode`): `auto` follows the
+ * agent role — a decision model on it means the flows are for the indexed
+ * engine, so the programmatic catalog author writes them and the LLM is
+ * asked only for the Expected lines it cannot read (the 2026-09-18 plan's
+ * decisions A and Q3). One config decides both halves of the Jev path.
+ */
+export function authorModeOf(options: Pick<CliOptions, 'authorMode' | 'factory'>): 'jev' | 'llm' {
+  if (options.authorMode !== 'auto') return options.authorMode;
+  const agent = options.factory.config.roles.agent;
+  return isDecisionModel(agent.provider, agent.modelId) ? 'jev' : 'llm';
+}
+
+/**
+ * The model behind `FlowAuthor` for this run: the programmatic catalog
+ * author wrapping the LLM author under `jev`, the LLM author alone under
+ * `llm`. Both resolve their key lazily.
+ */
+export function buildAuthorModel(
+  options: Pick<CliOptions, 'authorMode' | 'factory'>,
+  log?: ((line: string) => void) | undefined,
+): FlowAuthorModel {
+  const llm = new LlmFlowAuthorModel({ factory: options.factory });
+  if (authorModeOf(options) === 'llm') return llm;
+  return new JevCatalogAuthorModel({ fallback: llm, ...(log === undefined ? {} : { onLog: log }) });
 }
 
 /**

@@ -239,7 +239,7 @@ export function relaxTextSelector(selector: string): string | null {
  * from shape would let a genuine CSS tag selector be rewritten into a role
  * selector that matches something else entirely.
  */
-const ARIA_ROLES: ReadonlySet<string> = new Set([
+export const ARIA_ROLES: ReadonlySet<string> = new Set([
   'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button',
   'caption', 'cell', 'checkbox', 'code', 'columnheader', 'combobox', 'complementary',
   'contentinfo', 'definition', 'deletion', 'dialog', 'directory', 'document', 'emphasis',

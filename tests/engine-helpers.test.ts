@@ -44,8 +44,12 @@ import { headRoleOf, optionNamePatterns, targetsPopupContent } from '../src/engi
 import {
   ListboxOptionDisabledError,
   ListboxOptionMissingError,
+  ListboxOptionUnclickableError,
   optionCandidates,
   uniquePrefixMatch,
+  listHolds,
+  searchStillAnswering,
+  SEARCH_DEBOUNCE_MS,
   selectFromListbox,
   splitMultiValue,
 } from '../src/engine/listbox.js';
@@ -255,6 +259,29 @@ describe('listbox: uniquePrefixMatch is the one option that starts with the valu
   });
 });
 
+describe('listbox: a typed search head is believed only once it has been answered', () => {
+  const preload = ['40001067 - Building Pallet Staff', '40001069 - Business Operation Improvement DM'];
+
+  it('listHolds asks the pick\'s own rules of names already read', () => {
+    assert.equal(listHolds(preload, '40106337'), false, 'the stale preload does not hold the code');
+    assert.equal(listHolds([...preload, '40106337 - Studio Traffic Staff & Admin'], '40106337'), true, 'a whole word of a longer name');
+    assert.equal(listHolds(['A — Permanent'], 'A - Permanent'), true, 'any dash');
+    assert.equal(listHolds(['Female'], 'Male'), false, 'never a substring');
+    assert.equal(listHolds(['Thailand - Thailand', 'Taiwan - Taiwan'], 'Thai'), true, 'the one prefix match');
+    assert.equal(listHolds([], '40106337'), false);
+  });
+
+  it('searchStillAnswering waits for a debounce, then for the request, then for the render — never past the budget', () => {
+    const at = { requests: 0, pending: 0, sinceLastLandedMs: null, settleMs: 250, budgetMs: 2_000 };
+    assert.equal(searchStillAnswering({ ...at, sinceTypedMs: 300 }), true, 'a debounce may not have fired yet');
+    assert.equal(searchStillAnswering({ ...at, sinceTypedMs: SEARCH_DEBOUNCE_MS }), false, 'no request in the window: a client-side list has answered');
+    assert.equal(searchStillAnswering({ ...at, sinceTypedMs: 1_200, requests: 1, pending: 1 }), true, 'a request in flight');
+    assert.equal(searchStillAnswering({ ...at, sinceTypedMs: 1_200, requests: 1, sinceLastLandedMs: 40 }), true, 'landed, not yet rendered');
+    assert.equal(searchStillAnswering({ ...at, sinceTypedMs: 1_500, requests: 1, sinceLastLandedMs: 250 }), false, 'landed and settled');
+    assert.equal(searchStillAnswering({ ...at, sinceTypedMs: 2_000, requests: 1, pending: 1 }), false, 'the budget is the step\'s own');
+  });
+});
+
 describe('cache: scopeUrl keeps the page-naming params only', () => {
   it('drops navigation and tracking noise, keeps ?step= and friends, sorted', () => {
     assert.equal(scopeUrl('https://example.test/login?next=/home'), 'https://example.test/login');
@@ -370,6 +397,13 @@ const FIXTURE_HTML = `<!doctype html>
     <button id="province" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Province">Select Province</button>
     <button id="district" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="District">Select District</button>
 
+    <!-- server-searched select: a preload of 20, replaced by a debounced fetch.
+         #pos filters the preload client-side meanwhile and drops a pending
+         search on clear (the live shape); #pos-stale shows the preload
+         untouched until the answer lands. -->
+    <button id="pos" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Position">Search position...</button>
+    <button id="pos-stale" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Position (stale)">Search position...</button>
+
     <!-- searchable-multi-select: checkbox rows -->
     <button id="company" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Company">Select companies</button>
     <ul id="company-list" role="listbox" hidden>
@@ -387,6 +421,15 @@ const FIXTURE_HTML = `<!doctype html>
     <!-- DateField: button[aria-haspopup=dialog] → role=dialog calendar -->
     <button id="hire-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Hire Date">Select date</button>
     <button id="start-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="วันที่มีผล">เลือกวันที่</button>
+    <!-- EH-DOB: humi's REAL DateField month view — no combobox, no year
+         input, and the heading toggle's aria-label ("Choose month and year")
+         never equals its own rendered text, unlike the two fixtures above. -->
+    <button id="dob-date" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Date of Birth">Select date</button>
+    <!-- The same widget in a popover the PAGE dismisses once, shortly after it
+         opens (cnext PopoverPanel closes when a scrolling ancestor of its
+         anchor moves — a reflow after the previous field's blur does it). -->
+    <button id="dob-flaky" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Date of Birth (dismissed once)">Select date</button>
+    <button id="dob-gone" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Date of Birth (dismissed always)">Select date</button>
 
     <!-- FormField: label + control + aria-describedby message -->
     <div class="field">
@@ -507,6 +550,44 @@ const FIXTURE_HTML = `<!doctype html>
       }
       portalSelect(document.getElementById('province'), function () { return provinces; }, function (p) { chosenProvince = p; document.getElementById('district').textContent = 'Select District'; setStatus('province:' + p); }, 0);
       portalSelect(document.getElementById('district'), function () { return chosenProvince ? districts[chosenProvince] : []; }, function (d) { setStatus('district:' + d); }, 300);
+      // --- server-searched select
+      function serverSelect(btn, clientFilter) {
+        var portal = null, timer = null;
+        function close() { if (portal) { portal.remove(); portal = null; } btn.setAttribute('aria-expanded', 'false'); }
+        btn.addEventListener('click', function () {
+          if (portal) { close(); return; }
+          btn.setAttribute('aria-expanded', 'true');
+          portal = document.createElement('div'); portal.className = 'popup'; portal.style.position = 'fixed'; portal.style.top = '10px'; portal.style.left = '10px'; portal.style.zIndex = '9999';
+          var input = document.createElement('input'); input.type = 'text'; input.placeholder = 'Search...'; portal.appendChild(input);
+          var ul = document.createElement('ul'); ul.setAttribute('role', 'listbox'); portal.appendChild(ul);
+          document.body.appendChild(portal);
+          var options = [];
+          for (var i = 0; i < 20; i++) options.push((40001067 + i) + ' - Preloaded Position ' + i);
+          function render() {
+            ul.innerHTML = '';
+            var f = clientFilter ? input.value.toLowerCase() : '';
+            var shown = options.filter(function (o) { return o.toLowerCase().indexOf(f) >= 0; });
+            if (!shown.length) { var e = document.createElement('li'); e.textContent = 'No options found'; ul.appendChild(e); return; }
+            shown.forEach(function (o) {
+              var li = document.createElement('li'); li.setAttribute('role', 'option'); li.textContent = o;
+              li.addEventListener('click', function () { btn.textContent = o; setStatus(btn.id + ':' + o); close(); });
+              ul.appendChild(li);
+            });
+          }
+          input.addEventListener('input', function () {
+            render();
+            if (timer) clearTimeout(timer);
+            var q = input.value.trim();
+            if (!q) return;
+            timer = setTimeout(function () {
+              fetch('/positions?q=' + encodeURIComponent(q)).then(function (r) { return r.json(); }).then(function (rows) { options = rows; render(); });
+            }, 300);
+          });
+          render();
+        });
+      }
+      serverSelect(document.getElementById('pos'), true);
+      serverSelect(document.getElementById('pos-stale'), false);
       // --- multi-select
       var company = document.getElementById('company'), companyList = document.getElementById('company-list');
       company.addEventListener('click', function () { var open = companyList.hidden; companyList.hidden = !open; company.setAttribute('aria-expanded', String(open)); });
@@ -602,6 +683,80 @@ const FIXTURE_HTML = `<!doctype html>
       }
       dateField(document.getElementById('hire-date'), 'en', new Date(2026, 8, 3), new Date(2025, 0, 1), new Date(2028, 10, 30));
       dateField(document.getElementById('start-date'), 'th', new Date(2026, 8, 3), new Date(2025, 0, 1), new Date(2028, 10, 30));
+      // --- EH-DOB: humi's real DateField month view (no select, no year
+      // input — Previous/Next-year buttons and a plain year readout; the
+      // heading toggle's accessible name is fixed copy, distinct from its
+      // own rendered text, exactly the shape that broke jumpViaMonthView).
+      function humiDobField(btn, initial, min, max, dismissals) {
+        var view = { y: initial.getFullYear(), m: initial.getMonth() }, mode = 'day', popup = null, value = null;
+        function label(d) { return d.getDate() + ' ' + ENS[d.getMonth()] + ' ' + d.getFullYear(); }
+        function disabled(d) { return d < min || d > max; }
+        function close() { if (popup) { popup.remove(); popup = null; } btn.setAttribute('aria-expanded', 'false'); }
+        function render() {
+          popup.innerHTML = '';
+          var head = document.createElement('div');
+          var prevM = document.createElement('button'); prevM.type = 'button'; prevM.setAttribute('aria-label', 'Previous month'); prevM.textContent = '‹';
+          prevM.addEventListener('click', function () { view.m -= 1; if (view.m < 0) { view.m = 11; view.y -= 1; } render(); });
+          head.appendChild(prevM);
+          var title = document.createElement('button'); title.type = 'button';
+          title.setAttribute('aria-label', 'Choose month and year');
+          title.setAttribute('aria-expanded', String(mode === 'month'));
+          title.textContent = EN[view.m] + ' ' + view.y;
+          title.addEventListener('click', function () { mode = mode === 'month' ? 'day' : 'month'; render(); });
+          head.appendChild(title);
+          var nextM = document.createElement('button'); nextM.type = 'button'; nextM.setAttribute('aria-label', 'Next month'); nextM.textContent = '›';
+          nextM.addEventListener('click', function () { view.m += 1; if (view.m > 11) { view.m = 0; view.y += 1; } render(); });
+          head.appendChild(nextM);
+          popup.appendChild(head);
+          if (mode === 'day') {
+            var grid = document.createElement('div');
+            var first = new Date(view.y, view.m, 1), days = new Date(view.y, view.m + 1, 0).getDate();
+            for (var p = 0; p < first.getDay(); p++) { var pad = document.createElement('div'); pad.setAttribute('aria-hidden', 'true'); grid.appendChild(pad); }
+            for (var d = 1; d <= days; d++) {
+              (function (day) {
+                var date = new Date(view.y, view.m, day);
+                var b = document.createElement('button'); b.type = 'button'; b.textContent = String(day);
+                b.setAttribute('aria-pressed', String(value !== null && value.getTime() === date.getTime()));
+                if (disabled(date)) b.disabled = true;
+                b.addEventListener('click', function () { if (disabled(date)) return; value = date; btn.textContent = label(date); setStatus('date:' + btn.id + ':' + date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0')); close(); });
+                grid.appendChild(b);
+              })(d);
+            }
+            popup.appendChild(grid);
+          } else {
+            var yrow = document.createElement('div');
+            var prevY = document.createElement('button'); prevY.type = 'button'; prevY.setAttribute('aria-label', 'Previous year'); prevY.textContent = '‹';
+            prevY.addEventListener('click', function () { view.y -= 1; render(); });
+            yrow.appendChild(prevY);
+            var yp = document.createElement('p'); yp.textContent = String(view.y);
+            yrow.appendChild(yp);
+            var nextY = document.createElement('button'); nextY.type = 'button'; nextY.setAttribute('aria-label', 'Next year'); nextY.textContent = '›';
+            nextY.addEventListener('click', function () { view.y += 1; render(); });
+            yrow.appendChild(nextY);
+            popup.appendChild(yrow);
+            var mgrid = document.createElement('div');
+            ENS.forEach(function (m, i) {
+              var mb = document.createElement('button'); mb.type = 'button'; mb.textContent = m;
+              mb.setAttribute('aria-pressed', String(i === view.m));
+              mb.addEventListener('click', function () { view.m = i; mode = 'day'; render(); });
+              mgrid.appendChild(mb);
+            });
+            popup.appendChild(mgrid);
+          }
+        }
+        btn.addEventListener('click', function () {
+          if (popup) { close(); return; }
+          var base = value || initial; view = { y: base.getFullYear(), m: base.getMonth() }; mode = 'day';
+          popup = document.createElement('div'); popup.setAttribute('role', 'dialog'); popup.setAttribute('aria-label', 'Calendar');
+          popup.className = 'popup'; popup.style.position = 'fixed'; popup.style.top = '40px'; popup.style.left = '40px'; popup.style.zIndex = '100';
+          document.body.appendChild(popup); btn.setAttribute('aria-expanded', 'true'); render();
+          if (dismissals > 0) { dismissals -= 1; setTimeout(close, 60); }
+        });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+      }
+      humiDobField(document.getElementById('dob-date'), new Date(2026, 8, 3), new Date(1900, 0, 1), new Date(2030, 11, 31), 0);
+      humiDobField(document.getElementById('dob-flaky'), new Date(2026, 8, 3), new Date(1900, 0, 1), new Date(2030, 11, 31), 1);
+      humiDobField(document.getElementById('dob-gone'), new Date(2026, 8, 3), new Date(1900, 0, 1), new Date(2030, 11, 31), 99);
       // --- uploads
       function reportFiles(input) { input.addEventListener('change', function () { document.getElementById('upload-status').textContent = input.id + ':' + Array.prototype.map.call(input.files, function (f) { return f.name; }).join(','); }); }
       reportFiles(document.getElementById('import-file')); reportFiles(document.getElementById('cert-file')); reportFiles(document.getElementById('chooser-input'));
@@ -616,6 +771,65 @@ const FIXTURE_HTML = `<!doctype html>
     </script>
   </body>
 </html>`;
+
+// The live shape (HUMI SIT Employee Group, 2026-09-21): the form scrolls inside
+// a pane, the trigger sits on the pane's last visible line, and the listbox is
+// a `position: fixed` panel placed under the trigger with no flip — so it opens
+// below the fold — and dismissed when the pane scrolls. `#covered` is the
+// control whose option stays unclickable wherever it is: a transparent sheet
+// lies over its list.
+const FOLD_HTML = `<!doctype html>
+<html><head><style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  #pane { height: 100%; overflow-y: auto; }
+  .spacer { height: 1400px; }
+  button.trigger { display: block; height: 40px; width: 300px; }
+  ul[role=listbox] { position: fixed; margin: 0; padding: 0; list-style: none; width: 300px; background: #fff; }
+  li[role=option] { height: 36px; }
+  #sheet { position: fixed; display: none; z-index: 10; }
+</style></head><body>
+<div id="pane">
+  <div class="spacer"></div>
+  <button id="fold" class="trigger" aria-haspopup="listbox" aria-expanded="false">Select Employee Group</button>
+  <div class="spacer"></div>
+  <button id="covered" class="trigger" aria-haspopup="listbox" aria-expanded="false">Select Contract Type</button>
+  <div class="spacer"></div>
+</div>
+<p id="status" style="position:fixed;top:0;right:0;margin:0"></p>
+<div id="sheet"></div>
+<script>
+  var pane = document.getElementById('pane');
+  function wire(id, names, covered) {
+    var trigger = document.getElementById(id);
+    var list = null;
+    function close() { if (list) { list.remove(); list = null; } trigger.setAttribute('aria-expanded', 'false'); document.getElementById('sheet').style.display = 'none'; }
+    trigger.addEventListener('click', function () {
+      if (list) { close(); return; }
+      var r = trigger.getBoundingClientRect();
+      list = document.createElement('ul');
+      list.setAttribute('role', 'listbox');
+      list.style.top = (r.bottom + 4) + 'px';
+      list.style.left = r.left + 'px';
+      names.forEach(function (name) {
+        var li = document.createElement('li');
+        li.setAttribute('role', 'option');
+        li.textContent = name;
+        li.addEventListener('click', function () { trigger.textContent = name; document.getElementById('status').textContent = id + ':' + name; close(); });
+        list.appendChild(li);
+      });
+      document.body.appendChild(list);
+      trigger.setAttribute('aria-expanded', 'true');
+      if (covered) {
+        var sheet = document.getElementById('sheet');
+        sheet.style.cssText = 'position:fixed;z-index:10;display:block;left:' + r.left + 'px;top:' + (r.bottom + 4) + 'px;width:300px;height:200px';
+      }
+    });
+    pane.addEventListener('scroll', close);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+  }
+  wire('fold', ['A - Permanent', 'B - Expat Outbound', 'C - Expat Inbound', 'E - Temporary'], false);
+  wire('covered', ['Permanent', 'Temporary'], true);
+</script></body></html>`;
 
 const NOT_FOUND_HTML = `<!doctype html>
 <html lang="th"><head><meta charset="utf-8"><title>Humi</title></head>
@@ -652,6 +866,20 @@ describe('engine helpers against a real page (CDP)', { skip: skipBrowser }, () =
       if (req.url?.startsWith('/missing')) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
         res.end(NOT_FOUND_HTML);
+        return;
+      }
+      if (req.url?.startsWith('/fold')) {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(FOLD_HTML);
+        return;
+      }
+      if (req.url?.startsWith('/positions')) {
+        const q = new URL(req.url, 'http://fixture').searchParams.get('q') ?? '';
+        const rows = ['40106337 - Studio Traffic Staff & Admin', '40106338 - Studio Traffic Manager'].filter((row) => row.includes(q));
+        setTimeout(() => {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(rows));
+        }, 400);
         return;
       }
       if (req.url?.startsWith('/sample.csv')) {
@@ -700,6 +928,58 @@ describe('engine helpers against a real page (CDP)', { skip: skipBrowser }, () =
     });
   });
 
+  it('listbox: a control that IS the open list is picked from, never clicked (HUMI จังหวัด, 2026-09-18)', async () => {
+    await withPage(async (page) => {
+      await page.locator('#grp').click();
+      await page.locator('#grp-list').waitFor({ state: 'visible' });
+      const result = await selectFromListbox(page, page.locator('#grp-list'), 'A - Permanent');
+      assert.deepEqual(result.picked, ['A — Permanent']);
+      assert.equal(await page.locator('#status').innerText(), 'grp:A');
+    });
+  });
+
+  it('listbox: a server-searched list is read after its search answers, not while it shows "No options found" (HUMI SIT Position, 2026-09-21)', async () => {
+    await withPage(async (page) => {
+      const result = await selectFromListbox(page, page.locator('#pos'), '40106337');
+      assert.deepEqual(result.picked, ['40106337 - Studio Traffic Staff & Admin']);
+      assert.equal(result.typed, '40106337');
+      assert.equal(result.confirmed, true);
+      assert.equal(await page.locator('#status').innerText(), 'pos:40106337 - Studio Traffic Staff & Admin');
+    });
+  });
+
+  it('listbox: a server-searched list still showing its stale preload is read again once the answer lands', async () => {
+    await withPage(async (page) => {
+      const result = await selectFromListbox(page, page.locator('#pos-stale'), '40106337');
+      assert.deepEqual(result.picked, ['40106337 - Studio Traffic Staff & Admin']);
+      assert.equal(result.confirmed, true);
+    });
+  });
+
+  it('listbox: a code the server does not hold still fails, on the list\'s own answer to the search', async () => {
+    await withPage(async (page) => {
+      await assert.rejects(
+        selectFromListbox(page, page.locator('#pos'), '49999999'),
+        (error: unknown) => {
+          assert.ok(error instanceof ListboxOptionMissingError);
+          assert.equal(error.searchedEmpty, '49999999', 'the empty row read after the search landed');
+          assert.match(error.message, /no option named "49999999" appeared/);
+          return true;
+        },
+      );
+      assert.equal(await page.locator('#status').innerText(), 'idle', 'nothing was picked');
+    });
+  });
+
+  it('listbox: a list that already holds the value is not made to wait for a search', async () => {
+    await withPage(async (page) => {
+      const started = Date.now();
+      const result = await selectFromListbox(page, page.locator('#pos'), '40001070');
+      assert.deepEqual(result.picked, ['40001070 - Preloaded Position 3']);
+      assert.ok(Date.now() - started < 1_500, `picked from the preload in ${Date.now() - started} ms`);
+    });
+  });
+
   it('listbox: a bare code picks by whole word, never "AB" for "A"', async () => {
     await withPage(async (page) => {
       const result = await selectFromListbox(page, page.locator('#grp'), 'A');
@@ -740,6 +1020,63 @@ describe('engine helpers against a real page (CDP)', { skip: skipBrowser }, () =
       );
       assert.equal(await page.locator('#gender').getAttribute('aria-expanded'), 'false');
       assert.ok(await page.locator('#gender-list').isHidden());
+    });
+  });
+
+  /** `/fold`, with `selector` scrolled so its bottom edge is the pane's — and the window's — last line. */
+  async function onLastLine(page: import('playwright').Page, selector: string): Promise<void> {
+    await page.setViewportSize({ width: 1000, height: 600 });
+    await page.goto(`${origin}/fold`);
+    await page.evaluate(`(() => {
+      const pane = document.getElementById('pane');
+      const el = document.querySelector(${JSON.stringify(selector)});
+      pane.scrollTop = el.offsetTop + el.offsetHeight - pane.clientHeight;
+    })()`);
+    await page.waitForTimeout(100);
+  }
+
+  it('listbox: a trigger on the last visible line opens its fixed list below the fold — centred, reopened, the same option picked (HUMI SIT Employee Group, 2026-09-21)', async () => {
+    await withPage(async (page) => {
+      await onLastLine(page, '#fold');
+      const before = await page.locator('#fold').boundingBox();
+      assert.equal(Math.round((before?.y ?? 0) + (before?.height ?? 0)), 600, 'the fixture really puts the trigger on the last line');
+      const started = Date.now();
+      const result = await selectFromListbox(page, page.locator('#fold'), 'A - Permanent');
+      assert.deepEqual(result.picked, ['A - Permanent']);
+      assert.ok(result.confirmed, `trigger shows ${result.readBack}`);
+      assert.equal(await page.locator('#status').innerText(), 'fold:A - Permanent');
+      assert.ok(Date.now() - started < 2_000, 'decided by one geometry read, not by a click that spends its budget first');
+      const after = await page.locator('#fold').boundingBox();
+      assert.ok((after?.y ?? 0) > 200 && (after?.y ?? 0) < 400, `the trigger ended mid-viewport (y ${after?.y})`);
+    });
+  });
+
+  it('listbox: a pick that already works is not moved', async () => {
+    await withPage(async (page) => {
+      await page.setViewportSize({ width: 1000, height: 600 });
+      await page.goto(`${origin}/fold`);
+      await page.evaluate(`document.getElementById('pane').scrollTop = document.getElementById('fold').offsetTop - 100`);
+      await page.waitForTimeout(100);
+      const result = await selectFromListbox(page, page.locator('#fold'), 'E - Temporary');
+      assert.deepEqual(result.picked, ['E - Temporary']);
+      assert.equal(Math.round((await page.locator('#fold').boundingBox())?.y ?? 0), 100, 'no scroll for an option already in reach');
+    });
+  });
+
+  it('listbox: an option that is found and truly cannot be clicked fails as found-and-unclickable, never as "no option appeared", and picks nothing else', async () => {
+    await withPage(async (page) => {
+      await onLastLine(page, '#covered');
+      await assert.rejects(
+        selectFromListbox(page, page.locator('#covered'), 'Permanent', { timeout: 1_000 }),
+        (error: unknown) => {
+          assert.ok(error instanceof ListboxOptionUnclickableError, String(error));
+          assert.match(error.message, /and found option "Permanent" for "Permanent", but it could not be clicked \(2 shown\)/);
+          assert.match(error.message, /again after the trigger was centred and the list reopened/);
+          assert.doesNotMatch(error.message, /no option named/);
+          return true;
+        },
+      );
+      assert.equal(await page.locator('#status').innerText(), '', 'nothing was picked');
     });
   });
 
@@ -789,6 +1126,50 @@ describe('engine helpers against a real page (CDP)', { skip: skipBrowser }, () =
       const result = await pickDateInDialog(page, page.locator('#hire-date'), '2028-06-20');
       assert.equal(result.via, 'month-view');
       assert.equal(result.shown, '20 Jun 2028');
+      assert.ok(result.confirmed);
+    });
+  });
+
+  it('calendar: a century-scale jump (Date of Birth) drives a button-grid month view, not 700+ month-nav clicks (EH-DOB)', async () => {
+    await withPage(async (page) => {
+      const result = await pickDateInDialog(page, page.locator('#dob-date'), '1968-03-01', { timeout: 3_000 });
+      assert.equal(result.via, 'month-view');
+      assert.equal(result.shown, '1 Mar 1968');
+      assert.ok(result.confirmed);
+      assert.equal(await page.locator('#status').innerText(), 'date:dob-date:1968-03-01');
+      assert.equal(await openDialogNow(page), null, 'the dialog closed');
+    });
+  });
+
+  it('calendar: a popover the page dismissed once is reopened, and the jump still lands (HR-SIT 1-001, 2026-09-21)', async () => {
+    await withPage(async (page) => {
+      const result = await pickDateInDialog(page, page.locator('#dob-flaky'), '1968-03-01', { timeout: 1_500 });
+      assert.equal(result.via, 'month-view');
+      assert.equal(result.shown, '1 Mar 1968');
+      assert.ok(result.confirmed);
+    });
+  });
+
+  it('calendar: a popover dismissed every time fails naming the month view step, never "no previous-month control"', async () => {
+    await withPage(async (page) => {
+      await assert.rejects(
+        pickDateInDialog(page, page.locator('#dob-gone'), '1968-03-01', { timeout: 1_500 }),
+        (error: Error) => {
+          assert.equal(error.name, 'CalendarDriveError');
+          assert.match(error.message, /beyond month-by-month stepping/);
+          assert.match(error.message, /closed by itself once/);
+          return true;
+        },
+      );
+    });
+  });
+
+  it('calendar: the same button-grid widget still resolves a near-term date via plain month-nav (unaffected)', async () => {
+    await withPage(async (page) => {
+      const result = await pickDateInDialog(page, page.locator('#dob-date'), '2026-11-10');
+      assert.equal(result.via, 'month-nav');
+      assert.equal(result.navigated, 2);
+      assert.equal(result.shown, '10 Nov 2026');
       assert.ok(result.confirmed);
     });
   });

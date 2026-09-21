@@ -184,6 +184,9 @@ const FIELD_BY_HEADER = new Map<string, TextField>([
   ['positive/negative', 'polarity'],
   ['priority', 'priority'],
   ['testcase', 'testCase'],
+  ['title', 'testCase'],
+  // The HR SIT E2E workbook spells it this way on every sheet.
+  ['titile', 'testCase'],
   ['login/persona', 'persona'],
   ['loginpersona', 'persona'],
   ['login', 'persona'],
@@ -194,6 +197,7 @@ const FIELD_BY_HEADER = new Map<string, TextField>([
   ['menu', 'menu'],
   ['testscript/steps', 'steps'],
   ['teststeps', 'steps'],
+  ['teststep', 'steps'],
   ['expectedoutput', 'expected'],
   ['expectedresult', 'expected'],
   ['actualresult', 'actual'],
@@ -337,7 +341,12 @@ export function parseTestCaseRows(
   for (let i = 0; i < Math.min(rows.length, 5); i += 1) {
     const cells = rows[i] ?? [];
     const candidate = cells.map((cell) => FIELD_BY_HEADER.get(squash(cell)) ?? null);
-    if (REQUIRED.every((field) => candidate.includes(field))) {
+    // A sheet with one row per scenario has no Test Case ID column: its
+    // Scenario ID is the case's identity (HR_SIT_E2E, 2026-09-21 — unrecognised,
+    // it went to the general extractor, which truncated the document at 120k
+    // characters and spent 24 of its 34 claims on the first row of 25).
+    const identified = candidate.includes('caseId') || candidate.includes('scenarioId');
+    if (identified && REQUIRED.every((field) => field === 'caseId' || candidate.includes(field))) {
       headerAt = i;
       mapping = candidate;
       labels = cells.map((cell) => NOTE_LABEL_BY_HEADER.get(squash(cell)) ?? null);
@@ -369,6 +378,7 @@ export function parseTestCaseRows(
   let menu = '';
   let menuScenario = '';
 
+  const scenarioIsCase = !mapping.includes('caseId');
   const polarityColumn = mapping.indexOf('polarity');
   for (const raw of rows.slice(headerAt + 1)) {
     const { cells } = realignRow(raw, polarityColumn);
@@ -387,6 +397,9 @@ export function parseTestCaseRows(
     });
     row.note = notes.join('\n');
 
+    // Read before the carry-down below: a blank cell is a spacer here, not
+    // "the same case again".
+    if (scenarioIsCase) row.caseId = row.scenarioId;
     if (row.scenarioId !== '') scenarioId = row.scenarioId;
     else row.scenarioId = scenarioId;
     if (row.scenario !== '') scenario = row.scenario;

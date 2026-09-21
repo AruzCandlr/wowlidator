@@ -173,6 +173,8 @@ export interface SuiteLedger {
         personas?: Record<string, string> | undefined;
         /** The workbook slice this run was (`--sheet` / `--category`, CG-11). */
         sheets?: string[] | undefined;
+        /** Who wrote the flows: the programmatic catalog author for the indexed engine, or the generator role. */
+        authorMode?: 'jev' | 'llm' | undefined;
         categories?: string[] | undefined;
         /** Whether Blocked / Pending rows were authored on purpose (`--include-blocked`). */
         includeBlocked?: boolean | undefined;

@@ -37,13 +37,17 @@ import { fence, sanitizeInline } from '../providers/model-fence.js';
 import { fromTreeLine, withQualifiedRole, withRelaxedRoleName, withStableGreeting } from '../engine/selector.js';
 import {
   PLACEHOLDER_TOKEN,
+  absoluteDateOf,
   fieldLabelOf,
   formatStatedFor,
   fromDb,
   fromRepo,
   fromTestData,
+  isDatePhrase,
+  isDescription,
   resolveValues,
   unconfirmedFieldIn,
+  writtenValueOf,
   type TestDataPair,
   type ValueNeed,
   type ValueResolutionContext,
@@ -54,6 +58,7 @@ import { matchesRoutePattern } from '../context/context-engine.js';
 import { nearestRoutes, pathnameOf, routeIsDeclared } from '../context/route-match.js';
 import { concretiseRoute, type ConcreteEvidence } from './concretise.js';
 import { LOGIN_URL_PATTERN } from './value-rules.js';
+import { END_SUPPORTING_CONTEXT } from '../catalog/catalog.js';
 export { LOGIN_URL_PATTERN };
 import { formatProbeReport, probeInteractions } from '../context/page-probe.js';
 import { focusTreeText } from '../context/retriever.js';
@@ -62,7 +67,7 @@ import {
   generateStructuredForModel,
   type ModelSource,
 } from '../providers/llm-factory.js';
-import { observationSteps, substantiveAssertions, vacuousClaim } from './vacuous.js';
+import { isLoginFormSurface, isLoginProof, observationSteps, substantiveAssertions, vacuousClaim } from './vacuous.js';
 // The step-level evidence lookup (2026-09-08) and the two pure readers it is
 // built on — one definition of "every selector a step carries" and one of
 // "what the code declares the application renders", shared with the lookup and
@@ -88,8 +93,8 @@ import { AUTHORING, openQuestionIdsIn } from './value-rules.js';
 // The parser imports nothing of the generator, so the dependency runs one way.
 import { expectedLines, sectionOf, unconfirmedValue } from '../catalog/test-case-table.js';
 import { isFixtureSpec } from '../data/fixtures.js';
-import { multiPersonaGoal } from '../orchestrator/agent-guards.js';
-import { goalOutcomes } from '../orchestrator/goal-evidence.js';
+import { menuPathOf, multiPersonaGoal } from '../orchestrator/agent-guards.js';
+import { goalOutcomes, verificationOnlyGoal } from '../orchestrator/goal-evidence.js';
 import type { Flow, FlowStep, StepValueSource } from '../engine/runner.js';
 import { DEFAULT_MUTATION_POLICY, type MutationPolicy } from './test-generator.js';
 import type { FlowReviewer, ReviewRecord } from './flow-review.js';
@@ -567,6 +572,18 @@ export interface AuthorRequest {
    * one test.
    */
   singleCase?: boolean | undefined;
+  /**
+   * The catalog row's own described text (`describeCase`), when the request
+   * is a row — what a programmatic author (`jev-catalog-author.ts`) reads
+   * its steps from. The LLM author ignores it: the same text is already in
+   * `prompt`. Beside it, the facts the value resolver takes so the
+   * programmatic author can resolve a pair before it writes a goal.
+   */
+  caseText?: string | undefined;
+  caseId?: string | undefined;
+  runKey?: string | undefined;
+  now?: Date | undefined;
+  testDataPairs?: readonly TestDataPair[] | undefined;
 }
 
 /**
@@ -681,7 +698,11 @@ You have not been given a page; you are working from the request alone.
 /** The scope halves — short on purpose; every word here is paid on every call. */
 const UNIT_SCOPE_RULES = `<scope>UNIT — prove one thing on one page. Do not navigate away from
 the page you were given and do not sign in unless that page demands it. A
-short flow that proves its one claim is the right answer; do not widen it.</scope>`;
+short flow that proves its one claim is the right answer; do not widen it.
+When the page you were given is a sign-in page, the claim lives beyond it:
+sign in, reach the page the claim is about (grounded steps, else a workflow
+leg in the request's own words), and assert there. A flow that ends on the
+sign-in surface proves nothing and is refused.</scope>`;
 
 const E2E_SCOPE_RULES = `<scope>END-TO-END — carry the whole journey: reach the page the way a user
 does, act, and verify on the page that results. The flow must leave the page it
@@ -813,6 +834,16 @@ clicked still existing.
   expectCount the same box with {{before_total_plans+1}}, {{…-1}} or
   {{before_total_plans}}, the arithmetic inside the braces. A number printed in
   the sheet ("75 → 76", "1-15 of 43") is an illustration, never the value.
+- A field "matches" / "agrees with" / "ตรงกับ" / "ตาม" a rule, a master or a
+  table the page does not show, and the case itself states the field's value
+  ("Time Management Status = 01 - Clocking และ O.T. Flag = Yes ตาม Rule
+  Table", "Employee Group ตรงกับ Test Data" with "Employee Group = A -
+  Permanent" in Test data): a stated value, not two readings. Assert the
+  field's own value — expectValue for a textbox, expectText for a trigger or
+  cell — equal to the stated value, on the page where the field is shown,
+  citing the line. Save nothing: there is no second surface to read. Only when
+  both sides are readings ON THE PAGE (a tile and a table) is it the
+  save-and-compare above.
 - Either/or ("A หรือ B", "กรณีสร้างสำเร็จ … / กรณีปฏิเสธ …", "success or a
   validation message"): one expectAnyVisible with one selector per named
   outcome in "value", ";"-separated. Never for a line that states one outcome,
@@ -1119,6 +1150,9 @@ the flow satisfy them rather than explain a miss:
   expectCount; a [RECORD ONLY] line has a saveText and no expect*.
 - expectAnyVisible only where the line names alternatives.
 - Every workflow step is followed by evidence independent of the agent.
+- The flow does not stop at the sign-in: something is done and something is
+  asserted on the page the claim is about, never only that the sign-in form
+  went away.
 - With a personas section, every sign-in is a signIn by label and no step fills
   an email or password; without one, nothing sits between the credential fills
   and the submit click, nothing on the sign-in page is asserted after it, and
@@ -2422,6 +2456,13 @@ export interface FlowAuthorOptions {
    * feedback exists for.
    */
   attempts?: number | undefined;
+  /**
+   * Settle on the FIRST attempt whose every fatal complaint carries a grounded
+   * rewrite, instead of spending a re-ask to reach the same settlement at the
+   * last word (2026-09-18, HR SIT E2E-01). Default on;
+   * `WOWLIDATOR_AUTHOR_SETTLE_FIRST=off` restores the re-ask.
+   */
+  settleFirst?: boolean | undefined;
   maxAxNodes?: number | undefined;
   /** Open the page's menus and disclosures before authoring. Default false. */
   probe?: boolean | undefined;
@@ -2510,6 +2551,14 @@ export interface FlowAuthorOptions {
   declaredStrings?: readonly DeclaredString[] | undefined;
   /** Called at each authoring lifecycle event — for live progress output. */
   onLog?: ((line: string) => void) | undefined;
+  /**
+   * The flows this author writes are for the indexed (Jev) engine
+   * (`jev-catalog-author.ts`, 2026-09-18): a `workflow` goal that names a
+   * control the repository declares is the DESIGN there — the engine's
+   * numbered table is how that control is found at $0 — so
+   * `workflowOverDeclaredControls` is withheld. Every other lint applies.
+   */
+  indexed?: boolean | undefined;
 }
 
 export class FlowAuthor {
@@ -2536,6 +2585,8 @@ export class FlowAuthor {
   /** The whole index's declared renderings — see `FlowAuthorOptions.declaredStrings`. */
   readonly #declaredStrings: readonly DeclaredString[] | undefined;
   readonly #attempts: number;
+  readonly #settleFirst: boolean;
+  readonly #indexed: boolean;
   /**
    * Refusals this AUTHOR has already seen, across every row it has written —
    * shape → { exemplar, count }. One author instance writes a whole catalog,
@@ -2554,6 +2605,8 @@ export class FlowAuthor {
         ? Math.max(1, Math.floor(options.attempts))
         : fallback;
     this.#probe = options.probe ?? false;
+    this.#indexed = options.indexed === true;
+    this.#settleFirst = options.settleFirst ?? process.env['WOWLIDATOR_AUTHOR_SETTLE_FIRST']?.trim().toLowerCase() !== 'off';
     this.#maxProbes = options.maxProbes;
     this.#maxAxNodes = options.maxAxNodes ?? DEFAULT_AUTHOR_MAX_NODES;
     this.#policy = options.policy ?? DEFAULT_MUTATION_POLICY;
@@ -2834,7 +2887,16 @@ export class FlowAuthor {
         ...(this.#backend ? {} : { backend: false }),
         ...(projectContext ? { projectContext } : {}),
         ...(priorCases === undefined ? {} : { priorCases }),
-        ...(extra.caseText === undefined ? {} : { singleCase: true }),
+        ...(extra.caseText === undefined
+          ? {}
+          : {
+              singleCase: true,
+              caseText: extra.caseText,
+              ...(extra.caseId === undefined ? {} : { caseId: extra.caseId }),
+              ...(extra.runKey === undefined ? {} : { runKey: extra.runKey }),
+              ...(extra.now === undefined ? {} : { now: extra.now }),
+              ...(extra.testDataPairs === undefined ? {} : { testDataPairs: extra.testDataPairs }),
+            }),
         ...(this.#credentials ? { credentials: this.#credentials } : {}),
         // Per call first (a catalog row names its own personas), the author-wide
         // map otherwise. Labels and emails only reach the prompt.
@@ -3215,11 +3277,19 @@ export class FlowAuthor {
           );
         };
         const provedNothingAsWritten = recordOnly ? null : provesNothing();
+        // **A flow that stopped at the sign-in is refused last, with its
+        // settle** (2026-09-18, HR SIT E2E-01): the plain vacuous refusal has
+        // no rewrite, and this shape has one — the journey from the sheet's
+        // own script, the stated values from a tree — that must run AFTER
+        // the script settles below have written their legs. Judged on the
+        // flow as written; a drop by `groundLoginProof` re-judges it.
+        let signInOnly: SignInOnlyFlow | null =
+          provedNothingAsWritten === null ? null : signInOnlyFlow(result.setup ?? [], result.steps, url);
         if (recordOnly) {
           const note = `record-only case — the sheet has no oracle; ${observed} observation(s) saved for a person's review`;
           result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
           this.#onLog?.(note);
-        } else if (provedNothingAsWritten !== null) {
+        } else if (provedNothingAsWritten !== null && signInOnly === null) {
           refuse(provedNothingAsWritten);
         }
         // Steps the model wrote that could not run ride along as a weak
@@ -3533,7 +3603,10 @@ export class FlowAuthor {
           // again for the same emptiness.
           if (provedNothingAsWritten === null) {
             const nothing = provesNothing();
-            if (nothing !== null) refuse(nothing);
+            if (nothing !== null) {
+              signInOnly = signInOnlyFlow(result.setup ?? [], result.steps, url);
+              if (signInOnly === null) refuse(nothing);
+            }
           }
         }
 
@@ -3991,7 +4064,7 @@ export class FlowAuthor {
           );
         }
 
-        const unreconciled = unreconciledMatchClaim(result.steps, trimmed);
+        const unreconciled = unreconciledMatchClaim(result.steps, trimmed, extra.caseText);
         if (unreconciled !== null) {
           refuse(
             `the case's Expected output makes a RECONCILIATION claim (${JSON.stringify(unreconciled)}), and the authored ` +
@@ -3999,7 +4072,52 @@ export class FlowAuthor {
               'agree (ten such bugs shipped green in the EN-2 audit). Author it as: saveCount (or saveText) of one surface ' +
               'into a variable — the variable NAME goes in the step\'s "value" field (e.g. value: "rows-before") — ' +
               'then expectCount/expectText on the other surface carrying {{that-variable}}; for a ' +
-              '"no change" claim, save before the action and compare the same reading after it.',
+              '"no change" claim, save before the action and compare the same reading after it. If the other side is ' +
+              'not a surface on the page but a value the case itself states (a "Field = value" on that line, in Test data ' +
+              'or in another Expected line), assert that value on the field (expectValue / expectText) instead — there ' +
+              'is no second reading to save.',
+            {
+              // The last word (2026-09-18, HR SIT E2E-01): the claim is named
+              // as NOT covered, the way an unperformed script line is, and the
+              // flow goes out with its other claims — a blocked row proves
+              // nothing, and the note keeps a green on this line from reading
+              // as proof of it. Never a rewrite: no tree names "the other
+              // surface", so a guessed save-and-compare would be invention.
+              settle: () =>
+                `not covered: the reconciliation claim ${JSON.stringify(unreconciled)} — no step saves one reading and ` +
+                'compares it on the other, so the flow\'s presence checks do not prove it; handed over so the run and ' +
+                'the report record it',
+            },
+          );
+        }
+
+        // **A match claim whose other side is a value the case states**
+        // (2026-09-18, HR SIT E2E-01): "Time Management Status / O.T. Flag
+        // ตรงกับ Rule Table" was refused as a reconciliation, but the "Rule
+        // Table" is a master the sheet cites, not a surface — and the sheet
+        // wrote "Time Management Status = 01 - Clocking และ O.T. Flag = Yes"
+        // two lines up. The claim is that the derived field shows the stated
+        // value; a flow that never asserts it is THIN, not false, so this is
+        // weak, with its own settle from the tree.
+        const statedMatch = unassertedStatedMatch(result.steps, trimmed, extra.caseText);
+        if (statedMatch !== null) {
+          const pairs = statedMatch.missing.map((p) => `${p.field} = ${JSON.stringify(p.value)}`).join(', ');
+          refuse(
+            `the case says ${JSON.stringify(statedMatch.phrase)}, and the case itself states the value(s) the other side holds: ` +
+              `${pairs}. That is a stated value, not two readings to reconcile — there is no second surface to save. The authored ` +
+              `flow "${result.name}" never asserts it. Assert each field's own value (expectValue for a textbox, expectText for a ` +
+              'trigger/cell the tree lists) equal to the stated value, on the page where the field is shown, citing the line; ' +
+              'a workflow leg may reach that page, but the assertion after it carries the claim.',
+            {
+              severity: 'weak',
+              note: `the case states ${pairs} for the claim ${JSON.stringify(statedMatch.phrase)} and no step asserts it — not proved by this flow`,
+              settle: () =>
+                settleStatedMatch(
+                  result,
+                  statedMatch.missing,
+                  [evidenceTree, interactions].filter((t): t is string => typeof t === 'string').join('\n'),
+                ),
+            },
           );
         }
 
@@ -4255,7 +4373,7 @@ export class FlowAuthor {
           );
         }
 
-        const delegated = workflowOverDeclaredControls(result.steps, codeEvidence);
+        const delegated = this.#indexed ? null : workflowOverDeclaredControls(result.steps, codeEvidence);
         if (delegated !== null) {
           refuse(
             `the authored flow "${result.name}" hands a workflow step (step ${delegated.index}) a goal ` +
@@ -4310,6 +4428,43 @@ export class FlowAuthor {
               'option:checked internal.',
           );
         }
+        // The sign-in-only flow, last of all — see `signInOnlyFlow`. Its settle
+        // runs after every script settle above, so the legs those wrote are
+        // seen as performed and only the rest of the script is written here.
+        if (signInOnly !== null) {
+          const surface = signInOnly.asserted.length === 0 ? 'nothing at all' : `only the sign-in surface (${signInOnly.asserted.join('; ')})`;
+          const claimHead =
+            (extra.caseText === undefined
+              ? claimLinesOf(trimmed)[0]
+              : (sectionOf(extra.caseText, 'expected') ?? '')
+                  .split('\n')
+                  .map((line) => line.trim().replace(/^[-•*]\s*/, ''))
+                  .find((line) => line !== '')) ?? '';
+          refuse(
+            `the authored flow "${result.name}" performs nothing beyond the sign-in and asserts ${surface} — a run of it ` +
+              'passes whenever a session was created, whatever the application does about the claim' +
+              (claimHead === '' ? '' : ` (${JSON.stringify(claimHead.slice(0, 120))})`) +
+              '. The claim lives past the sign-in page, and the unit scope does not license stopping there: sign in, ' +
+              'reach the page the claim is about, and prove it there. Where a captured tree names the controls, write ' +
+              'grounded steps; where none does, hand each uncaptured stretch of the journey to the navigation agent as ' +
+              "ONE workflow step whose goal is the sheet's own words — the numbered Steps in order, each carrying its " +
+              'Test data as set "Field" = "value", the route and menu the case names — and after the legs assert every ' +
+              'value the case states (expectValue for a textbox, expectText for a trigger or cell) and every Expected ' +
+              'line, citing it. Never assert that the sign-in form is gone or that its fields are hidden: that holds on ' +
+              'any page.',
+            {
+              settle: () =>
+                settleSignInOnly(result, {
+                  setup: result.setup ?? [],
+                  caseText: extra.caseText,
+                  prompt: trimmed,
+                  evidence: [evidenceTree, interactions].filter((t): t is string => typeof t === 'string').join('\n'),
+                  startTree: [axTree, interactions].filter((t): t is string => typeof t === 'string').join('\n'),
+                  testData: extra.testDataPairs ?? testDataPairsOfCaseText(extra.caseText ?? trimmed),
+                }),
+            },
+          );
+        }
         // Order is source order, so two runs of one broken flow produce the
         // same feedback — the reason `temperature: 0` exists, applied to the
         // refusal rather than the generation.
@@ -4337,16 +4492,28 @@ export class FlowAuthor {
             // on the step it touched. One complaint that cannot be settled
             // keeps the refusal whole: a false claim is never handed over.
             const shapes = fatalShapesOf(refusal);
+            // **Settle first** (2026-09-18, HR SIT E2E-01): when every fatal
+            // complaint already knows its rewrite, a re-ask buys only the
+            // chance that the model writes the rewrite itself — and costs a
+            // second authoring call, which on that row ran 501 s on opus and
+            // died on the provider with no flow at all. The settlement is
+            // the same one the last word would perform, one call earlier;
+            // the run then proves or fails the settled claim and the report
+            // records it. A complaint with no rewrite still re-asks, because
+            // for a FALSE claim the model's second answer is the only way out.
+            const everySettles = violations.filter((v) => v.severity === 'fatal').every((v) => v.settle !== undefined);
             const lastWord =
               attempt >= this.#attempts ||
-              (shapes !== null && previousShapes !== null && sameShapes(shapes, previousShapes));
+              (shapes !== null && previousShapes !== null && sameShapes(shapes, previousShapes)) ||
+              (this.#settleFirst && everySettles);
             if (lastWord) {
               const settled = settleViolations(violations);
               if (settled.unsettled.length === 0) {
                 const note = settled.notes.join('; ');
                 result.notes = result.notes === '' ? note : `${result.notes}; ${note}`;
                 this.#onLog?.(
-                  `settled ${violations.filter((v) => v.severity === 'fatal').length} refusal(s) by rewriting instead of refusing: ${note}`,
+                  `settled ${violations.filter((v) => v.severity === 'fatal').length} refusal(s) by rewriting instead of refusing` +
+                    `${attempt < this.#attempts ? ' (on this attempt, no re-ask: every complaint knew its rewrite)' : ''}: ${note}`,
                 );
                 accepted = true;
                 acceptedOnAttempt = attempt;
@@ -5394,11 +5561,27 @@ export function wordingClaimAssertsDataValue(
    * were lost that way and none of them was about wording at all.
    *
    * Absent (a hand-authored flow, `wow go`) the prompt stands in, exactly as
-   * before.
+   * before — EXCEPT where the prompt is a list of claims (a free-form
+   * catalog: `claimLinesOf` finds more than one). There the same defect
+   * returns in a second dress, and it cost a live run (HR SIT E2E-01,
+   * 2026-09-18): of the row's 35 claims exactly ONE says `ข้อความ`, and it is
+   * about an in-app notification — *"ข้อความ In App = Congratulations! You
+   * have a new direct report…"*. The other 34 are about the hire. Classified
+   * from the joined claims, the whole 67-step flow became a wording flow, and
+   * the lint refused it twice for asserting "Minimum Job Grade", a value the
+   * sheet does state. The row was blocked with no verdict, two opus calls
+   * spent.
+   *
+   * So on that path a STEP is judged only when its own case name or intent
+   * says it is about wording. A step carries the claim it serves (`case`,
+   * the intent's citation); the background claims of fifteen other cases in
+   * one prompt do not make it one. Attribution nobody can make is silence,
+   * the rule every grounding check here follows.
    */
   caseText?: string | undefined,
 ): { index: number; value: string } | null {
-  if (!WORDING_CLAIM.test(caseText ?? prompt)) return null;
+  const perStep = caseText === undefined && claimLinesOf(prompt).length > 1;
+  if (!perStep && !WORDING_CLAIM.test(caseText ?? prompt)) return null;
   // No tree, no opinion. Ungrounded authoring has nothing to tell a label
   // from a row with, and a lint that refuses on absent evidence refuses
   // every honest wording flow too (caught by the echo-pipeline test, whose
@@ -5418,6 +5601,7 @@ export function wordingClaimAssertsDataValue(
   for (const [index, step] of steps.entries()) {
     const text = assertedText(step);
     if (text === null) continue;
+    if (perStep && !WORDING_CLAIM.test(`${(step as { case?: string }).case ?? ''}\n${'intent' in step ? (step.intent ?? '') : ''}`)) continue;
     const needle = fold(text);
     if (needle.length < 3 || claim.includes(needle)) continue;
     if (labelLines.some((line) => line.includes(needle))) continue;
@@ -5647,6 +5831,96 @@ function assertsBeforeNextNavigation(steps: readonly FlowStep[], from: number): 
  * nothing about whether the thing the step was for took place, and after a
  * `workflow` step that is the entire question.
  */
+/** Body steps that act on a page — a click, an entry, a key, a leg. Navigation (`goto`) is not one: it says where the flow is, not what it did. */
+const ACTS_ON_PAGE: ReadonlySet<string> = new Set([
+  'click',
+  'fill',
+  'fillRetry',
+  'type',
+  'selectOption',
+  'check',
+  'uncheck',
+  'press',
+  'hover',
+  'setValue',
+  'upload',
+  'closeModal',
+  'signOut',
+]);
+
+export interface SignInOnlyFlow {
+  /** The sign-in's own actions — credential fills, the submit, a `signIn` step. */
+  performed: number;
+  /** Every assertion the flow makes, each one on the sign-in surface, as `action selector`. */
+  asserted: string[];
+}
+
+/**
+ * A flow that performs nothing beyond the sign-in and asserts nothing beyond
+ * the sign-in surface (HR SIT E2E-01, 2026-09-18).
+ *
+ * Live: the row's claim is an end-to-end hire across four modules; the tree
+ * the author read was the sign-in page; the accepted flow — named "login
+ * page only" by the model itself — was goto, fill Username, fill password,
+ * click Sign in, goto, `expectHidden` of the Username field. It passed 6/6
+ * in 7.7 s. Nothing had asserted anything the case claims, and the one
+ * assertion holds whenever a session was created.
+ *
+ * Two structural halves, both required:
+ * - `vacuousClaim` finds no substantive assertion (the sign-in proof, the
+ *   sign-in form's own controls appearing or disappearing, and `expectUrl`
+ *   are not ones — `vacuous.ts`);
+ * - no step acts on a page other than a sign-in page: every action
+ *   (`ACTS_ON_PAGE`) happens while the most recent `goto` — or the page the
+ *   run started on — is a sign-in URL (`LOGIN_URL_PATTERN`); a `signIn`
+ *   step is the sign-in; a `workflow` leg, or any action after a navigation
+ *   away from the sign-in page, is the flow going somewhere, and the plain
+ *   vacuous refusal judges that shape as before.
+ *
+ * **The flow must have signed in** (2026-09-18, after the first cut
+ * over-fired): a `signIn` step, a credential block, or a run that started on
+ * a sign-in URL. Without one, "sign in, then reach the page the claim is
+ * about" is advice about a journey this flow never began, and the older
+ * rails — "contains no assertion", the plain vacuous refusal — say the true
+ * thing about it. Asserting NOTHING is still this shape when the sign-in
+ * happened: `groundLoginProof` drops a sign-in "proof" that was none, and
+ * the flow it leaves behind is the live incident with its one false
+ * assertion removed, not a different case. Consent gates (`clickIfVisible`,
+ * `when`) are furniture on any page.
+ */
+export function signInOnlyFlow(
+  setup: readonly FlowStep[],
+  steps: readonly FlowStep[],
+  startUrl: string | undefined,
+): SignInOnlyFlow | null {
+  const all = [...setup, ...steps];
+  if (vacuousClaim(all) === null) return null;
+  const signsIn = all.some((step) => step.action === 'signIn' || isCredentialFill(step));
+  if (!signsIn && (startUrl === undefined || !LOGIN_URL_PATTERN.test(startUrl))) return null;
+  let onSignIn = startUrl === undefined || LOGIN_URL_PATTERN.test(startUrl);
+  let performed = 0;
+  for (const step of all) {
+    if (step.action === 'goto') {
+      onSignIn = LOGIN_URL_PATTERN.test(step.url);
+      continue;
+    }
+    if (step.action === 'signIn') {
+      performed += 1;
+      onSignIn = false;
+      continue;
+    }
+    if (step.action === 'workflow') return null;
+    if (ACTS_ON_PAGE.has(step.action)) {
+      if (!onSignIn) return null;
+      performed += 1;
+    }
+  }
+  const asserted = all
+    .filter((step) => step.action.startsWith('expect'))
+    .map((step) => `${step.action} ${(step as { selector?: string; value?: string }).selector ?? (step as { value?: string }).value ?? ''}`.trim());
+  return { performed, asserted };
+}
+
 const OUTCOME_ASSERTIONS = new Set([
   'expectText',
   'expectVisible',
@@ -6843,6 +7117,34 @@ export function settleRepeatedControl(step: FlowStep, found: { role: string; nam
  */
 export const MAX_SETTLED_STATED_VALUES = 6;
 
+/** How many Expected lines the sign-in-only settle may assert by their own quoted words. */
+export const MAX_SETTLED_EXPECTED_LITERALS = 3;
+
+/**
+ * The words an Expected line QUOTES — the sheet saying, in its own
+ * punctuation, what the page must show (`ระบบแสดงข้อความ "Employee created"`).
+ * The sheet-verbatim exemption of `ungroundedTextExpectation` (2026-08-31)
+ * is what makes these assertable with no tree: the wording IS the claim, and
+ * a run settles it. An open question's id and an unresolved `<TOKEN>` quote
+ * nothing (`assertsOpenQuestion`, `typesPlaceholderToken` own those shapes).
+ */
+export function quotedExpectedLiterals(expected: string): { line: string; literal: string }[] {
+  const out: { line: string; literal: string }[] = [];
+  const seen = new Set<string>();
+  for (const raw of expected.split('\n')) {
+    const line = raw.trim().replace(/^[-•*]\s*/, '');
+    if (line === '') continue;
+    for (const match of line.matchAll(/"([^"\n]{1,120})"|“([^”\n]{1,120})”/g)) {
+      const literal = (match[1] ?? match[2] ?? '').trim();
+      if (literal === '' || seen.has(literal)) continue;
+      if (AUTHORING.openQuestion.test(literal) || PLACEHOLDER_TOKEN.test(literal)) continue;
+      seen.add(literal);
+      out.push({ line, literal });
+    }
+  }
+  return out;
+}
+
 /**
  * Which comparison the engine can make against a selector's own role, or null
  * for a role that holds no value of its own.
@@ -7064,6 +7366,52 @@ export function settleScriptDemand(
 export const MAX_SETTLED_SCRIPT_LEGS = 3;
 
 /**
+ * The script's numbered lines by number, each with the unnumbered lines under
+ * it folded in (`2. กรอกข้อมูล Identity` + `- กรอก Salutation, …`), in sheet
+ * order. One reader for every settle that performs a script line, so they
+ * cannot disagree about what a step says.
+ */
+export function scriptStepsOf(caseText: string): Map<number, { head: string; block: string }> {
+  const lines = new Map<number, { head: string; block: string }>();
+  let current = 0;
+  for (const raw of (sectionOf(caseText, 'steps') ?? '').split('\n')) {
+    const numbered = /^\s*(\d{1,2})[.)]\s*(.*)$/.exec(raw);
+    if (numbered !== null) {
+      current = Number(numbered[1]);
+      const head = (numbered[2] ?? '').trim();
+      lines.set(current, { head, block: head });
+      continue;
+    }
+    const continuation = raw.replace(/^\s*[-•*]\s*/, '').trim();
+    const step = lines.get(current);
+    if (current > 0 && continuation !== '' && step !== undefined) {
+      step.block = `${step.block}\n${continuation}`;
+    }
+  }
+  return lines;
+}
+
+/**
+ * The `Field = value` pairs a script line carries into a leg — the pairs the
+ * line writes itself, else the Test data pairs whose key the line names —
+ * minus what no goal may carry: an unconfirmed value, a token the resolver
+ * has not answered, an instruction to the tester, a date phrase the
+ * resolver has not computed. Written as `set "Field" = "value"`, the grammar
+ * `goalOutcomes` parses, so the agent sets the value at $0.
+ */
+function legPairsOf(text: string, testData: readonly TestDataPair[]): { key: string; value: string }[] {
+  const own = pairsOnLine(text);
+  const fromData = own.length > 0 ? own : testData.filter((p) => squash(p.key) !== '' && squash(text).includes(squash(p.key))).map((p) => ({ key: p.key, value: p.value }));
+  return fromData.filter(
+    (pair) =>
+      !unconfirmedValue(pair.value) &&
+      !PLACEHOLDER_TOKEN.test(pair.value) &&
+      !isDescription(pair.key, pair.value) &&
+      !isDatePhrase(pair.value, pair.key),
+  );
+}
+
+/**
  * Perform the numbered script steps the flow never reached — the fallback for
  * `unperformedScriptSteps` (2026-09-08).
  *
@@ -7096,6 +7444,7 @@ export function settleUnperformedScript(
   unperformed: { performedThrough: number; total: number; missing: readonly { n: number; text: string }[] },
   evidence: string | undefined,
   testData: readonly TestDataPair[] = [],
+  maxLegs: number = MAX_SETTLED_SCRIPT_LEGS,
 ): string {
   const notCovered = (which: readonly { n: number; text: string }[]): string =>
     `not covered: script step(s) ${which.map((m) => `${m.n} (${m.text.slice(0, 60)})`).join(', ')} — ` +
@@ -7104,26 +7453,15 @@ export function settleUnperformedScript(
   // The script's own lines by number, continuations folded in — the lint's
   // `missing` text is cut at 80 characters for the refusal message, and a
   // `Field = value` pair can sit past that.
-  const lines = new Map<number, string>();
-  let current = 0;
-  for (const raw of (sectionOf(caseText, 'steps') ?? '').split('\n')) {
-    const numbered = /^\s*(\d{1,2})[.)]\s*(.*)$/.exec(raw);
-    if (numbered !== null) {
-      current = Number(numbered[1]);
-      lines.set(current, (numbered[2] ?? '').trim());
-      continue;
-    }
-    const continuation = raw.replace(/^\s*[-•*]\s*/, '').trim();
-    if (current > 0 && continuation !== '' && lines.has(current)) {
-      lines.set(current, `${lines.get(current)!} ${continuation}`.trim());
-    }
-  }
+  const lines = scriptStepsOf(caseText);
 
   const performed: string[] = [];
   const delegated: string[] = [];
   const left: { n: number; text: string }[] = [];
   for (const step of [...unperformed.missing].sort((a, b) => a.n - b.n)) {
-    const text = (lines.get(step.n) ?? step.text).trim();
+    const line = lines.get(step.n);
+    const head = (line?.head ?? step.text).trim();
+    const text = (line?.block ?? step.text).trim();
     if (text === '') {
       left.push(step);
       continue;
@@ -7133,30 +7471,39 @@ export function settleUnperformedScript(
     // assertion the flow omitted, and the sheet's Expected output decides what
     // this flow asserts; performing it as an agent leg would make the agent
     // the witness for its own claim, which is the one thing an agent leg may
-    // never be. Such a line is named as not covered, as it was before.
+    // never be. Such a line is named as not covered, as it was before. Judged
+    // on the numbered line itself (`verificationOnlyGoal`, the engine's own
+    // reader): a bullet under it that says to record what was found does not
+    // turn a verification into an act.
     const demanded = withoutRouteLabels(text);
     const demands =
       scriptDemand(SCRIPT_DEMANDS.typing, demanded) ??
       scriptDemand(SCRIPT_DEMANDS.choosing, demanded) ??
       scriptDemand(SCRIPT_DEMANDS.acting, demanded);
-    if (demands === null) {
+    // A sign-in line is never a leg (2026-09-18): the flow's own sign-in — a
+    // `signIn` step, a credential block — performs it, and a hand-off to
+    // another persona is one `signIn`, never an agent asked to log in.
+    //
+    // `verificationOnlyGoal` is deliberately NOT consulted here (2026-09-18,
+    // after it regressed RU_09_54): it reads "Import ไฟล์และตรวจสอบผลลัพธ์"
+    // — a line that imports AND checks — as verification only, and the
+    // 2026-09-08 rule is that `scriptDemand` decides, so a line that asks the
+    // tester to act is performed however else it is worded.
+    if (demands === null || AUTHORING.script.signIn.test(head)) {
       left.push(step);
       continue;
     }
-    const label = `Step ${step.n}: ${text.slice(0, 160)}`;
+    const label = `Step ${step.n}: ${text.replace(/\n+/g, ' ').slice(0, 160)}`;
     const anchor = insertionAnchorFor(flow, step.n);
-    const pairs = pairsOnLine(text);
-    const fromData =
-      pairs.length > 0
-        ? pairs
-        : testData
-            .filter((p) => squash(p.key) !== '' && squash(text).includes(squash(p.key)))
-            .map((p) => ({ key: p.key, value: p.value }));
+    const fromData = legPairsOf(text, testData);
     let grounded = 0;
+    const carried: { key: string; value: string }[] = [];
     for (const pair of fromData) {
-      if (unconfirmedValue(pair.value)) continue;
       const control = treeControlNamed(pair.key, evidence);
-      if (control === null) continue;
+      if (control === null) {
+        carried.push(pair);
+        continue;
+      }
       const entry = entryStepFor(
         control,
         pair.value,
@@ -7166,21 +7513,28 @@ export function settleUnperformedScript(
             `with the sheet's value ${JSON.stringify(pair.value)}`,
         ),
       );
-      if (entry === null) continue;
+      if (entry === null) {
+        carried.push(pair);
+        continue;
+      }
       appendOrInsert(flow, anchor, entry);
       grounded += 1;
     }
-    if (grounded > 0) {
+    if (grounded > 0 && carried.length === 0) {
       performed.push(`step ${step.n} (${grounded} control(s) from the tree)`);
       continue;
     }
-    if (delegated.length >= MAX_SETTLED_SCRIPT_LEGS) {
+    if (delegated.length >= maxLegs) {
       left.push(step);
       continue;
     }
+    if (grounded > 0) performed.push(`step ${step.n} (${grounded} control(s) from the tree)`);
+    // The pairs no tree grounds ride the leg in the engine's own grammar, so
+    // the agent is handed the sheet's values and not only its words.
+    const goal = carried.length === 0 ? label : `${label}: set ${carried.map((p) => `${JSON.stringify(p.key)} = ${JSON.stringify(p.value)}`).join(', ')}`;
     appendOrInsert(flow, anchor, {
       action: 'workflow',
-      goal: label,
+      goal,
       intent: markGenerated(
         label,
         "no captured tree names its controls — an agent leg performs the sheet's own line, and the " +
@@ -7240,12 +7594,20 @@ export function settleWorkflowGoal(flow: SettleableFlow, step: FlowStep, evidenc
 export function unreconciledMatchClaim(
   steps: readonly FlowStep[],
   prompt: string,
+  caseText?: string,
 ): string | null {
   // The words are data (`value-rules.ts`, `authoring.matchClaim`); the shape
   // — an agree-word within a clause of a reading, or an unchanged-word within
-  // a clause of a quantity, either order — is the structure.
-  const m = AUTHORING.matchClaim.exec(prompt);
-  if (!m) return null;
+  // a clause of a quantity, either order — is the structure. A claim whose
+  // other side is a value the case itself STATES is not this lint's
+  // (`unassertedStatedMatch`): there is no second surface to save and compare.
+  const claim = matchClaimsIn(prompt, caseText).find((c) => !c.statedValue);
+  if (claim === undefined) return null;
+  return comparesSavedReading(steps) ? null : claim.phrase;
+}
+
+/** A saved reading a later expect compares — `{{var}}`, its delta form, or the DB spelling of the same comparison. */
+function comparesSavedReading(steps: readonly FlowStep[]): boolean {
   const saved = new Set<string>();
   for (const step of steps) {
     if (step.action === 'saveCount' || step.action === 'saveText') saved.add((step as { as: string }).as);
@@ -7261,7 +7623,457 @@ export function unreconciledMatchClaim(
   const dbCompared =
     steps.some((s) => s.action === 'dbSnapshot') &&
     steps.some((s) => s.action === 'expectDbDelta' || s.action === 'expectDbUnchanged');
-  return compared || dbCompared ? null : m[0].trim().slice(0, 120);
+  return compared || dbCompared;
+}
+
+/** One subject of a match claim and the value the case states for it. */
+export interface StatedMatchPair {
+  /** The subject's own words, cut to the part a `Field = value` line of the case names. */
+  field: string;
+  value: string;
+}
+
+/**
+ * One match claim of the case, read structurally (2026-09-18, HR SIT E2E-01
+ * live: *"Time Management Status / O.T. Flag ตรงกับ Rule Table"*, refused as
+ * a reconciliation nothing compared — while the sheet itself wrote *"Time
+ * Management Status = 01 - Clocking และ O.T. Flag = Yes"* two lines up. The
+ * "Rule Table" is a master the sheet cites, not a surface on the page; the
+ * claim is that the derived field shows the stated value).
+ *
+ * The subjects are the words left of the agree word on its own line, split
+ * on `/`, `,` and the conjunction words (`matchClaim.conjunctions`). A
+ * subject is STATED when some line of the case writes `<subject> = value`
+ * (the sheet's own pair grammar, key matched by squashed suffix so *"O.T.
+ * Flag ใน TM"* finds *"O.T. Flag = yes"*). When the claim took the agree form
+ * and EVERY subject is stated, the other side is the value the sheet wrote:
+ * a stated-value claim, never a save-and-compare. One unstated subject, or
+ * the unchanged form (a quantity before and after), is the real
+ * reconciliation as before.
+ */
+export interface MatchClaim {
+  /** The matched phrase, as the refusal reports it. */
+  phrase: string;
+  /** The subjects named left of the agree word; empty for the unchanged form. */
+  subjects: string[];
+  /** Each subject the case states a value for. */
+  stated: StatedMatchPair[];
+  /** The agree form with every subject stated: the other side is a value, not a surface. */
+  statedValue: boolean;
+}
+
+export function matchClaimsIn(prompt: string, caseText?: string): MatchClaim[] {
+  const out: MatchClaim[] = [];
+  const flags = AUTHORING.matchClaim.flags.includes('g') ? AUTHORING.matchClaim.flags : `g${AUTHORING.matchClaim.flags}`;
+  const pattern = new RegExp(AUTHORING.matchClaim.source, flags);
+  let pairs: StatedPairCandidate[] | null = null;
+  for (const m of prompt.matchAll(pattern)) {
+    const phrase = m[0].trim().slice(0, 120);
+    const lineStart = prompt.lastIndexOf('\n', m.index) + 1;
+    const agree = AUTHORING.matchAgree.test(m[0]);
+    const subjects = agree ? matchSubjectsOf(prompt.slice(lineStart, m.index)) : [];
+    // The CASE's own words state a value — never a retrieved document's
+    // (premise 8): the row when the caller has it, else the prompt after
+    // its supporting-context sentinel, else the prompt whole.
+    pairs ??= statedPairCandidatesIn(caseText ?? caseWordsOf(prompt));
+    const stated: StatedMatchPair[] = [];
+    for (const subject of subjects) {
+      const found = statedPairFor(subject, pairs);
+      if (found !== null) stated.push(found);
+    }
+    out.push({ phrase, subjects, stated, statedValue: agree && subjects.length > 0 && stated.length === subjects.length });
+  }
+  return out;
+}
+
+/** The prompt after its supporting-context sentinel — the claims and the row — or the whole prompt when it has none. */
+function caseWordsOf(prompt: string): string {
+  const at = prompt.lastIndexOf(END_SUPPORTING_CONTEXT);
+  return at === -1 ? prompt : prompt.slice(at + END_SUPPORTING_CONTEXT.length);
+}
+
+/**
+ * The subjects left of the agree word: the line's own bullet/number and any
+ * heading before a colon dropped (`Expected output: the tile matches …`),
+ * split on `/`, `,` and the conjunction words.
+ */
+function matchSubjectsOf(left: string): string[] {
+  const unnumbered = left.replace(/^\s*(?:[-•*]|\(?\d+(?:\.\d+)?[.)]?)?\s*(?:\[[^\]]*\]\s*)?/, '');
+  const head = unnumbered.slice(Math.max(unnumbered.lastIndexOf(':'), unnumbered.lastIndexOf('：')) + 1).trim();
+  if (head === '') return [];
+  return head
+    .split(AUTHORING.matchConjunction)
+    .map((s) => s.trim().replace(/[:：]\s*$/, '').trim())
+    .filter((s) => s !== '' && /[\p{L}\p{N}]/u.test(s));
+}
+
+interface StatedPairCandidate {
+  /** The words in front of the `=`, squashed. */
+  key: string;
+  /** The same words as the sheet wrote them, bullet and number dropped. */
+  field: string;
+  value: string;
+  /** The value ended at a line end, a conjunction, a note or a clause mark — not at a guess about where the next pair's key begins. */
+  clean: boolean;
+}
+
+/**
+ * Every `Field = value` the case writes, as candidates — one per `=` on
+ * every line, the key being the text since the previous pair. A value runs
+ * to the line end, or is cut at the first conjunction, then by
+ * `writtenValueOf` (a trailing note *"ตาม Rule Table"*, a parenthetical, a
+ * bound); a value that still holds a later `=` belongs to two pairs the
+ * sheet wrote on one line, and only its first token is kept, marked as an
+ * uncertain cut so a clean statement of the same field wins over it.
+ */
+function statedPairCandidatesIn(text: string): StatedPairCandidate[] {
+  const out: StatedPairCandidate[] = [];
+  for (const line of text.split('\n')) {
+    const parts = line.split(/\s*[=：]\s*/);
+    if (parts.length < 2) continue;
+    let keyText = parts[0] ?? '';
+    for (let i = 1; i < parts.length; i += 1) {
+      const rest = parts.slice(i).join(' = ');
+      const field = keyText.replace(/^\s*(?:[-•*]|\d+(?:\.\d+)?[.)])?\s*(?:\[[^\]]*\]\s*)?/, '').trim();
+      const key = squash(field);
+      const atConjunction = rest.split(AUTHORING.matchConjunction)[0] ?? '';
+      const uncertain = /[=：]/.test(atConjunction);
+      const head = uncertain ? (atConjunction.split(/\s+/)[0] ?? '') : atConjunction;
+      const value = writtenValueOf(head);
+      keyText = parts[i] ?? '';
+      if (key === '' || value === '' || /^[?<]/.test(value) || unconfirmedValue(value) || isDescription(keyText, value)) continue;
+      out.push({ key, field, value, clean: !uncertain });
+    }
+  }
+  return out;
+}
+
+/**
+ * The stated pair a match subject names, or null. The subject's longest
+ * window of words that some candidate key ENDS with (squashed) — *"O.T. Flag
+ * ใน TM"* → *"O.T. Flag"*, *"the Total Plans tile"* → *"Total Plans"* — wins,
+ * longest first, leftmost among equals; among candidates for it, a clean cut
+ * over an uncertain one, then the last line the sheet wrote (a later
+ * correction overrides an earlier draft).
+ */
+function statedPairFor(subject: string, candidates: readonly StatedPairCandidate[]): StatedMatchPair | null {
+  const words = subject.split(/\s+/).filter((w) => w !== '');
+  for (let n = words.length; n >= 1; n -= 1) {
+    for (let start = 0; start + n <= words.length; start += 1) {
+      const field = words.slice(start, start + n).join(' ');
+      const needle = squash(field);
+      if (needle.length < 3) continue;
+      let best: StatedPairCandidate | null = null;
+      for (const candidate of candidates) {
+        if (!candidate.key.endsWith(needle)) continue;
+        if (best === null || candidate.clean || !best.clean) best = candidate;
+      }
+      if (best !== null) return { field, value: best.value };
+    }
+  }
+  return null;
+}
+
+/**
+ * A stated-value match claim the flow never asserts (the weak companion of
+ * `unreconciledMatchClaim`, 2026-09-18). For every match claim whose other
+ * side is a value the case states, each stated pair must be asserted by a
+ * step that names the field (selector, name or intent) AND carries the value
+ * (selector, value, text or count — the intent alone is an explanation, not a
+ * claim). A flow that saves and compares a reading instead has made the
+ * stronger claim and is silent here. Returns the first claim with an
+ * unasserted pair and every such pair of it, for the message and the settle.
+ */
+export function unassertedStatedMatch(
+  steps: readonly FlowStep[],
+  prompt: string,
+  caseText?: string,
+): { phrase: string; missing: StatedMatchPair[] } | null {
+  const claims = matchClaimsIn(prompt, caseText).filter((c) => c.statedValue);
+  if (claims.length === 0 || comparesSavedReading(steps)) return null;
+  const asserted = steps
+    .filter((step) => step.action.startsWith('expect'))
+    .map((step) => {
+      const { intent, ...claim } = step as FlowStep & { intent?: unknown };
+      return { about: squash(`${JSON.stringify(claim)} ${typeof intent === 'string' ? intent : ''}`), holds: squash(JSON.stringify(claim)) };
+    });
+  for (const claim of claims) {
+    const missing = claim.stated.filter(
+      (pair) => !asserted.some((a) => a.about.includes(squash(pair.field)) && a.holds.includes(squash(pair.value))),
+    );
+    if (missing.length > 0) return { phrase: claim.phrase, missing };
+  }
+  return null;
+}
+
+/** Append a step to the body and to the last case (a folded single case shares the body's array and is appended once). */
+export function appendStep(flow: SettleableFlow, step: FlowStep): void {
+  flow.steps.push(step);
+  const last = (flow.cases ?? []).at(-1);
+  if (last !== undefined && last.steps !== flow.steps) last.steps.push(step);
+}
+
+/**
+ * The stated-value assertion, from the tree (the settle for
+ * `unassertedStatedMatch`). Each unasserted pair whose field a captured tree
+ * or the probe report names as a control that HOLDS a value (`valueAssertionFor`:
+ * a textbox → expectValue, a trigger/cell → expectText) is asserted at the end
+ * of the flow — after every leg that could have produced it — marked
+ * `[generated: …]`. A field no tree names, or one the tree lists under a
+ * role that holds no value of its own, is left to the note: never an
+ * expectText over a container, which passes when the value is anywhere
+ * inside it. Null when nothing was inserted, so the weak note stands.
+ */
+export function settleStatedMatch(flow: SettleableFlow, missing: readonly StatedMatchPair[], evidence: string | undefined): string | null {
+  const done: string[] = [];
+  const left: string[] = [];
+  for (const pair of missing) {
+    const control = treeControlNamed(pair.field, evidence);
+    const selector = control === null ? null : `role=${control.role}[name=${JSON.stringify(control.name)} i]`;
+    const action = selector === null ? null : valueAssertionFor(selector);
+    if (control === null || selector === null || action === null) {
+      left.push(`${pair.field} = ${JSON.stringify(pair.value)}`);
+      continue;
+    }
+    appendStep(flow, {
+      action,
+      selector,
+      value: pair.value,
+      intent: markGenerated(
+        `${pair.field} = ${pair.value}`,
+        `the case states this value for ${pair.field} and the tree names the control; asserted here instead of read against a rule the page does not show`,
+      ),
+    } as FlowStep);
+    done.push(`${action} ${selector} = ${JSON.stringify(pair.value)}`);
+  }
+  if (done.length === 0) return null;
+  return (
+    `stated value(s) asserted from the tree at the end of the flow (marked [generated: …]): ${done.join(', ')}` +
+    (left.length === 0 ? '' : `; no captured tree names a value-holding control for ${left.join(', ')} — not asserted, the report records it`)
+  );
+}
+
+/**
+ * How many script steps the sign-in-only settle may hand to the agent.
+ *
+ * Higher than `MAX_SETTLED_SCRIPT_LEGS` on purpose: that cap bounds the tail
+ * a flow left unperformed; this one bounds a WHOLE journey the model never
+ * wrote, and a journey cut off half-way — the form filled, Submit never
+ * pressed — makes every assertion after it fail for the harness's own
+ * reason, which is a false defect. A script with more acting steps than this
+ * is not settled (the refusal stands and the model is asked), never
+ * truncated. The catalog author (`jev-catalog-author.ts`) writes one leg per
+ * numbered step uncapped; the sheets measured there run to ten.
+ */
+export const MAX_SETTLED_JOURNEY_LEGS = 12;
+
+/** The numbered `N. [priority] claim` lines the claims path renders (`buildAuthoringPrompt`), the claim text alone. */
+export function claimLinesOf(prompt: string): string[] {
+  const out: string[] = [];
+  for (const line of caseWordsOf(prompt).split('\n')) {
+    const m = /^\s*\d{1,3}\.\s*\[[a-z]+\]\s*(.+\S)\s*$/i.exec(line);
+    if (m !== null) out.push(m[1]!);
+  }
+  return out;
+}
+
+/** The script step numbers cited by steps that PERFORM (an action or a leg), never by an assertion that only mentions one. */
+function performingCitations(steps: readonly FlowStep[]): Set<number> {
+  return citedScriptSteps(steps.filter((step) => ACTS_ON_PAGE.has(step.action) || step.action === 'workflow'));
+}
+
+/**
+ * Whether some assertion of the flow names the field and carries the value —
+ * the `unassertedStatedMatch` test, one predicate.
+ */
+function assertsStatedPair(steps: readonly FlowStep[], field: string, value: string): boolean {
+  return steps.some((step) => {
+    if (!step.action.startsWith('expect')) return false;
+    const { intent, ...claim } = step as FlowStep & { intent?: unknown };
+    const about = squash(`${JSON.stringify(claim)} ${typeof intent === 'string' ? intent : ''}`);
+    return about.includes(squash(field)) && squash(JSON.stringify(claim)).includes(squash(value));
+  });
+}
+
+/**
+ * The `Field = value` pairs the case STATES as expected — the Expected block
+ * of a row, or the numbered claims of the claims path — each a literal the
+ * page can be asked to show. A date phrase (`Hire Date = Today`) or an
+ * absolute date is left out: the sheet's phrase is not the page's rendering,
+ * and asserting it verbatim fails against a correct page. A later line for
+ * the same field wins, a clean cut over an uncertain one.
+ */
+export function statedExpectedPairs(text: string): StatedMatchPair[] {
+  const byKey = new Map<string, StatedPairCandidate>();
+  for (const candidate of statedPairCandidatesIn(text)) {
+    if (isDatePhrase(candidate.value, candidate.field) || absoluteDateOf(candidate.value) !== null) continue;
+    const have = byKey.get(candidate.key);
+    if (have === undefined || candidate.clean || !have.clean) byKey.set(candidate.key, candidate);
+  }
+  return [...byKey.values()].map((c) => ({ field: c.field, value: c.value }));
+}
+
+/**
+ * The journey a sign-in-only flow never wrote, from the evidence the row
+ * carries (the settle for `signInOnlyFlow`, 2026-09-18). Three moves, then a
+ * gate:
+ *
+ * - **The script, as legs.** On the table path every numbered step no
+ *   PERFORMING step cites — after the script settles that ran before this
+ *   one — is performed by `settleUnperformedScript`: an entry step for each
+ *   `Field = value` pair a tree names, else one `workflow` leg in the
+ *   sheet's own words. The sign-in line is the flow's own sign-in and is
+ *   never a leg; a route the sheet writes (`Menu path:`, or the `ไปที่ A > B`
+ *   line under the sign-in step) rides the first leg as `open A > B via the
+ *   menu`, the walker's grammar. On the claims path there is no script —
+ *   the prompt carries the claims, and a claim is an outcome, never an
+ *   instruction the agent may be handed (an agent asked to make a claim
+ *   true is the witness for its own claim) — so no leg is written.
+ * - **The stated values, from a tree.** Every `Field = value` the case
+ *   states as expected and no step asserts is appended after the legs where
+ *   a captured tree names the control as one that holds a value
+ *   (`settleStatedMatch`); a field no tree names is left to the note.
+ * - **The sign-in surface is annotated**, so the report never reads
+ *   "Username hidden" as a proof of the claim.
+ * - **The gate: no substantive assertion, no settlement.** A journey nobody
+ *   checks is the vacuous flow with legs in front of it; null keeps the
+ *   refusal, and the informed re-ask names the shape (legs in the sheet's
+ *   words, the stated values asserted after them).
+ */
+export function settleSignInOnly(
+  flow: SettleableFlow,
+  options: {
+    setup?: readonly FlowStep[] | undefined;
+    caseText?: string | undefined;
+    prompt: string;
+    /** Every tree the author saw — what an assertion after the legs may be grounded on. */
+    evidence?: string | undefined;
+    /** The page the flow is on now (the start tree and its probe) — the only page an entry step may be grounded on. */
+    startTree?: string | undefined;
+    testData?: readonly TestDataPair[] | undefined;
+  },
+): string | null {
+  const notes: string[] = [];
+  const left: string[] = [];
+  const setup = options.setup ?? [];
+
+  if (options.caseText !== undefined) {
+    const script = scriptStepsOf(options.caseText);
+    const performed = performingCitations(flow.steps);
+    const signsIn = [...setup, ...flow.steps].some((s) => s.action === 'signIn' || isCredentialFill(s));
+    const missing = [...script.entries()]
+      .filter(([n, { head }]) => !performed.has(n) && !(signsIn && AUTHORING.script.signIn.test(head)))
+      .map(([n, { head }]) => ({ n, text: head }));
+    const acting = missing.filter(({ n, text }) => {
+      const demanded = withoutRouteLabels(script.get(n)?.block ?? text);
+      return (
+        !verificationOnlyGoal(text) &&
+        (scriptDemand(SCRIPT_DEMANDS.typing, demanded) !== null ||
+          scriptDemand(SCRIPT_DEMANDS.choosing, demanded) !== null ||
+          scriptDemand(SCRIPT_DEMANDS.acting, demanded) !== null)
+      );
+    });
+    if (acting.length > MAX_SETTLED_JOURNEY_LEGS) {
+      return null;
+    }
+    if (missing.length > 0) {
+      const total = Math.max(...script.keys());
+      const before = flow.steps.length;
+      // Grounded on the page the flow is ON (the start tree and its probe),
+      // never on a page further along: an entry step written against a
+      // journey tree runs before any leg has opened that page, and fails
+      // against the page the flow is actually looking at.
+      const note = settleUnperformedScript(flow, options.caseText, { performedThrough: 0, total, missing }, options.startTree, options.testData ?? [], MAX_SETTLED_JOURNEY_LEGS);
+      if (flow.steps.length > before) notes.push(note);
+      else left.push(note);
+    }
+    // The route rides the first leg, in the walker's grammar — the sheet's
+    // Menu column, else the route line the script writes (`ไปที่ EC > New
+    // Hire`), read off the script's own lines.
+    const menu = sectionOf(options.caseText, 'menu path')?.trim() ?? '';
+    const routeLine = (sectionOf(options.caseText, 'steps') ?? '')
+      .split('\n')
+      .map((line) => line.trim())
+      .find((line) => SCRIPT_DEMANDS.routeLine.test(line) && /\S\s*>\s*\S/.test(line));
+    const route =
+      menu !== ''
+        ? menu
+        : routeLine === undefined
+          ? ''
+          : routeLine.replace(/^\s*[-•*\d.)\s]*/, '').replace(new RegExp(`^${SCRIPT_DEMANDS.routeLine.source.replace(/^\^\\s\*\[-•\\d\.\)\\s\]\*/, '')}\\s*`, 'iu'), '').trim();
+    const firstLeg = flow.steps.find((s): s is FlowStep & { action: 'workflow'; goal: string } => s.action === 'workflow' && ((s as { intent?: string }).intent ?? '').includes(GENERATED_STEP_MARKER));
+    if (route !== '' && firstLeg !== undefined && menuPathOf(firstLeg.goal) === null) {
+      const at = firstLeg.goal.indexOf(': set ');
+      const opening = ` — open ${route} via the menu`;
+      firstLeg.goal = at === -1 ? `${firstLeg.goal}${opening}` : `${firstLeg.goal.slice(0, at)}${opening}${firstLeg.goal.slice(at)}`;
+      notes.push(`the route ${JSON.stringify(route)} rides the first leg`);
+    }
+  }
+
+  // The stated values, only where the flow now REACHES the page that shows
+  // them: after a leg. A tree that names the field is evidence the field
+  // exists on that page, not that this flow gets there — on the claims path
+  // no leg is written, so an assertion appended after the sign-in landing
+  // would fail against a page the field is not on and file that failure
+  // against the application.
+  const reaches = flow.steps.some((s) => s.action === 'workflow');
+  const stated = statedExpectedPairs(options.caseText === undefined ? claimLinesOf(options.prompt).join('\n') : (sectionOf(options.caseText, 'expected') ?? ''));
+  const unnamed: string[] = [];
+  const toAssert: StatedMatchPair[] = [];
+  for (const pair of stated) {
+    // The control's own name is the field, so a clause the sheet wrote in
+    // front of the `=` ("ระบบ Auto-Derive Time Management Status", "… และ
+    // O.T. Flag") is asserted, and de-duplicated, by the tree's word.
+    const control = treeControlNamed(pair.field, options.evidence);
+    if (control === null) {
+      unnamed.push(`${pair.field} = ${JSON.stringify(pair.value)}`);
+      continue;
+    }
+    if (assertsStatedPair(flow.steps, control.name, pair.value)) continue;
+    toAssert.push({ field: control.name, value: pair.value });
+  }
+  if (reaches && toAssert.length > 0) {
+    const note = settleStatedMatch(flow, toAssert.slice(0, MAX_SETTLED_STATED_VALUES), options.evidence);
+    if (note !== null) notes.push(note);
+  } else if (!reaches && toAssert.length > 0) {
+    left.push(`${toAssert.length} stated value(s) a tree names are not asserted: no leg reaches the page that shows them`);
+  }
+  if (unnamed.length > 0) left.push(`no captured tree names a value-holding control for ${unnamed.join(', ')}`);
+
+  // **The Expected line's own quoted words, after the legs.** A stated pair
+  // needs a control a tree names; a line that quotes what the page must show
+  // (`ระบบแสดงข้อความ "Employee created"`) needs nothing but the sheet — the
+  // wording IS the claim, which is why `ungroundedTextExpectation` exempts a
+  // text the case writes verbatim. Without this the settle wrote the journey
+  // and then failed its own gate for want of anything to check, and the row
+  // was blocked with the legs thrown away (2026-09-18, HR SIT E2E-01).
+  if (reaches && substantiveAssertions([...setup, ...flow.steps]).length === 0) {
+    const expected = options.caseText === undefined ? claimLinesOf(options.prompt).join('\n') : (sectionOf(options.caseText, 'expected') ?? '');
+    const literals = quotedExpectedLiterals(expected).slice(0, MAX_SETTLED_EXPECTED_LITERALS);
+    for (const { line, literal } of literals) {
+      appendStep(flow, {
+        action: 'expectVisible',
+        selector: `text=${JSON.stringify(literal)}`,
+        intent: markGenerated(
+          `Expected: ${line.slice(0, 120)}`,
+          "the case quotes this wording, so the run proves or disproves it on the page the legs reach",
+        ),
+      } as FlowStep);
+    }
+    if (literals.length > 0) notes.push(`${literals.length} Expected line(s) asserted by the words the case itself quotes`);
+  }
+
+  for (const step of [...setup, ...flow.steps]) {
+    if (isLoginProof(step) || isLoginFormSurface(step)) {
+      annotateStep(step, 'the sign-in surface going away or rendering is no proof of the claim; the assertions after the legs carry it');
+    }
+  }
+
+  if (substantiveAssertions([...setup, ...flow.steps]).length === 0) return null;
+  return (
+    `the flow stopped at the sign-in; the journey was written by the harness (marked [generated: …]): ${notes.join('; ')}` +
+    (left.length === 0 ? '' : `; ${left.join('; ')}`)
+  );
 }
 
 /**

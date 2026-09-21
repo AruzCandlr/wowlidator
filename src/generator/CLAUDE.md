@@ -1601,3 +1601,301 @@ the case card back from the outcome's flow file, in the language the ledger
 recorded (`report` cannot change it). `needsNarrative(bundle, lang)` keeps a
 narrative already in that language, so a rebuild costs nothing twice. Tests:
 `tests/case-narrative.test.ts`.
+
+## The catalog generator for the indexed engine (`jev-catalog-author.ts`, 2026-09-18)
+
+Plan and decisions: `plans/20260918155200-jev-catalog-generator.md`. A second
+`FlowAuthorModel` — programmatic — behind the same `FlowAuthor`, selected by
+`authorModeOf` (`src/cli/runtime.ts`): automatic when the agent role is on a
+decision model (TypeSafe Jev), `--author-mode jev|llm` overriding.
+
+**What it reads, and what it writes, at $0.** The described row `FlowAuthor`
+already renders (`describeCase`) is the input — `AuthorRequest.caseText`, with
+`caseId`, `runKey`, `now` and the parsed `testDataPairs` beside it — and every
+reader is one this directory already had: the persona token → `signIn as:
+<LABEL>` in setup (`DEFAULT` when the row names none and the run has `--as`);
+the Menu column → the first leg's `open A > B > C via the menu`, the shape the
+engine's walker reads; each numbered Step → one `workflow` leg, verbatim,
+annotated `(test step N)`, carrying the Test data pairs whose field the step
+names (`attachPairs`; a stray pair rides the first input step) as `set Field =
+"value"` — the grammar `goalOutcomes` parses, so the engine's TYPE_TEXT /
+SELECT rung never pays a text helper; each pair resolved through
+`resolveValues` with `model: null` (relative dates, blank words, unique keys,
+written values) BEFORE the goal is written; each Expected line with a quoted
+literal → `expectVisible text="…"`, with a path → `expectUrl`. A sign-in step
+and a verification-only step (`verificationOnlyGoal`) are never legs.
+`legsRoundTrip` pins that every leg's pairs parse back out of its goal.
+
+**What is not programmatic.** An Expected line with no literal ("the form
+opens"), and a record-only line (a capture needs a selector), are UNREAD: the
+row pays ONE call to the LLM author, asked for those lines only with the
+programmatic steps stated as already written, and only the assertion steps of
+its answer are kept — the model cannot rewrite a leg. A request with no
+`caseText` (a free-text `author` prompt) goes to the LLM author whole.
+
+**One lint is withheld, none is weakened.** `FlowAuthorOptions.indexed` skips
+`workflowOverDeclaredControls`: a goal naming a control the repository
+declares is the design here — the engine's numbered table is how that control
+is found. `skipsAuthoredScript` already counts a `workflow` leg as performing
+(2026-09-04); `unsettledWorkflowClaim`, the vacuous lints, `groundLoginProof`
+and the rest apply unchanged, which is why the model sits behind `FlowAuthor`
+and not beside it. Tests: `tests/jev-catalog-author.test.ts` — the Thai row
+(persona, menu, pairs by step, a resolved date, the round trip), the fixture
+row (`DEFAULT`, one leg, an unread line), `attachPairs`, the model with a
+scripted fallback (no call for a readable row; one call naming only the
+unread line; a click the model wrote dropped), the whole `FlowAuthor` under
+indexed mode, and `authorModeOf`.
+
+**Measured on the EC catalog (40 rows, 2026-09-18), and what it changed.** Read at $0 through `planCatalogCase`: 144 legs, every persona token a `signIn`, the menu path on every first leg, 0 round-trip misses after four rules were added — the resolver's generated stand-in never enters a goal (it had put `Sub-District = 29999999` into a leg; only `relative-date`, `unique-per-run` and `test-data` sources may rewrite a pair), a blank value is not written (`= ""` parses as no pair), both halves of a pair are quoted (a bare control stops at a slash or a Thai phrase word), a key the sheet writes twice takes the LAST line (`Branch code = TA57_1001` then `T153_1733`), the sheet's routing metadata (`Entry Route = Keyin`, `Menu = …`, the engine's `NOT_A_CONTROL` shapes) and an unresolved `<TOKEN>` are never pairs — each noted in the rationale. What stays the model's: 366 of 368 Expected lines quote no literal (`Employee Status = Active`, `ระบบสร้าง Employee ID เป็นตัวเลข 8 หลัก`), so every EC row pays one assertions-only call; the round trip is `legsRoundTrip`, which honours the engine's `cleanControl` (`คีย์ Employee Group` is read as `Employee Group`).
+
+**The pairs ride the step whose BLOCK names them, and a derived value is never
+set (2026-09-18, HIR-EC-001 live).** The first real run's Identity leg carried
+29 of the row's 31 pairs — Cost Center, Division, Work Location, O.T. Flag
+among them — because `attachPairs` matched a field against the NUMBERED LINE
+only, and the sheet lists a step's fields in the bullets under it ("2.
+กรอกข้อมูล Identity ตาม Test Data" / "- กรอก Salutation, First Name … Hire Date
+และ Event Reason"). Three rules now, all read off the sheet's own sections:
+a step is its numbered line plus the unnumbered lines until the next number
+(`SheetStep.block`), and a pair rides the first step whose block names its
+field; a verification-only step and a sign-in step are never homes (step 8
+"ตรวจสอบ Employee ID / Status / Employee Group" names what it READS, and step
+1's "Manual Key-in" reads as an input verb); and a pair no step names, but an
+Expected LINE that says the application PRODUCES the value does, is DERIVED —
+"ระบบดึงข้อมูลจาก Department ได้แก่ Cost Center / SSO Location …", "ระบบ
+Auto-Derive … O.T. Flag = Yes ตาม Rule Table" — so it is left to the
+assertions and never set, with the rationale saying so. The marker words are
+data (`authoring.derived` in `value-rules.ts`: derive, auto-fill, pulled from,
+ดึงข้อมูล, คำนวณ, อัตโนมัติ …), because a first cut that read ANY Expected
+mention as derived withheld HIR-EC-002's "Hire Date" — an Expected line that
+merely echoes a keyed value ("Hire Date = Today ตามค่าที่กรอก") marks nothing.
+A pair named nowhere still rides the first input step. Measured on the 272 EC
+rows: 1,572 legs, 4,506 pairs in goals, and the derived set went from 184
+pairs under the wide rule to 17 under the marker rule; the 33
+round-trip misses are pre-existing shapes (a `*` in a key, `Hire Date + 119
+Day`, a Thai phrase value), untouched today. Why it cannot make a result worse:
+every rule only moves a pair to a narrower home or withholds one the sheet
+says the application fills in; nothing is invented, and the round trip
+(`legsRoundTrip`) still pins every written pair. The sign-in hand-off the same
+run exposed — the first leg starting on the login page HUMI lands a sign-in
+back on — is the engine's (`src/engine/CLAUDE.md`, the signed-in surface
+rule), not this author's: it has no route to write, and a guessed one would
+be exactly what `ungroundedGoto` refuses. Test: `tests/jev-catalog-author.test.ts`
+("a field is named in the bullets under a step, a verification step is no
+home, and an Expected-only field is derived").
+
+## A match against a value the sheet states is a stated-value claim, not a reconciliation (2026-09-18, HR SIT E2E-01)
+
+Read against the hrsit-jev run of 09:32Z: the free-form E2E sheet
+(`HR_SIT_E2E_V01-1.001.csv`, one scenario, not the table format, so the row
+went down the claims path with no `caseText` and a login-page tree), authored
+by opus through `claude-cli` with `--repo`. Attempt 1 was refused by
+`unreconciledMatchClaim` on *"ตรงกับ Rule Table"* — the TM line *"Time
+Management Status / O.T. Flag ใน TM ตรงกับ Rule Table"* — and told to save one
+surface and compare it on the other. There is no other surface: the "Rule
+Table" is a master the sheet cites (its formula is itself an open question,
+*"สูตร/เงื่อนไข Rule Table = ? OQ-HIR-13"*), and the sheet wrote the values two
+lines up — *"ระบบ Auto-Derive Time Management Status = 01 - Clocking และ O.T.
+Flag = Yes ตาม Rule Table"*, with *"Time Status = 01 O.T. Flag = yes"* in Test
+data besides. The claim is that the derived field shows the stated value. The
+lint had no `settle`, so the re-ask was the only way out; attempt 2 died on the
+provider after 501 s (a quota warning, 41k output tokens) and the row blocked.
+Two changes, both in `flow-author.ts`, the words in `value-rules.ts`:
+
+- **`matchClaimsIn` reads a match claim structurally.** The subjects are the
+  words left of the agree word on its own line (bullet, number and a `[tag]`
+  dropped, anything before a colon dropped), split on `/`, `,` and the
+  conjunction words (`matchClaim.conjunctions`: และ, and, &). A subject is
+  STATED when some line of the case writes `<subject> = value` — every `=` on
+  every line is a candidate, the key matched by squashed suffix over the
+  subject's longest word window (*"O.T. Flag ใน TM"* → *"O.T. Flag"*, *"the
+  Total Plans tile"* → *"Total Plans"*), the value cut at the first conjunction
+  and then by `writtenValueOf` (so *"Yes ตาม Rule Table"* is *"Yes"*); a value
+  that still holds a later `=` is two pairs on one line and keeps its first
+  token, marked uncertain so a clean statement of the same field wins. An open
+  question (`= ? OQ-…`), a `<TOKEN>` and an instruction (`isDescription`) state
+  nothing. The pairs come from the CASE's words only — the row when the caller
+  has it, else the prompt after `END_SUPPORTING_CONTEXT` (premise 8: a
+  document's pair is not the sheet's). The agree form with every subject
+  stated is a stated-value claim; one unstated subject, or the unchanged form
+  (a quantity before and after), is the reconciliation it always was.
+- **`unreconciledMatchClaim` skips stated-value claims and gains a `settle`.**
+  For a genuine two-surface claim it refuses as before; at the last word it now
+  names the claim as *not covered* — the same note `settleUnperformedScript`
+  writes for a script line nobody performs — and the flow goes out with its
+  other claims. Never a rewrite: no tree names "the other surface", and a
+  guessed save-and-compare would be invention.
+- **`unassertedStatedMatch` is the weak companion.** Each stated pair must be
+  asserted by a step that names the field (selector, name or intent) AND
+  carries the value (selector, value, text or count — the intent alone is an
+  explanation, not a claim); a flow that saves and compares instead has made
+  the stronger claim and is left alone. A miss is THIN, not false — nothing
+  asserts anything untrue — so it is `weak`: accepted at once with the note,
+  never re-asked. Its settle, `settleStatedMatch`, runs on acceptance: each
+  pair whose field a captured tree or the probe report names as a control that
+  HOLDS a value (`valueAssertionFor`: textbox → `expectValue`, trigger/cell →
+  `expectText`) is asserted at the end of the flow (`appendStep`, after every
+  leg that could have produced it), marked `[generated: …]`; a field no tree
+  names, or one under a role that holds no value (a region, a group), stays in
+  the note — never an `expectText` over a container, which passes when the
+  value is anywhere inside it.
+- **The prompt says the same in one rule** (`<claims>`, beside the
+  save-and-compare bullet): a field that matches a rule, a master or a table
+  the page does not show, whose value the case states, is asserted as that
+  value; save nothing; only two readings ON THE PAGE are a save-and-compare.
+  The refusal message for the two-surface form names the same distinction, so
+  a re-ask that is really a stated value is steered right.
+
+Why it cannot make the result worse: the stated-value form used to be refused
+outright and is now the flow the model wrote plus a note or a grounded
+assertion — the assertion reads the sheet's own value and the tree's own role,
+never a guess; the two-surface form is refused exactly as before through every
+re-ask, and its last word is a disclosure the report carries, not a pass on the
+line. Structural throughout: the agree word, the `=`, the tree's role; the only
+words added are three conjunctions, as data. Measured on the live row offline
+(the run's own claims file rebuilt into the author's prompt, attempt 1's flow
+from the log): before, `unreconciledMatchClaim` → *"ตรงกับ Rule Table"*, fatal,
+no settle; after, null, and `unassertedStatedMatch` names *Time Management
+Status = "01 - Clocking"* and *O.T. Flag = "Yes"* as unasserted — a weak note
+on the login tree, two inserted assertions on a tree that names the fields.
+What this does not fix, and who owns it: attempt 1 was a sign-in-only flow
+("none of the E2E-01 new-hire claims are observable on this page") because the
+tree the author read is the login page — the describe-path ceiling (a capture
+of the key-in page, or the indexed catalog author) — and the provider failure
+that actually blocked the row is `provider-expert`'s. Tests:
+`tests/flow-author.test.ts` ("a match against a value the case states is a
+stated-value claim, not a reconciliation"): the live subjects and pairs, the
+silent reconciliation lint, satisfaction after an agent leg, the intent-only
+miss, the two-surface claim in both languages and an English stated subject,
+a document's pair / an open question / an instruction stating nothing, the
+settle on the login tree and on a tree naming the fields, `appendStep`, the
+pipeline accepting the live shape on attempt 1 of 1 and inserting from the
+tree, and the two-surface last word as *not covered*.
+
+## Settle first: a complaint that knows its rewrite is not re-asked (2026-09-18, HR SIT E2E-01)
+
+The last word (2026-09-04) performs every fatal complaint's grounded rewrite
+once the budget is spent. Measured on HR SIT E2E-01 under Jev: attempt 1 was
+refused by `admitsUngroundedSelector` (settles by annotating) beside the weak
+stated-value note; the informed re-ask then ran 501 s on `claude-cli:opus`,
+produced 41k output tokens, and died on the provider — no flow, no ledger,
+and the settlement the last word would have made never happened. The re-ask
+had bought only the chance that the model writes the rewrite itself.
+
+`FlowAuthorOptions.settleFirst` (default on; `WOWLIDATOR_AUTHOR_SETTLE_FIRST=off`
+restores the old order): when every FATAL complaint of an attempt carries a
+`settle`, that attempt is the last word — the rewrites are performed, the flow
+goes out with the notes and the `[generated: …]` marks, and the run proves or
+fails each settled claim with the defect on the case page. A complaint with no
+rewrite still re-asks exactly as before: for a FALSE claim the model's second
+answer is the only way out, and premise 3 says a false claim is never handed
+over. Why it cannot make a result worse: the flow is the one the last word
+would have produced, one model call earlier; nothing new is authored, and a
+settle that finds no evidence leaves its complaint unsettled and the refusal
+whole. The log line says `(on this attempt, no re-ask: every complaint knew
+its rewrite)`. Tests: `tests/flow-author.test.ts` ("settle first…"; the
+identical-refusal test now pins the old order under `settleFirst: false`).
+
+## A flow that stops at the sign-in is a journey nobody wrote (2026-09-18, HR SIT E2E-01)
+
+**Incident.** A free-form E2E sheet (one scenario, a hire across EC/BE/TM/PY)
+went down the claims path: no `caseText`, and the only tree the author saw was
+the sign-in page. The model named its own answer *"E2E-01 new hire — login page
+only"* — goto, fill Username, fill password, click Sign in, goto the home,
+`expectHidden` of the Username field — and the suite sealed it **PASSED 6/6 in
+7.7 s** about a hire it never attempted. Its one assertion holds whenever a
+session was created. Nothing spoke: `skipsAuthoredScript` needs the sheet's
+Steps, which the claims path does not carry; `vacuous.ts` excluded only
+`expectVisible`/`expectEnabled`/`expectDisabled` of the sign-in form, so the
+`expectHidden` counted as substantive; and the 2026-09-10 rule ("the sign-in
+page going away is never a login proof") had dropped the submit-control form of
+that proof, not the identity field's.
+
+**Rule.** `isLoginFormSurface` now covers `expectHidden` of the identity or
+password field — the same surface seen from the other side — so no flow can be
+substantive on it. `signInOnlyFlow` (fatal, settles) is the shape itself: the
+flow signed in (a `signIn` step, a credential block, or a run that started on a
+sign-in URL), `vacuousClaim` finds nothing substantive, and no step acts on a
+page other than a sign-in page — a `workflow` leg or an action after a
+navigation away is the flow going somewhere and is judged as before. **Two
+older rails keep what is not this shape**: a flow that never signed in is the
+plain vacuous refusal's, because "sign in, then reach the page" is advice about
+a journey it never began. Asserting nothing at all IS this shape when the
+sign-in happened — `groundLoginProof` drops a "proof" that was none, and what
+it leaves is the incident with its one false assertion removed.
+
+**The settle writes the journey the flow never wrote** (`settleSignInOnly`),
+from the row's own evidence and nothing else: every numbered script step no
+step cites becomes an entry step where a captured tree names its control, else
+ONE `workflow` leg carrying the sheet's own line (`settleUnperformedScript`,
+capped at `MAX_SETTLED_JOURNEY_LEGS`); the sign-in line is never a leg, because
+the flow's own `signIn` performs it; the sheet's Menu path rides the first leg
+in the walker's grammar; then the assertions — every stated `Field = value` a
+tree names as a value-holding control (`settleStatedMatch`), and every Expected
+line the case QUOTES (`quotedExpectedLiterals`, capped at
+`MAX_SETTLED_EXPECTED_LITERALS`), which needs no tree because the sheet's
+wording IS the claim, the exemption `ungroundedTextExpectation` has carried
+since 2026-08-31. The sign-in surface is annotated so no report reads "Username
+hidden" as proof. **The gate**: no substantive assertion after all of it, and
+the settle returns null — a journey nobody checks is the vacuous flow with legs
+in front of it, and the refusal stands. On the claims path there is no script,
+so no leg is written: a claim is an outcome, never an instruction to hand an
+agent, and an agent asked to make a claim true is the witness for its own
+claim.
+
+**Why it cannot make a result worse.** The flow is refused today; what the
+settle hands over performs the sheet's own steps and asserts the sheet's own
+words, both marked `[generated: …]`, so the run proves or fails them and the
+case page records the defect — which is the whole point: a case that reaches
+its claim and fails is worth more than a green that never tried. Nothing is
+invented: a leg is a line of the script, an assertion is a value or a quotation
+the case wrote. With settle-first (the section above) this lands on attempt 1.
+`verificationOnlyGoal` is deliberately NOT consulted when deciding which script
+line becomes a leg: it reads "Import ไฟล์และตรวจสอบผลลัพธ์" — a line that acts
+AND checks — as verification only, and `scriptDemand` is what the 2026-09-08
+rule made the decider.
+
+**What this does not fix.** The author still saw only the sign-in page, because
+a free-form catalog authors as a UNIT test; `--scope e2e` is the launch flag
+that demands a full journey and turns on the journey capture that grounds it.
+The rail is the guarantee, the flag is the fix.
+
+Tests: `tests/flow-author.test.ts` ("a flow that stops at the sign-in": the
+predicate's two halves on the live shape, the shapes the older rails keep, the
+pipeline's refusal wording, and the settle producing legs + assertions on
+attempt 1).
+
+### The claims path is many claims, and one of them about wording does not make the flow one (2026-09-18, HR SIT E2E-01)
+
+The 2026-09-02 fix — "the wording classifier reads the case's own words, never
+the background" — holds only where the caller can hand over a case
+(`extra.caseText`, the table path). A free-form catalog has none: the prompt
+IS the claim list. Live, the row carried 35 claims, exactly ONE of which says
+`ข้อความ` and is about an in-app notification (*"ข้อความ In App =
+Congratulations! You have a new direct report…"*); the other 34 are about a
+hire. Classified from the joined claims, a 67-step flow became a wording flow,
+and `wordingClaimAssertsDataValue` refused it twice for asserting "Minimum Job
+Grade" — a value the sheet states and the case is about. The row was blocked
+with no verdict and two opus calls spent (173 s + 20 s).
+
+So when no case text is given AND the prompt holds more than one claim line
+(`claimLinesOf`), the lint judges a STEP only when the step's own `case` name
+or intent says it is about wording. A step carries the claim it serves; the
+background claims of fourteen other cases in one prompt do not make it one,
+and an attribution nobody can make is silence — the rule every grounding check
+here follows. A single-claim prompt and a `caseText` call are classified
+exactly as before. Tests: `tests/flow-author.test.ts` ("a claims-path prompt is
+many claims…").
+
+**The source a value is pulled from is not itself derived (2026-09-18, the
+same row one run later).** "ระบบดึงข้อมูลจาก Department ได้แก่ Cost Center / …"
+names Department as the SOURCE and the list after `ได้แก่` as what the
+application fills, and the first cut of the derived rule matched the whole
+line, so Department and Position read as derived too. On that row a step named
+them first, so nothing was lost — but on a sheet whose source appears only in
+Test Data it would have been withheld and never typed. The clause
+`จาก/from <source>` up to the list marker (`ได้แก่`, `including`, `such as`,
+`:`) is now dropped before a field is matched against the line. The same rule
+is mirrored in the `/jev-case` skill's `author.py`, which carries its own copy
+of the marker words and must be kept in step with `authoring.derived`. Test:
+`tests/jev-catalog-author.test.ts` ("the source a value is pulled FROM is the
+tester's input").

@@ -71,7 +71,7 @@ The agent's two early-stop judges — the look-only soft handoff at `AGENT_LOOK_
 
 Live (be100 PL_03_18, 2026-08-25 06:28): the goal named the plan to delete, the agent could not find its row, clicked `role=button[name="Delete" i] >> nth=0` — the first Delete on a 75-row table — confirmed the dialog, and the step's own network evidence shows `DELETE /api/benefit-plans?planId=TH_MED_001`. Its reasoning said it was the right row. On an authoritative database that delete is permanent, and PL_02_02 (re-authored 45 minutes later against that plan's name) dead-ended on every run after. The prompt's "no destructive action unless the goal asks" was satisfied on paper.
 
-`unscopedDestructiveClick` (`agent-guards.ts`, pure) is the structural form: when the goal names an identifier (`PL_03_15_16_17_18`, `TH_MED_001`) and the click's target control is destructive by name (`DESTRUCTIVE_NAME`), the selector must carry one of those identifiers — or sit inside a `role=dialog`, the confirmation of a delete already scoped. Refused on the first ask with the scoped shape shown; on the second ask it is **never acted on**: recorded as a failed action (`REFUSED` in the history), the turn counts as no progress, and the loop goes on — the right row may still be found, or `fail` said honestly. A goal that names no identifier has nothing to scope to and is left to the prompt.
+`unscopedDestructiveClick` (`agent-guards.ts`, pure) is the structural form: when the goal names an identifier (`PL_03_15_16_17_18`, `TH_MED_001`) and the click's target control is destructive by name (`DESTRUCTIVE_NAME`), the selector must carry one of those identifiers — or sit inside a `role=dialog`, the confirmation of a delete already scoped. Refused on the first ask with the scoped shape shown — a model that takes the correction goes on in the same turn; on the second ask it is **never acted on**: recorded as a failed action (`REFUSED` in the history) and, since Phase B (2026-09-05), the leg ENDS as a typed `guardrail` hold (`blocked`, rule `destructive-unscoped`; `circling` ends the same way). Until 2026-09-21 this paragraph and two tests in `tests/agent-guards.test.ts` still described the pre-Phase-B loop that went on. A goal that names no identifier has nothing to scope to and is left to the prompt.
 
 ## The tree the agent is shown must contain the answer
 
@@ -789,3 +789,250 @@ and serialising to make it safe turns a ten-minute run into an hour.
 Tests: `tests/mutation-policy.test.ts` ("a verified undo answers the approval
 question"), including the empty-table, denied-category, unobserved-row and
 manifest-rejection cases.
+
+## The jev policy: an indexed action space behind the same seam (`jev-policy.ts`, 2026-09-18)
+
+A port of browser-use/jev-ultrafast's control plane (plan
+`plans/20260918135009-jev-ultrafast-port.md`, spike
+`docs/research/2026-09-18-jev-spike/README.md`). Selected by the agent role's
+MODEL and nothing else: a decision model — TypeSafe's Jev, `typesafe` natively
+or `openrouter:~typesafe/jev-latest` — gets `JevAgentModel`
+(`agentModelFor`, `src/cli/runtime.ts`); every chat model keeps
+`LlmAgentModel` byte-for-byte. Both implement `AgentModel`; the loop is not
+forked.
+
+Three things it changes about a turn, and one it does not:
+
+- **The model picks an INDEX, never writes a selector.** The loop numbers the
+  SAME focused nodes the string tree renders (`indexElements`,
+  `agent-guards.ts`, on `AgentObservation.elements`, built every turn at $0),
+  and the policy hands back the chosen row's own canonical selector — the
+  `role=…[name="…" i]` the menu walker writes, plus `>> nth=k`. **`k` is
+  counted over the FULL tree, and by substring** (review 2026-09-18):
+  Playwright's `nth` counts matches in the whole document and its
+  `[name="X" i]` is a case-insensitive substring match, so a row is
+  positioned whenever any other node of its role on the page has a name
+  containing this one, with `k` the number of such nodes before it — counted
+  over the focus cut instead, an evicted earlier "Edit" made the k-th kept
+  one the wrong record, silently. A non-ARIA role (`StaticText`) is
+  `text="…"`, the form the read-only look proves an error message through.
+  So `normaliseAgentSelector`'s whole miss class cannot happen here, and
+  every guard, history line, record, provenance check and replay script
+  reads exactly what it always read.
+- **One request, speculative heads.** A single decisions call carries the
+  `operation` question (CLICK / TYPE_TEXT / SELECT when the table can serve
+  them; SCROLL_DOWN / WAIT / DONE / BLOCKED always — SCROLL_UP is not
+  offered: the bare `scroll` only scrolls down and the tree lists off-screen
+  nodes) and one target head per offered element operation, each carrying
+  the target rules only (the next-action rules ride the operation question
+  once, not once per head). Only the chosen operation's
+  head is consumed; an unused head cannot cause an action however it
+  answered. `validateChoice` refuses a choice outside the offer or a
+  distribution over other options — a typed error, no action; confidence and
+  the head's probability ride the decision onto `AgentAction.confidence` /
+  `probability` (descriptive, read by no judge).
+- **Text only when text is needed, and from the goal first.** TYPE_TEXT /
+  SELECT need a value the decision model cannot write. Rung 1 is
+  `goalValueFor`: the goal's own `control = value` pair (`goalOutcomes`)
+  matched to the chosen field's name, at no cost — the generator's "tokens
+  are resolved, never typed" honoured. Rung 2 is one structured call on the
+  **`data` role** with jev's text-helper contract (`{text: string | null}`);
+  `null` means the goal names no value and NOTHING is typed or guessed: the
+  model is re-asked ONCE with the field named ("no value is known for [8]
+  combobox …; choose another operation, or BLOCKED"), and a second
+  insistence ends the leg as the typed harness stop **`no-value`**
+  (`AgentDecision.origin: 'harness'` → `AgentRecord.endedBy`, in
+  `AGENT_HARNESS_STOPS`, worded "the goal names no value for the field the
+  agent chose") — never as the model's `unreachable` claim. A helper answer
+  is reused only while the whole helper input is byte-identical.
+- **Everything after `decide()` is untouched**: budgets, stalls, the
+  destination rule, the mutation gate, provenance, every refusal, the record.
+  Deliberately not offered: `goto` (the loop's $0 destination rungs), `press`
+  / `hover` / `check` / `uncheck` (a CLICK on a checkbox is the engine's
+  click), `dbCount` / `read` / `save` / `signOut` (text arguments a decision
+  model does not produce). Widened only if Phase 4's measurement asks.
+
+A `readOnly` run (`#agentTriage`'s look; `AgentObservation.readOnly` carries
+it) gets the verdict set — `verdict ∈ {proved, can-heal, fail}` +
+`proved_target` over every row — and answers `finish` with the verdict in
+`value` and the proving row as `selector`, exactly what `triageVerdictOf`
+reads. Jev has no eyes: a screenshot on the observation is ignored, and the
+harness re-checks the named element as it does for every model.
+
+Measured on the spike (three requests, an English and a Thai sign-in table):
+0.4–1.8 s a decision, ~1.3–1.6k input tokens, ≈$0.00005 a turn, every
+decision the one a tester would make. Tests: `tests/jev-policy.test.ts`
+(the table, the heads, consumption of one head only, the goal-value rung
+paying no model, the helper cache, the declined helper, the read-only
+verdict, an out-of-offer answer, and the loop driving the policy through the
+real `#act` on a fake page), `tests/decisions.test.ts` (the transport).
+
+### The runtime rails (Phase 3 of the jev port, 2026-09-18)
+
+jev-ultrafast's other half is code-owned node identity and event-based
+waiting. Ported inside the existing `#act`/settle path, never as a second
+execution plane (spike and diagnostics: `docs/research/2026-09-18-jev-spike/README.md`):
+
+- **Exact-node refs.** For an indexed policy (`AgentModel.indexed`), the turn
+  takes ONE `ariaSnapshot({ mode: 'ai' })` beside `#captureTree` and
+  `withRefs` (`agent-guards.ts`) attaches Playwright's `[ref=eN]` to every
+  targetable row by role and name in duplicate order — the row's `position`
+  among its exact duplicates in the WHOLE tree, so a duplicate the focus cut
+  evicted still shifts the pairing and the k-th kept row never takes the
+  evicted node's ref (review 2026-09-18). The policy puts the
+  chosen row's ref on `AgentDecision.ref`; `#actingSelector` acts through
+  `aria-ref=eN` — the exact element, not the first of several with that name
+  — while `decision.selector` stays the name selector for every guard, the
+  history, the record, the replay script and the mutation gate (which scopes
+  identifiers off the name, and a ref carries none). A ref is never
+  persisted: it is valid only against the snapshot it came from.
+- **Two Playwright facts that shape the code, both measured.** A DEFAULT-mode
+  `ariaSnapshot` (the gate's control-name read) regenerates the ref map and
+  RESTARTS its numbering, so an old ref is orphaned or aliases another node —
+  the gate therefore takes a ref decision's control name from the turn's own
+  AI snapshot (`#refNames`) and never calls the default-mode snapshot on
+  that path. And a stale ref does not throw: `waitFor` simply times out, so
+  freshness is a pre-act `count()` on the ref (`StaleRefError`, the page
+  changed since you looked) — an ordinary failed action, no progress, and
+  the next turn re-observes with fresh refs, which is jev's own "choose
+  again". `AgentRecord.refs = { matched, missed }` counts how often
+  Playwright's and Chrome's accessible names agreed over the leg.
+- **The settle after an action** (`#settleAfter`, `settleInPage`): two
+  animation frames or 50 ms, and after typing into an editable combobox its
+  first visible option under the controlled list, capped at 200 ms — a floor
+  under the judges' networkidle settle, never a ceiling. Built with
+  `new Function` from a string body: a string handed to `locator.evaluate`
+  is evaluated and never called, and an arrow with named inner closures is
+  rewritten by esbuild into `__name(fn, …)`, which the page does not have —
+  both silent under the catch until instrumented.
+- **Focus emulation** on every page the runner creates (`enableFocusEmulation`
+  in `applyViewport`, `engine/runner.ts`): a background lane's tab keeps
+  running animation frames, so menus and listboxes reach the tree at the
+  speed a person sees. Already present and NOT ported: geometry and
+  occlusion re-checks before input (Playwright's actionability in
+  `locator.click`/`fill`), native `<select>` and custom listboxes
+  (`selectOption`), no screenshots in the driving loop, the action recorded
+  before the next observation.
+
+Tests: `tests/jev-runtime.test.ts` — the parser and matcher (pure), and on
+CDP: the ref clicks the second of two identically named buttons where the
+name selector's `.first()` takes the first, a re-rendered page refuses the
+stale ref before anything is touched and the next turn carries fresh refs,
+and a combobox's options arriving 120 ms after typing are in the next
+observation.
+
+### The text helper may not invent an identifier (`inventedIdentifier`, 2026-09-18)
+
+Live (HUMI SIT, HIR-EC-001): the agent had wandered onto Microsoft's sign-in
+form (see `src/engine/CLAUDE.md`, the sign-in surface rule), Jev chose
+`TYPE_TEXT` on its email box, and the text helper — on the `data` role, served
+by `claude-cli`, whose session carries the operator's identity — answered the
+operator's own account email. The system prompt already said "never invent
+personal information"; a prompt is a request. The guarantee is structural: an
+identifier-shaped token in the helper's answer (an `@` address, a run of seven
+or more digits with or without separators) that appears in neither the goal
+nor the case card is refused, the answer becomes `null`, and the existing
+no-value path takes over — one re-ask with the field named, then a `fail`
+with `origin: 'harness'` and nothing typed. A value the sheet stated (a Test
+data pair in the goal, a persona's account) passes; a plain word ("Zurich", a
+search term) is not an identifier and is never judged. Logged on stderr with
+the refused token so a leaked value is visible in the job log rather than in a
+third party's form. Tests: `tests/jev-policy.test.ts` ("an identifier the goal
+never stated is refused").
+
+### A click on a control the goal gives a date for is an entry (the date rung, 2026-09-18)
+
+Run 3 of HIR-EC-001 on HUMI SIT, once the sign-in hand-off had put the leg on
+the app: four turns to the hire form, then five clicks on `button
+"วันเริ่มงาน"` and the circling guard. The Thai form renders its Hire Date as a
+picker TRIGGER — a button, so the table offered CLICK and nothing else — and
+a decision model cannot walk a calendar twelve months forward. The goal
+already said `"Hire Date" = "2027-09-01"`, and the engine already had the
+rung that writes a date into the `input[type=date]` a picker draws over
+(`#writable` → `#dateInputBeside` → `#writeDate`, written for the read-only
+"Select date" display in 2026-09-02's HIR-EC-002).
+
+Two structural pieces, no page knowledge: in `JevAgentModel.#decisionFrom`, a
+CLICK on a control that offers no TYPE_TEXT/SELECT and whose name the goal
+pairs with a value `isoDateOf` can read becomes a `fill` of that value on the
+same selector — once per control and goal (`#dateEntryTried`), so a page with
+no date input beside the trigger fails the fill in words, the history says so,
+and the next identical click goes through as the model chose. And
+`#writable`, which used to throw "not an input" for a button, first looks for
+the date input beside it exactly as it does for a read-only display. A
+non-date value, or a control that does offer text entry, is untouched. Tests:
+`tests/jev-policy.test.ts` ("a click on a control the goal gives a date for
+is an entry"), `tests/jev-runtime.test.ts` ("a fill on a picker trigger
+writes the date into the input beside it", CDP).
+
+**Widened the same day, by the next live run** (HUMI SIT 1.001): the goal said
+`set "Event Reason" = "New Hire"`, the tree renders that control as
+`button "Event Reason"`, so again the table offered CLICK alone — and the model
+clicked it three times until the circling guard stopped the leg. 1 of 54 steps
+passed, six high defects, and the harness's own diagnosis named the agent at
+62% while the repository's own test file showed the control is a real dropdown
+with six options. So a CLICK on a control that offers no TYPE_TEXT and no
+SELECT, whose name the goal pairs with a value that is NOT a date, becomes a
+`selectOption` of that value — the engine's `selectFromListbox` is the
+procedure for a trigger, and it opens, searches, matches and reports what the
+list offered. Dates keep the fill rung; the two are exclusive. Once per control
+and goal (`#pickTried`), so a control that is genuinely a button fails in
+words, the history carries the miss, and the next identical click goes through
+as the model chose. Test: `tests/jev-policy.test.ts` ("a dropdown the tree
+lists as a button is chosen from, not clicked").
+
+## An entry aimed at a calendar trigger ends in the calendar (2026-09-21, picks25 run)
+
+Run `picks25-wowlidate-20260921-125133` (HUMI SIT, agent on claude-cli:sonnet,
+8 of 8 sealed cases blocked/failed, 13 legs "gave up"). The Thai hire form's
+Date of Birth / Hire Date are `button[aria-haspopup=dialog]` with **no input
+anywhere near them**. Tally of the failed agent actions in the proof bundles:
+
+| shape | count | what the turn was told |
+|---|---|---|
+| `paste` on `role=button[name="วันเกิด"]` / `"วันเริ่มงาน"` | 9 | "is not an input … if it opens a picker, click it" (10–34 ms) |
+| `paste` on an invented `role=textbox[name="วันเกิด"]`, `[aria-label=…]` | 7 | no element matches (1.5 s) |
+| click / dropdown open `locator.click: Timeout …ms exceeded.` | 17 | nothing else — after a refused wizard Next |
+| `fill` national id, "did not keep the typed value" | 7 | held `1-2345-67890-12-3` for `1234567890123` |
+| `selectOption` on a field not on this wizard step | 11 | no element matches + the wizard hint |
+| `selectOption` `ไทย` in a list of `Thai - Thai` | 3 | the 128 options' head; "Thai" then passed |
+
+**Why the calendar rung was never reached.** `pickDateInDialog` was wired in
+exactly one place, the ladder's rung 1.03 (`runner.ts`, `#calendarTrigger`).
+The agent's `fill`/`type`/`paste` go through `#writable`, whose only date route
+was `#dateInputBeside` — an `input[type=date]` in the trigger's container, the
+OLDER `HumiDatePicker` shape. This `DateField` has none, so every entry threw
+the generic "not an input" and the model went hunting a textbox that does not
+exist. One judge-free turn per field became a no-progress stall.
+
+**The rule.** `#writable` now reads the control's own `aria-haspopup`. `dialog`
+→ `#pickDate`: `isoDateOf` the value, the engine's `pickDateInDialog`, and the
+action is ok **only when the trigger then displays that date** (`confirmed`) —
+the page's read-back, not the model's account; a disabled day surfaces as the
+picker's own `DateOutOfRangeError`. A value that is no date is refused in
+words that say what the control IS (no textbox of its own; fill this same
+selector with YYYY-MM-DD). `listbox`/`menu`/`tree` → "a dropdown trigger … use
+selectOption on this same selector". A trigger whose name the mutation gate
+classes is never opened this way (an entry is not a `click` the goal named).
+The date-pickers skill now says to fill the button instead of walking the
+dialog. **The progress accounting is unchanged**: a refused entry is still a
+failed action and never progress — the fix is that the refusal is typed by the
+control's ARIA and, for a date, no longer happens. Cannot slow a passing leg:
+the branch sits where the action already threw.
+
+Two smaller rails from the same tally, both pure predicates in `agent-guards.ts`:
+`interceptionOf` — `describe()` kept only line one of a Playwright error, so
+the interceptor its call log names never reached the model; the last
+`intercepts pointer events` line now rides the action's error (the loop still
+dismisses nothing itself). `heldAsTyped` — a read-back that differs only by
+added separators is the value kept, noted as "the field shows it as …"; a
+dropped, changed or reordered character is still the hydration loss.
+
+Not fixed here: the option-label locale miss (`listbox.ts`, another change in
+flight; one turn, self-corrected), goals that name step-2 fields while step 1
+cannot advance (generator; mostly downstream of the date), and goal values
+like "a future date" that `goalCitedValues` hunts verbatim (value-hunt ended
+two legs on a description, not a value). Live numbers still to be recorded —
+no build and no run were allowed while the catalog was live.
+Tests: `tests/agent-wave2.test.ts` (calendar route ×3, the covered control;
+CDP), `tests/agent-guards.test.ts` (`interceptionOf`, `heldAsTyped`).

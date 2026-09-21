@@ -39,6 +39,7 @@ export const AGENT_ENDED_BY_VALUES = [
   'stalled',
   'no-progress',
   'value-hunt',
+  'no-value',
   'cannot-offer',
   'fixture-present',
   'wandered',

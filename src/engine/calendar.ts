@@ -5,8 +5,12 @@
  * (aria-label "Calendar"/"ปฏิทิน") with a month heading, `Previous month`/
  * `Next month` (`เดือนก่อนหน้า`/`เดือนถัดไป`) buttons, a grid of day buttons
  * named by the bare day number (`aria-pressed` for the selected one,
- * `disabled` outside min/max), a month view behind the heading (a `select`
- * for the month, a number input for the year), and Today/Clear.
+ * `disabled` outside min/max), a month view behind the heading, and
+ * Today/Clear. The month view's own shape varies — a `select` for the month
+ * plus a fillable year field on one build, a plain grid of month buttons plus
+ * Previous/Next-year buttons and a non-interactive year readout on another
+ * (humi's real `DateField`, EH-DOB below) — `jumpViaMonthView` drives
+ * whichever is actually rendered.
  *
  * The engine had no path into it (EH-11, ~150 rows: BE Effective Start/End,
  * PY-Config effective dates, probation extend/confirm, TM leave ranges):
@@ -19,8 +23,10 @@
  * 2. read the month heading (any month name + 4-digit year in the dialog's
  *    text; a Buddhist year is converted) and step month by month with the
  *    nav buttons until it is the target month — at most `MAX_MONTH_STEPS`;
- *    when the jump is long and the heading is a button that opens a month
- *    view with a month `select` and a year field, use those instead;
+ *    when the jump is long, open the month view behind the heading (matched
+ *    by its own rendered text — see EH-DOB) and drive whichever of a year
+ *    field / year-nav buttons and a month `select` / month-button grid it
+ *    actually offers;
  * 3. click the day button named by the bare day number (the LAST such match
  *    for a day ≥ 15 — the leading days of the previous month sit above the
  *    grid — and the first for a day < 15, where trailing days follow); a
@@ -35,7 +41,7 @@
  */
 import type { Locator, Page } from 'playwright';
 
-import { dateRenderings, daysInMonth, formatDate, isoDateOf, monthYearOf, partsOf } from './dates.js';
+import { dateRenderings, daysInMonth, formatDate, isoDateOf, monthNumberOf, monthYearOf, partsOf } from './dates.js';
 import { waitForDialog } from './modal.js';
 
 export interface PickDateOptions {
@@ -115,49 +121,162 @@ function monthsBetween(from: { year: number; month: number }, to: { year: number
 }
 
 /**
- * Jump through the month view when the dialog offers one: a `select` named
- * for the month and a year field. Returns true when the heading now reads the
- * target month.
+ * What Playwright's own call log says stopped a click — the line that names
+ * an interceptor, a detached or unstable element — or the error's first line.
+ */
+function whyClickFailed(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const lines = message.split('\n').map((l) => l.replace(/^\s*-\s*/, '').trim());
+  const cause = lines.reverse().find((l) => /intercepts pointer events|not stable|not visible|detached|not attached|not enabled|outside of the viewport/i.test(l));
+  return (cause ?? lines[lines.length - 1] ?? message).slice(0, 200);
+}
+
+function escapeForNameRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Past this many year-nav-button clicks inside an open month view the widget
+ * is assumed to have refused to move (a min/max bound) or to be unreachable
+ * this way — bounded to the distance actually needed plus a little slack,
+ * not a flat ceiling, so a century-scale jump (a Date of Birth) still costs
+ * only as many clicks as the years it crosses (EH-DOB, below).
+ */
+const YEAR_NAV_SLACK = 5;
+
+/**
+ * Drives Previous/Next-year buttons inside an already-open month view to
+ * `year`. The displayed year is read generically off whichever ancestor of
+ * the nav button (up to a few levels up) carries a bare 4-digit number —
+ * never off a specific id/testid/label, since the widget need not expose it
+ * any particular way (humi: a plain, roleless `<p>2026</p>` between the two
+ * chevron buttons). A button that stops moving the year (a min/max bound
+ * reached) or offers no visible nav in the needed direction stops the walk
+ * rather than looping forever; the caller's own final heading check is what
+ * actually decides success.
+ */
+async function stepYearButtons(dialog: Locator, year: number, timeout: number): Promise<boolean> {
+  const nextYear = dialog.getByRole('button', { name: NEXT_YEAR }).first();
+  const prevYear = dialog.getByRole('button', { name: PREVIOUS_YEAR }).first();
+  const readYear = async (): Promise<number | null> => {
+    const anchor = (await prevYear.isVisible().catch(() => false)) ? prevYear : nextYear;
+    if (!(await anchor.isVisible().catch(() => false))) return null;
+    return anchor
+      .evaluate((el) => {
+        type ElementLike = { textContent: string | null; parentElement: ElementLike | null };
+        let node = (el as unknown as ElementLike).parentElement;
+        for (let i = 0; i < 4 && node; i++) {
+          const m = node.textContent?.match(/\b(\d{4})\b/);
+          if (m) return Number(m[1]);
+          node = node.parentElement;
+        }
+        return null;
+      })
+      .catch(() => null);
+  };
+  let current = await readYear();
+  if (current === null) return false;
+  const cap = Math.abs(year - current) + YEAR_NAV_SLACK;
+  let steps = 0;
+  while (current !== year && steps < cap) {
+    const button = year < current ? prevYear : nextYear;
+    if (!(await button.isVisible().catch(() => false))) return false;
+    await button.click({ timeout }).catch(() => undefined);
+    steps += 1;
+    const next = await readYear();
+    if (next === null || next === current) return false; // stalled: a min/max bound, or unreadable
+    current = next;
+  }
+  return current === year;
+}
+
+/**
+ * The button in an open month view named for `month` (1-based) by its OWN
+ * rendered text — read the same way `monthYearOf` reads the heading, never
+ * by accessible name (see `jumpViaMonthView`'s heading-toggle lookup for why).
+ */
+async function findMonthButton(dialog: Locator, month: number): Promise<Locator | null> {
+  const buttons = await dialog.getByRole('button').all();
+  for (const button of buttons) {
+    const text = ((await button.innerText().catch(() => '')) ?? '').trim();
+    if (monthNumberOf(text) === month) return button;
+  }
+  return null;
+}
+
+/**
+ * Jump through the month view when the dialog offers one. Two independent
+ * mechanisms, chosen by what is actually rendered rather than assumed: the
+ * MONTH is a `select` when one is visible, else a button named for it in a
+ * grid (humi's real `DateField`, EH-DOB below — a plain grid of month
+ * buttons, no combobox at all); the YEAR is a fillable field when one is
+ * visible, else Previous/Next-year buttons stepped in a loop. Returns null
+ * only once the dialog's own heading confirms the target month and year —
+ * the same re-run-the-author's-own-read the rest of the ladder relies on —
+ * and otherwise the sub-step that did not land, for the failure to name.
  */
 async function jumpViaMonthView(
   dialog: Locator,
   target: { year: number; month: number },
   timeout: number,
-): Promise<boolean> {
-  let monthSelect = dialog.getByRole('combobox', { name: SELECT_MONTH }).first();
-  let yearField = dialog.getByRole('spinbutton', { name: SELECT_YEAR }).or(dialog.getByRole('textbox', { name: SELECT_YEAR })).first();
-  if (!(await monthSelect.isVisible().catch(() => false))) {
-    // humi: the month heading is a button that opens the month view.
+): Promise<string | null> {
+  const monthSelect = dialog.getByRole('combobox', { name: SELECT_MONTH }).first();
+  const yearField = dialog.getByRole('spinbutton', { name: SELECT_YEAR }).or(dialog.getByRole('textbox', { name: SELECT_YEAR })).first();
+  if (!(await monthSelect.isVisible().catch(() => false)) && !(await yearField.isVisible().catch(() => false))) {
+    // The month/year picker sits behind a toggle (humi: the heading itself is
+    // a button). Matched by the button's OWN rendered text — what `headingOf`
+    // already read off the dialog — never by its accessible name: the app may
+    // label the toggle for assistive tech ("Choose month and year") while its
+    // visible content stays the month and year, and only the visible content
+    // is what `heading.text` holds. Accessible-name matching here is exactly
+    // EH-DOB's bug: the toggle button's real `aria-label` never equals the
+    // heading text, so a name-based lookup always missed it (EH-DOB, below).
     const heading = await headingOf(dialog, timeout);
-    if (heading === null) return false;
-    const headingButton = dialog.getByRole('button', { name: new RegExp(`^\\s*${heading.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'iu') }).first();
-    if (!(await headingButton.isVisible().catch(() => false))) return false;
-    await headingButton.click({ timeout }).catch(() => undefined);
-    monthSelect = dialog.getByRole('combobox', { name: SELECT_MONTH }).first();
-    yearField = dialog.getByRole('spinbutton', { name: SELECT_YEAR }).or(dialog.getByRole('textbox', { name: SELECT_YEAR })).first();
-    if (!(await monthSelect.isVisible().catch(() => false))) return false;
+    if (heading === null) return 'the dialog shows no month heading';
+    const headingButton = dialog
+      .getByRole('button')
+      .filter({ hasText: new RegExp(`^\\s*${escapeForNameRegex(heading.text)}\\s*$`, 'iu') })
+      .first();
+    if (!(await headingButton.isVisible().catch(() => false))) return `no button reads "${heading.text}" to open a month view`;
+    const clickFailure = await headingButton.click({ timeout }).then(() => null, whyClickFailed);
+    if (clickFailure !== null) return `the "${heading.text}" toggle could not be clicked (${clickFailure})`;
   }
-  // The year field shows the era the heading shows: a value ≥ 2400 is Buddhist.
-  const shownYear = Number(await yearField.inputValue({ timeout }).catch(() => ''));
-  const buddhist = Number.isFinite(shownYear) && shownYear >= 2400;
-  const wantYear = buddhist ? target.year + 543 : target.year;
-  if (await yearField.isVisible().catch(() => false)) {
-    await yearField.fill(String(wantYear), { timeout }).catch(() => undefined);
-    await yearField.press('Enter', { timeout }).catch(() => undefined);
+
+  const liveYearField = dialog.getByRole('spinbutton', { name: SELECT_YEAR }).or(dialog.getByRole('textbox', { name: SELECT_YEAR })).first();
+  if (await liveYearField.isVisible().catch(() => false)) {
+    // The year field shows the era the heading shows: a value ≥ 2400 is Buddhist.
+    const shownYear = Number(await liveYearField.inputValue({ timeout }).catch(() => ''));
+    const buddhist = Number.isFinite(shownYear) && shownYear >= 2400;
+    const wantYear = buddhist ? target.year + 543 : target.year;
+    await liveYearField.fill(String(wantYear), { timeout }).catch(() => undefined);
+    await liveYearField.press('Enter', { timeout }).catch(() => undefined);
+  } else if (!(await stepYearButtons(dialog, target.year, timeout))) {
+    return `the month view's year controls did not reach ${target.year}`;
   }
-  await monthSelect.selectOption({ index: target.month - 1 }, { timeout }).catch(() => undefined);
-  // A month grid (humi) needs the month button clicked to return to the day view.
-  const monthButtons = dialog.getByRole('button', { pressed: true });
-  if ((await monthButtons.count().catch(() => 0)) > 0 && (await monthSelect.isVisible().catch(() => false))) {
-    const options = await monthSelect.locator('option').allInnerTexts().catch(() => [] as string[]);
-    const label = options[target.month - 1];
-    if (label !== undefined) {
-      const button = dialog.getByRole('button', { name: new RegExp(`^\\s*${label.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'iu') }).first();
-      await button.click({ timeout }).catch(() => undefined);
+
+  const liveMonthSelect = dialog.getByRole('combobox', { name: SELECT_MONTH }).first();
+  if (await liveMonthSelect.isVisible().catch(() => false)) {
+    await liveMonthSelect.selectOption({ index: target.month - 1 }, { timeout }).catch(() => undefined);
+    // A month grid alongside the select needs the month button clicked too,
+    // to return to the day view.
+    const pressedButtons = dialog.getByRole('button', { pressed: true });
+    if ((await pressedButtons.count().catch(() => 0)) > 0) {
+      const options = await liveMonthSelect.locator('option').allInnerTexts().catch(() => [] as string[]);
+      const label = options[target.month - 1];
+      if (label !== undefined) {
+        const button = dialog.getByRole('button').filter({ hasText: new RegExp(`^\\s*${escapeForNameRegex(label.trim())}\\s*$`, 'iu') }).first();
+        await button.click({ timeout }).catch(() => undefined);
+      }
     }
+  } else {
+    const monthButton = await findMonthButton(dialog, target.month);
+    if (monthButton === null) return 'the month view offers no button for the target month';
+    await monthButton.click({ timeout }).catch(() => undefined);
   }
+
   const after = await headingOf(dialog, timeout);
-  return after !== null && after.year === target.year && after.month === target.month;
+  if (after !== null && after.year === target.year && after.month === target.month) return null;
+  return `after the month view the heading reads ${JSON.stringify(after?.text ?? '')}`;
 }
 
 /**
@@ -176,10 +295,14 @@ export async function pickDateInDialog(
   const target = partsOf(isoDate);
   if (target === null) throw new CalendarDriveError(`${JSON.stringify(isoDate)} is not an ISO date (YYYY-MM-DD)`);
 
-  const expanded = await attr(trigger, 'aria-expanded', 250);
-  if (expanded !== 'true') await trigger.first().click({ timeout });
-  const dialog = await waitForDialog(page, timeout);
-  if (dialog === null) throw new CalendarDriveError(`no dialog opened within ${timeout} ms of clicking the date field`);
+  const open = async (): Promise<Locator> => {
+    const expanded = await attr(trigger, 'aria-expanded', 250);
+    if (expanded !== 'true') await trigger.first().click({ timeout });
+    const opened = await waitForDialog(page, timeout);
+    if (opened === null) throw new CalendarDriveError(`no dialog opened within ${timeout} ms of clicking the date field`);
+    return opened;
+  };
+  let dialog = await open();
 
   // 2. Reach the month.
   let heading = await headingOf(dialog, timeout);
@@ -190,8 +313,24 @@ export async function pickDateInDialog(
   let navigated = 0;
   let via: PickDateResult['via'] = 'same-month';
   let delta = monthsBetween(heading, target);
-  if (Math.abs(delta) > MONTH_VIEW_THRESHOLD && (await jumpViaMonthView(dialog, target, timeout))) {
-    via = 'month-view';
+  let jumpFailure: string | null = null;
+  if (Math.abs(delta) > MONTH_VIEW_THRESHOLD) {
+    jumpFailure = await jumpViaMonthView(dialog, target, timeout);
+    if (jumpFailure !== null && !(await dialog.isVisible().catch(() => false))) {
+      // The popover closed under the driver (a click-outside, or a page that
+      // dismisses it when a scrolling ancestor moves). One fresh open, the
+      // same procedure; a second close fails below with both facts named.
+      dialog = await open();
+      const again = await jumpViaMonthView(dialog, target, timeout);
+      jumpFailure = again === null ? null : `${again}; the dialog had already closed by itself once (${jumpFailure})`;
+    }
+    if (jumpFailure === null) {
+      via = 'month-view';
+    } else {
+      // A month view left open has no day grid: toggle it back before stepping.
+      const openToggle = dialog.locator('button[aria-expanded="true"]').first();
+      if (await openToggle.isVisible().catch(() => false)) await openToggle.click({ timeout }).catch(() => undefined);
+    }
     heading = (await headingOf(dialog, timeout)) ?? heading;
     delta = monthsBetween(heading, target);
   }
@@ -204,6 +343,13 @@ export async function pickDateInDialog(
     heading = (await headingOf(dialog, timeout)) ?? heading;
     delta = monthsBetween(heading, target);
     via = 'month-nav';
+  }
+  if (jumpFailure !== null && Math.abs(delta) > MAX_MONTH_STEPS) {
+    await page.keyboard.press('Escape').catch(() => undefined);
+    throw new CalendarDriveError(
+      `could not reach ${isoDate}: ${Math.abs(delta)} months from "${heading.text}" is beyond month-by-month stepping (${MAX_MONTH_STEPS}), ` +
+        `and the month view did not take it — ${jumpFailure}`,
+    );
   }
   while (delta !== 0 && navigated < MAX_MONTH_STEPS) {
     const nav = dialog.getByRole('button', { name: delta > 0 ? NEXT_MONTH : PREVIOUS_MONTH }).first();

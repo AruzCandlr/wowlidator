@@ -17,6 +17,7 @@
  */
 
 import { formatAxNode, INTERACTIVE_ROLES, type AxNode } from '../healer/jit-healer.js';
+import { ARIA_ROLES, normaliseAgentSelector } from '../engine/selector.js';
 import { tokenize } from '../context/relevance.js';
 import { foldValue, goalOutcomes, valueShownIn } from './goal-evidence.js';
 
@@ -845,4 +846,230 @@ export function sameOptions(a: readonly string[], b: readonly string[]): boolean
       .sort()
       .join('\n');
   return a.length === b.length && fold(a) === fold(b);
+}
+
+// --- The indexed action space (the jev policy, 2026-09-18) --------------------
+
+/**
+ * What an element in the numbered table may be asked to do. `CLICK` for any
+ * enabled interactive control; `TYPE_TEXT` for a field that takes text
+ * (textbox, searchbox, spinbutton, a non-readonly combobox); `SELECT` for a
+ * combobox or listbox whose value is chosen from a list. The operation names
+ * are jev-ultrafast's, kept verbatim so the two policies can be compared.
+ */
+export type ElementOperation = 'CLICK' | 'TYPE_TEXT' | 'SELECT';
+
+/**
+ * One row of the table an indexed policy chooses from. Built from the SAME
+ * focused nodes the string tree renders, so the model's table and the
+ * judges' tree can never disagree about what is on the page. `selector` is
+ * the canonical name selector the loop already writes for its menu walker —
+ * the guards, the history, the record and the replay script all read it —
+ * with `>> nth=k` for the k-th control of the same role and name in document
+ * order. `ref` (Phase 3) is the per-capture `aria-ref` of the exact node,
+ * never persisted.
+ */
+export interface IndexedElement {
+  /** 1-based, in document order over the table. */
+  index: number;
+  role: string;
+  name: string;
+  value: string;
+  checked: boolean;
+  disabled: boolean;
+  readonly: boolean;
+  required: boolean;
+  url: string;
+  operations: ElementOperation[];
+  /** Null for a row that cannot be targeted by name (a value-only node). */
+  selector: string | null;
+  /**
+   * How many nodes of the same role and EXACT name precede this one in the
+   * full tree — the row's place among its exact duplicates in document
+   * order, which is what an aria snapshot's k-th same-named ref is. Counted
+   * over the population, never the focus cut (review 2026-09-18).
+   */
+  position: number;
+  ref?: string | undefined;
+}
+
+/**
+ * The refs in Playwright's AI-mode aria snapshot (`ariaSnapshot({ mode: 'ai' })`,
+ * Phase 3 of the jev port): `- button "Edit" [ref=e8]` → `button::Edit` →
+ * `['e8', …]`, in document order, so the k-th control of a role and name maps
+ * to the k-th ref — the same duplicate rule `indexElements` uses for `nth`.
+ * A line with no ref (`- text: City`, `- listbox`) contributes nothing. Pure:
+ * a ref is valid only against the snapshot it came from, and the caller
+ * takes one per turn and persists none.
+ */
+export interface AriaRefs {
+  /** `role::name` → refs in document order. */
+  byKey: Map<string, string[]>;
+  /** ref → the accessible name the snapshot gave that node (empty for an unnamed one). */
+  names: Map<string, string>;
+}
+
+export function refsFromAriaSnapshot(snapshot: string): AriaRefs {
+  const byKey = new Map<string, string[]>();
+  const names = new Map<string, string>();
+  const line = /^\s*-\s+([A-Za-z]+)(?:\s+"((?:[^"\\]|\\.)*)")?[^\n]*?\[ref=(e\d+)\]/;
+  for (const raw of snapshot.split('\n')) {
+    const m = line.exec(raw);
+    if (m === null) continue;
+    let name = '';
+    if (m[2] !== undefined) {
+      try {
+        name = JSON.parse(`"${m[2]}"`) as string;
+      } catch {
+        name = m[2];
+      }
+    }
+    const key = `${m[1]!.toLowerCase()}::${name}`;
+    (byKey.get(key) ?? byKey.set(key, []).get(key)!).push(m[3]!);
+    names.set(m[3]!, name);
+  }
+  return { byKey, names };
+}
+
+/**
+ * Attach a ref to every row whose role and name the snapshot also lists, in
+ * the same duplicate order. A row the snapshot does not name keeps no ref and
+ * takes the selector path — a ref is an optimisation with the name selector
+ * as the floor, never a requirement. Returns the count each way so the record
+ * can say how often Playwright's and Chrome's accessible names agreed.
+ */
+export function withRefs(
+  elements: readonly IndexedElement[],
+  refs: ReadonlyMap<string, readonly string[]> | AriaRefs,
+): { elements: IndexedElement[]; matched: number; missed: number } {
+  const lookup: ReadonlyMap<string, readonly string[]> = 'byKey' in refs ? refs.byKey : refs;
+  let matched = 0;
+  let missed = 0;
+  const out = elements.map((element) => {
+    if (element.selector === null || element.operations.length === 0) return element;
+    const key = `${element.role.toLowerCase()}::${element.name}`;
+    // The row's place among its exact duplicates in the WHOLE document, so a
+    // duplicate the focus cut evicted still shifts the pairing — otherwise
+    // the k-th kept row took the k-th ref, which was the evicted node's.
+    const ref = lookup.get(key)?.[element.position];
+    if (ref === undefined) {
+      missed += 1;
+      return element;
+    }
+    matched += 1;
+    return { ...element, ref };
+  });
+  return { elements: out, matched, missed };
+}
+
+const TEXT_ROLES: ReadonlySet<string> = new Set(['textbox', 'searchbox', 'spinbutton']);
+const SELECT_ROLES: ReadonlySet<string> = new Set(['combobox', 'listbox']);
+
+/**
+ * Number the focused tree. Every named (or valued) node is a row — the text
+ * nodes give the model the page's words, which DONE/BLOCKED judgments need —
+ * and only an enabled interactive node with a name carries operations. A
+ * disabled control is listed with none, so the model can see that it is
+ * there and choose WAIT, rather than being told nothing.
+ *
+ * `population` is the FULL tree the focused `nodes` were cut from (review
+ * 2026-09-18): Playwright's `nth=k` counts matches in the whole document,
+ * and its `[name="X" i]` is a case-insensitive SUBSTRING match — so a row
+ * needs `nth` whenever any other node of its role in the whole page has a
+ * name containing this one, and `k` is the number of such nodes BEFORE it in
+ * document order. Counted over the focus subset, an evicted earlier
+ * duplicate would have made the k-th kept "Edit" the wrong record, silently.
+ * A role outside the ARIA set (`StaticText`, `RootWebArea`) has no role
+ * selector in any engine; its row is targetable as `text="…"`, the form the
+ * read-only look needs to prove a claim through an error message.
+ */
+export function indexElements(nodes: readonly AxNode[], population: readonly AxNode[] = nodes): IndexedElement[] {
+  const fold = (s: string): string => s.toLowerCase();
+  const rows: IndexedElement[] = [];
+  for (const node of nodes) {
+    if (node.name === '' && node.value === '') continue;
+    const interactive = INTERACTIVE_ROLES.has(node.role) && node.name !== '';
+    let selector: string | null = null;
+    let position = 0;
+    if (node.name !== '' && !ARIA_ROLES.has(node.role.toLowerCase())) {
+      selector = `text=${JSON.stringify(node.name)}`;
+    } else if (node.name !== '') {
+      const needle = fold(node.name);
+      let before = 0;
+      let others = 0;
+      for (const other of population) {
+        if (other === node) break;
+        if (other.role === node.role && fold(other.name).includes(needle)) before += 1;
+        if (other.role === node.role && other.name === node.name) position += 1;
+      }
+      for (const other of population) {
+        if (other !== node && other.role === node.role && fold(other.name).includes(needle)) others += 1;
+      }
+      selector =
+        normaliseAgentSelector(`role=${node.role}[name=${JSON.stringify(node.name)}]`) + (others > 0 ? ` >> nth=${before}` : '');
+    }
+    const operations: ElementOperation[] = [];
+    if (interactive && !node.disabled) {
+      operations.push('CLICK');
+      const editable = TEXT_ROLES.has(node.role) || node.role === 'combobox';
+      if (editable && node.readonly !== true) operations.push('TYPE_TEXT');
+      if (SELECT_ROLES.has(node.role)) operations.push('SELECT');
+    }
+    rows.push({
+      index: rows.length + 1,
+      role: node.role,
+      name: node.name,
+      value: node.value,
+      checked: node.checked,
+      disabled: node.disabled,
+      readonly: node.readonly === true,
+      required: node.required === true,
+      url: node.url,
+      operations,
+      selector,
+      position,
+    });
+  }
+  return rows;
+}
+
+/** How much of the blocker's own markup an action error keeps. */
+const INTERCEPTOR_CHARS = 160;
+
+/**
+ * What Playwright says took the pointer, out of its own actionability log —
+ * or null when the log names nothing.
+ *
+ * Live (picks25 run, 2026-09-21): after a wizard's Next was refused, 17 agent
+ * clicks and dropdown opens each ended `locator.click: Timeout 5000ms
+ * exceeded.` and nothing else, because only the first line of the error was
+ * kept; the model guessed at "a sticky error banner" and clicked the covered
+ * controls again. The log's LAST interception line is the state the click
+ * gave up on. The same evidence the ladder's overlay rung acts on, here only
+ * handed to the next turn: the loop dismisses nothing on its own.
+ */
+export function interceptionOf(message: string): string | null {
+  const lines = message.split('\n').filter((line) => line.includes('intercepts pointer events'));
+  const last = lines[lines.length - 1];
+  if (last === undefined) return null;
+  const blocker = last.replace(/^\s*-\s*/, '').replace(/\s*intercepts pointer events.*$/, '').replace(/\s+/g, ' ').trim();
+  if (blocker === '') return null;
+  return blocker.length > INTERCEPTOR_CHARS ? `${blocker.slice(0, INTERCEPTOR_CHARS - 1)}…` : blocker;
+}
+
+/**
+ * Does a field that reads back differently still hold what was typed?
+ *
+ * Live (picks25 run, 2026-09-21, seven lanes): `fill` of a 13-digit national
+ * id read back `1-2345-67890-12-3` from a masked input and was reported
+ * FAILED — "the field did not keep the typed value" — about a field holding
+ * every character typed, in order; each lane then spent turns re-entering it.
+ * A mask only ADDS separators: the same letters and digits in the same order
+ * is the value kept. Anything else (a character dropped, changed, reordered,
+ * an empty field) is still the hydration loss the read-back exists to catch.
+ */
+export function heldAsTyped(typed: string, held: string): boolean {
+  const bare = (text: string): string => text.replace(/[^\p{L}\p{N}]/gu, '');
+  const want = bare(typed);
+  return want !== '' && want === bare(held);
 }

@@ -67,10 +67,11 @@ export function isLoginProof(step: FlowStep): boolean {
 }
 
 /**
- * The sign-in FORM's own controls appearing or becoming interactive — the
- * identity field, the password field, the literal "Sign in"/"Log in" submit
- * button — proof the login page rendered its own inputs, not that anything
- * the case asked about happened.
+ * The sign-in FORM's own controls appearing, becoming interactive, or GOING
+ * AWAY — the identity field, the password field, the literal "Sign in"/"Log
+ * in" submit button — proof the login page rendered its own inputs (or that
+ * it stopped rendering them), not that anything the case asked about
+ * happened.
  *
  * Deliberately narrower than `LOGIN_CONTROL`: that regex's "next" / "continue"
  * / "submit" are legitimate wizard-step button names far past sign-in (a
@@ -88,14 +89,21 @@ export function isLoginProof(step: FlowStep): boolean {
  * them "the sign-in form is there," none of them about the hire it never
  * attempted. The narrower `isLoginProof` (expectHidden only) let all three
  * count as substantive, so the flow sailed past this module's own lint.
+ *
+ * `expectHidden` of the identity or password field is the same surface seen
+ * from the other side (HR SIT E2E-01, 2026-09-18): a flow named "login page
+ * only" — goto, fill Username, fill password, click Sign in, goto, expectHidden
+ * `role=textbox[name="Username" i]` — passed 6/6 in 7.7 s about an end-to-end
+ * hire it never attempted, because that one assertion holds whenever the
+ * session was created. The 2026-09-10 rule already says the sign-in page going
+ * away is never a login proof; `isLoginProof` covered only the submit control.
  */
 const LOGIN_FORM_CONTROL = /\bemail\b|username|user ?name|sign[ -]?in|log[ -]?in|เข้าสู่ระบบ|อีเมล/i;
+const LOGIN_FORM_ASSERTIONS: ReadonlySet<string> = new Set(['expectVisible', 'expectEnabled', 'expectDisabled', 'expectHidden']);
 
-function isLoginFormSurface(step: FlowStep): boolean {
-  if (step.action !== 'expectVisible' && step.action !== 'expectEnabled' && step.action !== 'expectDisabled') {
-    return false;
-  }
-  const selector = step.selector.trim();
+export function isLoginFormSurface(step: FlowStep): boolean {
+  if (!LOGIN_FORM_ASSERTIONS.has(step.action)) return false;
+  const selector = ((step as { selector?: string }).selector ?? '').trim();
   if (/^input\[type=["']password["']\]/i.test(selector)) return true;
   const role = /^role=(?:textbox|button)\[name=["']([^"']*)["']/i.exec(selector);
   return role !== null && LOGIN_FORM_CONTROL.test(role[1] ?? '');

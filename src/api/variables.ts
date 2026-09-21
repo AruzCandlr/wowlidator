@@ -103,6 +103,11 @@ const ANY_PLACEHOLDER = /\{\{[^}]*\}\}/;
  */
 const SENSITIVE_NAME = /(token|secret|password|key|auth|session|cookie)/i;
 
+/** Is a value saved under this name a credential by name — shown in a report as its name only? */
+export function isSensitiveName(name: string): boolean {
+  return SENSITIVE_NAME.test(name);
+}
+
 export class UnknownVariableError extends Error {
   override readonly name = 'UnknownVariableError';
   readonly variable: string;
